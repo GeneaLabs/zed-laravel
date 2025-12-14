@@ -1,0 +1,19 @@
+[package]
+name = "zed-laravel"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mike"]
+license = "MIT"
+description = "Laravel development support for Zed editor"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"
+
+[profile.release]
+lto = true
+opt-level = "z"
+codegen-units = 1
+strip = true

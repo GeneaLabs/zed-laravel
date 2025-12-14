@@ -1,0 +1,14 @@
+#!/usr/bin/env php
+<?php
+
+/*
+|--------------------------------------------------------------------------
+| Test Artisan File
+|--------------------------------------------------------------------------
+|
+| This is a minimal artisan file for testing the Laravel Zed extension.
+| It allows the extension to detect this directory as a Laravel project.
+|
+*/
+
+echo "Laravel test project\n";

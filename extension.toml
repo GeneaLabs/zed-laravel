@@ -1,0 +1,11 @@
+id = "laravel"
+name = "Laravel"
+description = "Laravel development support for Zed with go-to-definition for Blade, Livewire, and Flux components"
+version = "0.1.0"
+schema_version = 1
+authors = ["Mike"]
+repository = "https://github.com/yourusername/zed-laravel"
+
+[language_servers.laravel-lsp]
+name = "Laravel LSP"
+languages = ["PHP", "Blade"]
