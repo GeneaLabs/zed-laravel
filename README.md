@@ -11,13 +11,13 @@ This will allow you to navigate to the referenced resource, but will also show a
 - [x] Blade Components
 - [x] Livewire Components
 - [x] Views
-- [ ] Routes
-- [ ] Configs
+- [x] Routes
+- [X] Configs
 - [ ] Middleware
 - [ ] Translations
 - [ ] App Bindings
 - [ ] Assets
-- [ ] Env Variables
+- [X] Env Variables
 - [ ] Inertia Pages
 
 ### Auto Completion
