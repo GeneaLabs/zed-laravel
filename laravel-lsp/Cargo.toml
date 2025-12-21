@@ -1,0 +1,60 @@
+[package]
+name = "laravel-lsp"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mike"]
+description = "Language Server Protocol implementation for Laravel development"
+license = "MIT"
+
+[dependencies]
+# LSP framework
+tower-lsp = "0.20"
+lsp-types = "0.94"
+
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# File system and paths
+walkdir = "2.5"
+glob = "0.3"
+
+# Regex for pattern matching
+regex = "1.11"
+lazy_static = "1.5"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Tree-sitter parsers
+# Using latest version to match the Blade grammar from GitHub
+tree-sitter = "0.26"
+tree-sitter-php = "0.24"
+
+[build-dependencies]
+# For downloading grammar from GitHub
+ureq = "2.10"
+
+# For extracting tar.gz archives
+flate2 = "1.0"
+tar = "0.4"
+
+# For compiling C code
+cc = "1.0"
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+strip = true
