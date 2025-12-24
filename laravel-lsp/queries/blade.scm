@@ -73,7 +73,19 @@
 ; because they're closers, not definitions to navigate to
 
 ; ============================================================================
-; Pattern 4: @include('view.name') directive (for future)
+; Pattern 4: @vite directive for asset references
+; ============================================================================
+; Matches: @vite('resources/css/app.css')
+;          @vite(['resources/css/app.css', 'resources/js/app.js'])
+;
+; The @vite directive includes asset paths that should be navigable
+; We capture the directive to extract asset paths from its arguments
+
+; Single @vite directive with arguments
+(directive) @vite_directive
+
+; ============================================================================
+; Pattern 5: @include('view.name') directive (for future)
 ; ============================================================================
 ; Matches: @include('partials.header')
 ;

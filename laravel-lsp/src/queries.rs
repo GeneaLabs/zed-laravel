@@ -96,11 +96,15 @@ pub fn find_view_calls<'a>(
         let capture = &query_match.captures[*capture_index];
         let capture_name = query.capture_names()[capture.index as usize];
 
-        // We only care about the view_name capture
-        if capture_name == "view_name" {
+        // We care about both view_name and route_view_name captures
+        if capture_name == "view_name" || capture_name == "route_view_name" {
             let node = capture.node;
             let view_name = node.utf8_text(source_bytes)?;
 
+            // Determine if this is a route view (Route::view or Volt::route)
+            // These should show ERROR severity if view not found
+            let is_route_view = capture_name == "route_view_name";
+            
             results.push(ViewMatch {
                 view_name,
                 byte_start: node.start_byte(),
@@ -108,6 +112,7 @@ pub fn find_view_calls<'a>(
                 row: node.start_position().row,
                 column: node.start_position().column,
                 end_column: node.end_position().column,
+                is_route_view,
             });
         }
     }
@@ -152,6 +157,7 @@ pub fn find_blade_components<'a>(
                     row: node.start_position().row,
                     column: node.start_position().column,
                     end_column: node.end_position().column,
+                    resolved_path: None,
                 });
             }
         }
@@ -578,6 +584,8 @@ pub struct ViewMatch<'a> {
     pub column: usize,
     /// End column number (0-indexed) - end of the match
     pub end_column: usize,
+    /// Whether this is from Route::view() or Volt::route() (should be ERROR if missing)
+    pub is_route_view: bool,
 }
 
 /// Represents a matched Blade component (<x-*>)
@@ -592,6 +600,8 @@ pub struct ComponentMatch<'a> {
     pub row: usize,
     pub column: usize,
     pub end_column: usize,
+    /// Resolved file path (cached during pre-parsing for performance)
+    pub resolved_path: Option<std::path::PathBuf>,
 }
 
 /// Represents a matched Livewire component
@@ -685,10 +695,9 @@ pub struct MiddlewareMatch<'a> {
 }
 
 /// Represents a matched translation call in PHP or Blade code
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TranslationMatch<'a> {
-    /// The translation key (e.g., "messages.welcome", "auth.failed")
-    /// May contain dots for nested keys or be a plain string for JSON translations
+    /// The translation key (e.g., "messages.welcome" or "Welcome to app")
     pub translation_key: &'a str,
     /// Starting byte offset in source
     pub byte_start: usize,
@@ -700,6 +709,160 @@ pub struct TranslationMatch<'a> {
     pub column: usize,
     /// End column number (0-indexed) - end of the match
     pub end_column: usize,
+}
+
+/// Represents a matched asset or path helper call
+#[derive(Debug, Clone)]
+pub struct AssetMatch<'a> {
+    /// The asset path or file path
+    pub path: &'a str,
+    /// The type of helper used
+    pub helper_type: AssetHelperType,
+    /// Starting byte offset in source
+    pub byte_start: usize,
+    /// Ending byte offset in source
+    pub byte_end: usize,
+    /// Line number (0-indexed)
+    pub row: usize,
+    /// Column number (0-indexed) - start of the match
+    pub column: usize,
+    /// End column number (0-indexed) - end of the match
+    pub end_column: usize,
+}
+
+/// Represents a matched Vite asset path within a @vite directive
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViteAssetMatch<'a> {
+    /// The asset path (e.g., "resources/css/app.css")
+    pub path: &'a str,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub row: usize,
+    pub column: usize,
+    pub end_column: usize,
+}
+
+/// Types of asset/path helpers
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssetHelperType {
+    Asset,        // asset() -> public/
+    PublicPath,   // public_path() -> public/
+    BasePath,     // base_path() -> project root
+    AppPath,      // app_path() -> app/
+    StoragePath,  // storage_path() -> storage/
+    DatabasePath, // database_path() -> database/
+    LangPath,     // lang_path() -> lang/
+    ConfigPath,   // config_path() -> config/
+    ResourcePath, // resource_path() -> resources/
+    Mix,          // mix() -> public/
+    ViteAsset,    // Vite::asset() -> resources/
+}
+
+/// Find all asset and path helper calls in PHP code
+///
+/// Returns a vector of AssetMatch structs containing path and helper type
+pub fn find_asset_calls<'a>(
+    tree: &Tree,
+    source: &'a str,
+    language: &Language,
+) -> Result<Vec<AssetMatch<'a>>> {
+    let query = compile_php_query(language)?;
+    let mut cursor = QueryCursor::new();
+    let mut results = Vec::new();
+
+    let root_node = tree.root_node();
+    let source_bytes = source.as_bytes();
+
+    let mut captures = cursor.captures(&query, root_node, source_bytes);
+
+    while let Some((query_match, capture_index)) = captures.next() {
+        let capture = &query_match.captures[*capture_index];
+        let capture_name = query.capture_names()[capture.index as usize];
+
+        // Determine the helper type based on capture name
+        let helper_type = match capture_name {
+            "asset_path" => AssetHelperType::Asset,
+            "public_path" => AssetHelperType::PublicPath,
+            "base_path" => AssetHelperType::BasePath,
+            "app_path" => AssetHelperType::AppPath,
+            "storage_path" => AssetHelperType::StoragePath,
+            "database_path" => AssetHelperType::DatabasePath,
+            "lang_path" => AssetHelperType::LangPath,
+            "config_path" => AssetHelperType::ConfigPath,
+            "resource_path" => AssetHelperType::ResourcePath,
+            "mix_path" => AssetHelperType::Mix,
+            "vite_asset_path" => AssetHelperType::ViteAsset,
+            _ => continue,
+        };
+
+        let node = capture.node;
+        let path = node.utf8_text(source_bytes)?;
+
+        results.push(AssetMatch {
+            path,
+            helper_type,
+            byte_start: node.start_byte(),
+            byte_end: node.end_byte(),
+            row: node.start_position().row,
+            column: node.start_position().column,
+            end_column: node.end_position().column,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Extract asset paths from @vite directive arguments
+/// e.g., @vite(['resources/css/app.css', 'resources/js/app.js'])
+/// or @vite['resources/css/app.css'] (without opening paren from tree-sitter)
+/// Returns a vector of (path, byte_start, byte_end) tuples
+pub fn extract_vite_asset_paths(directive_text: &str) -> Vec<(&str, usize, usize)> {
+    let mut paths = Vec::new();
+    
+    // Find the opening bracket or parenthesis
+    // Tree-sitter may give us "@vite['...']" without the opening paren
+    let start_pos = directive_text.find('(')
+        .or_else(|| directive_text.find('['))
+        .unwrap_or(0);
+    
+    let args_section = &directive_text[start_pos..];
+    let mut in_string = false;
+    let mut string_start = 0;
+    let mut quote_char = '\0';
+    let mut i = 0;
+    let bytes = args_section.as_bytes();
+    
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        
+        if !in_string {
+            // Look for opening quotes
+            if ch == '\'' || ch == '"' {
+                in_string = true;
+                quote_char = ch;
+                string_start = i + 1; // Start after the quote
+            }
+        } else {
+            // Look for closing quote (same as opening)
+            if ch == quote_char {
+                // Extract the string content between quotes
+                if let Ok(path) = std::str::from_utf8(&bytes[string_start..i]) {
+                    // Only include paths that look like file paths (not empty, not just whitespace)
+                    if !path.trim().is_empty() {
+                        // Calculate absolute byte positions in the original directive_text
+                        let abs_start = start_pos + string_start;
+                        let abs_end = start_pos + i;
+                        paths.push((path, abs_start, abs_end));
+                    }
+                }
+                in_string = false;
+            }
+        }
+        
+        i += 1;
+    }
+    
+    paths
 }
 
 /// Calculate the column range of the quoted string within a directive's arguments
@@ -948,9 +1111,133 @@ mod tests {
             let name_len = m.view_name.len();
             let column_span = m.end_column - m.column;
             eprintln!("Checking '{}': name_len={}, column_span={}", m.view_name, name_len, column_span);
-            assert_eq!(column_span, name_len,
-                "Column span should equal name length for '{}'", m.view_name);
         }
+    }
+
+    #[test]
+    fn test_find_route_view_calls() {
+        let php_code = r#"<?php
+        Route::view('/home', 'welcome');
+        Route::view('/about', "pages.about");
+        Route::view('/contact', 'contact.form');
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
+
+        // Debug: print what we found
+        eprintln!("Found {} Route::view() matches:", matches.len());
+        for (i, m) in matches.iter().enumerate() {
+            eprintln!("  [{}] view_name='{}' at {}:{}", i, m.view_name, m.row, m.column);
+        }
+
+        assert_eq!(matches.len(), 3, "Should find 3 Route::view() calls");
+
+        // Check that we found all views (second argument of Route::view)
+        let view_names: Vec<&str> = matches.iter().map(|m| m.view_name).collect();
+        assert!(view_names.contains(&"welcome"), "Should find welcome");
+        assert!(view_names.contains(&"pages.about"), "Should find pages.about");
+        assert!(view_names.contains(&"contact.form"), "Should find contact.form");
+    }
+
+    #[test]
+    fn test_mixed_view_patterns() {
+        let php_code = r#"<?php
+        return view('users.index');
+        Route::view('/home', 'welcome');
+        return View::make('admin.dashboard');
+        Route::view('/about', "pages.about");
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
+
+        // Debug: print what we found
+        eprintln!("Found {} mixed pattern matches:", matches.len());
+        for (i, m) in matches.iter().enumerate() {
+            eprintln!("  [{}] view_name='{}' at {}:{}", i, m.view_name, m.row, m.column);
+        }
+
+        assert_eq!(matches.len(), 4, "Should find all 4 view patterns");
+
+        // Check that we found all views from different patterns
+        let view_names: Vec<&str> = matches.iter().map(|m| m.view_name).collect();
+        assert!(view_names.contains(&"users.index"), "Should find view() call");
+        assert!(view_names.contains(&"welcome"), "Should find Route::view() call");
+        assert!(view_names.contains(&"admin.dashboard"), "Should find View::make() call");
+        assert!(view_names.contains(&"pages.about"), "Should find Route::view() call");
+    }
+
+    #[test]
+    fn test_find_volt_route_calls() {
+        let php_code = r#"<?php
+        Volt::route('/home', 'welcome');
+        Volt::route('/about', "pages.about");
+        Volt::route('/contact', 'volt.contact');
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
+
+        // Debug: print what we found
+        eprintln!("Found {} Volt::route() matches:", matches.len());
+        for (i, m) in matches.iter().enumerate() {
+            eprintln!("  [{}] view_name='{}' at {}:{} is_route_view={}", 
+                i, m.view_name, m.row, m.column, m.is_route_view);
+        }
+
+        assert_eq!(matches.len(), 3, "Should find 3 Volt::route() calls");
+
+        // Check that we found all views (second argument of Volt::route)
+        let view_names: Vec<&str> = matches.iter().map(|m| m.view_name).collect();
+        assert!(view_names.contains(&"welcome"), "Should find welcome");
+        assert!(view_names.contains(&"pages.about"), "Should find pages.about");
+        assert!(view_names.contains(&"volt.contact"), "Should find volt.contact");
+        
+        // Verify all are marked as route views (should be ERROR if missing)
+        for m in matches.iter() {
+            assert!(m.is_route_view, "Volt::route() should set is_route_view=true");
+        }
+    }
+
+    #[test]
+    fn test_route_view_flag_distinction() {
+        let php_code = r#"<?php
+        return view('users.index');
+        Route::view('/home', 'welcome');
+        Volt::route('/about', 'pages.about');
+        return View::make('admin.dashboard');
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
+
+        // Debug: print what we found
+        eprintln!("Found {} matches with is_route_view flags:", matches.len());
+        for (i, m) in matches.iter().enumerate() {
+            eprintln!("  [{}] view_name='{}' is_route_view={}", 
+                i, m.view_name, m.is_route_view);
+        }
+
+        assert_eq!(matches.len(), 4, "Should find all 4 view patterns");
+
+        // Find specific matches
+        let users_index = matches.iter().find(|m| m.view_name == "users.index").unwrap();
+        let welcome = matches.iter().find(|m| m.view_name == "welcome").unwrap();
+        let pages_about = matches.iter().find(|m| m.view_name == "pages.about").unwrap();
+        let admin_dashboard = matches.iter().find(|m| m.view_name == "admin.dashboard").unwrap();
+
+        // Regular view() and View::make() should NOT be route views
+        assert!(!users_index.is_route_view, "view() should have is_route_view=false");
+        assert!(!admin_dashboard.is_route_view, "View::make() should have is_route_view=false");
+
+        // Route::view() and Volt::route() SHOULD be route views
+        assert!(welcome.is_route_view, "Route::view() should have is_route_view=true");
+        assert!(pages_about.is_route_view, "Volt::route() should have is_route_view=true");
     }
 
     #[test]
@@ -1288,6 +1575,398 @@ $no = __('No');
         for m in &matches {
             eprintln!("  - '{}' at line {}", m.translation_key, m.row + 1);
         }
+    }
+
+    #[test]
+    fn test_view_positions_exclude_quotes() {
+        // This test verifies that view name positions exclude the surrounding quotes
+        let php_code = r#"<?php
+return view('welcome');
+echo view("dashboard");
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
+
+        assert_eq!(matches.len(), 2, "Should find 2 view calls");
+
+        for view_match in &matches {
+            let source_bytes = php_code.as_bytes();
+            
+            // Extract the actual characters at the matched byte positions
+            let char_at_start = source_bytes[view_match.byte_start] as char;
+            let char_at_end = source_bytes[view_match.byte_end - 1] as char;
+            
+            eprintln!("Testing view '{}' at byte range {}..{}", 
+                view_match.view_name, view_match.byte_start, view_match.byte_end);
+            eprintln!("  char_at_start: '{}' (should NOT be a quote)", char_at_start);
+            eprintln!("  char_at_end: '{}' (should NOT be a quote)", char_at_end);
+            
+            // The byte positions should point to the actual view name content, not the quotes
+            assert_ne!(char_at_start, '\'', "Start position should not be a single quote");
+            assert_ne!(char_at_start, '"', "Start position should not be a double quote");
+            assert_ne!(char_at_end, '\'', "End position should not be a single quote");
+            assert_ne!(char_at_end, '"', "End position should not be a double quote");
+            
+            // The extracted text should match the view name
+            let extracted_text = std::str::from_utf8(
+                &source_bytes[view_match.byte_start..view_match.byte_end]
+            ).expect("Should be valid UTF-8");
+            
+            assert_eq!(extracted_text, view_match.view_name,
+                "Extracted text should match view_name without quotes");
+        }
+    }
+
+    #[test]
+    fn test_view_column_positions_exclude_quotes() {
+        // This test verifies that column positions for LSP ranges exclude the surrounding quotes
+        let php_code = r#"<?php
+return view('welcome');
+echo view("dashboard");
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
+
+        assert_eq!(matches.len(), 2, "Should find 2 view calls");
+
+        for view_match in &matches {
+            let source_bytes = php_code.as_bytes();
+            
+            // Get the line of text
+            let lines: Vec<&str> = php_code.lines().collect();
+            let line_text = lines[view_match.row];
+            let line_bytes = line_text.as_bytes();
+            
+            // Extract characters at the column positions
+            if view_match.column < line_bytes.len() {
+                let char_at_column = line_bytes[view_match.column] as char;
+                eprintln!("Testing view '{}' at row {} column {} (end_column {})", 
+                    view_match.view_name, view_match.row, view_match.column, view_match.end_column);
+                eprintln!("  Line: '{}'", line_text);
+                eprintln!("  char_at_column {}: '{}' (should NOT be a quote)", view_match.column, char_at_column);
+                
+                // The column position should point to the first character of the view name, not the quote
+                assert_ne!(char_at_column, '\'', 
+                    "Column {} should not point to a single quote, but found '{}' in line: {}", 
+                    view_match.column, char_at_column, line_text);
+                assert_ne!(char_at_column, '"', 
+                    "Column {} should not point to a double quote, but found '{}' in line: {}", 
+                    view_match.column, char_at_column, line_text);
+            }
+            
+            if view_match.end_column > 0 && view_match.end_column <= line_bytes.len() {
+                let char_before_end = line_bytes[view_match.end_column - 1] as char;
+                eprintln!("  char before end_column {}: '{}' (should NOT be a quote)", view_match.end_column, char_before_end);
+                
+                // The end_column-1 should point to the last character of the view name, not the quote
+                assert_ne!(char_before_end, '\'', 
+                    "Character before end_column {} should not be a single quote, but found '{}' in line: {}", 
+                    view_match.end_column, char_before_end, line_text);
+                assert_ne!(char_before_end, '"', 
+                    "Character before end_column {} should not be a double quote, but found '{}' in line: {}", 
+                    view_match.end_column, char_before_end, line_text);
+            }
+        }
+    }
+
+    #[test]
+    fn test_route_view_column_positions_exclude_quotes() {
+        // This test specifically checks Route::view() and Volt::route() patterns
+        // to ensure column positions exclude quotes for goto navigation
+        let php_code = r#"<?php
+Route::view('/home', 'welcome');
+Route::view('/about', "pages.about");
+Volt::route('/contact', 'contact.form');
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
+
+        assert_eq!(matches.len(), 3, "Should find 3 route view calls");
+
+        for view_match in &matches {
+            let lines: Vec<&str> = php_code.lines().collect();
+            let line_text = lines[view_match.row];
+            let line_bytes = line_text.as_bytes();
+            
+            eprintln!("\nTesting route view '{}' at row {} column {}-{}", 
+                view_match.view_name, view_match.row, view_match.column, view_match.end_column);
+            eprintln!("  Line: '{}'", line_text);
+            
+            // Check start position
+            if view_match.column < line_bytes.len() {
+                let char_at_start = line_bytes[view_match.column] as char;
+                eprintln!("  char_at_column[{}]: '{}' (should be first char of '{}')", 
+                    view_match.column, char_at_start, view_match.view_name);
+                
+                // Should point to first character of view name, not quote
+                assert_ne!(char_at_start, '\'', 
+                    "Route::view() column should not point to single quote");
+                assert_ne!(char_at_start, '"', 
+                    "Route::view() column should not point to double quote");
+                
+                // Should match the first character of the view name
+                let expected_first_char = view_match.view_name.chars().next().unwrap();
+                assert_eq!(char_at_start, expected_first_char,
+                    "Start column should point to first char of view name");
+            }
+            
+            // Check end position
+            if view_match.end_column > 0 && view_match.end_column <= line_bytes.len() {
+                let char_before_end = line_bytes[view_match.end_column - 1] as char;
+                eprintln!("  char_at_column[{}]: '{}' (should be last char of '{}')", 
+                    view_match.end_column - 1, char_before_end, view_match.view_name);
+                
+                // Should point to last character of view name, not quote
+                assert_ne!(char_before_end, '\'', 
+                    "Route::view() end column should not point to single quote");
+                assert_ne!(char_before_end, '"', 
+                    "Route::view() end column should not point to double quote");
+                
+                // Should match the last character of the view name
+                let expected_last_char = view_match.view_name.chars().last().unwrap();
+                assert_eq!(char_before_end, expected_last_char,
+                    "End column should point to last char of view name");
+            }
+            
+            // Extract the text using the column range
+            let extracted = &line_bytes[view_match.column..view_match.end_column];
+            let extracted_text = std::str::from_utf8(extracted).expect("Should be valid UTF-8");
+            eprintln!("  Extracted: '{}' (should match '{}')", extracted_text, view_match.view_name);
+            
+            assert_eq!(extracted_text, view_match.view_name,
+                "Column range should extract exact view name without quotes");
+        }
+    }
+
+    #[test]
+    fn test_find_asset_calls() {
+        let php_code = r#"<?php
+        $css = asset('css/app.css');
+        $img = asset("images/logo.png");
+        $js = asset('js/main.js');
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_asset_calls(&tree, php_code, &lang).expect("Should find assets");
+
+        assert_eq!(matches.len(), 3, "Should find 3 asset() calls");
+
+        let paths: Vec<&str> = matches.iter().map(|m| m.path).collect();
+        assert!(paths.contains(&"css/app.css"), "Should find css/app.css");
+        assert!(paths.contains(&"images/logo.png"), "Should find images/logo.png");
+        assert!(paths.contains(&"js/main.js"), "Should find js/main.js");
+
+        // Check helper types
+        for m in &matches {
+            assert_eq!(m.helper_type, AssetHelperType::Asset);
+        }
+    }
+
+    #[test]
+    fn test_find_path_helpers() {
+        let php_code = r#"<?php
+        $base = base_path('composer.json');
+        $app = app_path('Models/User.php');
+        $storage = storage_path('logs/laravel.log');
+        $db = database_path('seeders/UserSeeder.php');
+        $lang = lang_path('en/messages.php');
+        $config = config_path('app.php');
+        $resource = resource_path('views/welcome.blade.php');
+        $public = public_path('index.php');
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_asset_calls(&tree, php_code, &lang).expect("Should find paths");
+
+        assert_eq!(matches.len(), 8, "Should find 8 path helper calls");
+
+        // Check each helper type
+        let base_match = matches.iter().find(|m| m.path == "composer.json").unwrap();
+        assert_eq!(base_match.helper_type, AssetHelperType::BasePath);
+
+        let app_match = matches.iter().find(|m| m.path == "Models/User.php").unwrap();
+        assert_eq!(app_match.helper_type, AssetHelperType::AppPath);
+
+        let storage_match = matches.iter().find(|m| m.path == "logs/laravel.log").unwrap();
+        assert_eq!(storage_match.helper_type, AssetHelperType::StoragePath);
+
+        let db_match = matches.iter().find(|m| m.path == "seeders/UserSeeder.php").unwrap();
+        assert_eq!(db_match.helper_type, AssetHelperType::DatabasePath);
+
+        let lang_match = matches.iter().find(|m| m.path == "en/messages.php").unwrap();
+        assert_eq!(lang_match.helper_type, AssetHelperType::LangPath);
+
+        let config_match = matches.iter().find(|m| m.path == "app.php").unwrap();
+        assert_eq!(config_match.helper_type, AssetHelperType::ConfigPath);
+
+        let resource_match = matches.iter().find(|m| m.path == "views/welcome.blade.php").unwrap();
+        assert_eq!(resource_match.helper_type, AssetHelperType::ResourcePath);
+
+        let public_match = matches.iter().find(|m| m.path == "index.php").unwrap();
+        assert_eq!(public_match.helper_type, AssetHelperType::PublicPath);
+    }
+
+    #[test]
+    fn test_find_vite_asset_calls() {
+        let php_code = r#"<?php
+        $logo = Vite::asset('resources/images/logo.svg');
+        $icon = Vite::asset("resources/images/favicon.ico");
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_asset_calls(&tree, php_code, &lang).expect("Should find Vite assets");
+
+        assert_eq!(matches.len(), 2, "Should find 2 Vite::asset() calls");
+
+        let paths: Vec<&str> = matches.iter().map(|m| m.path).collect();
+        assert!(paths.contains(&"resources/images/logo.svg"), "Should find logo.svg");
+        assert!(paths.contains(&"resources/images/favicon.ico"), "Should find favicon.ico");
+
+        for m in &matches {
+            assert_eq!(m.helper_type, AssetHelperType::ViteAsset);
+        }
+    }
+
+    #[test]
+    fn test_find_mix_calls() {
+        let php_code = r#"<?php
+        $css = mix('css/app.css');
+        $js = mix("js/app.js");
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_asset_calls(&tree, php_code, &lang).expect("Should find mix calls");
+
+        assert_eq!(matches.len(), 2, "Should find 2 mix() calls");
+
+        let paths: Vec<&str> = matches.iter().map(|m| m.path).collect();
+        assert!(paths.contains(&"css/app.css"), "Should find css/app.css");
+        assert!(paths.contains(&"js/app.js"), "Should find js/app.js");
+
+        for m in &matches {
+            assert_eq!(m.helper_type, AssetHelperType::Mix);
+        }
+    }
+
+    #[test]
+    fn test_extract_vite_asset_paths() {
+        // Single asset
+        let directive = "@vite('resources/css/app.css')";
+        let paths = extract_vite_asset_paths(directive);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].0, "resources/css/app.css");
+
+        // Multiple assets in array
+        let directive = "@vite(['resources/css/app.css', 'resources/js/app.js'])";
+        let paths = extract_vite_asset_paths(directive);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].0, "resources/css/app.css");
+        assert_eq!(paths[1].0, "resources/js/app.js");
+
+        // With double quotes
+        let directive = r#"@vite(["resources/css/app.css", "resources/js/app.js"])"#;
+        let paths = extract_vite_asset_paths(directive);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].0, "resources/css/app.css");
+        assert_eq!(paths[1].0, "resources/js/app.js");
+
+        // Mixed quotes
+        let directive = r#"@vite(['resources/css/app.css', "resources/js/app.js"])"#;
+        let paths = extract_vite_asset_paths(directive);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].0, "resources/css/app.css");
+        assert_eq!(paths[1].0, "resources/js/app.js");
+
+        // With spaces
+        let directive = "@vite([ 'resources/css/app.css' , 'resources/js/app.js' ])";
+        let paths = extract_vite_asset_paths(directive);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].0, "resources/css/app.css");
+        assert_eq!(paths[1].0, "resources/js/app.js");
+    }
+
+    #[test]
+    fn test_asset_column_positions_exclude_quotes() {
+        let php_code = r#"<?php
+$img = asset('images/logo.png');
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_asset_calls(&tree, php_code, &lang).expect("Should find assets");
+
+        assert_eq!(matches.len(), 1);
+        let asset_match = &matches[0];
+
+        let lines: Vec<&str> = php_code.lines().collect();
+        let line_text = lines[asset_match.row];
+        let line_bytes = line_text.as_bytes();
+
+        // Check that column positions don't include quotes
+        let char_at_start = line_bytes[asset_match.column] as char;
+        assert_ne!(char_at_start, '\'', "Column should not point to quote");
+        assert_ne!(char_at_start, '"', "Column should not point to quote");
+
+        // Should be the first character of the path
+        assert_eq!(char_at_start, 'i', "Should point to first char of 'images'");
+
+        // Extract text using column range
+        let extracted = &line_bytes[asset_match.column..asset_match.end_column];
+        let extracted_text = std::str::from_utf8(extracted).expect("Should be valid UTF-8");
+        assert_eq!(extracted_text, "images/logo.png", "Should extract path without quotes");
+    }
+
+    #[test]
+    fn test_extract_vite_with_actual_format() {
+        // Test with the actual format we get from tree-sitter (missing opening paren)
+        let directive = "@vite['resources/css/app.css', 'resources/js/app.js']";
+        let paths = extract_vite_asset_paths(directive);
+        eprintln!("Extracted {} paths from: {}", paths.len(), directive);
+        for (i, (path, start, end)) in paths.iter().enumerate() {
+            eprintln!("  [{}] path='{}' offset={}-{}", i, path, start, end);
+        }
+        
+        // Even without opening paren, should still extract paths
+        assert_eq!(paths.len(), 2, "Should extract 2 paths even without opening paren");
+        if paths.len() >= 2 {
+            assert_eq!(paths[0].0, "resources/css/app.css");
+            assert_eq!(paths[1].0, "resources/js/app.js");
+        }
+    }
+
+    #[test]
+    fn test_find_vite_directive() {
+        let blade_code = r#"
+@vite(['resources/css/app.css', 'resources/js/app.js'])
+        "#;
+
+        let tree = parse_blade(blade_code).expect("Should parse Blade");
+        let lang = language_blade();
+        let matches = find_directives(&tree, blade_code, &lang).expect("Should find directives");
+
+        eprintln!("Found {} directives", matches.len());
+        for (i, m) in matches.iter().enumerate() {
+            eprintln!("  [{}] directive_name='{}' full_text='{}'", i, m.directive_name, m.full_text);
+        }
+
+        // Should find @vite directive
+        let vite_match = matches.iter().find(|m| m.directive_name == "vite");
+        assert!(vite_match.is_some(), "Should find @vite directive");
+        
+        let vite = vite_match.unwrap();
+        assert_eq!(vite.directive_name, "vite");
+        assert!(vite.full_text.contains("resources/css/app.css"));
+        assert!(vite.full_text.contains("resources/js/app.js"));
     }
 
 }

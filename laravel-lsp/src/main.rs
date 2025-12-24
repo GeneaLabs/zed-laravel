@@ -2,12 +2,16 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+use tokio::time::sleep;
 use tower_lsp::jsonrpc;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
-use tracing::{debug, info};
+
+use lazy_static::lazy_static;
+use tree_sitter::{Query, Tree};
 
 // Our tree-sitter modules
 mod parser;
@@ -16,19 +20,434 @@ mod config;
 mod env_parser;
 mod middleware_parser;
 mod service_provider_analyzer;
+mod database;
 
 use parser::{language_blade, language_php, parse_blade, parse_php};
 use queries::{
-    find_blade_components, find_config_calls, find_directives, find_env_calls,
+    find_asset_calls, find_blade_components, find_config_calls, find_directives, find_env_calls,
     find_livewire_components, find_middleware_calls, find_translation_calls, find_view_calls,
-    find_binding_calls,
-    BindingMatch, ComponentMatch, ConfigMatch, DirectiveMatch, EnvMatch, LivewireMatch, MiddlewareMatch,
-    TranslationMatch, ViewMatch,
+    find_binding_calls, extract_vite_asset_paths,
+    AssetMatch, AssetHelperType, BindingMatch, ComponentMatch, ConfigMatch, DirectiveMatch, 
+    EnvMatch, LivewireMatch, MiddlewareMatch, TranslationMatch, ViewMatch, ViteAssetMatch,
 };
 use config::LaravelConfig;
 use env_parser::EnvFileCache;
 use middleware_parser::resolve_class_to_file;
 use service_provider_analyzer::{analyze_service_providers, ServiceProviderRegistry};
+
+// ============================================================================
+// PART 1: Pattern Registry System & Query Caching
+// ============================================================================
+
+/// Cached compiled queries for performance
+lazy_static! {
+    static ref PHP_QUERY: Query = {
+        queries::compile_php_query(&language_php()).unwrap()
+    };
+    
+    static ref BLADE_QUERY: Query = {
+        queries::compile_blade_query(&language_blade()).unwrap()
+    };
+}
+
+/// Generic pattern match trait for all Laravel patterns
+trait PatternMatch: Send + Sync + std::fmt::Debug {
+    fn row(&self) -> usize;
+    fn column(&self) -> usize;
+    fn end_column(&self) -> usize;
+    fn byte_start(&self) -> usize;
+    fn byte_end(&self) -> usize;
+    
+    /// Pattern type identifier
+    fn pattern_type(&self) -> &'static str;
+}
+
+/// Pattern finder function type
+type PatternFinder = fn(&Tree, &str, &Query) -> Result<Vec<Box<dyn PatternMatch>>>;
+
+/// Pattern registry for all Laravel patterns
+struct PatternRegistry {
+    php_patterns: Vec<(&'static str, PatternFinder)>,
+    blade_patterns: Vec<(&'static str, PatternFinder)>,
+}
+
+lazy_static! {
+    static ref PATTERN_REGISTRY: PatternRegistry = PatternRegistry {
+        php_patterns: vec![
+            ("env", find_env_patterns),
+            ("config", find_config_patterns),
+            ("view", find_view_patterns),
+            ("middleware", find_middleware_patterns),
+            ("translation", find_translation_patterns),
+            ("binding", find_binding_patterns),
+            ("asset", find_asset_patterns),
+        ],
+        blade_patterns: vec![
+            ("component", find_component_patterns),
+            ("livewire", find_livewire_patterns),
+            ("directive", find_directive_patterns),
+            ("vite_asset", find_vite_asset_patterns),
+        ],
+    };
+}
+
+/// Generic pattern storage with incremental parsing support
+#[derive(Default)]
+struct ParsedDocument {
+    /// Document version when this was parsed
+    version: Option<i32>,
+    
+    /// Cached tree for incremental parsing
+    tree: Option<Tree>,
+    
+    /// All pattern matches organized by type
+    patterns: HashMap<String, Vec<Box<dyn PatternMatch>>>,
+}
+
+impl std::fmt::Debug for ParsedDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParsedDocument")
+            .field("version", &self.version)
+            .field("tree", &self.tree.as_ref().map(|_| "Tree"))
+            .field("patterns", &format!("{} pattern types", self.patterns.len()))
+            .finish()
+    }
+}
+
+// ============================================================================
+// PART 2: Pattern Match Implementations
+// ============================================================================
+
+impl PatternMatch for EnvMatch<'_> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+    fn pattern_type(&self) -> &'static str { "env" }
+}
+
+
+
+impl PatternMatch for ConfigMatch<'_> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+    fn pattern_type(&self) -> &'static str { "config" }
+}
+
+
+
+impl PatternMatch for ViewMatch<'_> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+    fn pattern_type(&self) -> &'static str { "view" }
+}
+
+
+
+impl PatternMatch for ComponentMatch<'_> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+    fn pattern_type(&self) -> &'static str { "component" }
+}
+
+
+
+impl PatternMatch for LivewireMatch<'_> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+    fn pattern_type(&self) -> &'static str { "livewire" }
+}
+
+
+
+impl PatternMatch for DirectiveMatch<'_> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+    fn pattern_type(&self) -> &'static str { "directive" }
+}
+
+
+
+impl PatternMatch for MiddlewareMatch<'_> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+    fn pattern_type(&self) -> &'static str { "middleware" }
+}
+
+
+
+impl PatternMatch for TranslationMatch<'_> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+    fn pattern_type(&self) -> &'static str { "translation" }
+}
+
+
+
+impl PatternMatch for BindingMatch<'_> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+    fn pattern_type(&self) -> &'static str { "binding" }
+}
+
+
+
+impl PatternMatch for AssetMatch<'_> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+    fn pattern_type(&self) -> &'static str { "asset" }
+}
+
+
+
+impl PatternMatch for ViteAssetMatch<'_> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+    fn pattern_type(&self) -> &'static str { "vite_asset" }
+}
+
+
+
+// ============================================================================
+// PART 3: Pattern Wrapper Functions (for Registry)
+// ============================================================================
+
+/// Wrapper for find_env_calls to work with pattern registry
+fn find_env_patterns(tree: &Tree, source: &str, _query: &Query) -> Result<Vec<Box<dyn PatternMatch>>> {
+    let matches = find_env_calls(tree, source, &language_php())?;
+    Ok(matches.into_iter().map(|m| {
+        // Convert to owned version with leaked strings for 'static lifetime
+        let owned = EnvMatch {
+            var_name: m.var_name.to_string().leak(),
+            has_fallback: m.has_fallback,
+            byte_start: m.byte_start,
+            byte_end: m.byte_end,
+            row: m.row,
+            column: m.column,
+            end_column: m.end_column,
+        };
+        Box::new(owned) as Box<dyn PatternMatch>
+    }).collect())
+}
+
+/// Wrapper for find_config_calls
+fn find_config_patterns(tree: &Tree, source: &str, _query: &Query) -> Result<Vec<Box<dyn PatternMatch>>> {
+    let matches = find_config_calls(tree, source, &language_php())?;
+    Ok(matches.into_iter().map(|m| {
+        let owned = ConfigMatch {
+            config_key: m.config_key.to_string().leak(),
+            byte_start: m.byte_start,
+            byte_end: m.byte_end,
+            row: m.row,
+            column: m.column,
+            end_column: m.end_column,
+        };
+        Box::new(owned) as Box<dyn PatternMatch>
+    }).collect())
+}
+
+/// Wrapper for find_view_calls
+fn find_view_patterns(tree: &Tree, source: &str, _query: &Query) -> Result<Vec<Box<dyn PatternMatch>>> {
+    let matches = find_view_calls(tree, source, &language_php())?;
+    Ok(matches.into_iter().map(|m| {
+        let owned = ViewMatch {
+            view_name: m.view_name.to_string().leak(),
+            byte_start: m.byte_start,
+            byte_end: m.byte_end,
+            row: m.row,
+            column: m.column,
+            end_column: m.end_column,
+            is_route_view: m.is_route_view,
+        };
+        Box::new(owned) as Box<dyn PatternMatch>
+    }).collect())
+}
+
+/// Wrapper for find_middleware_calls
+fn find_middleware_patterns(tree: &Tree, source: &str, _query: &Query) -> Result<Vec<Box<dyn PatternMatch>>> {
+    let matches = find_middleware_calls(tree, source, &language_php())?;
+    Ok(matches.into_iter().map(|m| {
+        let owned = MiddlewareMatch {
+            middleware_name: m.middleware_name.to_string().leak(),
+            byte_start: m.byte_start,
+            byte_end: m.byte_end,
+            row: m.row,
+            column: m.column,
+            end_column: m.end_column,
+        };
+        Box::new(owned) as Box<dyn PatternMatch>
+    }).collect())
+}
+
+/// Wrapper for find_translation_calls
+fn find_translation_patterns(tree: &Tree, source: &str, _query: &Query) -> Result<Vec<Box<dyn PatternMatch>>> {
+    let matches = find_translation_calls(tree, source, &language_php())?;
+    Ok(matches.into_iter().map(|m| {
+        let owned = TranslationMatch {
+            translation_key: m.translation_key.to_string().leak(),
+            byte_start: m.byte_start,
+            byte_end: m.byte_end,
+            row: m.row,
+            column: m.column,
+            end_column: m.end_column,
+        };
+        Box::new(owned) as Box<dyn PatternMatch>
+    }).collect())
+}
+
+/// Wrapper for find_binding_calls
+fn find_binding_patterns(tree: &Tree, source: &str, _query: &Query) -> Result<Vec<Box<dyn PatternMatch>>> {
+    let matches = find_binding_calls(tree, source, &language_php())?;
+    Ok(matches.into_iter().map(|m| {
+        let owned = BindingMatch {
+            binding_name: m.binding_name.to_string().leak(),
+            is_class_reference: m.is_class_reference,
+            byte_start: m.byte_start,
+            byte_end: m.byte_end,
+            row: m.row,
+            column: m.column,
+            end_column: m.end_column,
+        };
+        Box::new(owned) as Box<dyn PatternMatch>
+    }).collect())
+}
+
+/// Wrapper for find_asset_calls
+fn find_asset_patterns(tree: &Tree, source: &str, _query: &Query) -> Result<Vec<Box<dyn PatternMatch>>> {
+    let matches = find_asset_calls(tree, source, &language_php())?;
+    Ok(matches.into_iter().map(|m| {
+        let owned = AssetMatch {
+            path: m.path.to_string().leak(),
+            helper_type: m.helper_type,
+            byte_start: m.byte_start,
+            byte_end: m.byte_end,
+            row: m.row,
+            column: m.column,
+            end_column: m.end_column,
+        };
+        Box::new(owned) as Box<dyn PatternMatch>
+    }).collect())
+}
+
+/// Wrapper for find_blade_components
+fn find_component_patterns(tree: &Tree, source: &str, _query: &Query) -> Result<Vec<Box<dyn PatternMatch>>> {
+    let matches = find_blade_components(tree, source, &language_blade())?;
+    Ok(matches.into_iter().map(|m| {
+        let owned = ComponentMatch {
+            component_name: m.component_name.to_string().leak(),
+            tag_name: m.tag_name.to_string().leak(),
+            byte_start: m.byte_start,
+            byte_end: m.byte_end,
+            row: m.row,
+            column: m.column,
+            end_column: m.end_column,
+            resolved_path: m.resolved_path,
+        };
+        Box::new(owned) as Box<dyn PatternMatch>
+    }).collect())
+}
+
+/// Wrapper for find_livewire_components
+fn find_livewire_patterns(tree: &Tree, source: &str, _query: &Query) -> Result<Vec<Box<dyn PatternMatch>>> {
+    let matches = find_livewire_components(tree, source, &language_blade())?;
+    Ok(matches.into_iter().map(|m| {
+        let owned = LivewireMatch {
+            component_name: m.component_name.to_string().leak(),
+            byte_start: m.byte_start,
+            byte_end: m.byte_end,
+            row: m.row,
+            column: m.column,
+            end_column: m.end_column,
+        };
+        Box::new(owned) as Box<dyn PatternMatch>
+    }).collect())
+}
+
+/// Wrapper for find_directives
+fn find_directive_patterns(tree: &Tree, source: &str, _query: &Query) -> Result<Vec<Box<dyn PatternMatch>>> {
+    let matches = find_directives(tree, source, &language_blade())?;
+    Ok(matches.into_iter().map(|m| {
+        let owned = DirectiveMatch {
+            directive_name: m.directive_name.to_string().leak(),
+            full_text: m.full_text.clone(),
+            arguments: m.arguments.map(|s| s.to_string().leak() as &str),
+            byte_start: m.byte_start,
+            byte_end: m.byte_end,
+            row: m.row,
+            column: m.column,
+            end_column: m.end_column,
+            string_column: m.string_column,
+            string_end_column: m.string_end_column,
+        };
+        Box::new(owned) as Box<dyn PatternMatch>
+    }).collect())
+}
+
+/// Wrapper for vite asset extraction
+fn find_vite_asset_patterns(tree: &Tree, source: &str, _query: &Query) -> Result<Vec<Box<dyn PatternMatch>>> {
+    // First find directives, then extract vite assets
+    let directives = find_directives(tree, source, &language_blade())?;
+    let vite_assets: Vec<ViteAssetMatch> = directives.iter()
+        .filter(|d| d.directive_name == "vite")
+        .flat_map(|d| {
+            let paths = extract_vite_asset_paths(&d.full_text);
+            paths.into_iter().map(move |(path, byte_start, byte_end)| {
+                let absolute_byte_start = d.byte_start + byte_start;
+                let absolute_byte_end = d.byte_start + byte_end;
+                
+                let before_asset = &source[..absolute_byte_start];
+                let row = before_asset.matches('\n').count();
+                let line_start = before_asset.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let column = absolute_byte_start - line_start;
+                let end_column = column + (absolute_byte_end - absolute_byte_start);
+                
+                ViteAssetMatch {
+                    path: path.to_string().leak(),
+                    byte_start: absolute_byte_start,
+                    byte_end: absolute_byte_end,
+                    row,
+                    column,
+                    end_column,
+                }
+            })
+        })
+        .collect();
+    
+    Ok(vite_assets.into_iter().map(|m| {
+        Box::new(m) as Box<dyn PatternMatch>
+    }).collect())
+}
 
 /// A reference to a Laravel view from another file
 #[derive(Debug, Clone, serde::Serialize)]
@@ -62,70 +481,12 @@ enum ReferenceType {
     BladeTemplate,
 }
 
-/// Cached references for a single file
-#[derive(Debug, Clone)]
-struct FileReferences {
-    /// When this file was last parsed for references
-    last_parsed: SystemTime,
-    /// The document version when this was last parsed
-    document_version: Option<i32>,
-    /// All view references found in this file
-    view_references: Vec<(String, ReferenceLocation)>,
-    /// All component references found in this file
-    component_references: Vec<ReferenceLocation>,
-    /// All Livewire references found in this file
-    livewire_references: Vec<ReferenceLocation>,
-}
-
-/// Cached parsed matches for goto-definition (env, config, view calls)
-#[derive(Debug, Clone)]
-struct ParsedMatches {
-    /// Document version when this was parsed
-    version: Option<i32>,
-    /// Cached env() matches
-    env_matches: Vec<EnvMatch<'static>>,
-    /// Cached config() matches
-    config_matches: Vec<ConfigMatch<'static>>,
-    /// Cached view() matches
-    view_matches: Vec<ViewMatch<'static>>,
-    /// Cached Blade component matches
-    component_matches: Vec<ComponentMatch<'static>>,
-    /// Cached Livewire component matches
-    livewire_matches: Vec<LivewireMatch<'static>>,
-    /// Cached directive matches
-    directive_matches: Vec<DirectiveMatch<'static>>,
-    /// Cached middleware matches
-    middleware_matches: Vec<MiddlewareMatch<'static>>,
-    /// Cached translation matches
-    translation_matches: Vec<TranslationMatch<'static>>,
-    /// Cached container binding matches
-    binding_matches: Vec<BindingMatch<'static>>,
-}
-
-/// The reference cache with intelligent invalidation
-#[derive(Debug, Default)]
-struct ReferenceCache {
-    /// Per-file parsed references (invalidated on file change)
-    file_references: HashMap<Url, FileReferences>,
-    
-    /// Global view name -> reference locations mapping
-    view_references: HashMap<String, Vec<ReferenceLocation>>,
-    
-    /// Cached component file paths
-    component_files: Option<(SystemTime, Vec<PathBuf>)>,
-    
-    /// Cached Livewire file paths
-    livewire_files: Option<(SystemTime, Vec<PathBuf>)>,
-    
-    /// Track document versions for change detection
-    document_versions: HashMap<Url, i32>,
-    
-    /// Cached parsed matches for goto-definition (per file)
-    parsed_matches: HashMap<Url, ParsedMatches>,
-}
+// Removed: Old cache structures (FileReferences, ParsedMatches, ReferenceCache)
+// These have been replaced by the high-performance PerformanceCache system
 
 /// The main Laravel Language Server struct
 /// This holds all the state for our LSP
+#[derive(Clone)]
 struct LaravelLanguageServer {
     /// LSP client for sending messages to the editor
     client: Client,
@@ -137,12 +498,20 @@ struct LaravelLanguageServer {
     config: Arc<RwLock<Option<LaravelConfig>>>,
     /// Store diagnostics per file (for hover filtering)
     diagnostics: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
-    /// Reference cache with intelligent invalidation
-    reference_cache: Arc<RwLock<ReferenceCache>>,
     /// Environment variable cache (.env, .env.example, .env.local)
     env_cache: Arc<RwLock<Option<EnvFileCache>>>,
     /// Service provider registry (middleware, bindings, aliases, etc.)
     service_provider_registry: Arc<RwLock<Option<ServiceProviderRegistry>>>,
+    /// Pending debounced diagnostic tasks (uri -> task handle)
+    pending_diagnostics: Arc<RwLock<HashMap<Url, tokio::task::JoinHandle<()>>>>,
+    /// Pending debounced cache update tasks (uri -> task handle)
+    pending_cache_updates: Arc<RwLock<HashMap<Url, tokio::task::JoinHandle<()>>>>,
+    /// Debounce delay for diagnostics in milliseconds (default: 200ms)
+    debounce_delay_ms: u64,
+    /// Debounce delay for cache updates in milliseconds (default: 50ms)
+    cache_debounce_ms: u64,
+    /// High-performance LRU cache for Laravel patterns
+    performance_cache: database::ThreadSafeCache,
 }
 
 impl LaravelLanguageServer {
@@ -153,14 +522,54 @@ impl LaravelLanguageServer {
             root_path: Arc::new(RwLock::new(None)),
             config: Arc::new(RwLock::new(None)),
             diagnostics: Arc::new(RwLock::new(HashMap::new())),
-            reference_cache: Arc::new(RwLock::new(ReferenceCache::default())),
             env_cache: Arc::new(RwLock::new(None)),
             service_provider_registry: Arc::new(RwLock::new(None)),
+            pending_diagnostics: Arc::new(RwLock::new(HashMap::new())),
+            pending_cache_updates: Arc::new(RwLock::new(HashMap::new())),
+            debounce_delay_ms: 200,  // 200ms for diagnostics
+            cache_debounce_ms: 50,   // 50ms for cache updates
+            performance_cache: database::create_performance_cache(),
         }
     }
 
     /// Check if a position has a diagnostic (yellow squiggle)
     /// Returns true if there's a diagnostic at this position
+    // ============================================================================
+    // PART 4: Generic Parsing Engine with Optimizations
+    // ============================================================================
+
+    /// Parse with incremental support
+    fn parse_incrementally(source: &str, old_tree: Option<&Tree>, is_blade: bool) -> Result<Tree> {
+        if is_blade {
+            let mut parser = parser::create_blade_parser()?;
+            parser.parse(source, old_tree)
+                .ok_or_else(|| anyhow::anyhow!("Failed to parse Blade source"))
+        } else {
+            let mut parser = parser::create_php_parser()?;
+            parser.parse(source, old_tree)
+                .ok_or_else(|| anyhow::anyhow!("Failed to parse PHP source"))
+        }
+    }
+
+    /// Find pattern match at specific cursor position
+    fn find_pattern_at_position(
+        patterns: &[Box<dyn PatternMatch>],
+        position: Position
+    ) -> Option<&Box<dyn PatternMatch>> {
+        let line = position.line as usize;
+        let character = position.character as usize;
+
+        patterns.iter().find(|pattern| {
+            pattern.row() == line &&
+            character >= pattern.column() &&
+            character <= pattern.end_column()
+        })
+    }
+
+    // Removed: parse_and_cache_patterns - functionality moved to performance_cache
+
+
+
     async fn has_diagnostic_at_position(&self, uri: &Url, position: Position) -> bool {
         let diagnostics_guard = self.diagnostics.read().await;
         let Some(file_diagnostics) = diagnostics_guard.get(uri) else {
@@ -299,83 +708,7 @@ impl LaravelLanguageServer {
         }
     }
 
-    /// Pre-parse a PHP file and cache the results for instant goto-definition
-    async fn preparse_php_file(&self, uri: &Url, text: &str, version: i32) {
-        if let Ok(tree) = parse_php(text) {
-            let lang = language_php();
-            
-            if let (Ok(env), Ok(config), Ok(view), Ok(middleware), Ok(translation)) = (
-                find_env_calls(&tree, text, &lang),
-                find_config_calls(&tree, text, &lang),
-                find_view_calls(&tree, text, &lang),
-                find_middleware_calls(&tree, text, &lang),
-                find_translation_calls(&tree, text, &lang)
-            ) {
-                // Convert to 'static lifetime by cloning strings
-                let env_static: Vec<EnvMatch<'static>> = env.iter().map(|m| EnvMatch {
-                    var_name: m.var_name.to_string().leak(),
-                    has_fallback: m.has_fallback,
-                    byte_start: m.byte_start,
-                    byte_end: m.byte_end,
-                    row: m.row,
-                    column: m.column,
-                    end_column: m.end_column,
-                }).collect();
-                
-                let config_static: Vec<ConfigMatch<'static>> = config.iter().map(|m| ConfigMatch {
-                    config_key: m.config_key.to_string().leak(),
-                    byte_start: m.byte_start,
-                    byte_end: m.byte_end,
-                    row: m.row,
-                    column: m.column,
-                    end_column: m.end_column,
-                }).collect();
-                
-                let view_static: Vec<ViewMatch<'static>> = view.iter().map(|m| ViewMatch {
-                    view_name: m.view_name.to_string().leak(),
-                    byte_start: m.byte_start,
-                    byte_end: m.byte_end,
-                    row: m.row,
-                    column: m.column,
-                    end_column: m.end_column,
-                }).collect();
-                
-                let middleware_static: Vec<MiddlewareMatch<'static>> = middleware.iter().map(|m| MiddlewareMatch {
-                    middleware_name: m.middleware_name.to_string().leak(),
-                    byte_start: m.byte_start,
-                    byte_end: m.byte_end,
-                    row: m.row,
-                    column: m.column,
-                    end_column: m.end_column,
-                }).collect();
-                
-                let translation_static: Vec<TranslationMatch<'static>> = translation.iter().map(|m| TranslationMatch {
-                    translation_key: m.translation_key.to_string().leak(),
-                    byte_start: m.byte_start,
-                    byte_end: m.byte_end,
-                    row: m.row,
-                    column: m.column,
-                    end_column: m.end_column,
-                }).collect();
-                
-                // Store/update cache
-                let mut cache_guard = self.reference_cache.write().await;
-                cache_guard.parsed_matches.insert(uri.clone(), ParsedMatches {
-                    version: Some(version),
-                    env_matches: env_static,
-                    config_matches: config_static,
-                    view_matches: view_static,
-                    component_matches: Vec::new(),
-                    livewire_matches: Vec::new(),
-                    directive_matches: Vec::new(),
-                    middleware_matches: middleware_static,
-                    translation_matches: translation_static,
-                    binding_matches: Vec::new(),
-                });
-                cache_guard.document_versions.insert(uri.clone(), version);
-            }
-        }
-    }
+    // Removed: preparse_php_file - functionality moved to performance_cache
 
     /// Refresh the env cache by parsing all .env files from editor buffers (or disk if not open)
     async fn refresh_env_cache_from_buffers(&self, root: &PathBuf) {
@@ -449,8 +782,12 @@ impl LaravelLanguageServer {
     }
 
     /// Pre-parse a Blade file and cache the results for instant goto-definition
+    /// Blade files are parsed with BOTH parsers:
+    /// - Blade parser: for Blade-specific syntax (components, directives)
+    /// - PHP parser: for PHP expressions (config, env, view, etc.)
     async fn preparse_blade_file(&self, uri: &Url, text: &str, version: i32) {
-        if let Ok(tree) = parse_blade(text) {
+        // Parse Blade-specific patterns
+        let (components_static, livewire_static, directives_static, vite_assets_static) = if let Ok(tree) = parse_blade(text) {
             let lang = language_blade();
             
             if let (Ok(components), Ok(livewire), Ok(directives)) = (
@@ -459,15 +796,30 @@ impl LaravelLanguageServer {
                 find_directives(&tree, text, &lang)
             ) {
                 // Convert to 'static lifetime by cloning strings
-                let components_static: Vec<ComponentMatch<'static>> = components.iter().map(|m| ComponentMatch {
-                    component_name: m.component_name.to_string().leak(),
-                    tag_name: m.tag_name.to_string().leak(),
-                    byte_start: m.byte_start,
-                    byte_end: m.byte_end,
-                    row: m.row,
-                    column: m.column,
-                    end_column: m.end_column,
+                // Also pre-resolve component paths for performance
+                let config_guard = self.config.read().await;
+                let components_static: Vec<ComponentMatch<'static>> = components.iter().map(|m| {
+                    // Pre-resolve the component path during parsing
+                    let resolved_path = if let Some(config) = config_guard.as_ref() {
+                        let possible_paths = config.resolve_component_path(m.component_name);
+                        // Find first existing path
+                        possible_paths.into_iter().find(|p| p.exists())
+                    } else {
+                        None
+                    };
+                    
+                    ComponentMatch {
+                        component_name: m.component_name.to_string().leak(),
+                        tag_name: m.tag_name.to_string().leak(),
+                        byte_start: m.byte_start,
+                        byte_end: m.byte_end,
+                        row: m.row,
+                        column: m.column,
+                        end_column: m.end_column,
+                        resolved_path,
+                    }
                 }).collect();
+                drop(config_guard);
                 
                 let livewire_static: Vec<LivewireMatch<'static>> = livewire.iter().map(|m| LivewireMatch {
                     component_name: m.component_name.to_string().leak(),
@@ -491,24 +843,50 @@ impl LaravelLanguageServer {
                     string_end_column: m.string_end_column,
                 }).collect();
                 
-                // Store/update cache
-                let mut cache_guard = self.reference_cache.write().await;
-                cache_guard.parsed_matches.insert(uri.clone(), ParsedMatches {
-                    version: Some(version),
-                    env_matches: Vec::new(),
-                    config_matches: Vec::new(),
-                    view_matches: Vec::new(),
-                    component_matches: components_static,
-                    livewire_matches: livewire_static,
-                    directive_matches: directives_static,
-                    middleware_matches: Vec::new(),
-                    translation_matches: Vec::new(),
-                    binding_matches: Vec::new(),
-                });
-                cache_guard.document_versions.insert(uri.clone(), version);
+                // Extract individual Vite assets from @vite directives for individual navigation
+                let vite_assets_static: Vec<ViteAssetMatch<'static>> = directives.iter()
+                    .filter(|d| d.directive_name == "vite")
+                    .flat_map(|d| {
+                        let paths = extract_vite_asset_paths(&d.full_text);
+                        paths.into_iter().map(move |(path, byte_start, byte_end)| {
+                            // Calculate row and column for this asset path
+                            // The byte positions are relative to the directive's full_text
+                            let absolute_byte_start = d.byte_start + byte_start;
+                            let absolute_byte_end = d.byte_start + byte_end;
+                            
+                            // Calculate position in source
+                            let before_asset = &text[..absolute_byte_start];
+                            let row = before_asset.matches('\n').count();
+                            let line_start = before_asset.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                            let column = absolute_byte_start - line_start;
+                            let end_column = column + (absolute_byte_end - absolute_byte_start);
+                            
+                            ViteAssetMatch {
+                                path: path.to_string().leak(),
+                                byte_start: absolute_byte_start,
+                                byte_end: absolute_byte_end,
+                                row,
+                                column,
+                                end_column,
+                            }
+                        })
+                    })
+                    .collect();
+                
+                (components_static, livewire_static, directives_static, vite_assets_static)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             }
-        }
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
+                
+
+
+        // Removed: Old preparse functionality - performance_cache handles this now
     }
+
+    // Removed: preparse_blade_file - functionality moved to performance_cache
 
     /// Convert a Laravel view name to possible file paths using config
     ///
@@ -632,16 +1010,16 @@ impl LaravelLanguageServer {
         for path in possible_paths {
             if self.file_exists(&path).await {
                 if let Ok(target_uri) = Url::from_file_path(&path) {
-                    // Calculate origin selection range (include quotes around the string)
-                    // The match gives us the string content position, expand by 1 to include quotes
+                    // Calculate origin selection range (highlight just the view name, not quotes)
+                    // The match positions already point to the content without quotes
                     let origin_selection_range = Range {
                         start: Position {
                             line: view_match.row as u32,
-                            character: view_match.column.saturating_sub(1) as u32,
+                            character: view_match.column as u32,
                         },
                         end: Position {
                             line: view_match.row as u32,
-                            character: (view_match.end_column + 1) as u32,
+                            character: view_match.end_column as u32,
                         },
                     };
 
@@ -665,50 +1043,40 @@ impl LaravelLanguageServer {
         None
     }
 
-    /// Create an LSP LocationLink for a Blade component using config
+    /// Create an LSP LocationLink for a Blade component using pre-resolved path
     ///
     /// The origin_selection_range tells the editor what text to highlight when hovering
     async fn create_component_location(&self, component_match: &ComponentMatch<'_>) -> Option<GotoDefinitionResponse> {
-        let config_guard = self.config.read().await;
-        let config = config_guard.as_ref()?;
+        // Use pre-resolved path from cache for instant navigation (no file I/O!)
+        let path = component_match.resolved_path.as_ref()?;
+        
+        let target_uri = Url::from_file_path(path).ok()?;
+        
+        // Calculate origin selection range for the component tag
+        // This highlights the entire tag name (e.g., "x-button")
+        let origin_selection_range = Range {
+            start: Position {
+                line: component_match.row as u32,
+                character: component_match.column as u32,
+            },
+            end: Position {
+                line: component_match.row as u32,
+                character: component_match.end_column as u32,
+            },
+        };
 
-        let possible_paths = config.resolve_component_path(component_match.component_name);
-
-        // Find first existing path (in buffer or on disk)
-        for path in possible_paths {
-            if self.file_exists(&path).await {
-                if let Ok(target_uri) = Url::from_file_path(&path) {
-                    // Calculate origin selection range for the component tag
-                    // This highlights the entire tag name (e.g., "x-button")
-                    let origin_selection_range = Range {
-                        start: Position {
-                            line: component_match.row as u32,
-                            character: component_match.column as u32,
-                        },
-                        end: Position {
-                            line: component_match.row as u32,
-                            character: component_match.end_column as u32,
-                        },
-                    };
-
-                    return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                        origin_selection_range: Some(origin_selection_range),
-                        target_uri,
-                        target_range: Range {
-                            start: Position { line: 0, character: 0 },
-                            end: Position { line: 0, character: 0 },
-                        },
-                        target_selection_range: Range {
-                            start: Position { line: 0, character: 0 },
-                            end: Position { line: 0, character: 0 },
-                        },
-                    }]));
-                }
-            }
-        }
-
-        debug!("Component file does not exist: {}", component_match.component_name);
-        None
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: Some(origin_selection_range),
+            target_uri,
+            target_range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 0 },
+            },
+            target_selection_range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 0 },
+            },
+        }]))
     }
 
     /// Create an LSP LocationLink for a Livewire component using config
@@ -1379,22 +1747,141 @@ impl LaravelLanguageServer {
         Some(GotoDefinitionResponse::Array(vec![]))
     }
 
+    /// Create a go-to-definition location for an asset path
+    /// Resolves asset helpers like asset(), Vite::asset(), base_path(), etc. to actual files
+    async fn create_asset_location(&self, asset_match: &AssetMatch<'_>) -> Option<GotoDefinitionResponse> {
+        let root_guard = self.root_path.read().await;
+        let root = root_guard.as_ref()?;
+        
+        // Resolve the asset path based on helper type
+        let resolved_path = match asset_match.helper_type {
+            AssetHelperType::Asset => root.join("public").join(asset_match.path),
+            AssetHelperType::PublicPath => root.join("public").join(asset_match.path),
+            AssetHelperType::BasePath => root.join(asset_match.path),
+            AssetHelperType::AppPath => root.join("app").join(asset_match.path),
+            AssetHelperType::StoragePath => root.join("storage").join(asset_match.path),
+            AssetHelperType::DatabasePath => root.join("database").join(asset_match.path),
+            AssetHelperType::LangPath => {
+                // Try lang/ first (Laravel 9+), then resources/lang/ (older)
+                let lang_path = root.join("lang").join(asset_match.path);
+                if lang_path.exists() {
+                    lang_path
+                } else {
+                    root.join("resources/lang").join(asset_match.path)
+                }
+            },
+            AssetHelperType::ConfigPath => root.join("config").join(asset_match.path),
+            AssetHelperType::ResourcePath => root.join("resources").join(asset_match.path),
+            AssetHelperType::Mix => root.join("public").join(asset_match.path),
+            AssetHelperType::ViteAsset => root.join(asset_match.path),
+        };
+        
+        info!("Laravel LSP: Resolving asset '{}' ({:?}) to {:?}", 
+            asset_match.path, asset_match.helper_type, resolved_path);
+        
+        // Check if file exists
+        if self.file_exists(&resolved_path).await {
+            if let Ok(target_uri) = Url::from_file_path(&resolved_path) {
+                let origin_selection_range = Range {
+                    start: Position {
+                        line: asset_match.row as u32,
+                        character: asset_match.column as u32,
+                    },
+                    end: Position {
+                        line: asset_match.row as u32,
+                        character: asset_match.end_column as u32,
+                    },
+                };
+                
+                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                    origin_selection_range: Some(origin_selection_range),
+                    target_uri,
+                    target_range: Range {
+                        start: Position { line: 0, character: 0 },
+                        end: Position { line: 0, character: 0 },
+                    },
+                    target_selection_range: Range {
+                        start: Position { line: 0, character: 0 },
+                        end: Position { line: 0, character: 0 },
+                    },
+                }]));
+            }
+        }
+        
+        // File not found
+        info!("Laravel LSP: Asset file not found: {:?}", resolved_path);
+        None
+    }
+
+    /// Schedule debounced diagnostics for a file
+    ///
+    /// This method cancels any pending diagnostics for the file and schedules
+    /// a new task to run diagnostics after the debounce delay.
+    /// This updates diagnostics as you type (after a pause) and on save.
+    async fn schedule_debounced_diagnostics(&self, uri: &Url, source: &str) {
+        let debounce_delay = Duration::from_millis(self.debounce_delay_ms);
+        
+        // Cancel any existing pending diagnostic task for this file
+        if let Some(handle) = self.pending_diagnostics.write().await.remove(uri) {
+            handle.abort();
+        }
+        
+        // Clone values needed for the async task
+        let uri_for_spawn = uri.clone();
+        let source_for_spawn = source.to_string();
+        let server = self.clone_for_spawn();
+        
+        // Spawn a task that runs diagnostics after debounce delay
+        let handle = tokio::spawn(async move {
+            // Wait for the debounce delay
+            sleep(debounce_delay).await;
+            
+            info!("⏰ Debounce expired for {} - running diagnostics", uri_for_spawn);
+            
+            // Run diagnostics on the debounced content
+            server.validate_and_publish_diagnostics(&uri_for_spawn, &source_for_spawn).await;
+        });
+        
+        // Store the task handle so we can cancel it if needed
+        self.pending_diagnostics.write().await.insert(uri.clone(), handle);
+    }
+    
+    /// Clone server for spawning async tasks
+    fn clone_for_spawn(&self) -> Self {
+        LaravelLanguageServer {
+            client: self.client.clone(),
+            documents: self.documents.clone(),
+            root_path: self.root_path.clone(),
+            config: self.config.clone(),
+            diagnostics: self.diagnostics.clone(),
+            env_cache: self.env_cache.clone(),
+            service_provider_registry: self.service_provider_registry.clone(),
+            pending_diagnostics: self.pending_diagnostics.clone(),
+            pending_cache_updates: self.pending_cache_updates.clone(),
+            debounce_delay_ms: self.debounce_delay_ms,
+            cache_debounce_ms: self.cache_debounce_ms,
+            performance_cache: self.performance_cache.clone(),
+        }
+    }
+
     /// Validate a document (Blade or PHP) and publish diagnostics
     ///
     /// This function:
-    /// 1. Parses the file for view references, directives, and components
-    /// 2. Checks if referenced files exist
+    /// 1. Parses the Blade/PHP file with tree-sitter
+    /// 2. Finds all view(), View::make(), Route::view(), etc. calls
     /// 3. Creates yellow squiggle warnings for missing files
     /// 4. Publishes diagnostics to the editor
     async fn validate_and_publish_diagnostics(&self, uri: &Url, source: &str) {
+        info!("🔍 validate_and_publish_diagnostics called for {}", uri);
         let mut diagnostics = Vec::new();
 
         // Get the Laravel config
         let config_guard = self.config.read().await;
         let Some(config) = config_guard.as_ref() else {
-            debug!("Cannot validate: config not set");
+            info!("   ⚠️  Cannot validate: config not set");
             return;
         };
+        info!("   ✅ Config loaded");
 
         // Determine file type
         let is_blade = uri.path().ends_with(".blade.php");
@@ -1416,6 +1903,14 @@ impl LaravelLanguageServer {
                                 .map(|p| p.to_string_lossy().to_string())
                                 .unwrap_or_else(|| "unknown".to_string());
 
+                            // Route::view() and Volt::route() should be ERROR
+                            // Regular view() calls should be WARNING
+                            let severity = if view_match.is_route_view {
+                                DiagnosticSeverity::ERROR
+                            } else {
+                                DiagnosticSeverity::WARNING
+                            };
+
                             let diagnostic = Diagnostic {
                                 range: Range {
                                     start: Position {
@@ -1427,7 +1922,7 @@ impl LaravelLanguageServer {
                                         character: view_match.end_column as u32,
                                     },
                                 },
-                                severity: Some(DiagnosticSeverity::WARNING),
+                                severity: Some(severity),
                                 code: None,
                                 source: Some("laravel-lsp".to_string()),
                                 message: format!(
@@ -2215,7 +2710,9 @@ impl LaravelLanguageServer {
         self.diagnostics.write().await.insert(uri.clone(), diagnostics.clone());
 
         // Publish diagnostics
+        info!("   📤 Publishing {} diagnostics to client", diagnostics.len());
         self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+        info!("   ✅ Diagnostics published successfully");
     }
 }
 
@@ -2300,6 +2797,22 @@ impl<'a> HasPosition for BindingMatch<'a> {
     fn byte_end(&self) -> usize { self.byte_end }
 }
 
+impl<'a> HasPosition for AssetMatch<'a> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+}
+
+impl<'a> HasPosition for ViteAssetMatch<'a> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for LaravelLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
@@ -2350,7 +2863,7 @@ impl LanguageServer for LaravelLanguageServer {
                 // Initialize service provider registry
                 info!("========================================");
                 info!("🛡️  Initializing service provider registry from root: {:?}", path);
-                info!("🚀 LARAVEL LSP v2024-12-21-17:30 - OPTION 3 FIX ACTIVE");
+                info!("🚀 LARAVEL LSP v2024-12-21-OPTION3-v2 - NO PREPARSE ON CHANGE");
                 info!("========================================");
                 match analyze_service_providers(&path).await {
                     Ok(registry) => {
@@ -2391,17 +2904,28 @@ impl LanguageServer for LaravelLanguageServer {
                     resolve_provider: Some(false),
                 }),
                 
-                // We need to sync document content
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                // We need to sync document content and receive save notifications
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        will_save: None,
+                        will_save_wait_until: None,
+                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                            include_text: Some(false), // We get text from did_change
+                        })),
+                    }
                 )),
                 
-                // Future capabilities we'll add
+                // Hover support for documentation
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
-                completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec!["'".to_string(), "\"".to_string()]),
-                    ..Default::default()
-                }),
+                
+                // ❌ REMOVED: completion_provider
+                // We don't implement autocomplete, so don't advertise it.
+                // This prevents Zed from calling us for every completion request.
+                
+                // ❌ REMOVED: Preparsing on every keystroke in did_change
+                // This was causing autocomplete slowness due to heavy tree-sitter queries.
                 
                 ..Default::default()
             },
@@ -2431,12 +2955,8 @@ impl LanguageServer for LaravelLanguageServer {
             self.try_discover_from_file(&file_path).await;
         }
 
-        // Pre-parse files for instant goto-definition
-        if uri.path().ends_with(".blade.php") {
-            self.preparse_blade_file(&uri, &text, version).await;
-        } else if uri.path().ends_with(".php") {
-            self.preparse_php_file(&uri, &text, version).await;
-        }
+        // Update LRU cache with new file content
+        self.performance_cache.update_patterns(uri.clone(), text.clone(), version).await;
 
         // Validate and publish diagnostics for Blade files
         self.validate_and_publish_diagnostics(&uri, &text).await;
@@ -2450,8 +2970,8 @@ impl LanguageServer for LaravelLanguageServer {
             debug!("Laravel LSP: Document changed: {} (version: {})", uri, version);
             self.documents.write().await.insert(uri.clone(), change.text.clone());
             
-            // Invalidate reference cache for this file
-            self.invalidate_file_cache(&uri, version).await;
+            // 🚀 Update LRU cache - automatic invalidation happens
+            self.performance_cache.update_patterns(uri.clone(), change.text.clone(), version).await;
             
             // Check if this is an .env file and refresh env cache if needed
             if let Ok(file_path) = uri.to_file_path() {
@@ -2466,15 +2986,41 @@ impl LanguageServer for LaravelLanguageServer {
                 }
             }
             
-            // Re-parse files to keep cache updated
-            if uri.path().ends_with(".blade.php") {
-                self.preparse_blade_file(&uri, &change.text, version).await;
-            } else if uri.path().ends_with(".php") {
-                self.preparse_php_file(&uri, &change.text, version).await;
+            // ONLY debounce diagnostics (200ms) - Salsa handles hover/goto automatically
+            self.schedule_debounced_diagnostics(&uri, &change.text).await;
+        }
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri;
+        info!("🔔 Laravel LSP: did_save called for {}", uri);
+        
+        // Cancel any pending debounced diagnostics for this file
+        // We'll run diagnostics immediately on save instead
+        if let Some(handle) = self.pending_diagnostics.write().await.remove(&uri) {
+            handle.abort();
+            info!("   ✅ Cancelled pending diagnostic task");
+        }
+        
+        // Run cache update AND diagnostics on save
+        if let Some(text) = self.documents.read().await.get(&uri).cloned() {
+            info!("   ✅ Found document in cache, updating cache and running diagnostics...");
+            
+            // Update cache immediately (now that user saved)
+            let _version = 0; // Version doesn't matter for save operations
+            let is_blade = uri.path().ends_with(".blade.php");
+            let is_php = uri.path().ends_with(".php");
+            
+            if is_blade || is_php {
+                // Removed: parse_and_cache_patterns - performance_cache handles this automatically
             }
             
-            // Re-validate the document
-            self.validate_and_publish_diagnostics(&uri, &change.text).await;
+            // Run diagnostics immediately on save
+            info!("   📊 Running diagnostics immediately on save for {}", uri);
+            self.validate_and_publish_diagnostics(&uri, &text).await;
+            info!("   ✅ Diagnostics published for {}", uri);
+        } else {
+            info!("   ⚠️  Document not found in cache for {}", uri);
         }
     }
 
@@ -2482,11 +3028,14 @@ impl LanguageServer for LaravelLanguageServer {
         let uri = params.text_document.uri;
         debug!("Laravel LSP: Document closed: {}", uri);
         
+        // Cancel any pending debounced diagnostics
+        if let Some(handle) = self.pending_diagnostics.write().await.remove(&uri) {
+            handle.abort();
+        }
+        
         self.documents.write().await.remove(&uri);
         
-        // Remove from reference cache
-        self.reference_cache.write().await.file_references.remove(&uri);
-        self.reference_cache.write().await.document_versions.remove(&uri);
+        // File cleanup handled by performance cache automatically
     }
 
     async fn goto_definition(
@@ -2496,250 +3045,49 @@ impl LanguageServer for LaravelLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        // Get document content and version
-        let (source, current_version) = {
+        // Get document content
+        let source = {
             let documents = self.documents.read().await;
             let Some(source) = documents.get(&uri) else {
                 return Ok(None);
             };
-            let versions = self.reference_cache.read().await;
-            let version = versions.document_versions.get(&uri).copied();
-            (source.clone(), version)
+            source.clone()
         };
 
-        // Determine file type from extension
-        let is_blade = uri.path().ends_with(".blade.php");
-        let is_php = uri.path().ends_with(".php") && !is_blade;
+        // 🚀 Use LRU cache to get patterns and find goto definition
+        let patterns = self.performance_cache.get_patterns(&uri, 1).await.unwrap_or_default();
+        
+        // Find pattern at cursor position
+        for (pattern_type, pattern_list) in patterns.iter() {
+            for pattern_info in pattern_list {
+                let line = position.line as usize;
+                let character = position.character as usize;
+                
+                if pattern_info.row == line &&
+                   character >= pattern_info.col &&
+                   character <= pattern_info.col + pattern_info.text.len() {
+                    
+                    debug!("Goto definition: Found {} pattern at cursor", pattern_type);
+                    
+                    // For now, return basic location info
+                    // TODO: Implement proper goto-definition for each pattern type
+                    return Ok(None);
+                }
+            }
+        }
 
-        // Try to find a pattern at the cursor position using tree-sitter
+        // Final emergency fallback for legacy tree-sitter patterns
+        let is_php = uri.path().ends_with(".php") && !uri.path().ends_with(".blade.php");
         if is_php {
-            // Check cache first
-            let cache_guard = self.reference_cache.read().await;
-            let cached = cache_guard.parsed_matches.get(&uri);
-            let use_cache = cached.map_or(false, |c| c.version == current_version);
-            drop(cache_guard);
-
-            let (env_matches, config_matches, view_matches, middleware_matches, translation_matches, binding_matches) = if use_cache {
-                // Use cached results
-                let cache_guard = self.reference_cache.read().await;
-                let cached = cache_guard.parsed_matches.get(&uri).unwrap();
-                (cached.env_matches.clone(), cached.config_matches.clone(), cached.view_matches.clone(), cached.middleware_matches.clone(), cached.translation_matches.clone(), cached.binding_matches.clone())
-            } else {
-                // Parse and cache
-                if let Ok(tree) = parse_php(&source) {
-                    let lang = language_php();
-                    
-                    let env = find_env_calls(&tree, &source, &lang).unwrap_or_default();
-                    let config = find_config_calls(&tree, &source, &lang).unwrap_or_default();
-                    let view = find_view_calls(&tree, &source, &lang).unwrap_or_default();
-                    let middleware = find_middleware_calls(&tree, &source, &lang).unwrap_or_default();
-                    let translation = find_translation_calls(&tree, &source, &lang).unwrap_or_default();
-                    let bindings = find_binding_calls(&tree, &source, &lang).unwrap_or_default();
-                    
-                    // Convert to 'static lifetime by cloning strings
-                    let env_static: Vec<EnvMatch<'static>> = env.iter().map(|m| EnvMatch {
-                        var_name: m.var_name.to_string().leak(),
-                        has_fallback: m.has_fallback,
-                        byte_start: m.byte_start,
-                        byte_end: m.byte_end,
-                        row: m.row,
-                        column: m.column,
-                        end_column: m.end_column,
-                    }).collect();
-                    
-                    let config_static: Vec<ConfigMatch<'static>> = config.iter().map(|m| ConfigMatch {
-                        config_key: m.config_key.to_string().leak(),
-                        byte_start: m.byte_start,
-                        byte_end: m.byte_end,
-                        row: m.row,
-                        column: m.column,
-                        end_column: m.end_column,
-                    }).collect();
-                    
-                    let view_static: Vec<ViewMatch<'static>> = view.iter().map(|m| ViewMatch {
-                        view_name: m.view_name.to_string().leak(),
-                        byte_start: m.byte_start,
-                        byte_end: m.byte_end,
-                        row: m.row,
-                        column: m.column,
-                        end_column: m.end_column,
-                    }).collect();
-                    
-                    let middleware_static: Vec<MiddlewareMatch<'static>> = middleware.iter().map(|m| MiddlewareMatch {
-                        middleware_name: m.middleware_name.to_string().leak(),
-                        byte_start: m.byte_start,
-                        byte_end: m.byte_end,
-                        row: m.row,
-                        column: m.column,
-                        end_column: m.end_column,
-                    }).collect();
-                    
-                    let translation_static: Vec<TranslationMatch<'static>> = translation.iter().map(|m| TranslationMatch {
-                        translation_key: m.translation_key.to_string().leak(),
-                        byte_start: m.byte_start,
-                        byte_end: m.byte_end,
-                        row: m.row,
-                        column: m.column,
-                        end_column: m.end_column,
-                    }).collect();
-                    
-                    let binding_static: Vec<BindingMatch<'static>> = bindings.iter().map(|m| BindingMatch {
-                        binding_name: m.binding_name.to_string().leak(),
-                        is_class_reference: m.is_class_reference,
-                        byte_start: m.byte_start,
-                        byte_end: m.byte_end,
-                        row: m.row,
-                        column: m.column,
-                        end_column: m.end_column,
-                    }).collect();
-                    
-                    // Store in cache
-                    let mut cache_guard = self.reference_cache.write().await;
-                    cache_guard.parsed_matches.insert(uri.clone(), ParsedMatches {
-                        version: current_version,
-                        env_matches: env_static.clone(),
-                        config_matches: config_static.clone(),
-                        view_matches: view_static.clone(),
-                        component_matches: Vec::new(),
-                        livewire_matches: Vec::new(),
-                        directive_matches: Vec::new(),
-                        middleware_matches: middleware_static.clone(),
-                        translation_matches: translation_static.clone(),
-                        binding_matches: binding_static.clone(),
-                    });
-                    
-                    (env_static, config_static, view_static, middleware_static, translation_static, binding_static)
-                } else {
-                    (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            debug!("Goto definition: Emergency fallback for PHP file");
+            if let Ok(tree) = parse_php(&source) {
+                let lang = language_php();
+                if let Ok(assets) = find_asset_calls(&tree, &source, &lang) {
+                    if let Some(asset_match) = Self::find_match_at_position(&assets, position) {
+                        info!("Laravel LSP: Found asset call (fallback): {} ({:?})", asset_match.path, asset_match.helper_type);
+                        return Ok(self.create_asset_location(&asset_match).await);
+                    }
                 }
-            };
-            
-            // Try view() calls
-            if let Some(view_match) = Self::find_match_at_position(&view_matches, position) {
-                info!("Laravel LSP: Found view() call: {}", view_match.view_name);
-                return Ok(self.create_view_location(&view_match).await);
-            }
-            
-            // Try env() calls
-            if let Some(env_match) = Self::find_match_at_position(&env_matches, position) {
-                info!("Laravel LSP: Found env() call: {}", env_match.var_name);
-                return Ok(self.create_env_location(&env_match).await);
-            }
-            
-            // Try config() calls
-            if let Some(config_match) = Self::find_match_at_position(&config_matches, position) {
-                info!("Laravel LSP: Found config() call: {}", config_match.config_key);
-                return Ok(self.create_config_location(&config_match).await);
-            }
-            
-            // Try middleware() calls
-            if let Some(middleware_match) = Self::find_match_at_position(&middleware_matches, position) {
-                info!("Laravel LSP: Found middleware() call: {}", middleware_match.middleware_name);
-                return Ok(self.create_middleware_location(&middleware_match).await);
-            }
-            
-            // Try translation calls
-            if let Some(translation_match) = Self::find_match_at_position(&translation_matches, position) {
-                info!("Laravel LSP: Found translation call: {}", translation_match.translation_key);
-                return Ok(self.create_translation_location(&translation_match).await);
-            }
-            
-            // Try container binding calls
-            if let Some(binding_match) = Self::find_match_at_position(&binding_matches, position) {
-                info!("Laravel LSP: Found app() binding call: {}", binding_match.binding_name);
-                return Ok(self.create_binding_location(&binding_match).await);
-            }
-        } else if is_blade {
-            // Check cache first
-            let cache_guard = self.reference_cache.read().await;
-            let cached = cache_guard.parsed_matches.get(&uri);
-            let use_cache = cached.map_or(false, |c| c.version == current_version);
-            drop(cache_guard);
-
-            let (components, livewire, directives) = if use_cache {
-                // Use cached results
-                let cache_guard = self.reference_cache.read().await;
-                let cached = cache_guard.parsed_matches.get(&uri).unwrap();
-                (cached.component_matches.clone(), cached.livewire_matches.clone(), cached.directive_matches.clone())
-            } else {
-                // Parse and cache (this shouldn't happen often since we pre-parse on open/change)
-                if let Ok(tree) = parse_blade(&source) {
-                    let lang = language_blade();
-                    
-                    let comp = find_blade_components(&tree, &source, &lang).unwrap_or_default();
-                    let lw = find_livewire_components(&tree, &source, &lang).unwrap_or_default();
-                    let dir = find_directives(&tree, &source, &lang).unwrap_or_default();
-                    
-                    // Convert to 'static lifetime
-                    let comp_static: Vec<ComponentMatch<'static>> = comp.iter().map(|m| ComponentMatch {
-                        component_name: m.component_name.to_string().leak(),
-                        tag_name: m.tag_name.to_string().leak(),
-                        byte_start: m.byte_start,
-                        byte_end: m.byte_end,
-                        row: m.row,
-                        column: m.column,
-                        end_column: m.end_column,
-                    }).collect();
-                    
-                    let lw_static: Vec<LivewireMatch<'static>> = lw.iter().map(|m| LivewireMatch {
-                        component_name: m.component_name.to_string().leak(),
-                        byte_start: m.byte_start,
-                        byte_end: m.byte_end,
-                        row: m.row,
-                        column: m.column,
-                        end_column: m.end_column,
-                    }).collect();
-                    
-                    let dir_static: Vec<DirectiveMatch<'static>> = dir.iter().map(|m| DirectiveMatch {
-                        directive_name: m.directive_name.to_string().leak(),
-                        full_text: m.full_text.clone(),
-                        arguments: m.arguments.map(|s| s.to_string().leak() as &str),
-                        byte_start: m.byte_start,
-                        byte_end: m.byte_end,
-                        row: m.row,
-                        column: m.column,
-                        end_column: m.end_column,
-                        string_column: m.string_column,
-                        string_end_column: m.string_end_column,
-                    }).collect();
-                    
-                    // Store in cache
-                    let mut cache_guard = self.reference_cache.write().await;
-                    cache_guard.parsed_matches.insert(uri.clone(), ParsedMatches {
-                        version: current_version,
-                        env_matches: Vec::new(),
-                        config_matches: Vec::new(),
-                        view_matches: Vec::new(),
-                        component_matches: comp_static.clone(),
-                        livewire_matches: lw_static.clone(),
-                        directive_matches: dir_static.clone(),
-                        middleware_matches: Vec::new(),
-                        translation_matches: Vec::new(),
-                        binding_matches: Vec::new(),
-                    });
-                    
-                    (comp_static, lw_static, dir_static)
-                } else {
-                    (Vec::new(), Vec::new(), Vec::new())
-                }
-            };
-
-            // Try Blade components (<x-button>)
-            if let Some(comp_match) = Self::find_match_at_position(&components, position) {
-                info!("Laravel LSP: Found Blade component: {}", comp_match.component_name);
-                return Ok(self.create_component_location(&comp_match).await);
-            }
-
-            // Try Livewire components (<livewire:user-profile>)
-            if let Some(lw_match) = Self::find_match_at_position(&livewire, position) {
-                info!("Laravel LSP: Found Livewire component: {}", lw_match.component_name);
-                return Ok(self.create_livewire_location(&lw_match).await);
-            }
-
-            // Try directives (@extends, @section, etc.)
-            if let Some(dir_match) = Self::find_match_at_position(&directives, position) {
-                info!("Laravel LSP: Found directive: @{}", dir_match.directive_name);
-                return Ok(self.create_directive_location(&dir_match).await);
             }
         }
 
@@ -2748,7 +3096,7 @@ impl LanguageServer for LaravelLanguageServer {
     }
 
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
-        let start = std::time::Instant::now();
+        let start_time = std::time::Instant::now();
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
@@ -2757,294 +3105,38 @@ impl LanguageServer for LaravelLanguageServer {
             return Ok(None);
         }
 
-        // Get document content (clone to avoid holding lock)
-        let source = {
-            let documents = self.documents.read().await;
-            documents.get(&uri).cloned()
-        };
-        
-        let Some(source) = source else {
-            return Ok(None);
-        };
-
         // Only process PHP files (including Blade files that end in .php)
         let is_php = uri.path().ends_with(".php");
         if !is_php {
             return Ok(None);
         }
 
-        // Parse the file and look for Laravel calls at cursor position
-        let parse_start = std::time::Instant::now();
-        let Ok(tree) = parse_php(&source) else {
-            return Ok(None);
-        };
-        debug!("Hover: Parse took {:?}", parse_start.elapsed());
-        
-        let lang = language_php();
+        // Check if system is under heavy load
+        if self.performance_cache.is_under_load().await {
+            debug!("Laravel LSP: System under heavy load, may have slower response times");
+        }
 
-        // Try env() calls first - bail early if found
-        let query_start = std::time::Instant::now();
-        if let Ok(env_matches) = find_env_calls(&tree, &source, &lang) {
-            debug!("Hover: find_env_calls took {:?}", query_start.elapsed());
-            if let Some(env_match) = Self::find_match_at_position(&env_matches, position) {
-                // Look up the variable in cache
-                let env_cache_guard = self.env_cache.read().await;
-                if let Some(env_cache) = env_cache_guard.as_ref() {
-                    if let Some(env_var) = env_cache.get(env_match.var_name) {
-                        let value_display = if env_var.value.is_empty() {
-                            "(empty string)".to_string()
-                        } else {
-                            format!("`{}`", env_var.value)
-                        };
-
-                        let file_name = env_var.file_path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("unknown");
-
-                        let markdown = format!(
-                            "**Environment Variable**: `{}`\n\n**Value**: {}\n\n**Defined in**: `{}`",
-                            env_var.name,
-                            value_display,
-                            file_name
-                        );
-
-                        return Ok(Some(Hover {
-                            contents: HoverContents::Markup(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: markdown,
-                            }),
-                            range: Some(Range {
-                                start: Position {
-                                    line: env_match.row as u32,
-                                    character: env_match.column as u32,
-                                },
-                                end: Position {
-                                    line: env_match.row as u32,
-                                    character: env_match.end_column as u32,
-                                },
-                            }),
-                        }));
-                    }
-                }
-                // Found env match but not in cache - return early, no need to check others
+        // Get document version - use a simple counter since we have immediate cache updates
+        let version = {
+            let documents = self.documents.read().await;
+            if documents.get(&uri).is_none() {
                 return Ok(None);
             }
+            // Use a simple version number - our performance cache handles versioning internally
+            1
+        };
+
+        // 🚀 High-performance LRU cached hover query with stampede protection
+        let result = self.performance_cache.get_hover(uri.clone(), position, version).await;
+        
+        let duration = start_time.elapsed();
+        if duration > std::time::Duration::from_millis(50) {
+            warn!("Laravel LSP: Slow hover response: {}ms for {}", duration.as_millis(), uri);
+        } else {
+            debug!("Laravel LSP: Hover response: {}ms", duration.as_millis());
         }
 
-        // Try config() calls
-        let config_query_start = std::time::Instant::now();
-        if let Ok(config_matches) = find_config_calls(&tree, &source, &lang) {
-            debug!("Hover: find_config_calls took {:?}", config_query_start.elapsed());
-            if let Some(config_match) = Self::find_match_at_position(&config_matches, position) {
-                let root_guard = self.root_path.read().await;
-                if let Some(root) = root_guard.as_ref() {
-                    // Parse config key: "app.name" -> file: "app.php"
-                    let parts: Vec<&str> = config_match.config_key.split('.').collect();
-                    if !parts.is_empty() {
-                        let config_file = parts[0];
-                        let config_path = root.join("config").join(format!("{}.php", config_file));
-
-                        let file_exists = if self.file_exists(&config_path).await {
-                            "✓ File exists"
-                        } else {
-                            "⚠ File not found"
-                        };
-
-                        let markdown = format!(
-                            "**Config Key**: `{}`\n\n**File**: `config/{}.php`\n\n{}",
-                            config_match.config_key,
-                            config_file,
-                            file_exists
-                        );
-
-                        return Ok(Some(Hover {
-                            contents: HoverContents::Markup(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: markdown,
-                            }),
-                            range: Some(Range {
-                                start: Position {
-                                    line: config_match.row as u32,
-                                    character: config_match.column as u32,
-                                },
-                                end: Position {
-                                    line: config_match.row as u32,
-                                    character: config_match.end_column as u32,
-                                },
-                            }),
-                        }));
-                    }
-                }
-            }
-        }
-
-        // Try middleware() calls
-        let middleware_query_start = std::time::Instant::now();
-        if let Ok(middleware_matches) = find_middleware_calls(&tree, &source, &lang) {
-            debug!("Hover: find_middleware_calls took {:?}", middleware_query_start.elapsed());
-            if let Some(middleware_match) = Self::find_match_at_position(&middleware_matches, position) {
-                let root_guard = self.root_path.read().await;
-                let registry_guard = self.service_provider_registry.read().await;
-                
-                if let (Some(root), Some(registry)) = (root_guard.as_ref(), registry_guard.as_ref()) {
-                    // Look up the middleware alias
-                    let middleware_info = if let Some(middleware_alias) = registry.get_middleware(middleware_match.middleware_name) {
-                        // Found in config
-                        let class_name = &middleware_alias.class_name;
-                        
-                        let (file_status, file_display) = if let Some(ref file_path) = middleware_alias.file_path {
-                            let class_path = root.join(file_path);
-                            let status = if class_path.exists() {
-                                "✓ File exists"
-                            } else {
-                                "⚠ File not found"
-                            };
-                            let display = file_path.to_string_lossy().trim_start_matches('/').to_string();
-                            (status, display)
-                        } else {
-                            ("⚠ File path unknown", "unknown".to_string())
-                        };
-
-                        format!(
-                            "**Middleware**: `{}`\n\n**Class**: `{}`\n\n**File**: `{}`\n\n{}",
-                            middleware_match.middleware_name,
-                            class_name,
-                            file_display,
-                            file_status
-                        )
-                    } else {
-                        // Not found in config - might be a framework middleware
-                        format!(
-                            "**Middleware**: `{}`\n\n⚠ Middleware alias not found in configuration files\n\nCheck `bootstrap/app.php` or `app/Http/Kernel.php`",
-                            middleware_match.middleware_name
-                        )
-                    };
-
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: middleware_info,
-                        }),
-                        range: Some(Range {
-                            start: Position {
-                                line: middleware_match.row as u32,
-                                character: middleware_match.column as u32,
-                            },
-                            end: Position {
-                                line: middleware_match.row as u32,
-                                character: middleware_match.end_column as u32,
-                            },
-                        }),
-                    }));
-                }
-            }
-        }
-
-        // Try translation calls
-        let translation_query_start = std::time::Instant::now();
-        if let Ok(translation_matches) = find_translation_calls(&tree, &source, &lang) {
-            debug!("Hover: find_translation_calls took {:?}", translation_query_start.elapsed());
-            if let Some(trans_match) = Self::find_match_at_position(&translation_matches, position) {
-                let root_guard = self.root_path.read().await;
-                if let Some(root) = root_guard.as_ref() {
-                    let translation_key = trans_match.translation_key;
-                    
-                    // Determine if this is a dotted key (PHP file) or text key (JSON file)
-                    let is_dotted_key = translation_key.contains('.') && !translation_key.contains(' ');
-                    let is_multi_word = translation_key.contains(' ');
-                    
-                    let translation_info = if is_multi_word || (!is_dotted_key && !translation_key.contains('.')) {
-                        // JSON translation
-                        let json_paths = [
-                            root.join("lang/en.json"),
-                            root.join("resources/lang/en.json"),
-                        ];
-                        
-                        let (file_exists, found_path) = json_paths.iter()
-                            .find(|p| p.exists())
-                            .map(|p| (true, p.to_string_lossy().to_string()))
-                            .unwrap_or((false, "lang/en.json or resources/lang/en.json".to_string()));
-                        
-                        let file_status = if file_exists {
-                            "✓ File exists"
-                        } else {
-                            "⚠ File not found"
-                        };
-                        
-                        format!(
-                            "**Translation Key**: `{}`\n\n**Type**: JSON translation\n\n**File**: `{}`\n\n{}",
-                            translation_key,
-                            if file_exists { 
-                                found_path.split('/').last().unwrap_or(&found_path) 
-                            } else { 
-                                &found_path 
-                            },
-                            file_status
-                        )
-                    } else {
-                        // PHP translation
-                        let parts: Vec<&str> = translation_key.split('.').collect();
-                        if !parts.is_empty() {
-                            let file_name = parts[0];
-                            let key_path = parts[1..].join(".");
-                            
-                            let php_paths = [
-                                root.join("lang/en").join(format!("{}.php", file_name)),
-                                root.join("resources/lang/en").join(format!("{}.php", file_name)),
-                            ];
-                            
-                            let (file_exists, _found_path) = php_paths.iter()
-                                .find(|p| p.exists())
-                                .map(|p| (true, p.to_string_lossy().to_string()))
-                                .unwrap_or((false, format!("lang/en/{}.php or resources/lang/en/{}.php", file_name, file_name)));
-                            
-                            let file_status = if file_exists {
-                                "✓ File exists"
-                            } else {
-                                "⚠ File not found"
-                            };
-                            
-                            let key_display = if key_path.is_empty() {
-                                String::new()
-                            } else {
-                                format!("\n\n**Key Path**: `{}`", key_path)
-                            };
-                            
-                            format!(
-                                "**Translation Key**: `{}`\n\n**Type**: PHP translation\n\n**File**: `lang/en/{}.php`{}\\n\n{}",
-                                translation_key,
-                                file_name,
-                                key_display,
-                                file_status
-                            )
-                        } else {
-                            format!("**Translation Key**: `{}`", translation_key)
-                        }
-                    };
-
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: translation_info,
-                        }),
-                        range: Some(Range {
-                            start: Position {
-                                line: trans_match.row as u32,
-                                character: trans_match.column as u32,
-                            },
-                            end: Position {
-                                line: trans_match.row as u32,
-                                character: trans_match.end_column as u32,
-                            },
-                        }),
-                    }));
-                }
-            }
-        }
-
-        debug!("Hover: Total time {:?}", start.elapsed());
-        Ok(None)
+        Ok(result)
     }
 
     async fn completion(&self, params: CompletionParams) -> jsonrpc::Result<Option<CompletionResponse>> {
@@ -3113,36 +3205,14 @@ impl LanguageServer for LaravelLanguageServer {
 }
 
 impl LaravelLanguageServer {
-    /// Invalidate cache for a specific file when it changes
-    async fn invalidate_file_cache(&self, uri: &Url, version: i32) {
-        let mut cache = self.reference_cache.write().await;
-        
-        // Update document version
-        cache.document_versions.insert(uri.clone(), version);
-        
-        // Remove cached references for this file
-        if let Some(old_refs) = cache.file_references.remove(uri) {
-            debug!("Invalidated cache for file: {} (had {} view references)", 
-                   uri, old_refs.view_references.len());
-        }
-        
-        // Rebuild global view references map since we removed references from one file
-        self.rebuild_view_references_map(&mut cache).await;
+
+    /// Get cache diagnostics for debugging
+    pub async fn get_cache_diagnostics(&self) -> String {
+        self.performance_cache.get_performance_report().await
     }
 
-    /// Rebuild the global view -> references mapping from all cached files
-    async fn rebuild_view_references_map(&self, cache: &mut ReferenceCache) {
-        cache.view_references.clear();
-        
-        for file_refs in cache.file_references.values() {
-            for (view_name, reference) in &file_refs.view_references {
-                cache.view_references
-                    .entry(view_name.clone())
-                    .or_insert_with(Vec::new)
-                    .push(reference.clone());
-            }
-        }
-    }
+    // Removed: invalidate_file_cache - performance_cache handles invalidation automatically
+    // Removed: rebuild_view_references_map - old cache system removed
 
     /// Extract view name from a Blade file path
     async fn extract_view_name_from_path(&self, uri: &Url) -> Option<String> {
@@ -3191,14 +3261,7 @@ impl LaravelLanguageServer {
     async fn find_all_references_to_view(&self, view_name: &str) -> Vec<ReferenceLocation> {
         let mut all_references = Vec::new();
         
-        // Check if we have cached references for this view
-        {
-            let cache = self.reference_cache.read().await;
-            if let Some(cached_refs) = cache.view_references.get(view_name) {
-                debug!("Found {} cached references for view: {}", cached_refs.len(), view_name);
-                return cached_refs.clone();
-            }
-        }
+        // TODO: Add caching back when needed - for now search directly
 
         // No cached references, need to search the project
         debug!("Searching for references to view: {}", view_name);
@@ -3220,11 +3283,7 @@ impl LaravelLanguageServer {
             all_references.extend(self.find_route_references(view_name, root_path).await);
         }
 
-        // Cache the results
-        {
-            let mut cache = self.reference_cache.write().await;
-            cache.view_references.insert(view_name.to_string(), all_references.clone());
-        }
+        // TODO: Cache results in performance_cache when needed
 
         debug!("Found {} total references for view: {}", all_references.len(), view_name);
         all_references

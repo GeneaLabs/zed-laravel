@@ -7,7 +7,7 @@ use Livewire\Volt\Volt;
 Route::get('/', function () {
     return view('welcome');
 })->name('home');
-
+Route::view('test', 'test1');
 Route::view('dashboard', 'dashboard')
     ->middleware(['auth', 'verified'])
     ->name('dashboard');
@@ -53,15 +53,25 @@ Route::get('/test-translations', function () {
 
 // Test container binding navigation and diagnostics
 
-// ✅ Valid bindings - no diagnostic, navigate to bound class or registration
-app('test'); // Navigate to AppServiceProvider or User class
-app('cache'); // Navigate to CacheManager (framework binding)
-app('user.service'); // Navigate to AppServiceProvider or UserService class
+Route::get('/test-bindings', function () {
+    // ✅ Valid bindings - no diagnostic, navigate to bound class or registration
+    $cache = app('cache'); // Navigate to CacheManager (framework binding)
+    $config = app('config'); // Navigate to Repository (framework binding)
+    
+    // ✅ Class references - always valid, navigate to class file
+    $user = app(\App\Models\User::class); // Navigate to User.php
+    
+    // Test various binding formats
+    $db = app('db'); // Framework binding
+    $events = app('events'); // Framework binding
+    
+    return 'Testing bindings';
+});
 
-// ✅ Class references - always valid, navigate to class file
-app(\App\Models\User::class); // Navigate to User.php
-app(\App\Services\UserService::class); // Navigate to UserService.php (if exists)
-
-// ❌ ERROR diagnostic: binding not found
-app('nonexistent'); // Red squiggle - binding not defined
-app('my.custom.service'); // Red squiggle - binding not defined
+Route::get('/test-binding-errors', function () {
+    // ❌ ERROR diagnostic: binding not found
+    $invalid = app('nonexistent'); // Should show error - binding not defined
+    $custom = app('my.custom.service'); // Should show error - binding not defined
+    
+    return 'Testing invalid bindings';
+});

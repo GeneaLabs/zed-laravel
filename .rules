@@ -1,0 +1,51 @@
+## Documentation Guidelines
+
+- Do NOT create documentation files (CHANGES.md, SUMMARY.md, INSTALL.md, USAGE.md, etc.) unless explicitly requested
+- Do NOT create guides, tutorials, or how-to files
+- After implementing changes, provide a brief verbal summary instead of creating files
+- Focus only on code changes requested
+- Keep documentation to code comments only
+- do not create code comments as a way of documenting code behavior
+
+## RULE VIOLATIONS
+If I violate any rule:
+1. I MUST acknowledge the violation
+2. I MUST delete/undo the violation
+3. I MUST explain which rule was broken
+4. I MUST ask how to proceed correctly
+
+## REQUIRED WORKFLOW
+
+Every task follows this pattern:
+1. 🔍 Analyze the request
+2. 💡 Present 2-3 options
+3. ⏸️ STOP and wait for user choice
+4. 📝 Show preview of changes
+5. ⏸️ STOP and wait for approval
+6. 🔧 Make changes
+7. 💬 Verbal summary ONLY (no docs!)
+
+### TWO-PHASE APPROVAL REQUIRED
+
+Phase 1: Option Selection
+- User chooses an option (e.g., "option 1", "option 2")
+- This is NOT approval to implement
+
+Phase 2: Implementation Approval  
+- I MUST show detailed preview of ALL changes
+- I MUST list every file that will be modified/created
+- I MUST ask: "Shall I proceed? (yes/no)"
+- ONLY these words approve implementation: "yes", "proceed", "go ahead", "do it", "make the changes"
+
+### FORBIDDEN ASSUMPTIONS
+- ❌ Option selection ≠ Implementation approval
+- ❌ "option X" ≠ "yes, proceed"
+- ❌ Enthusiasm ≠ Permission
+- ❌ NEVER assume approval - ALWAYS ask explicitly
+
+### MANDATORY CHECKLIST BEFORE ANY FILE OPERATION
+Before edit_file/create_file/delete_file, I MUST verify:
+- [ ] Showed complete preview of changes
+- [ ] Asked "Shall I proceed?"
+- [ ] Received explicit approval keyword (yes/proceed/go ahead/do it)
+- [ ] NOT just option selection ("option 1" is NOT approval)
