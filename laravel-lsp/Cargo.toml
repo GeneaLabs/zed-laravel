@@ -11,6 +11,9 @@ license = "MIT"
 tower-lsp = "0.20"
 lsp-types = "0.94"
 
+# Salsa incremental computation
+salsa = "^0.25"
+
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
 
@@ -41,6 +44,9 @@ thiserror = "1.0"
 # Using latest version to match the Blade grammar from GitHub
 tree-sitter = "0.26"
 tree-sitter-php = "0.24"
+
+# Additional dependencies for Salsa integration
+arc-swap = "1.7"
 
 [build-dependencies]
 # For downloading grammar from GitHub

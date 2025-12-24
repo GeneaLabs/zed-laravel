@@ -730,17 +730,7 @@ pub struct AssetMatch<'a> {
     pub end_column: usize,
 }
 
-/// Represents a matched Vite asset path within a @vite directive
-#[derive(Debug, Clone, PartialEq)]
-pub struct ViteAssetMatch<'a> {
-    /// The asset path (e.g., "resources/css/app.css")
-    pub path: &'a str,
-    pub byte_start: usize,
-    pub byte_end: usize,
-    pub row: usize,
-    pub column: usize,
-    pub end_column: usize,
-}
+
 
 /// Types of asset/path helpers
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -812,58 +802,7 @@ pub fn find_asset_calls<'a>(
     Ok(results)
 }
 
-/// Extract asset paths from @vite directive arguments
-/// e.g., @vite(['resources/css/app.css', 'resources/js/app.js'])
-/// or @vite['resources/css/app.css'] (without opening paren from tree-sitter)
-/// Returns a vector of (path, byte_start, byte_end) tuples
-pub fn extract_vite_asset_paths(directive_text: &str) -> Vec<(&str, usize, usize)> {
-    let mut paths = Vec::new();
-    
-    // Find the opening bracket or parenthesis
-    // Tree-sitter may give us "@vite['...']" without the opening paren
-    let start_pos = directive_text.find('(')
-        .or_else(|| directive_text.find('['))
-        .unwrap_or(0);
-    
-    let args_section = &directive_text[start_pos..];
-    let mut in_string = false;
-    let mut string_start = 0;
-    let mut quote_char = '\0';
-    let mut i = 0;
-    let bytes = args_section.as_bytes();
-    
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
-        
-        if !in_string {
-            // Look for opening quotes
-            if ch == '\'' || ch == '"' {
-                in_string = true;
-                quote_char = ch;
-                string_start = i + 1; // Start after the quote
-            }
-        } else {
-            // Look for closing quote (same as opening)
-            if ch == quote_char {
-                // Extract the string content between quotes
-                if let Ok(path) = std::str::from_utf8(&bytes[string_start..i]) {
-                    // Only include paths that look like file paths (not empty, not just whitespace)
-                    if !path.trim().is_empty() {
-                        // Calculate absolute byte positions in the original directive_text
-                        let abs_start = start_pos + string_start;
-                        let abs_end = start_pos + i;
-                        paths.push((path, abs_start, abs_end));
-                    }
-                }
-                in_string = false;
-            }
-        }
-        
-        i += 1;
-    }
-    
-    paths
-}
+
 
 /// Calculate the column range of the quoted string within a directive's arguments
 /// e.g., for @include with arguments "'my.view'", returns the columns for the quoted string
