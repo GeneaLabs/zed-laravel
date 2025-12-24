@@ -8,8 +8,8 @@
 /// This allows the LSP to work with any Laravel project structure,
 /// not just the default conventions.
 
-use anyhow::{anyhow, Result};
-use serde::{Deserialize, Serialize};
+use anyhow::Result;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -420,7 +420,7 @@ fn extract_base_path(line: &str) -> Option<&str> {
 }
 
 /// Extract quoted paths from a line (for absolute paths)
-fn extract_quoted_path(line: &str) -> Option<&str> {
+fn extract_quoted_path(_line: &str) -> Option<&str> {
     // This is a simple implementation
     // A real version would need more sophisticated parsing
     None

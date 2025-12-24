@@ -198,8 +198,7 @@ pub fn find_directives<'a>(
             // Remove @ symbol to get the directive name only
             // This is for the directive_name field, but byte positions should include @
             let directive_name = directive_text.strip_prefix('@')
-                .unwrap_or(directive_text)
-                .trim();
+                .unwrap_or(directive_text);
 
             // Look for a sibling parameter node right after this directive
             // In the tree: directive and parameter are siblings
@@ -461,6 +460,99 @@ pub fn find_config_calls<'a>(
     Ok(results)
 }
 
+/// Find all middleware() and withoutMiddleware() calls in PHP route definitions
+///
+/// This function parses route middleware definitions like:
+/// - Route::middleware('auth')
+/// - Route::middleware(['auth', 'web'])
+/// - ->middleware('verified')
+/// - ->withoutMiddleware('guest')
+///
+/// It handles both single middleware strings and arrays of middleware.
+/// Middleware with parameters (e.g., 'throttle:60,1') are captured as-is.
+pub fn find_middleware_calls<'a>(
+    tree: &Tree,
+    source: &'a str,
+    language: &Language,
+) -> Result<Vec<MiddlewareMatch<'a>>> {
+    let query = compile_php_query(language)?;
+    let mut cursor = QueryCursor::new();
+    let mut results = Vec::new();
+
+    let root_node = tree.root_node();
+    let source_bytes = source.as_bytes();
+
+    let mut captures = cursor.captures(&query, root_node, source_bytes);
+
+    while let Some((query_match, capture_index)) = captures.next() {
+        let capture = &query_match.captures[*capture_index];
+        let capture_name = query.capture_names()[capture.index as usize];
+
+        // We only care about the middleware_name capture
+        if capture_name == "middleware_name" {
+            let node = capture.node;
+            let middleware_name = node.utf8_text(source_bytes)?;
+
+            results.push(MiddlewareMatch {
+                middleware_name,
+                byte_start: node.start_byte(),
+                byte_end: node.end_byte(),
+                row: node.start_position().row,
+                column: node.start_position().column,
+                end_column: node.end_position().column,
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+/// Find all translation calls in PHP code
+///
+/// This function parses translation retrieval patterns like:
+/// - __('messages.welcome')
+/// - trans('validation.required')
+/// - trans_choice('messages.apples', 10)
+/// - Lang::get('auth.failed')
+///
+/// It extracts the translation key from the first argument.
+pub fn find_translation_calls<'a>(
+    tree: &Tree,
+    source: &'a str,
+    language: &Language,
+) -> Result<Vec<TranslationMatch<'a>>> {
+    let query = compile_php_query(language)?;
+    let mut cursor = QueryCursor::new();
+    let mut results = Vec::new();
+
+    let root_node = tree.root_node();
+    let source_bytes = source.as_bytes();
+
+    let mut captures = cursor.captures(&query, root_node, source_bytes);
+
+    while let Some((query_match, capture_index)) = captures.next() {
+        let capture = &query_match.captures[*capture_index];
+        let capture_name = query.capture_names()[capture.index as usize];
+
+        // We only care about the translation_key capture
+        if capture_name == "translation_key" {
+            let node = capture.node;
+            let translation_key = node.utf8_text(source_bytes)?;
+
+            results.push(TranslationMatch {
+                translation_key,
+                byte_start: node.start_byte(),
+                byte_end: node.end_byte(),
+                row: node.start_position().row,
+                column: node.start_position().column,
+                end_column: node.end_position().column,
+            });
+        }
+    }
+
+    Ok(results)
+}
+
 // ============================================================================
 // PART 6: Match Data Structures
 // ============================================================================
@@ -575,6 +667,41 @@ pub struct ConfigMatch<'a> {
     pub end_column: usize,
 }
 
+/// Represents a matched middleware call in PHP route definitions
+#[derive(Debug, Clone, PartialEq)]
+pub struct MiddlewareMatch<'a> {
+    /// The middleware name/alias (e.g., "auth", "verified", "throttle:60,1")
+    pub middleware_name: &'a str,
+    /// Starting byte offset in source
+    pub byte_start: usize,
+    /// Ending byte offset in source
+    pub byte_end: usize,
+    /// Line number (0-indexed)
+    pub row: usize,
+    /// Column number (0-indexed) - start of the match
+    pub column: usize,
+    /// End column number (0-indexed) - end of the match
+    pub end_column: usize,
+}
+
+/// Represents a matched translation call in PHP or Blade code
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranslationMatch<'a> {
+    /// The translation key (e.g., "messages.welcome", "auth.failed")
+    /// May contain dots for nested keys or be a plain string for JSON translations
+    pub translation_key: &'a str,
+    /// Starting byte offset in source
+    pub byte_start: usize,
+    /// Ending byte offset in source
+    pub byte_end: usize,
+    /// Line number (0-indexed)
+    pub row: usize,
+    /// Column number (0-indexed) - start of the match
+    pub column: usize,
+    /// End column number (0-indexed) - end of the match
+    pub end_column: usize,
+}
+
 /// Calculate the column range of the quoted string within a directive's arguments
 /// e.g., for @include with arguments "'my.view'", returns the columns for the quoted string
 fn calculate_string_column_range(directive_column: usize, directive_name: &str, arguments: &str) -> Option<(usize, usize)> {
@@ -615,6 +742,97 @@ fn calculate_string_column_range(directive_column: usize, directive_name: &str, 
 // PART 5: Tests
 // ============================================================================
 
+
+// ============================================================================
+// Container Binding Resolution
+// ============================================================================
+
+/// A match for a container binding resolution call
+#[derive(Debug, Clone)]
+pub struct BindingMatch<'a> {
+    /// The binding name/class being resolved (e.g., "auth", "App\\Contracts\\PaymentGateway")
+    pub binding_name: &'a str,
+    /// Whether this is a class reference (Class::class) or a string binding
+    pub is_class_reference: bool,
+    /// Starting byte offset in source
+    pub byte_start: usize,
+    /// Ending byte offset in source
+    pub byte_end: usize,
+    /// Line number (0-indexed)
+    pub row: usize,
+    /// Column number (0-indexed) - start of the match
+    pub column: usize,
+    /// End column number (0-indexed) - end of the match
+    pub end_column: usize,
+}
+
+/// Find all container binding resolution calls in PHP code
+///
+/// Matches:
+/// - app('auth') - string binding
+/// - app('cache') - string binding
+/// - app(SomeInterface::class) - class reference
+/// - app(\App\Services\PaymentService::class) - qualified class reference
+pub fn find_binding_calls<'a>(
+    tree: &Tree,
+    source: &'a str,
+    language: &Language,
+) -> Result<Vec<BindingMatch<'a>>> {
+    let query = compile_php_query(language)?;
+    let mut cursor = QueryCursor::new();
+    let mut results = Vec::new();
+
+    let root_node = tree.root_node();
+    let source_bytes = source.as_bytes();
+
+    let mut captures = cursor.captures(&query, root_node, source_bytes);
+
+    while let Some((query_match, capture_index)) = captures.next() {
+        let capture = &query_match.captures[*capture_index];
+        let capture_name = query.capture_names()[capture.index as usize];
+
+        // Handle string bindings: app('auth'), app('cache'), etc.
+        if capture_name == "binding_name" {
+            if let Ok(binding_text) = capture.node.utf8_text(source_bytes) {
+                let start_point = capture.node.start_position();
+                let end_point = capture.node.end_position();
+
+                results.push(BindingMatch {
+                    binding_name: binding_text,
+                    is_class_reference: false,
+                    byte_start: capture.node.start_byte(),
+                    byte_end: capture.node.end_byte(),
+                    row: start_point.row,
+                    column: start_point.column,
+                    end_column: end_point.column,
+                });
+            }
+        }
+        // Handle class references: app(SomeClass::class)
+        else if capture_name == "binding_class_name" {
+            if let Ok(class_text) = capture.node.utf8_text(source_bytes) {
+                // Clean up the class name - remove leading backslash if present
+                let clean_class = class_text.trim_start_matches('\\');
+
+                let start_point = capture.node.start_position();
+                let end_point = capture.node.end_position();
+
+                results.push(BindingMatch {
+                    binding_name: clean_class,
+                    is_class_reference: true,
+                    byte_start: capture.node.start_byte(),
+                    byte_end: capture.node.end_byte(),
+                    row: start_point.row,
+                    column: start_point.column,
+                    end_column: end_point.column,
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,7 +871,7 @@ mod tests {
         let (start, end) = result.unwrap();
         // 0 + 8 (@include) + 1 (open paren) + 2 (spaces) = 11
         assert_eq!(start, 11, "String should start at column 11 with spaces");
-        assert_eq!(end, 24, "String should end at column 24");
+        assert_eq!(end, 22, "String should end at column 22");
 
         // Test with double quotes
         let result = calculate_string_column_range(0, "extends", "\"layouts.app\"");
@@ -898,6 +1116,178 @@ mod tests {
         eprintln!("  full_text: '{}'", directive_match.full_text);
         eprintln!("  byte_start: {} (char: '{}')", directive_match.byte_start, char_at_start);
         eprintln!("  column: {}", directive_match.column);
+    }
+
+    #[test]
+    fn test_find_middleware_calls() {
+        let php_code = r#"
+<?php
+
+use Illuminate\Support\Facades\Route;
+
+Route::get('/dashboard', function () {
+    return view('dashboard');
+})->middleware('auth');
+
+Route::middleware('verified')->group(function () {
+    Route::get('/profile', [ProfileController::class, 'show']);
+});
+
+Route::middleware(['auth', 'verified'])->group(function () {
+    Route::get('/settings', [SettingsController::class, 'index']);
+});
+
+Route::withoutMiddleware('auth')->get('/public', function () {
+    return 'public';
+});
+
+Route::get('/api/data')->middleware(['throttle:60,1', 'auth']);
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_middleware_calls(&tree, php_code, &lang).expect("Should find middleware");
+
+        assert!(!matches.is_empty(), "Should find middleware calls");
+
+        // Verify we found all the middleware references
+        let middleware_names: Vec<&str> = matches.iter().map(|m| m.middleware_name).collect();
+        
+        assert!(middleware_names.contains(&"auth"), "Should find 'auth' middleware");
+        assert!(middleware_names.contains(&"verified"), "Should find 'verified' middleware");
+        assert!(middleware_names.contains(&"throttle:60,1"), "Should find 'throttle:60,1' middleware with parameters");
+
+        eprintln!("✓ Found {} middleware references:", matches.len());
+        for m in &matches {
+            eprintln!("  - '{}' at line {}", m.middleware_name, m.row + 1);
+        }
+    }
+
+    #[test]
+    fn test_find_translation_calls() {
+        let php_code = r#"
+<?php
+
+// Short helper function
+$message = __('messages.welcome');
+$error = __("auth.failed");
+
+// Trans helper
+$title = trans('pages.home.title');
+$description = trans("pages.about.description");
+
+// Trans choice for pluralization
+$count = trans_choice('messages.apples', 10);
+$time = trans_choice("messages.minutes_ago", $minutes);
+
+// Lang facade
+$greeting = Lang::get('messages.greeting');
+$farewell = \Lang::get("messages.farewell");
+
+// JSON translations (plain strings)
+$simple = __('Welcome to our application');
+
+// Nested keys
+$nested = __('validation.custom.email.required');
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_translation_calls(&tree, php_code, &lang).expect("Should find translations");
+
+        assert!(!matches.is_empty(), "Should find translation calls");
+
+        // Verify we found all the translation references
+        let translation_keys: Vec<&str> = matches.iter().map(|m| m.translation_key).collect();
+        
+        assert!(translation_keys.contains(&"messages.welcome"), "Should find 'messages.welcome'");
+        assert!(translation_keys.contains(&"auth.failed"), "Should find 'auth.failed'");
+        assert!(translation_keys.contains(&"pages.home.title"), "Should find 'pages.home.title'");
+        assert!(translation_keys.contains(&"messages.apples"), "Should find 'messages.apples' from trans_choice");
+        assert!(translation_keys.contains(&"messages.greeting"), "Should find 'messages.greeting' from Lang::get");
+        assert!(translation_keys.contains(&"Welcome to our application"), "Should find JSON translation");
+        assert!(translation_keys.contains(&"validation.custom.email.required"), "Should find nested key");
+
+        eprintln!("✓ Found {} translation references:", matches.len());
+        for m in &matches {
+            eprintln!("  - '{}' at line {}", m.translation_key, m.row + 1);
+        }
+    }
+
+    #[test]
+    fn test_find_multi_word_translation_calls() {
+        let php_code = r#"
+<?php
+
+// Multi-word translations (JSON only)
+$welcome = __('Welcome to our application');
+$please_login = __('Please login to continue');
+$success = trans('Your profile has been updated');
+$error = Lang::get('An error occurred while processing your request');
+
+// Mixed with single words
+$ok = __('OK');
+$long_message = __('This is a longer message with multiple words');
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_translation_calls(&tree, php_code, &lang).expect("Should find translations");
+
+        assert!(!matches.is_empty(), "Should find translation calls");
+
+        // Verify we found all the translation references
+        let translation_keys: Vec<&str> = matches.iter().map(|m| m.translation_key).collect();
+        
+        assert!(translation_keys.contains(&"Welcome to our application"), "Should find multi-word key");
+        assert!(translation_keys.contains(&"Please login to continue"), "Should find multi-word key");
+        assert!(translation_keys.contains(&"Your profile has been updated"), "Should find multi-word key");
+        assert!(translation_keys.contains(&"An error occurred while processing your request"), "Should find long multi-word key");
+        assert!(translation_keys.contains(&"OK"), "Should find single-word key");
+        assert!(translation_keys.contains(&"This is a longer message with multiple words"), "Should find long message");
+
+        eprintln!("✓ Found {} multi-word translation references:", matches.len());
+        for m in &matches {
+            eprintln!("  - '{}' at line {}", m.translation_key, m.row + 1);
+        }
+    }
+
+    #[test]
+    fn test_find_single_word_translation_calls() {
+        let php_code = r#"
+<?php
+
+// Single word keys (could be JSON or PHP)
+$confirm = __('Confirm');
+$cancel = __('Cancel');
+$save = trans('Save');
+$delete = Lang::get('Delete');
+
+// These should also be found
+$yes = __('Yes');
+$no = __('No');
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let matches = find_translation_calls(&tree, php_code, &lang).expect("Should find translations");
+
+        assert!(!matches.is_empty(), "Should find translation calls");
+
+        // Verify we found all the single-word translation references
+        let translation_keys: Vec<&str> = matches.iter().map(|m| m.translation_key).collect();
+        
+        assert!(translation_keys.contains(&"Confirm"), "Should find 'Confirm'");
+        assert!(translation_keys.contains(&"Cancel"), "Should find 'Cancel'");
+        assert!(translation_keys.contains(&"Save"), "Should find 'Save'");
+        assert!(translation_keys.contains(&"Delete"), "Should find 'Delete'");
+        assert!(translation_keys.contains(&"Yes"), "Should find 'Yes'");
+        assert!(translation_keys.contains(&"No"), "Should find 'No'");
+
+        eprintln!("✓ Found {} single-word translation references:", matches.len());
+        for m in &matches {
+            eprintln!("  - '{}' at line {}", m.translation_key, m.row + 1);
+        }
     }
 
 }

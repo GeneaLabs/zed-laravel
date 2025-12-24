@@ -14,15 +14,21 @@ mod parser;
 mod queries;
 mod config;
 mod env_parser;
+mod middleware_parser;
+mod service_provider_analyzer;
 
 use parser::{language_blade, language_php, parse_blade, parse_php};
 use queries::{
     find_blade_components, find_config_calls, find_directives, find_env_calls,
-    find_livewire_components, find_view_calls, ComponentMatch, ConfigMatch, DirectiveMatch,
-    EnvMatch, LivewireMatch, ViewMatch,
+    find_livewire_components, find_middleware_calls, find_translation_calls, find_view_calls,
+    find_binding_calls,
+    BindingMatch, ComponentMatch, ConfigMatch, DirectiveMatch, EnvMatch, LivewireMatch, MiddlewareMatch,
+    TranslationMatch, ViewMatch,
 };
 use config::LaravelConfig;
 use env_parser::EnvFileCache;
+use middleware_parser::resolve_class_to_file;
+use service_provider_analyzer::{analyze_service_providers, ServiceProviderRegistry};
 
 /// A reference to a Laravel view from another file
 #[derive(Debug, Clone, serde::Serialize)]
@@ -88,6 +94,12 @@ struct ParsedMatches {
     livewire_matches: Vec<LivewireMatch<'static>>,
     /// Cached directive matches
     directive_matches: Vec<DirectiveMatch<'static>>,
+    /// Cached middleware matches
+    middleware_matches: Vec<MiddlewareMatch<'static>>,
+    /// Cached translation matches
+    translation_matches: Vec<TranslationMatch<'static>>,
+    /// Cached container binding matches
+    binding_matches: Vec<BindingMatch<'static>>,
 }
 
 /// The reference cache with intelligent invalidation
@@ -129,6 +141,8 @@ struct LaravelLanguageServer {
     reference_cache: Arc<RwLock<ReferenceCache>>,
     /// Environment variable cache (.env, .env.example, .env.local)
     env_cache: Arc<RwLock<Option<EnvFileCache>>>,
+    /// Service provider registry (middleware, bindings, aliases, etc.)
+    service_provider_registry: Arc<RwLock<Option<ServiceProviderRegistry>>>,
 }
 
 impl LaravelLanguageServer {
@@ -141,6 +155,7 @@ impl LaravelLanguageServer {
             diagnostics: Arc::new(RwLock::new(HashMap::new())),
             reference_cache: Arc::new(RwLock::new(ReferenceCache::default())),
             env_cache: Arc::new(RwLock::new(None)),
+            service_provider_registry: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -243,6 +258,24 @@ impl LaravelLanguageServer {
             }
         }
 
+        // Re-initialize service provider registry with the new root
+        info!("========================================");
+        info!("🛡️  Re-initializing service provider registry from new root: {:?}", discovered_root);
+        info!("========================================");
+        match analyze_service_providers(&discovered_root).await {
+            Ok(registry) => {
+                info!("Laravel LSP: Service provider registry loaded: {} middleware aliases found", registry.middleware_aliases.len());
+                if !registry.middleware_aliases.is_empty() {
+                    info!("Laravel LSP: Available middleware: {:?}", 
+                          registry.middleware_aliases.keys().collect::<Vec<_>>());
+                }
+                *self.service_provider_registry.write().await = Some(registry);
+            }
+            Err(e) => {
+                info!("Laravel LSP: Failed to analyze service providers: {}", e);
+            }
+        }
+
         // Re-initialize environment variable cache with the new root
         info!("========================================");
         info!("📁 Re-initializing env cache from new root: {:?}", discovered_root);
@@ -271,10 +304,12 @@ impl LaravelLanguageServer {
         if let Ok(tree) = parse_php(text) {
             let lang = language_php();
             
-            if let (Ok(env), Ok(config), Ok(view)) = (
+            if let (Ok(env), Ok(config), Ok(view), Ok(middleware), Ok(translation)) = (
                 find_env_calls(&tree, text, &lang),
                 find_config_calls(&tree, text, &lang),
-                find_view_calls(&tree, text, &lang)
+                find_view_calls(&tree, text, &lang),
+                find_middleware_calls(&tree, text, &lang),
+                find_translation_calls(&tree, text, &lang)
             ) {
                 // Convert to 'static lifetime by cloning strings
                 let env_static: Vec<EnvMatch<'static>> = env.iter().map(|m| EnvMatch {
@@ -305,6 +340,24 @@ impl LaravelLanguageServer {
                     end_column: m.end_column,
                 }).collect();
                 
+                let middleware_static: Vec<MiddlewareMatch<'static>> = middleware.iter().map(|m| MiddlewareMatch {
+                    middleware_name: m.middleware_name.to_string().leak(),
+                    byte_start: m.byte_start,
+                    byte_end: m.byte_end,
+                    row: m.row,
+                    column: m.column,
+                    end_column: m.end_column,
+                }).collect();
+                
+                let translation_static: Vec<TranslationMatch<'static>> = translation.iter().map(|m| TranslationMatch {
+                    translation_key: m.translation_key.to_string().leak(),
+                    byte_start: m.byte_start,
+                    byte_end: m.byte_end,
+                    row: m.row,
+                    column: m.column,
+                    end_column: m.end_column,
+                }).collect();
+                
                 // Store/update cache
                 let mut cache_guard = self.reference_cache.write().await;
                 cache_guard.parsed_matches.insert(uri.clone(), ParsedMatches {
@@ -315,6 +368,9 @@ impl LaravelLanguageServer {
                     component_matches: Vec::new(),
                     livewire_matches: Vec::new(),
                     directive_matches: Vec::new(),
+                    middleware_matches: middleware_static,
+                    translation_matches: translation_static,
+                    binding_matches: Vec::new(),
                 });
                 cache_guard.document_versions.insert(uri.clone(), version);
             }
@@ -445,6 +501,9 @@ impl LaravelLanguageServer {
                     component_matches: components_static,
                     livewire_matches: livewire_static,
                     directive_matches: directives_static,
+                    middleware_matches: Vec::new(),
+                    translation_matches: Vec::new(),
+                    binding_matches: Vec::new(),
                 });
                 cache_guard.document_versions.insert(uri.clone(), version);
             }
@@ -890,6 +949,436 @@ impl LaravelLanguageServer {
         }]))
     }
 
+    /// Create a go-to-definition location for a middleware reference
+    /// Jumps to the middleware class file based on the alias
+    /// If the class file doesn't exist, jumps to where the alias is defined
+    async fn create_middleware_location(&self, middleware_match: &MiddlewareMatch<'_>) -> Option<GotoDefinitionResponse> {
+        let root_guard = self.root_path.read().await;
+        let root = root_guard.as_ref()?;
+
+        // Get service provider registry
+        let registry_guard = self.service_provider_registry.read().await;
+        let registry = registry_guard.as_ref()?;
+
+        // Look up the middleware alias (handles parameters like "throttle:60,1")
+        let middleware_reg = registry.get_middleware(middleware_match.middleware_name)?;
+        
+        info!("Laravel LSP: Found middleware alias '{}' -> {}", 
+              middleware_match.middleware_name, middleware_reg.class_name);
+
+        // Try to find the middleware class file
+        let middleware_path = if let Some(file_path) = &middleware_reg.file_path {
+            Some(file_path.clone())
+        } else {
+            // Try to resolve the class name to a file path
+            let class_name = &middleware_reg.class_name;
+            let path_str = class_name.replace("\\", "/");
+            
+            // Try App namespace first
+            if path_str.starts_with("App/") {
+                let relative = path_str.strip_prefix("App/").unwrap();
+                let file_path = root.join("app").join(relative).with_extension("php");
+                
+                if self.file_exists(&file_path).await {
+                    Some(file_path)
+                } else {
+                    info!("Laravel LSP: Middleware class file not found: {:?}", file_path);
+                    None
+                }
+            } else if path_str.starts_with("Illuminate/") {
+                // Framework middleware - try to navigate to vendor
+                let relative = path_str.strip_prefix("Illuminate/").unwrap();
+                let vendor_path = root.join("vendor/laravel/framework/src/Illuminate").join(relative).with_extension("php");
+                
+                if self.file_exists(&vendor_path).await {
+                    Some(vendor_path)
+                } else {
+                    info!("Laravel LSP: Framework middleware file not found: {:?}", vendor_path);
+                    None
+                }
+            } else {
+                info!("Laravel LSP: Unable to resolve middleware path for: {}", class_name);
+                None
+            }
+        };
+
+        // If middleware class file exists, navigate to it
+        if let Some(path) = middleware_path {
+            if self.file_exists(&path).await {
+                info!("Laravel LSP: Found middleware file: {:?}", path);
+
+                // Create URI for the middleware file
+                let target_uri = Url::from_file_path(&path).ok()?;
+
+                // Origin selection range - highlight the middleware name inside quotes
+                let origin_selection_range = Range {
+                    start: Position {
+                        line: middleware_match.row as u32,
+                        character: middleware_match.column as u32,
+                    },
+                    end: Position {
+                        line: middleware_match.row as u32,
+                        character: middleware_match.end_column as u32,
+                    },
+                };
+
+                // Jump to the top of the middleware class file
+                // TODO: Parse the file and find the exact class declaration
+                let target_selection_range = Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 0 },
+                };
+
+                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                    origin_selection_range: Some(origin_selection_range),
+                    target_uri,
+                    target_range: target_selection_range,
+                    target_selection_range,
+                }]));
+            }
+        }
+
+        // Middleware class file doesn't exist - navigate to where the alias is defined instead
+        if let (Some(source_file), Some(source_line)) = (&middleware_reg.source_file, middleware_reg.source_line) {
+            if self.file_exists(source_file).await {
+                info!("Laravel LSP: Middleware class not found, navigating to alias definition at {:?}:{}",
+                      source_file, source_line);
+
+                let target_uri = Url::from_file_path(source_file).ok()?;
+
+                // Origin selection range - highlight the middleware name inside quotes
+                let origin_selection_range = Range {
+                    start: Position {
+                        line: middleware_match.row as u32,
+                        character: middleware_match.column as u32,
+                    },
+                    end: Position {
+                        line: middleware_match.row as u32,
+                        character: middleware_match.end_column as u32,
+                    },
+                };
+
+                // Jump to the line where the alias is defined
+                let target_selection_range = Range {
+                    start: Position { 
+                        line: source_line as u32, 
+                        character: 0 
+                    },
+                    end: Position { 
+                        line: source_line as u32, 
+                        character: 0 
+                    },
+                };
+
+                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                    origin_selection_range: Some(origin_selection_range),
+                    target_uri,
+                    target_range: target_selection_range,
+                    target_selection_range,
+                }]));
+            }
+        }
+
+        info!("Laravel LSP: Could not navigate to middleware class or alias definition");
+        None
+    }
+
+    /// Create a go-to-definition location for a translation reference
+    /// Jumps to the translation file (PHP or JSON) where the key is defined
+    async fn create_translation_location(&self, translation_match: &TranslationMatch<'_>) -> Option<GotoDefinitionResponse> {
+        let root_guard = self.root_path.read().await;
+        let root = root_guard.as_ref()?;
+
+        let translation_key = translation_match.translation_key;
+        
+        info!("Laravel LSP: Looking for translation key: {}", translation_key);
+
+        // Check if this looks like a JSON translation (no dots, or contains spaces)
+        let looks_like_json = !translation_key.contains('.') || translation_key.contains(' ');
+
+        // Try JSON first if it looks like a JSON translation
+        if looks_like_json {
+            info!("Laravel LSP: Checking JSON translation files for: {}", translation_key);
+            
+            // Try both possible locations for JSON files
+            let json_paths = [
+                root.join("lang/en.json"),
+                root.join("resources/lang/en.json"),
+            ];
+
+            // First, try to find an existing JSON file
+            for json_path in &json_paths {
+                if self.file_exists(json_path).await {
+                    info!("Laravel LSP: Found JSON translation file: {:?}", json_path);
+                    
+                    let target_uri = Url::from_file_path(json_path).ok()?;
+                    
+                    let origin_selection_range = Range {
+                        start: Position {
+                            line: translation_match.row as u32,
+                            character: translation_match.column as u32,
+                        },
+                        end: Position {
+                            line: translation_match.row as u32,
+                            character: translation_match.end_column as u32,
+                        },
+                    };
+
+                    let target_selection_range = Range {
+                        start: Position { line: 0, character: 0 },
+                        end: Position { line: 0, character: 0 },
+                    };
+
+                    return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                        origin_selection_range: Some(origin_selection_range),
+                        target_uri,
+                        target_range: target_selection_range,
+                        target_selection_range,
+                    }]));
+                }
+            }
+            
+            info!("Laravel LSP: JSON translation file not found");
+            
+            // If multi-word (contains spaces), navigate to where JSON file SHOULD be
+            // This allows users to create the file if it doesn't exist
+            if translation_key.contains(' ') {
+                info!("Laravel LSP: Multi-word translation, pointing to expected JSON location");
+                
+                // Prefer Laravel 9+ location (lang/en.json)
+                let preferred_json_path = root.join("lang/en.json");
+                
+                if let Ok(target_uri) = Url::from_file_path(&preferred_json_path) {
+                    let origin_selection_range = Range {
+                        start: Position {
+                            line: translation_match.row as u32,
+                            character: translation_match.column as u32,
+                        },
+                        end: Position {
+                            line: translation_match.row as u32,
+                            character: translation_match.end_column as u32,
+                        },
+                    };
+
+                    let target_selection_range = Range {
+                        start: Position { line: 0, character: 0 },
+                        end: Position { line: 0, character: 0 },
+                    };
+
+                    return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                        origin_selection_range: Some(origin_selection_range),
+                        target_uri,
+                        target_range: target_selection_range,
+                        target_selection_range,
+                    }]));
+                }
+                
+                return None;
+            }
+            
+            // If JSON file doesn't exist and this is a single word (no dots, no spaces),
+            // fall back to checking common PHP translation files
+            if !translation_key.contains('.') {
+                info!("Laravel LSP: Falling back to common PHP files for single-word key: {}", translation_key);
+                
+                // Try common translation file names
+                let common_files = ["messages", "common", "app"];
+                
+                for file_name in &common_files {
+                    let php_paths = [
+                        root.join("lang/en").join(format!("{}.php", file_name)),
+                        root.join("resources/lang/en").join(format!("{}.php", file_name)),
+                    ];
+                    
+                    for php_path in &php_paths {
+                        if self.file_exists(php_path).await {
+                            info!("Laravel LSP: Found fallback PHP translation file: {:?}", php_path);
+                            
+                            let target_uri = Url::from_file_path(php_path).ok()?;
+                            
+                            let origin_selection_range = Range {
+                                start: Position {
+                                    line: translation_match.row as u32,
+                                    character: translation_match.column as u32,
+                                },
+                                end: Position {
+                                    line: translation_match.row as u32,
+                                    character: translation_match.end_column as u32,
+                                },
+                            };
+
+                            let target_selection_range = Range {
+                                start: Position { line: 0, character: 0 },
+                                end: Position { line: 0, character: 0 },
+                            };
+
+                            return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                                origin_selection_range: Some(origin_selection_range),
+                                target_uri,
+                                target_range: target_selection_range,
+                                target_selection_range,
+                            }]));
+                        }
+                    }
+                }
+            }
+            
+            // Fall through to PHP file handling for single-word keys
+        }
+
+        // PHP translation - parse the key: "messages.welcome" -> file: "messages.php", key: "welcome"
+        let parts: Vec<&str> = translation_key.split('.').collect();
+        if parts.is_empty() {
+            debug!("Laravel LSP: Translation key '{}' has no parts", translation_key);
+            return None;
+        }
+
+        let translation_file = parts[0];
+        
+        // Try both possible locations for PHP translation files
+        let php_paths = [
+            root.join("lang/en").join(format!("{}.php", translation_file)),
+            root.join("resources/lang/en").join(format!("{}.php", translation_file)),
+        ];
+
+        for translation_path in &php_paths {
+            if self.file_exists(translation_path).await {
+                info!("Laravel LSP: Found translation file: {:?}", translation_path);
+
+                let target_uri = Url::from_file_path(translation_path).ok()?;
+
+                let origin_selection_range = Range {
+                    start: Position {
+                        line: translation_match.row as u32,
+                        character: translation_match.column as u32,
+                    },
+                    end: Position {
+                        line: translation_match.row as u32,
+                        character: translation_match.end_column as u32,
+                    },
+                };
+
+                // Jump to the top of the translation file
+                // TODO: Parse the PHP file and find the exact nested key location
+                let target_selection_range = Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 0 },
+                };
+
+                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                    origin_selection_range: Some(origin_selection_range),
+                    target_uri,
+                    target_range: target_selection_range,
+                    target_selection_range,
+                }]));
+            }
+        }
+
+        info!("Laravel LSP: Translation file not found for key: {}", translation_key);
+        None
+    }
+
+    /// Create a go-to-definition location for a container binding call
+    /// Handles both app('string') and app(SomeClass::class) patterns
+    async fn create_binding_location(&self, binding_match: &BindingMatch<'_>) -> Option<GotoDefinitionResponse> {
+        let binding_name = binding_match.binding_name;
+        
+        info!("Laravel LSP: Looking for container binding: {} (is_class: {})", 
+              binding_name, binding_match.is_class_reference);
+
+        // If it's a class reference (Class::class), resolve directly to the class file
+        if binding_match.is_class_reference {
+            return self.resolve_class_binding(binding_match).await;
+        }
+
+        // For string bindings, check the service provider registry
+        let registry_guard = self.service_provider_registry.read().await;
+        if let Some(registry) = registry_guard.as_ref() {
+            if let Some(binding_reg) = registry.get_binding(binding_name) {
+                info!("Laravel LSP: Found binding registration for '{}'", binding_name);
+                
+                // Always navigate to where the binding is registered (not the concrete class)
+                if let (Some(source_file), Some(source_line)) = (&binding_reg.source_file, binding_reg.source_line) {
+                    if let Ok(target_uri) = Url::from_file_path(source_file) {
+                        let origin_selection_range = Range {
+                            start: Position {
+                                line: binding_match.row as u32,
+                                character: binding_match.column as u32,
+                            },
+                            end: Position {
+                                line: binding_match.row as u32,
+                                character: binding_match.end_column as u32,
+                            },
+                        };
+
+                        let target_selection_range = Range {
+                            start: Position { line: source_line as u32, character: 0 },
+                            end: Position { line: source_line as u32, character: 0 },
+                        };
+
+                        info!("Laravel LSP: Navigating to binding registration at {:?}:{}", source_file, source_line);
+                        return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                            origin_selection_range: Some(origin_selection_range),
+                            target_uri,
+                            target_range: target_selection_range,
+                            target_selection_range,
+                        }]));
+                    }
+                } else {
+                    // Binding exists but has no source file (framework binding)
+                    // Return empty array to prevent Zed's fallback navigation
+                    info!("Laravel LSP: Binding '{}' exists (framework) but has no source file, returning empty", binding_name);
+                    return Some(GotoDefinitionResponse::Array(vec![]));
+                }
+            }
+        }
+
+        // No binding found - return empty array to prevent Zed's fallback navigation
+        info!("Laravel LSP: No binding found for '{}', returning empty to prevent fallback", binding_name);
+        Some(GotoDefinitionResponse::Array(vec![]))
+    }
+
+    /// Resolve a class reference binding (Class::class) to its file
+    async fn resolve_class_binding(&self, binding_match: &BindingMatch<'_>) -> Option<GotoDefinitionResponse> {
+        let class_name = binding_match.binding_name;
+        
+        let root_guard = self.root_path.read().await;
+        let root = root_guard.as_ref()?;
+        
+        // Use the existing resolve_class_to_file function
+        if let Some(file_path) = resolve_class_to_file(class_name, root) {
+            if let Ok(target_uri) = Url::from_file_path(&file_path) {
+                let origin_selection_range = Range {
+                    start: Position {
+                        line: binding_match.row as u32,
+                        character: binding_match.column as u32,
+                    },
+                    end: Position {
+                        line: binding_match.row as u32,
+                        character: binding_match.end_column as u32,
+                    },
+                };
+
+                let target_selection_range = Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 0 },
+                };
+
+                info!("Laravel LSP: Resolved class reference '{}' to {:?}", class_name, file_path);
+                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                    origin_selection_range: Some(origin_selection_range),
+                    target_uri,
+                    target_range: target_selection_range,
+                    target_selection_range,
+                }]));
+            }
+        }
+
+        // Class file not found - return empty array to prevent Zed's fallback
+        info!("Laravel LSP: Class file not found for '{}', returning empty to prevent fallback", class_name);
+        Some(GotoDefinitionResponse::Array(vec![]))
+    }
+
     /// Validate a document (Blade or PHP) and publish diagnostics
     ///
     /// This function:
@@ -1008,6 +1497,354 @@ impl LaravelLanguageServer {
                     }
                 }
                 drop(env_cache_guard);
+                
+                // Check middleware calls - warn about undefined middleware or missing class files
+                let registry_guard = self.service_provider_registry.read().await;
+                let root_guard = self.root_path.read().await;
+                if let (Some(registry), Some(root)) = (registry_guard.as_ref(), root_guard.as_ref()) {
+                    if let Ok(middleware_calls) = find_middleware_calls(&tree, source, &lang) {
+                        for middleware_match in middleware_calls {
+                            let middleware_name = middleware_match.middleware_name;
+                            
+                            // Check if middleware exists in registry
+                            info!("Laravel LSP: Checking middleware '{}' in registry", middleware_name);
+                            if let Some(middleware_reg) = registry.get_middleware(middleware_name) {
+                                info!("Laravel LSP: Middleware '{}' found in registry, class: {}", middleware_name, middleware_reg.class_name);
+                                // Middleware is in registry - check if class file exists
+                                if let Some(ref file_path) = middleware_reg.file_path {
+                                    let class_path = root.join(file_path);
+                                    info!("Laravel LSP: Checking file path: {:?}, exists: {}", class_path, class_path.exists());
+                                    if !class_path.exists() {
+                                        // ERROR - middleware defined but class file missing (will crash at runtime)
+                                        info!("Laravel LSP: Creating ERROR diagnostic for missing middleware class file: {}", middleware_name);
+                                        let diagnostic = Diagnostic {
+                                            range: Range {
+                                                start: Position {
+                                                    line: middleware_match.row as u32,
+                                                    character: middleware_match.column as u32,
+                                                },
+                                                end: Position {
+                                                    line: middleware_match.row as u32,
+                                                    character: middleware_match.end_column as u32,
+                                                },
+                                            },
+                                            severity: Some(DiagnosticSeverity::ERROR),
+                                            code: None,
+                                            source: Some("laravel-lsp".to_string()),
+                                            message: format!(
+                                                "Middleware '{}' not found\nClass: {}\nExpected at: {}\n\nThe middleware alias is registered but the class file doesn't exist.\n💡 Click to view where the alias is defined.",
+                                                middleware_name,
+                                                middleware_reg.class_name,
+                                                file_path.to_string_lossy()
+                                            ),
+                                            related_information: None,
+                                            tags: None,
+                                            code_description: None,
+                                            data: None,
+                                        };
+                                        diagnostics.push(diagnostic);
+                                    } else {
+                                        info!("Laravel LSP: Middleware '{}' class file exists at {:?}", middleware_name, class_path);
+                                    }
+                                } else {
+                                    info!("Laravel LSP: Middleware '{}' in registry but no file_path resolved - skipping diagnostic", middleware_name);
+                                    // Skip diagnostic - can't verify file existence without a path
+                                    // This handles some framework middleware
+                                }
+                            } else {
+                                // Middleware not in registry - try to resolve it by convention
+                                info!("Laravel LSP: Middleware '{}' NOT found in registry, attempting resolution by convention", middleware_name);
+                                
+                                // Convert kebab-case to PascalCase (e.g., 'undefined-middleware' -> 'UndefinedMiddleware')
+                                let class_name = Self::kebab_to_pascal_case(middleware_name);
+                                let app_class = format!("App\\Http\\Middleware\\{}", class_name);
+                                
+                                // Try to resolve as App\Http\Middleware\{ClassName}
+                                if let Some(file_path) = resolve_class_to_file(&app_class, root) {
+                                    let class_path = root.join(&file_path);
+                                    info!("Laravel LSP: Attempting to resolve middleware '{}' as class '{}' at {:?}", middleware_name, app_class, class_path);
+                                    
+                                    if !class_path.exists() {
+                                        // ERROR - middleware not in config and class file doesn't exist
+                                        info!("Laravel LSP: Creating ERROR diagnostic for unresolved middleware: {}", middleware_name);
+                                        let diagnostic = Diagnostic {
+                                            range: Range {
+                                                start: Position {
+                                                    line: middleware_match.row as u32,
+                                                    character: middleware_match.column as u32,
+                                                },
+                                                end: Position {
+                                                    line: middleware_match.row as u32,
+                                                    character: middleware_match.end_column as u32,
+                                                },
+                                            },
+                                            severity: Some(DiagnosticSeverity::ERROR),
+                                            code: None,
+                                            source: Some("laravel-lsp".to_string()),
+                                            message: format!(
+                                                "Middleware '{}' not found\nExpected at: {}\n\nCreate the middleware or add an alias in bootstrap/app.php",
+                                                middleware_name,
+                                                file_path.to_string_lossy()
+                                            ),
+                                            related_information: None,
+                                            tags: None,
+                                            code_description: None,
+                                            data: None,
+                                        };
+                                        diagnostics.push(diagnostic);
+                                    } else {
+                                        info!("Laravel LSP: Middleware '{}' resolved by convention, file exists at {:?}", middleware_name, class_path);
+                                    }
+                                } else {
+                                    // Can't resolve - show INFO as we don't know where to check
+                                    info!("Laravel LSP: Middleware '{}' NOT found in registry and can't resolve file path, creating INFO diagnostic", middleware_name);
+                                    let diagnostic = Diagnostic {
+                                        range: Range {
+                                            start: Position {
+                                                line: middleware_match.row as u32,
+                                                character: middleware_match.column as u32,
+                                            },
+                                            end: Position {
+                                                line: middleware_match.row as u32,
+                                                character: middleware_match.end_column as u32,
+                                            },
+                                        },
+                                        severity: Some(DiagnosticSeverity::INFORMATION),
+                                        code: None,
+                                        source: Some("laravel-lsp".to_string()),
+                                        message: format!(
+                                            "Middleware '{}' not found\n\nIf this middleware exists, add an alias in bootstrap/app.php",
+                                            middleware_name
+                                        ),
+                                        related_information: None,
+                                        tags: None,
+                                        code_description: None,
+                                        data: None,
+                                    };
+                                    diagnostics.push(diagnostic);
+                                }
+                            }
+                        }
+                    }
+                }
+                drop(root_guard);
+                drop(registry_guard);
+                
+                // Check translation calls - warn about missing translation files
+                if let Ok(translation_calls) = find_translation_calls(&tree, source, &lang) {
+                    let root_guard = self.root_path.read().await;
+                    if let Some(root) = root_guard.as_ref() {
+                        for trans_match in translation_calls {
+                            let translation_key = trans_match.translation_key;
+                            
+                            // Determine if this is a dotted key (PHP file) or text key (JSON file)
+                            let is_dotted_key = translation_key.contains('.') && !translation_key.contains(' ');
+                            let is_multi_word = translation_key.contains(' ');
+                            
+                            let mut file_exists = false;
+                            let mut expected_location = String::new();
+                            
+                            if is_multi_word || (!is_dotted_key && !translation_key.contains('.')) {
+                                // Check JSON files
+                                let json_paths = [
+                                    root.join("lang/en.json"),
+                                    root.join("resources/lang/en.json"),
+                                ];
+                                
+                                for json_path in &json_paths {
+                                    if json_path.exists() {
+                                        file_exists = true;
+                                        break;
+                                    }
+                                }
+                                
+                                if !file_exists {
+                                    expected_location = "lang/en.json or resources/lang/en.json".to_string();
+                                }
+                            } else if is_dotted_key {
+                                // Check PHP file based on first segment
+                                let parts: Vec<&str> = translation_key.split('.').collect();
+                                if !parts.is_empty() {
+                                    let file_name = parts[0];
+                                    let php_paths = [
+                                        root.join("lang/en").join(format!("{}.php", file_name)),
+                                        root.join("resources/lang/en").join(format!("{}.php", file_name)),
+                                    ];
+                                    
+                                    for php_path in &php_paths {
+                                        if php_path.exists() {
+                                            file_exists = true;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    if !file_exists {
+                                        expected_location = format!("lang/en/{}.php or resources/lang/en/{}.php", file_name, file_name);
+                                    }
+                                }
+                            }
+                            
+                            // Create diagnostic if file not found
+                            if !file_exists {
+                                // ERROR for dotted keys (likely to break at runtime)
+                                // INFO for text keys (might be intentional)
+                                let (severity, message) = if is_dotted_key {
+                                    (
+                                        DiagnosticSeverity::ERROR,
+                                        format!(
+                                            "Translation file not found for key '{}'\nExpected at: {}",
+                                            translation_key,
+                                            expected_location
+                                        )
+                                    )
+                                } else {
+                                    (
+                                        DiagnosticSeverity::INFORMATION,
+                                        format!(
+                                            "Translation file not found for key '{}'\nCreate {} to add this translation",
+                                            translation_key,
+                                            expected_location
+                                        )
+                                    )
+                                };
+                                
+                                let diagnostic = Diagnostic {
+                                    range: Range {
+                                        start: Position {
+                                            line: trans_match.row as u32,
+                                            character: trans_match.column as u32,
+                                        },
+                                        end: Position {
+                                            line: trans_match.row as u32,
+                                            character: trans_match.end_column as u32,
+                                        },
+                                    },
+                                    severity: Some(severity),
+                                    code: None,
+                                    source: Some("laravel-lsp".to_string()),
+                                    message,
+                                    related_information: None,
+                                    tags: None,
+                                    code_description: None,
+                                    data: None,
+                                };
+                                diagnostics.push(diagnostic);
+                            }
+                        }
+                    }
+                    drop(root_guard);
+                }
+                
+                // Check container binding calls - error for undefined bindings or missing class files
+                let registry_guard = self.service_provider_registry.read().await;
+                let root_guard = self.root_path.read().await;
+                if let (Some(registry), Some(root)) = (registry_guard.as_ref(), root_guard.as_ref()) {
+                    if let Ok(binding_calls) = find_binding_calls(&tree, source, &lang) {
+                        for binding_match in binding_calls {
+                            // Only validate string bindings (not Class::class references)
+                            // Class::class references might be auto-resolved by Laravel
+                            if !binding_match.is_class_reference {
+                                let binding_name = binding_match.binding_name;
+                                
+                                // Check if binding exists in registry
+                                if let Some(binding_reg) = registry.get_binding(binding_name) {
+                                    // Binding exists - check if the concrete class file exists
+                                    if let Some(ref file_path) = binding_reg.file_path {
+                                        let class_path = root.join(file_path);
+                                        if !class_path.exists() {
+                                            // ERROR - binding exists but class file is missing
+                                            info!("Laravel LSP: Creating ERROR diagnostic for binding with missing class: {}", binding_name);
+                                            
+                                            // Build the diagnostic message with registration location
+                                            let mut message = format!(
+                                                "Binding '{}' registered but class file not found\nExpected class at: {}",
+                                                binding_name,
+                                                file_path.to_string_lossy()
+                                            );
+                                            
+                                            // Add registration location if available
+                                            if let Some(ref source_file) = binding_reg.source_file {
+                                                let registered_in = source_file.file_name()
+                                                    .and_then(|n| n.to_str())
+                                                    .unwrap_or("service provider");
+                                                
+                                                if let Some(line) = binding_reg.source_line {
+                                                    message.push_str(&format!("\n\nBound in: {}:{}", registered_in, line + 1));
+                                                } else {
+                                                    message.push_str(&format!("\n\nBound in: {}", registered_in));
+                                                }
+                                            }
+                                            
+                                            message.push_str(&format!("\nConcrete class: {}", binding_reg.concrete_class));
+                                            
+                                            let diagnostic = Diagnostic {
+                                                range: Range {
+                                                    start: Position {
+                                                        line: binding_match.row as u32,
+                                                        character: binding_match.column as u32,
+                                                    },
+                                                    end: Position {
+                                                        line: binding_match.row as u32,
+                                                        character: binding_match.end_column as u32,
+                                                    },
+                                                },
+                                                severity: Some(DiagnosticSeverity::ERROR),
+                                                code: None,
+                                                source: Some("laravel-lsp".to_string()),
+                                                message,
+                                                related_information: None,
+                                                tags: None,
+                                                code_description: None,
+                                                data: None,
+                                            };
+                                            diagnostics.push(diagnostic);
+                                        }
+                                    }
+                                } else {
+                                    // Binding not found - check if it's a known framework binding
+                                    let framework_bindings = [
+                                        "app", "auth", "auth.driver", "blade.compiler", "cache", "cache.store",
+                                        "config", "cookie", "db", "db.connection", "encrypter", "events",
+                                        "files", "filesystem", "filesystem.disk", "hash", "log", "mailer",
+                                        "queue", "queue.connection", "redirect", "redis", "request", "router",
+                                        "session", "session.store", "url", "validator", "view",
+                                    ];
+                                    
+                                    if !framework_bindings.contains(&binding_name) {
+                                        // ERROR - binding not found and not a known framework binding
+                                        info!("Laravel LSP: Creating ERROR diagnostic for undefined binding: {}", binding_name);
+                                        let diagnostic = Diagnostic {
+                                            range: Range {
+                                                start: Position {
+                                                    line: binding_match.row as u32,
+                                                    character: binding_match.column as u32,
+                                                },
+                                                end: Position {
+                                                    line: binding_match.row as u32,
+                                                    character: binding_match.end_column as u32,
+                                                },
+                                            },
+                                            severity: Some(DiagnosticSeverity::ERROR),
+                                            code: None,
+                                            source: Some("laravel-lsp".to_string()),
+                                            message: format!(
+                                                "Container binding '{}' not found\n\nDefine this binding in a service provider's register() method",
+                                                binding_name
+                                            ),
+                                            related_information: None,
+                                            tags: None,
+                                            code_description: None,
+                                            data: None,
+                                        };
+                                        diagnostics.push(diagnostic);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                drop(root_guard);
+                drop(registry_guard);
             }
 
             // Store and publish diagnostics for PHP files
@@ -1028,6 +1865,116 @@ impl LaravelLanguageServer {
         };
 
         let lang = language_blade();
+        
+        // Also parse Blade files with PHP parser to catch {{ __() }} syntax
+        if let Ok(php_tree) = parse_php(source) {
+            let php_lang = language_php();
+            
+            // Check translation calls in PHP expressions within Blade
+            if let Ok(translation_calls) = find_translation_calls(&php_tree, source, &php_lang) {
+                let root_guard = self.root_path.read().await;
+                if let Some(root) = root_guard.as_ref() {
+                    for trans_match in translation_calls {
+                        let translation_key = trans_match.translation_key;
+                        
+                        // Determine if this is a dotted key (PHP file) or text key (JSON file)
+                        let is_dotted_key = translation_key.contains('.') && !translation_key.contains(' ');
+                        let is_multi_word = translation_key.contains(' ');
+                        
+                        let mut file_exists = false;
+                        let mut expected_location = String::new();
+                        
+                        if is_multi_word || (!is_dotted_key && !translation_key.contains('.')) {
+                            // Check JSON files
+                            let json_paths = [
+                                root.join("lang/en.json"),
+                                root.join("resources/lang/en.json"),
+                            ];
+                            
+                            for json_path in &json_paths {
+                                if json_path.exists() {
+                                    file_exists = true;
+                                    break;
+                                }
+                            }
+                            
+                            if !file_exists {
+                                expected_location = "lang/en.json or resources/lang/en.json".to_string();
+                            }
+                        } else if is_dotted_key {
+                            // Check PHP file based on first segment
+                            let parts: Vec<&str> = translation_key.split('.').collect();
+                            if !parts.is_empty() {
+                                let file_name = parts[0];
+                                let php_paths = [
+                                    root.join("lang/en").join(format!("{}.php", file_name)),
+                                    root.join("resources/lang/en").join(format!("{}.php", file_name)),
+                                ];
+                                
+                                for php_path in &php_paths {
+                                    if php_path.exists() {
+                                        file_exists = true;
+                                        break;
+                                    }
+                                }
+                                
+                                if !file_exists {
+                                    expected_location = format!("lang/en/{}.php or resources/lang/en/{}.php", file_name, file_name);
+                                }
+                            }
+                        }
+                        
+                        // Create diagnostic if file not found
+                        if !file_exists {
+                            // ERROR for dotted keys (likely to break at runtime)
+                            // INFO for text keys (might be intentional)
+                            let (severity, message) = if is_dotted_key {
+                                (
+                                    DiagnosticSeverity::ERROR,
+                                    format!(
+                                        "Translation file not found for key '{}'\nExpected at: {}",
+                                        translation_key,
+                                        expected_location
+                                    )
+                                )
+                            } else {
+                                (
+                                    DiagnosticSeverity::INFORMATION,
+                                    format!(
+                                        "Translation file not found for key '{}'\nCreate {} to add this translation",
+                                        translation_key,
+                                        expected_location
+                                    )
+                                )
+                            };
+                            
+                            let diagnostic = Diagnostic {
+                                range: Range {
+                                    start: Position {
+                                        line: trans_match.row as u32,
+                                        character: trans_match.column as u32,
+                                    },
+                                    end: Position {
+                                        line: trans_match.row as u32,
+                                        character: trans_match.end_column as u32,
+                                    },
+                                },
+                                severity: Some(severity),
+                                code: None,
+                                source: Some("laravel-lsp".to_string()),
+                                message,
+                                related_information: None,
+                                tags: None,
+                                code_description: None,
+                                data: None,
+                            };
+                            diagnostics.push(diagnostic);
+                        }
+                    }
+                }
+                drop(root_guard);
+            }
+        }
 
         // Check @extends and @include directives
         if let Ok(directives) = find_directives(&tree, source, &lang) {
@@ -1154,6 +2101,116 @@ impl LaravelLanguageServer {
             }
         }
 
+        // Check @lang directives for translation files
+        if let Ok(directives) = find_directives(&tree, source, &lang) {
+            let root_guard = self.root_path.read().await;
+            if let Some(root) = root_guard.as_ref() {
+                for directive in directives {
+                    // Only validate @lang directives
+                    if directive.directive_name == "lang" {
+                        if let Some(translation_key) = Self::extract_view_from_directive_args(
+                            directive.arguments.unwrap_or("")
+                        ) {
+                            // Determine if this is a dotted key (PHP file) or text key (JSON file)
+                            let is_dotted_key = translation_key.contains('.') && !translation_key.contains(' ');
+                            let is_multi_word = translation_key.contains(' ');
+                            
+                            let mut file_exists = false;
+                            let mut expected_location = String::new();
+                            
+                            if is_multi_word || (!is_dotted_key && !translation_key.contains('.')) {
+                                // Check JSON files
+                                let json_paths = [
+                                    root.join("lang/en.json"),
+                                    root.join("resources/lang/en.json"),
+                                ];
+                                
+                                for json_path in &json_paths {
+                                    if json_path.exists() {
+                                        file_exists = true;
+                                        break;
+                                    }
+                                }
+                                
+                                if !file_exists {
+                                    expected_location = "lang/en.json or resources/lang/en.json".to_string();
+                                }
+                            } else if is_dotted_key {
+                                // Check PHP file based on first segment
+                                let parts: Vec<&str> = translation_key.split('.').collect();
+                                if !parts.is_empty() {
+                                    let file_name = parts[0];
+                                    let php_paths = [
+                                        root.join("lang/en").join(format!("{}.php", file_name)),
+                                        root.join("resources/lang/en").join(format!("{}.php", file_name)),
+                                    ];
+                                    
+                                    for php_path in &php_paths {
+                                        if php_path.exists() {
+                                            file_exists = true;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    if !file_exists {
+                                        expected_location = format!("lang/en/{}.php or resources/lang/en/{}.php", file_name, file_name);
+                                    }
+                                }
+                            }
+                            
+                            // Create diagnostic if file not found
+                            if !file_exists {
+                                // WARNING for dotted keys (more likely to be actual errors)
+                                // INFO for text keys (might be intentional)
+                                let (severity, message) = if is_dotted_key {
+                                    (
+                                        DiagnosticSeverity::WARNING,
+                                        format!(
+                                            "Translation file not found for key '{}'\nExpected at: {}",
+                                            translation_key,
+                                            expected_location
+                                        )
+                                    )
+                                } else {
+                                    (
+                                        DiagnosticSeverity::INFORMATION,
+                                        format!(
+                                            "Translation file not found for key '{}'\nCreate {} to add this translation",
+                                            translation_key,
+                                            expected_location
+                                        )
+                                    )
+                                };
+                                
+                                let diagnostic = Diagnostic {
+                                    range: Range {
+                                        start: Position {
+                                            line: directive.row as u32,
+                                            character: directive.string_column as u32,
+                                        },
+                                        end: Position {
+                                            line: directive.row as u32,
+                                            character: directive.string_end_column as u32,
+                                        },
+                                    },
+                                    severity: Some(severity),
+                                    code: None,
+                                    source: Some("laravel-lsp".to_string()),
+                                    message,
+                                    related_information: None,
+                                    tags: None,
+                                    code_description: None,
+                                    data: None,
+                                };
+                                diagnostics.push(diagnostic);
+                            }
+                        }
+                    }
+                }
+            }
+            drop(root_guard);
+        }
+
         // Store diagnostics for hover filtering
         self.diagnostics.write().await.insert(uri.clone(), diagnostics.clone());
 
@@ -1219,6 +2276,30 @@ impl<'a> HasPosition for ConfigMatch<'a> {
     fn byte_end(&self) -> usize { self.byte_end }
 }
 
+impl<'a> HasPosition for MiddlewareMatch<'a> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+}
+
+impl<'a> HasPosition for TranslationMatch<'a> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+}
+
+impl<'a> HasPosition for BindingMatch<'a> {
+    fn row(&self) -> usize { self.row }
+    fn column(&self) -> usize { self.column }
+    fn end_column(&self) -> usize { self.end_column }
+    fn byte_start(&self) -> usize { self.byte_start }
+    fn byte_end(&self) -> usize { self.byte_end }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for LaravelLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
@@ -1263,6 +2344,38 @@ impl LanguageServer for LaravelLanguageServer {
                     }
                     Err(e) => {
                         info!("Laravel LSP: Failed to parse env files (will continue without env support): {}", e);
+                    }
+                }
+                
+                // Initialize service provider registry
+                info!("========================================");
+                info!("🛡️  Initializing service provider registry from root: {:?}", path);
+                info!("🚀 LARAVEL LSP v2024-12-21-17:30 - OPTION 3 FIX ACTIVE");
+                info!("========================================");
+                match analyze_service_providers(&path).await {
+                    Ok(registry) => {
+                        info!("Laravel LSP: Service provider registry loaded: {} middleware aliases, {} bindings, {} singletons", 
+                              registry.middleware_aliases.len(), 
+                              registry.bindings.len(),
+                              registry.singletons.len());
+                        
+                        // Debug: Show some binding examples
+                        if let Some(cache_binding) = registry.bindings.get("cache").or_else(|| registry.singletons.get("cache")) {
+                            info!("Laravel LSP: DEBUG - 'cache' binding found: concrete={}, source_file={:?}, source_line={:?}", 
+                                  cache_binding.concrete_class,
+                                  cache_binding.source_file,
+                                  cache_binding.source_line);
+                        } else {
+                            info!("Laravel LSP: DEBUG - 'cache' binding NOT found in registry!");
+                        }
+                        if !registry.middleware_aliases.is_empty() {
+                            info!("Laravel LSP: Available middleware: {:?}", 
+                                  registry.middleware_aliases.keys().collect::<Vec<_>>());
+                        }
+                        *self.service_provider_registry.write().await = Some(registry);
+                    }
+                    Err(e) => {
+                        info!("Laravel LSP: Failed to analyze service providers: {}", e);
                     }
                 }
             }
@@ -1406,11 +2519,11 @@ impl LanguageServer for LaravelLanguageServer {
             let use_cache = cached.map_or(false, |c| c.version == current_version);
             drop(cache_guard);
 
-            let (env_matches, config_matches, view_matches) = if use_cache {
+            let (env_matches, config_matches, view_matches, middleware_matches, translation_matches, binding_matches) = if use_cache {
                 // Use cached results
                 let cache_guard = self.reference_cache.read().await;
                 let cached = cache_guard.parsed_matches.get(&uri).unwrap();
-                (cached.env_matches.clone(), cached.config_matches.clone(), cached.view_matches.clone())
+                (cached.env_matches.clone(), cached.config_matches.clone(), cached.view_matches.clone(), cached.middleware_matches.clone(), cached.translation_matches.clone(), cached.binding_matches.clone())
             } else {
                 // Parse and cache
                 if let Ok(tree) = parse_php(&source) {
@@ -1419,6 +2532,9 @@ impl LanguageServer for LaravelLanguageServer {
                     let env = find_env_calls(&tree, &source, &lang).unwrap_or_default();
                     let config = find_config_calls(&tree, &source, &lang).unwrap_or_default();
                     let view = find_view_calls(&tree, &source, &lang).unwrap_or_default();
+                    let middleware = find_middleware_calls(&tree, &source, &lang).unwrap_or_default();
+                    let translation = find_translation_calls(&tree, &source, &lang).unwrap_or_default();
+                    let bindings = find_binding_calls(&tree, &source, &lang).unwrap_or_default();
                     
                     // Convert to 'static lifetime by cloning strings
                     let env_static: Vec<EnvMatch<'static>> = env.iter().map(|m| EnvMatch {
@@ -1449,6 +2565,34 @@ impl LanguageServer for LaravelLanguageServer {
                         end_column: m.end_column,
                     }).collect();
                     
+                    let middleware_static: Vec<MiddlewareMatch<'static>> = middleware.iter().map(|m| MiddlewareMatch {
+                        middleware_name: m.middleware_name.to_string().leak(),
+                        byte_start: m.byte_start,
+                        byte_end: m.byte_end,
+                        row: m.row,
+                        column: m.column,
+                        end_column: m.end_column,
+                    }).collect();
+                    
+                    let translation_static: Vec<TranslationMatch<'static>> = translation.iter().map(|m| TranslationMatch {
+                        translation_key: m.translation_key.to_string().leak(),
+                        byte_start: m.byte_start,
+                        byte_end: m.byte_end,
+                        row: m.row,
+                        column: m.column,
+                        end_column: m.end_column,
+                    }).collect();
+                    
+                    let binding_static: Vec<BindingMatch<'static>> = bindings.iter().map(|m| BindingMatch {
+                        binding_name: m.binding_name.to_string().leak(),
+                        is_class_reference: m.is_class_reference,
+                        byte_start: m.byte_start,
+                        byte_end: m.byte_end,
+                        row: m.row,
+                        column: m.column,
+                        end_column: m.end_column,
+                    }).collect();
+                    
                     // Store in cache
                     let mut cache_guard = self.reference_cache.write().await;
                     cache_guard.parsed_matches.insert(uri.clone(), ParsedMatches {
@@ -1459,11 +2603,14 @@ impl LanguageServer for LaravelLanguageServer {
                         component_matches: Vec::new(),
                         livewire_matches: Vec::new(),
                         directive_matches: Vec::new(),
+                        middleware_matches: middleware_static.clone(),
+                        translation_matches: translation_static.clone(),
+                        binding_matches: binding_static.clone(),
                     });
                     
-                    (env_static, config_static, view_static)
+                    (env_static, config_static, view_static, middleware_static, translation_static, binding_static)
                 } else {
-                    (Vec::new(), Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
                 }
             };
             
@@ -1483,6 +2630,24 @@ impl LanguageServer for LaravelLanguageServer {
             if let Some(config_match) = Self::find_match_at_position(&config_matches, position) {
                 info!("Laravel LSP: Found config() call: {}", config_match.config_key);
                 return Ok(self.create_config_location(&config_match).await);
+            }
+            
+            // Try middleware() calls
+            if let Some(middleware_match) = Self::find_match_at_position(&middleware_matches, position) {
+                info!("Laravel LSP: Found middleware() call: {}", middleware_match.middleware_name);
+                return Ok(self.create_middleware_location(&middleware_match).await);
+            }
+            
+            // Try translation calls
+            if let Some(translation_match) = Self::find_match_at_position(&translation_matches, position) {
+                info!("Laravel LSP: Found translation call: {}", translation_match.translation_key);
+                return Ok(self.create_translation_location(&translation_match).await);
+            }
+            
+            // Try container binding calls
+            if let Some(binding_match) = Self::find_match_at_position(&binding_matches, position) {
+                info!("Laravel LSP: Found app() binding call: {}", binding_match.binding_name);
+                return Ok(self.create_binding_location(&binding_match).await);
             }
         } else if is_blade {
             // Check cache first
@@ -1548,6 +2713,9 @@ impl LanguageServer for LaravelLanguageServer {
                         component_matches: comp_static.clone(),
                         livewire_matches: lw_static.clone(),
                         directive_matches: dir_static.clone(),
+                        middleware_matches: Vec::new(),
+                        translation_matches: Vec::new(),
+                        binding_matches: Vec::new(),
                     });
                     
                     (comp_static, lw_static, dir_static)
@@ -1584,6 +2752,11 @@ impl LanguageServer for LaravelLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
+        // Don't show hover if there's already a diagnostic at this position
+        if self.has_diagnostic_at_position(&uri, position).await {
+            return Ok(None);
+        }
+
         // Get document content (clone to avoid holding lock)
         let source = {
             let documents = self.documents.read().await;
@@ -1600,7 +2773,7 @@ impl LanguageServer for LaravelLanguageServer {
             return Ok(None);
         }
 
-        // Parse the file and look for env() or config() calls at cursor position
+        // Parse the file and look for Laravel calls at cursor position
         let parse_start = std::time::Instant::now();
         let Ok(tree) = parse_php(&source) else {
             return Ok(None);
@@ -1654,12 +2827,12 @@ impl LanguageServer for LaravelLanguageServer {
                         }));
                     }
                 }
-                // Found env match but not in cache - return early, no need to check config
+                // Found env match but not in cache - return early, no need to check others
                 return Ok(None);
             }
         }
 
-        // Try config() calls only if env didn't match
+        // Try config() calls
         let config_query_start = std::time::Instant::now();
         if let Ok(config_matches) = find_config_calls(&tree, &source, &lang) {
             debug!("Hover: find_config_calls took {:?}", config_query_start.elapsed());
@@ -1702,6 +2875,170 @@ impl LanguageServer for LaravelLanguageServer {
                             }),
                         }));
                     }
+                }
+            }
+        }
+
+        // Try middleware() calls
+        let middleware_query_start = std::time::Instant::now();
+        if let Ok(middleware_matches) = find_middleware_calls(&tree, &source, &lang) {
+            debug!("Hover: find_middleware_calls took {:?}", middleware_query_start.elapsed());
+            if let Some(middleware_match) = Self::find_match_at_position(&middleware_matches, position) {
+                let root_guard = self.root_path.read().await;
+                let registry_guard = self.service_provider_registry.read().await;
+                
+                if let (Some(root), Some(registry)) = (root_guard.as_ref(), registry_guard.as_ref()) {
+                    // Look up the middleware alias
+                    let middleware_info = if let Some(middleware_alias) = registry.get_middleware(middleware_match.middleware_name) {
+                        // Found in config
+                        let class_name = &middleware_alias.class_name;
+                        
+                        let (file_status, file_display) = if let Some(ref file_path) = middleware_alias.file_path {
+                            let class_path = root.join(file_path);
+                            let status = if class_path.exists() {
+                                "✓ File exists"
+                            } else {
+                                "⚠ File not found"
+                            };
+                            let display = file_path.to_string_lossy().trim_start_matches('/').to_string();
+                            (status, display)
+                        } else {
+                            ("⚠ File path unknown", "unknown".to_string())
+                        };
+
+                        format!(
+                            "**Middleware**: `{}`\n\n**Class**: `{}`\n\n**File**: `{}`\n\n{}",
+                            middleware_match.middleware_name,
+                            class_name,
+                            file_display,
+                            file_status
+                        )
+                    } else {
+                        // Not found in config - might be a framework middleware
+                        format!(
+                            "**Middleware**: `{}`\n\n⚠ Middleware alias not found in configuration files\n\nCheck `bootstrap/app.php` or `app/Http/Kernel.php`",
+                            middleware_match.middleware_name
+                        )
+                    };
+
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: middleware_info,
+                        }),
+                        range: Some(Range {
+                            start: Position {
+                                line: middleware_match.row as u32,
+                                character: middleware_match.column as u32,
+                            },
+                            end: Position {
+                                line: middleware_match.row as u32,
+                                character: middleware_match.end_column as u32,
+                            },
+                        }),
+                    }));
+                }
+            }
+        }
+
+        // Try translation calls
+        let translation_query_start = std::time::Instant::now();
+        if let Ok(translation_matches) = find_translation_calls(&tree, &source, &lang) {
+            debug!("Hover: find_translation_calls took {:?}", translation_query_start.elapsed());
+            if let Some(trans_match) = Self::find_match_at_position(&translation_matches, position) {
+                let root_guard = self.root_path.read().await;
+                if let Some(root) = root_guard.as_ref() {
+                    let translation_key = trans_match.translation_key;
+                    
+                    // Determine if this is a dotted key (PHP file) or text key (JSON file)
+                    let is_dotted_key = translation_key.contains('.') && !translation_key.contains(' ');
+                    let is_multi_word = translation_key.contains(' ');
+                    
+                    let translation_info = if is_multi_word || (!is_dotted_key && !translation_key.contains('.')) {
+                        // JSON translation
+                        let json_paths = [
+                            root.join("lang/en.json"),
+                            root.join("resources/lang/en.json"),
+                        ];
+                        
+                        let (file_exists, found_path) = json_paths.iter()
+                            .find(|p| p.exists())
+                            .map(|p| (true, p.to_string_lossy().to_string()))
+                            .unwrap_or((false, "lang/en.json or resources/lang/en.json".to_string()));
+                        
+                        let file_status = if file_exists {
+                            "✓ File exists"
+                        } else {
+                            "⚠ File not found"
+                        };
+                        
+                        format!(
+                            "**Translation Key**: `{}`\n\n**Type**: JSON translation\n\n**File**: `{}`\n\n{}",
+                            translation_key,
+                            if file_exists { 
+                                found_path.split('/').last().unwrap_or(&found_path) 
+                            } else { 
+                                &found_path 
+                            },
+                            file_status
+                        )
+                    } else {
+                        // PHP translation
+                        let parts: Vec<&str> = translation_key.split('.').collect();
+                        if !parts.is_empty() {
+                            let file_name = parts[0];
+                            let key_path = parts[1..].join(".");
+                            
+                            let php_paths = [
+                                root.join("lang/en").join(format!("{}.php", file_name)),
+                                root.join("resources/lang/en").join(format!("{}.php", file_name)),
+                            ];
+                            
+                            let (file_exists, _found_path) = php_paths.iter()
+                                .find(|p| p.exists())
+                                .map(|p| (true, p.to_string_lossy().to_string()))
+                                .unwrap_or((false, format!("lang/en/{}.php or resources/lang/en/{}.php", file_name, file_name)));
+                            
+                            let file_status = if file_exists {
+                                "✓ File exists"
+                            } else {
+                                "⚠ File not found"
+                            };
+                            
+                            let key_display = if key_path.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\n\n**Key Path**: `{}`", key_path)
+                            };
+                            
+                            format!(
+                                "**Translation Key**: `{}`\n\n**Type**: PHP translation\n\n**File**: `lang/en/{}.php`{}\\n\n{}",
+                                translation_key,
+                                file_name,
+                                key_display,
+                                file_status
+                            )
+                        } else {
+                            format!("**Translation Key**: `{}`", translation_key)
+                        }
+                    };
+
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: translation_info,
+                        }),
+                        range: Some(Range {
+                            start: Position {
+                                line: trans_match.row as u32,
+                                character: trans_match.column as u32,
+                            },
+                            end: Position {
+                                line: trans_match.row as u32,
+                                character: trans_match.end_column as u32,
+                            },
+                        }),
+                    }));
                 }
             }
         }

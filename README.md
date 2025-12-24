@@ -12,12 +12,12 @@ This will allow you to navigate to the referenced resource, but will also show a
 - [x] Livewire Components
 - [x] Views
 - [x] Routes
-- [X] Configs
-- [ ] Middleware
-- [ ] Translations
+- [x] Configs
+- [x] Middleware
+- [x] Translations
 - [ ] App Bindings
 - [ ] Assets
-- [X] Env Variables
+- [x] Env Variables
 - [ ] Inertia Pages
 
 ### Auto Completion

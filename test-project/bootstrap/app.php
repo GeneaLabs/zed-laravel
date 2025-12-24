@@ -11,7 +11,10 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        //
+        // Test middleware with missing class file (for ERROR diagnostic testing)
+        $middleware->alias([
+            'test-missing' => \App\Http\Middleware\TestMissingMiddleware::class,
+        ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         //
