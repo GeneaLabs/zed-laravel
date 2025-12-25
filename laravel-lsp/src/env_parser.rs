@@ -1,12 +1,13 @@
-/// Environment variable parser for Laravel .env files
-///
-/// This module handles parsing of .env files and tracking environment variables
-/// across .env, .env.example, and .env.local files.
-///
-/// Laravel loads env files in this priority order:
-/// 1. .env (highest priority - actual values)
-/// 2. .env.local (local overrides)
-/// 3. .env.example (template/documentation)
+//! Environment variable parser for Laravel .env files
+//!
+//! This module handles parsing of .env files and tracking environment variables
+//! across .env, .env.example, and .env.local files.
+//!
+//! Laravel loads env files in this priority order:
+//! 1. .env (highest priority - actual values)
+//! 2. .env.local (local overrides)
+//! 3. .env.example (template/documentation)
+#![allow(dead_code)]
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;

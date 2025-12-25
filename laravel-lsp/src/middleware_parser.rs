@@ -1,11 +1,15 @@
-/// This module parses middleware configuration from Laravel applications
-///
-/// It supports both:
-/// - Laravel 10 and below: app/Http/Kernel.php
-/// - Laravel 11+: bootstrap/app.php
-///
-/// The parser extracts middleware aliases and maps them to their class names,
-/// enabling goto-definition for middleware references in routes.
+//! This module parses middleware configuration from Laravel applications
+//!
+//! It supports both:
+//! - Laravel 10 and below: app/Http/Kernel.php
+//! - Laravel 11+: bootstrap/app.php
+//!
+//! The parser extracts middleware aliases and maps them to their class names,
+//! enabling goto-definition for middleware references in routes.
+//!
+//! NOTE: Currently only `resolve_class_to_file` is used externally.
+//! The rest is for future middleware configuration parsing.
+#![allow(dead_code)]
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;

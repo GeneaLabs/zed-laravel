@@ -13,6 +13,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
 /// Laravel project configuration
@@ -38,6 +39,9 @@ pub struct LaravelConfig {
 
     /// Whether Livewire is installed
     pub has_livewire: bool,
+
+    /// When this config was last parsed
+    pub last_parsed: SystemTime,
 }
 
 impl LaravelConfig {
@@ -95,6 +99,7 @@ impl LaravelConfig {
             component_paths: HashMap::new(),
             livewire_path: None,
             has_livewire: false,
+            last_parsed: SystemTime::now(),
         };
 
         // Step 1: Detect Livewire from composer.json
@@ -117,6 +122,28 @@ impl LaravelConfig {
         info!("  Livewire path: {:?}", config.livewire_path);
 
         Ok(config)
+    }
+
+    /// Check if any of the config files have been modified since last parse
+    /// Returns true if a refresh is needed
+    pub fn needs_refresh(&self) -> bool {
+        let files_to_check = [
+            self.root.join("config/view.php"),
+            self.root.join("config/livewire.php"),
+            self.root.join("composer.json"),
+        ];
+
+        for file_path in &files_to_check {
+            if let Ok(metadata) = std::fs::metadata(file_path) {
+                if let Ok(modified) = metadata.modified() {
+                    if modified > self.last_parsed {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     /// Detect if Livewire is installed by checking composer.json

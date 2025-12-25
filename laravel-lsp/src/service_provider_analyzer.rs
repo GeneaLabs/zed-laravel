@@ -10,6 +10,7 @@
 //!
 //! This is the "Laravel way" of discovering what's available in the application,
 //! as opposed to just file system scanning or autoload parsing.
+#![allow(dead_code)]
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -165,7 +166,7 @@ impl ServiceProviderRegistry {
             BindingType::Singleton | BindingType::Scoped => &mut self.singletons,
             BindingType::Bind | BindingType::Alias => &mut self.bindings,
         };
-        
+
         if let Some(existing) = target_map.get(&registration.abstract_name) {
             if registration.priority >= existing.priority {
                 target_map.insert(registration.abstract_name.clone(), registration);
@@ -173,6 +174,45 @@ impl ServiceProviderRegistry {
         } else {
             target_map.insert(registration.abstract_name.clone(), registration);
         }
+    }
+
+    /// Check if any of the source files have been modified since last parse
+    /// Returns true if a refresh is needed
+    pub fn needs_refresh(&self) -> bool {
+        let files_to_check = [
+            self.root_path.join("bootstrap/app.php"),
+            self.root_path.join("app/Http/Kernel.php"),
+        ];
+
+        for file_path in &files_to_check {
+            if let Ok(metadata) = std::fs::metadata(file_path) {
+                if let Ok(modified) = metadata.modified() {
+                    if modified > self.last_parsed {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Also check app/Providers directory
+        let providers_dir = self.root_path.join("app/Providers");
+        if providers_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&providers_dir) {
+                for entry in entries.flatten() {
+                    if entry.path().extension().map_or(false, |e| e == "php") {
+                        if let Ok(metadata) = entry.metadata() {
+                            if let Ok(modified) = metadata.modified() {
+                                if modified > self.last_parsed {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        false
     }
 }
 

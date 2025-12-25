@@ -19,26 +19,28 @@ mod config;
 mod env_parser;
 mod middleware_parser;
 mod service_provider_analyzer;
-mod database;
 
-// Salsa modules
-mod salsa_db;
+// Salsa 0.25 implementation (incremental computation)
+mod salsa_impl;
 
 use parser::{language_blade, language_php, parse_blade, parse_php};
 use queries::{
-    find_asset_calls, find_blade_components, find_directives, find_env_calls,
-    find_livewire_components, find_middleware_calls, find_translation_calls, find_view_calls,
-    find_binding_calls,
-    AssetMatch, AssetHelperType, BindingMatch, ComponentMatch, ConfigMatch, DirectiveMatch, 
-    EnvMatch, LivewireMatch, MiddlewareMatch, TranslationMatch, ViewMatch,
+    find_binding_calls, find_blade_components, find_directives,
+    find_env_calls, find_livewire_components, find_middleware_calls,
+    find_translation_calls, find_view_calls,
 };
 use config::LaravelConfig;
 use env_parser::EnvFileCache;
 use middleware_parser::resolve_class_to_file;
 use service_provider_analyzer::{analyze_service_providers, ServiceProviderRegistry};
 
-// Incremental database imports
-use salsa_db::IncrementalDatabase;
+// Salsa 0.25 database - integrated via actor pattern for async compatibility
+use salsa_impl::{
+    SalsaActor, SalsaHandle, PatternAtPosition,
+    ViewReferenceData, ComponentReferenceData, DirectiveReferenceData,
+    EnvReferenceData, ConfigReferenceData, LivewireReferenceData,
+    MiddlewareReferenceData, TranslationReferenceData, AssetReferenceData, BindingReferenceData,
+};
 
 // ============================================================================
 // PART 1: Core Language Server Implementation
@@ -84,30 +86,30 @@ enum ReferenceType {
 struct LaravelLanguageServer {
     /// LSP client for sending messages to the editor
     client: Client,
-    /// Store document contents for analysis
-    documents: Arc<RwLock<HashMap<Url, String>>>,
+    /// Store document contents and versions for analysis (content, version)
+    documents: Arc<RwLock<HashMap<Url, (String, i32)>>>,
     /// The root path of the Laravel project
     root_path: Arc<RwLock<Option<PathBuf>>>,
     /// Laravel project configuration (paths for views, components, Livewire, etc.)
     config: Arc<RwLock<Option<LaravelConfig>>>,
+    /// Track when we last attempted to initialize config (for retry logic)
+    config_last_attempt: Arc<RwLock<Option<std::time::Instant>>>,
     /// Store diagnostics per file (for hover filtering)
     diagnostics: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
     /// Environment variable cache (.env, .env.example, .env.local)
     env_cache: Arc<RwLock<Option<EnvFileCache>>>,
+    /// Track when we last attempted to initialize env_cache (for retry logic)
+    env_cache_last_attempt: Arc<RwLock<Option<std::time::Instant>>>,
     /// Service provider registry (middleware, bindings, aliases, etc.)
     service_provider_registry: Arc<RwLock<Option<ServiceProviderRegistry>>>,
+    /// Track when we last attempted to initialize service_provider_registry
+    service_provider_registry_last_attempt: Arc<RwLock<Option<std::time::Instant>>>,
     /// Pending debounced diagnostic tasks (uri -> task handle)
     pending_diagnostics: Arc<RwLock<HashMap<Url, tokio::task::JoinHandle<()>>>>,
-    /// Pending debounced cache update tasks (uri -> task handle)
-    pending_cache_updates: Arc<RwLock<HashMap<Url, tokio::task::JoinHandle<()>>>>,
     /// Debounce delay for diagnostics in milliseconds (default: 200ms)
     debounce_delay_ms: u64,
-    /// Debounce delay for cache updates in milliseconds (default: 50ms)
-    cache_debounce_ms: u64,
-    /// High-performance LRU cache for Laravel patterns
-    performance_cache: database::ThreadSafeCache,
-    /// Incremental computation database
-    incremental_db: Arc<IncrementalDatabase>,
+    /// Salsa 0.25 database handle (runs on dedicated thread via actor pattern)
+    salsa: SalsaHandle,
 }
 
 impl LaravelLanguageServer {
@@ -117,15 +119,15 @@ impl LaravelLanguageServer {
             documents: Arc::new(RwLock::new(HashMap::new())),
             root_path: Arc::new(RwLock::new(None)),
             config: Arc::new(RwLock::new(None)),
+            config_last_attempt: Arc::new(RwLock::new(None)),
             diagnostics: Arc::new(RwLock::new(HashMap::new())),
             env_cache: Arc::new(RwLock::new(None)),
+            env_cache_last_attempt: Arc::new(RwLock::new(None)),
             service_provider_registry: Arc::new(RwLock::new(None)),
+            service_provider_registry_last_attempt: Arc::new(RwLock::new(None)),
             pending_diagnostics: Arc::new(RwLock::new(HashMap::new())),
-            pending_cache_updates: Arc::new(RwLock::new(HashMap::new())),
             debounce_delay_ms: 200,  // 200ms for diagnostics
-            cache_debounce_ms: 50,   // 50ms for cache updates
-            performance_cache: database::create_performance_cache(),
-            incremental_db: Arc::new(IncrementalDatabase::new()),
+            salsa: SalsaActor::spawn(),
         }
     }
 
@@ -224,7 +226,7 @@ impl LaravelLanguageServer {
                 // Re-validate all open documents since config changed (view paths, component paths, etc.)
                 info!("Laravel LSP: Re-validating all open documents due to config change");
                 let documents = self.documents.read().await;
-                for (doc_uri, doc_text) in documents.iter() {
+                for (doc_uri, (doc_text, _version)) in documents.iter() {
                     self.validate_and_publish_diagnostics(doc_uri, doc_text).await;
                 }
             }
@@ -298,7 +300,7 @@ impl LaravelLanguageServer {
         for env_path in env_files {
             // Check if file is open in editor
             if let Ok(env_uri) = Url::from_file_path(&env_path) {
-                if let Some(buffer_content) = documents.get(&env_uri) {
+                if let Some((buffer_content, _version)) = documents.get(&env_uri) {
                     // Parse from editor buffer (includes unsaved changes!)
                     info!("Laravel LSP: Parsing .env from buffer: {:?}", env_path);
                     if let Ok(vars) = parse_env_content(buffer_content, env_path.clone()) {
@@ -326,7 +328,7 @@ impl LaravelLanguageServer {
         
         // Re-validate all open PHP documents since env vars changed
         info!("Laravel LSP: Re-validating all open documents due to .env change");
-        for (doc_uri, doc_text) in documents.iter() {
+        for (doc_uri, (doc_text, _version)) in documents.iter() {
             if doc_uri.path().ends_with(".php") {
                 self.validate_and_publish_diagnostics(doc_uri, doc_text).await;
             }
@@ -347,358 +349,9 @@ impl LaravelLanguageServer {
         path.exists()
     }
 
-    /// Pre-parse a Blade file and cache the results for instant goto-definition
-    /// Blade files are parsed with BOTH parsers:
-    /// - Blade parser: for Blade-specific syntax (components, directives)
-    /// - PHP parser: for PHP expressions (config, env, view, etc.)
-    async fn preparse_blade_file(&self, _uri: &Url, text: &str, _version: i32) {
-        // Parse Blade-specific patterns
-        let (_components_static, _livewire_static, _directives_static) = if let Ok(tree) = parse_blade(text) {
-            let lang = language_blade();
-            
-            if let (Ok(components), Ok(livewire), Ok(directives)) = (
-                find_blade_components(&tree, text, &lang),
-                find_livewire_components(&tree, text, &lang),
-                find_directives(&tree, text, &lang)
-            ) {
-                // Convert to 'static lifetime by cloning strings
-                // Also pre-resolve component paths for performance
-                let config_guard = self.config.read().await;
-                let components_static: Vec<ComponentMatch<'static>> = components.iter().map(|m| {
-                    // Pre-resolve the component path during parsing
-                    let resolved_path = if let Some(config) = config_guard.as_ref() {
-                        let possible_paths = config.resolve_component_path(m.component_name);
-                        // Find first existing path
-                        possible_paths.into_iter().find(|p| p.exists())
-                    } else {
-                        None
-                    };
-                    
-                    ComponentMatch {
-                        component_name: m.component_name.to_string().leak(),
-                        tag_name: m.tag_name.to_string().leak(),
-                        byte_start: m.byte_start,
-                        byte_end: m.byte_end,
-                        row: m.row,
-                        column: m.column,
-                        end_column: m.end_column,
-                        resolved_path,
-                    }
-                }).collect();
-                drop(config_guard);
-                
-                let livewire_static: Vec<LivewireMatch<'static>> = livewire.iter().map(|m| LivewireMatch {
-                    component_name: m.component_name.to_string().leak(),
-                    byte_start: m.byte_start,
-                    byte_end: m.byte_end,
-                    row: m.row,
-                    column: m.column,
-                    end_column: m.end_column,
-                }).collect();
-                
-                let directives_static: Vec<DirectiveMatch<'static>> = directives.iter().map(|m| DirectiveMatch {
-                    directive_name: m.directive_name.to_string().leak(),
-                    full_text: m.full_text.clone(),
-                    arguments: m.arguments.map(|s| s.to_string().leak() as &str),
-                    byte_start: m.byte_start,
-                    byte_end: m.byte_end,
-                    row: m.row,
-                    column: m.column,
-                    end_column: m.end_column,
-                    string_column: m.string_column,
-                    string_end_column: m.string_end_column,
-                }).collect();
-                
-                (components_static, livewire_static, directives_static)
-            } else {
-                (Vec::new(), Vec::new(), Vec::new())
-            }
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        };
-                
-
-
-        // Removed: Old preparse functionality - performance_cache handles this now
-    }
-
-    // Removed: preparse_blade_file - functionality moved to performance_cache
-
-    /// Convert a Laravel view name to possible file paths using config
-    ///
-    /// Returns the first existing path, or the first configured path if none exist
-    async fn resolve_view_path(&self, view_name: &str) -> Option<PathBuf> {
-        let config_guard = self.config.read().await;
-        let config = config_guard.as_ref()?;
-
-        let possible_paths = config.resolve_view_path(view_name);
-
-        // Return first existing path
-        for path in &possible_paths {
-            if path.exists() {
-                return Some(path.clone());
-            }
-        }
-
-        // Return first possibility even if it doesn't exist (for diagnostics)
-        possible_paths.first().cloned()
-    }
-
-    /// Find view references at a specific position in the document
-    async fn find_view_at_position(
-        &self,
-        uri: &Url,
-        position: Position,
-    ) -> Option<String> {
-        let documents = self.documents.read().await;
-        let content = documents.get(uri)?;
-        
-        // Convert position to byte offset
-        let lines: Vec<&str> = content.lines().collect();
-        if position.line >= lines.len() as u32 {
-            return None;
-        }
-        
-        let line = lines[position.line as usize];
-        let char_pos = position.character as usize;
-        
-        // Look for view() or View::make() calls on this line
-        if let Some(view_name) = self.extract_view_from_line(line, char_pos) {
-            return Some(view_name);
-        }
-        
-        None
-    }
-
-    /// Extract view name from a line at a specific character position
-    fn extract_view_from_line(&self, line: &str, char_pos: usize) -> Option<String> {
-        // Check for view() calls
-        if let Some(start) = line.find("view(") {
-            let after_view = &line[start + 5..];
-            if let Some(quote_start) = after_view.find(|c| c == '\'' || c == '"') {
-                let quote_char = after_view.chars().nth(quote_start)?;
-                let content_start = start + 5 + quote_start + 1;
-                let after_quote = &line[content_start..];
-                
-                if let Some(quote_end) = after_quote.find(quote_char) {
-                    let content_end = content_start + quote_end;
-                    
-                    // Check if cursor is within the view name
-                    if char_pos >= content_start && char_pos <= content_end {
-                        return Some(after_quote[..quote_end].to_string());
-                    }
-                }
-            }
-        }
-        
-        // Check for View::make() calls
-        if let Some(start) = line.find("View::make(") {
-            let after_view = &line[start + 11..];
-            if let Some(quote_start) = after_view.find(|c| c == '\'' || c == '"') {
-                let quote_char = after_view.chars().nth(quote_start)?;
-                let content_start = start + 11 + quote_start + 1;
-                let after_quote = &line[content_start..];
-                
-                if let Some(quote_end) = after_quote.find(quote_char) {
-                    let content_end = content_start + quote_end;
-                    
-                    // Check if cursor is within the view name
-                    if char_pos >= content_start && char_pos <= content_end {
-                        return Some(after_quote[..quote_end].to_string());
-                    }
-                }
-            }
-        }
-        
-        None
-    }
-
     // ========================================================================
     // Tree-sitter-based helper functions
     // ========================================================================
-
-
-
-    /// Create an LSP LocationLink for a view file using config
-    ///
-    /// The origin_selection_range tells the editor what text to highlight when hovering
-    async fn create_view_location(&self, view_match: &ViewMatch<'_>) -> Option<GotoDefinitionResponse> {
-        let config_guard = self.config.read().await;
-        let config = config_guard.as_ref()?;
-
-        let possible_paths = config.resolve_view_path(view_match.view_name);
-
-        // Find first existing path (in buffer or on disk)
-        for path in possible_paths {
-            if self.file_exists(&path).await {
-                if let Ok(target_uri) = Url::from_file_path(&path) {
-                    // Calculate origin selection range (highlight just the view name, not quotes)
-                    // The match positions already point to the content without quotes
-                    let origin_selection_range = Range {
-                        start: Position {
-                            line: view_match.row as u32,
-                            character: view_match.column as u32,
-                        },
-                        end: Position {
-                            line: view_match.row as u32,
-                            character: view_match.end_column as u32,
-                        },
-                    };
-
-                    return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                        origin_selection_range: Some(origin_selection_range),
-                        target_uri,
-                        target_range: Range {
-                            start: Position { line: 0, character: 0 },
-                            end: Position { line: 0, character: 0 },
-                        },
-                        target_selection_range: Range {
-                            start: Position { line: 0, character: 0 },
-                            end: Position { line: 0, character: 0 },
-                        },
-                    }]));
-                }
-            }
-        }
-
-        debug!("View file does not exist: {}", view_match.view_name);
-        None
-    }
-
-    /// Create an LSP LocationLink for a Blade component using pre-resolved path
-    ///
-    /// The origin_selection_range tells the editor what text to highlight when hovering
-    async fn create_component_location(&self, component_match: &ComponentMatch<'_>) -> Option<GotoDefinitionResponse> {
-        // Use pre-resolved path from cache for instant navigation (no file I/O!)
-        let path = component_match.resolved_path.as_ref()?;
-        
-        let target_uri = Url::from_file_path(path).ok()?;
-        
-        // Calculate origin selection range for the component tag
-        // This highlights the entire tag name (e.g., "x-button")
-        let origin_selection_range = Range {
-            start: Position {
-                line: component_match.row as u32,
-                character: component_match.column as u32,
-            },
-            end: Position {
-                line: component_match.row as u32,
-                character: component_match.end_column as u32,
-            },
-        };
-
-        Some(GotoDefinitionResponse::Link(vec![LocationLink {
-            origin_selection_range: Some(origin_selection_range),
-            target_uri,
-            target_range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 0 },
-            },
-            target_selection_range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 0 },
-            },
-        }]))
-    }
-
-    /// Create an LSP LocationLink for a Livewire component using config
-    ///
-    /// The origin_selection_range tells the editor what text to highlight when hovering
-    async fn create_livewire_location(&self, livewire_match: &LivewireMatch<'_>) -> Option<GotoDefinitionResponse> {
-        let config_guard = self.config.read().await;
-        let config = config_guard.as_ref()?;
-
-        let path = config.resolve_livewire_path(livewire_match.component_name)?;
-
-        if self.file_exists(&path).await {
-            if let Ok(target_uri) = Url::from_file_path(&path) {
-                // Calculate origin selection range for the Livewire component
-                // For <livewire:user-profile>, this highlights "user-profile"
-                // For @livewire('user-profile'), this highlights 'user-profile' (with quotes)
-                let origin_selection_range = Range {
-                    start: Position {
-                        line: livewire_match.row as u32,
-                        character: livewire_match.column as u32,
-                    },
-                    end: Position {
-                        line: livewire_match.row as u32,
-                        character: livewire_match.end_column as u32,
-                    },
-                };
-
-                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                    origin_selection_range: Some(origin_selection_range),
-                    target_uri,
-                    target_range: Range {
-                        start: Position { line: 0, character: 0 },
-                        end: Position { line: 0, character: 0 },
-                    },
-                    target_selection_range: Range {
-                        start: Position { line: 0, character: 0 },
-                        end: Position { line: 0, character: 0 },
-                    },
-                }]));
-            }
-        }
-
-        debug!("Livewire component file does not exist: {:?}", path);
-        None
-    }
-
-    /// For @extends and @include, navigate to the referenced view
-    /// The highlighting will be on the view string only, not the entire directive
-    async fn create_directive_location(&self, directive: &DirectiveMatch<'_>) -> Option<GotoDefinitionResponse> {
-        // For @extends and @include, we can extract the view name from arguments
-        if (directive.directive_name == "extends" || directive.directive_name == "include")
-            && directive.arguments.is_some()
-        {
-            let arguments = directive.arguments.unwrap();
-
-            // Extract view name from arguments like "('layouts.app')"
-            if let Some(view_name) = Self::extract_view_from_directive_args(arguments) {
-                // Resolve the view path
-                let config_guard = self.config.read().await;
-                let config = config_guard.as_ref()?;
-                let possible_paths = config.resolve_view_path(&view_name);
-
-                // Find first existing path (in buffer or on disk)
-                for path in possible_paths {
-                    if self.file_exists(&path).await {
-                        if let Ok(target_uri) = Url::from_file_path(&path) {
-                            // Use the pre-calculated string column positions from DirectiveMatch
-                            // These are already set to point to the quoted string, not the full directive
-                            // Adjust by 1 on each side to exclude the quotes from highlighting
-                            let origin_selection_range = Range {
-                                start: Position {
-                                    line: directive.row as u32,
-                                    character: (directive.string_column + 1) as u32,  // Skip opening quote
-                                },
-                                end: Position {
-                                    line: directive.row as u32,
-                                    character: (directive.string_end_column - 1) as u32,  // Skip closing quote
-                                },
-                            };
-
-                            return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                                origin_selection_range: Some(origin_selection_range),
-                                target_uri,
-                                target_range: Range {
-                                    start: Position { line: 0, character: 0 },
-                                    end: Position { line: 0, character: 0 },
-                                },
-                                target_selection_range: Range {
-                                    start: Position { line: 0, character: 0 },
-                                    end: Position { line: 0, character: 0 },
-                                },
-                            }]));
-                        }
-                    }
-                }
-            }
-        }
-
-        None
-    }
 
     /// Extract view name from directive arguments
     /// e.g., "('layouts.app')" → "layouts.app"
@@ -728,611 +381,511 @@ impl LaravelLanguageServer {
             .collect()
     }
 
-    /// Create a go-to-definition location for an env() call
-    /// Jumps to the .env file where the variable is defined
-    async fn create_env_location(&self, env_match: &EnvMatch<'_>) -> Option<GotoDefinitionResponse> {
-        let env_cache_guard = self.env_cache.read().await;
-        let env_cache = env_cache_guard.as_ref()?;
+    // ========================================================================
+    // Salsa-based helper functions (for cached pattern data)
+    // ========================================================================
 
-        debug!("Laravel LSP: Looking up env variable '{}' in cache ({} variables total)", 
-               env_match.var_name, env_cache.variables.len());
+    /// Create LocationLink for a view reference from Salsa data
+    async fn create_view_location_from_salsa(&self, view: &ViewReferenceData) -> Option<GotoDefinitionResponse> {
+        self.try_init_config().await;
 
-        // Look up the variable in the cache
-        let env_var = match env_cache.get(env_match.var_name) {
-            Some(var) => {
-                info!("Laravel LSP: Found env variable '{}' in {:?}", 
-                      var.name, var.file_path.file_name());
-                var
-            }
-            None => {
-                info!("Laravel LSP: Env variable '{}' not found in cache", env_match.var_name);
-                return None;
-            }
-        };
+        let config_guard = self.config.read().await;
+        let config = config_guard.as_ref()?;
+        let possible_paths = config.resolve_view_path(&view.name);
 
-        // Create URI for the .env file
-        let target_uri = Url::from_file_path(&env_var.file_path).ok()?;
-
-        // Origin selection range - highlight just the variable name inside quotes
-        let origin_selection_range = Range {
-            start: Position {
-                line: env_match.row as u32,
-                character: env_match.column as u32,
-            },
-            end: Position {
-                line: env_match.row as u32,
-                character: env_match.end_column as u32,
-            },
-        };
-
-        // Target selection range - highlight the variable name in .env file
-        let target_selection_range = Range {
-            start: Position {
-                line: env_var.line as u32,
-                character: env_var.column as u32,
-            },
-            end: Position {
-                line: env_var.line as u32,
-                character: (env_var.column + env_var.name.len()) as u32,
-            },
-        };
-
-        Some(GotoDefinitionResponse::Link(vec![LocationLink {
-            origin_selection_range: Some(origin_selection_range),
-            target_uri,
-            target_range: target_selection_range,
-            target_selection_range,
-        }]))
-    }
-
-    /// Create a go-to-definition location for a config() call
-    /// Jumps to the config file where the key is defined
-    async fn create_config_location(&self, config_match: &ConfigMatch<'_>) -> Option<GotoDefinitionResponse> {
-        let root_guard = self.root_path.read().await;
-        let root = root_guard.as_ref()?;
-
-        // Parse config key: "app.name" -> file: "app.php", key: "name"
-        let parts: Vec<&str> = config_match.config_key.split('.').collect();
-        if parts.is_empty() {
-            debug!("Laravel LSP: Config key '{}' has no parts", config_match.config_key);
-            return None;
-        }
-
-        let config_file = parts[0];
-        let config_path = root.join("config").join(format!("{}.php", config_file));
-
-        if !self.file_exists(&config_path).await {
-            info!("Laravel LSP: Config file not found: {:?}", config_path);
-            return None;
-        }
-
-        info!("Laravel LSP: Found config file: {:?}", config_path);
-
-        // Create URI for the config file
-        let target_uri = Url::from_file_path(&config_path).ok()?;
-
-        // Origin selection range - highlight the config key inside quotes
-        let origin_selection_range = Range {
-            start: Position {
-                line: config_match.row as u32,
-                character: config_match.column as u32,
-            },
-            end: Position {
-                line: config_match.row as u32,
-                character: config_match.end_column as u32,
-            },
-        };
-
-        // Try to find the exact line in the config file
-        // For now, just jump to the top of the file
-        // TODO: Parse the config file and find the exact key location
-        let target_selection_range = Range {
-            start: Position { line: 0, character: 0 },
-            end: Position { line: 0, character: 0 },
-        };
-
-        Some(GotoDefinitionResponse::Link(vec![LocationLink {
-            origin_selection_range: Some(origin_selection_range),
-            target_uri,
-            target_range: target_selection_range,
-            target_selection_range,
-        }]))
-    }
-
-    /// Create a go-to-definition location for a middleware reference
-    /// Jumps to the middleware class file based on the alias
-    /// If the class file doesn't exist, jumps to where the alias is defined
-    async fn create_middleware_location(&self, middleware_match: &MiddlewareMatch<'_>) -> Option<GotoDefinitionResponse> {
-        let root_guard = self.root_path.read().await;
-        let root = root_guard.as_ref()?;
-
-        // Get service provider registry
-        let registry_guard = self.service_provider_registry.read().await;
-        let registry = registry_guard.as_ref()?;
-
-        // Look up the middleware alias (handles parameters like "throttle:60,1")
-        let middleware_reg = registry.get_middleware(middleware_match.middleware_name)?;
-        
-        info!("Laravel LSP: Found middleware alias '{}' -> {}", 
-              middleware_match.middleware_name, middleware_reg.class_name);
-
-        // Try to find the middleware class file
-        let middleware_path = if let Some(file_path) = &middleware_reg.file_path {
-            Some(file_path.clone())
-        } else {
-            // Try to resolve the class name to a file path
-            let class_name = &middleware_reg.class_name;
-            let path_str = class_name.replace("\\", "/");
-            
-            // Try App namespace first
-            if path_str.starts_with("App/") {
-                let relative = path_str.strip_prefix("App/").unwrap();
-                let file_path = root.join("app").join(relative).with_extension("php");
-                
-                if self.file_exists(&file_path).await {
-                    Some(file_path)
-                } else {
-                    info!("Laravel LSP: Middleware class file not found: {:?}", file_path);
-                    None
-                }
-            } else if path_str.starts_with("Illuminate/") {
-                // Framework middleware - try to navigate to vendor
-                let relative = path_str.strip_prefix("Illuminate/").unwrap();
-                let vendor_path = root.join("vendor/laravel/framework/src/Illuminate").join(relative).with_extension("php");
-                
-                if self.file_exists(&vendor_path).await {
-                    Some(vendor_path)
-                } else {
-                    info!("Laravel LSP: Framework middleware file not found: {:?}", vendor_path);
-                    None
-                }
-            } else {
-                info!("Laravel LSP: Unable to resolve middleware path for: {}", class_name);
-                None
-            }
-        };
-
-        // If middleware class file exists, navigate to it
-        if let Some(path) = middleware_path {
+        for path in possible_paths {
             if self.file_exists(&path).await {
-                info!("Laravel LSP: Found middleware file: {:?}", path);
-
-                // Create URI for the middleware file
-                let target_uri = Url::from_file_path(&path).ok()?;
-
-                // Origin selection range - highlight the middleware name inside quotes
-                let origin_selection_range = Range {
-                    start: Position {
-                        line: middleware_match.row as u32,
-                        character: middleware_match.column as u32,
-                    },
-                    end: Position {
-                        line: middleware_match.row as u32,
-                        character: middleware_match.end_column as u32,
-                    },
-                };
-
-                // Jump to the top of the middleware class file
-                // TODO: Parse the file and find the exact class declaration
-                let target_selection_range = Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 0 },
-                };
-
-                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                    origin_selection_range: Some(origin_selection_range),
-                    target_uri,
-                    target_range: target_selection_range,
-                    target_selection_range,
-                }]));
+                if let Ok(target_uri) = Url::from_file_path(&path) {
+                    let origin_selection_range = Range {
+                        start: Position { line: view.line, character: view.column },
+                        end: Position { line: view.line, character: view.end_column },
+                    };
+                    return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                        origin_selection_range: Some(origin_selection_range),
+                        target_uri,
+                        target_range: Range::default(),
+                        target_selection_range: Range::default(),
+                    }]));
+                }
             }
         }
-
-        // Middleware class file doesn't exist - navigate to where the alias is defined instead
-        if let (Some(source_file), Some(source_line)) = (&middleware_reg.source_file, middleware_reg.source_line) {
-            if self.file_exists(source_file).await {
-                info!("Laravel LSP: Middleware class not found, navigating to alias definition at {:?}:{}",
-                      source_file, source_line);
-
-                let target_uri = Url::from_file_path(source_file).ok()?;
-
-                // Origin selection range - highlight the middleware name inside quotes
-                let origin_selection_range = Range {
-                    start: Position {
-                        line: middleware_match.row as u32,
-                        character: middleware_match.column as u32,
-                    },
-                    end: Position {
-                        line: middleware_match.row as u32,
-                        character: middleware_match.end_column as u32,
-                    },
-                };
-
-                // Jump to the line where the alias is defined
-                let target_selection_range = Range {
-                    start: Position { 
-                        line: source_line as u32, 
-                        character: 0 
-                    },
-                    end: Position { 
-                        line: source_line as u32, 
-                        character: 0 
-                    },
-                };
-
-                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                    origin_selection_range: Some(origin_selection_range),
-                    target_uri,
-                    target_range: target_selection_range,
-                    target_selection_range,
-                }]));
-            }
-        }
-
-        info!("Laravel LSP: Could not navigate to middleware class or alias definition");
         None
     }
 
-    /// Create a go-to-definition location for a translation reference
-    /// Jumps to the translation file (PHP or JSON) where the key is defined
-    async fn create_translation_location(&self, translation_match: &TranslationMatch<'_>) -> Option<GotoDefinitionResponse> {
-        let root_guard = self.root_path.read().await;
-        let root = root_guard.as_ref()?;
+    /// Create LocationLink for a component reference from Salsa data
+    async fn create_component_location_from_salsa(&self, comp: &ComponentReferenceData) -> Option<GotoDefinitionResponse> {
+        self.try_init_config().await;
 
-        let translation_key = translation_match.translation_key;
-        
-        info!("Laravel LSP: Looking for translation key: {}", translation_key);
+        let config_guard = self.config.read().await;
+        let config = config_guard.as_ref()?;
+        let possible_paths = config.resolve_component_path(&comp.name);
 
-        // Check if this looks like a JSON translation (no dots, or contains spaces)
-        let looks_like_json = !translation_key.contains('.') || translation_key.contains(' ');
-
-        // Try JSON first if it looks like a JSON translation
-        if looks_like_json {
-            info!("Laravel LSP: Checking JSON translation files for: {}", translation_key);
-            
-            // Try both possible locations for JSON files
-            let json_paths = [
-                root.join("lang/en.json"),
-                root.join("resources/lang/en.json"),
-            ];
-
-            // First, try to find an existing JSON file
-            for json_path in &json_paths {
-                if self.file_exists(json_path).await {
-                    info!("Laravel LSP: Found JSON translation file: {:?}", json_path);
-                    
-                    let target_uri = Url::from_file_path(json_path).ok()?;
-                    
+        for path in possible_paths {
+            if self.file_exists(&path).await {
+                if let Ok(target_uri) = Url::from_file_path(&path) {
                     let origin_selection_range = Range {
-                        start: Position {
-                            line: translation_match.row as u32,
-                            character: translation_match.column as u32,
-                        },
-                        end: Position {
-                            line: translation_match.row as u32,
-                            character: translation_match.end_column as u32,
-                        },
+                        start: Position { line: comp.line, character: comp.column },
+                        end: Position { line: comp.line, character: comp.end_column },
                     };
-
-                    let target_selection_range = Range {
-                        start: Position { line: 0, character: 0 },
-                        end: Position { line: 0, character: 0 },
-                    };
-
                     return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                         origin_selection_range: Some(origin_selection_range),
                         target_uri,
-                        target_range: target_selection_range,
-                        target_selection_range,
+                        target_range: Range::default(),
+                        target_selection_range: Range::default(),
                     }]));
                 }
             }
-            
-            info!("Laravel LSP: JSON translation file not found");
-            
-            // If multi-word (contains spaces), navigate to where JSON file SHOULD be
-            // This allows users to create the file if it doesn't exist
-            if translation_key.contains(' ') {
-                info!("Laravel LSP: Multi-word translation, pointing to expected JSON location");
-                
-                // Prefer Laravel 9+ location (lang/en.json)
-                let preferred_json_path = root.join("lang/en.json");
-                
-                if let Ok(target_uri) = Url::from_file_path(&preferred_json_path) {
-                    let origin_selection_range = Range {
-                        start: Position {
-                            line: translation_match.row as u32,
-                            character: translation_match.column as u32,
-                        },
-                        end: Position {
-                            line: translation_match.row as u32,
-                            character: translation_match.end_column as u32,
-                        },
-                    };
+        }
+        None
+    }
 
-                    let target_selection_range = Range {
-                        start: Position { line: 0, character: 0 },
-                        end: Position { line: 0, character: 0 },
-                    };
+    /// Create LocationLink for a Livewire reference from Salsa data
+    async fn create_livewire_location_from_salsa(&self, lw: &LivewireReferenceData) -> Option<GotoDefinitionResponse> {
+        self.try_init_config().await;
 
-                    return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                        origin_selection_range: Some(origin_selection_range),
-                        target_uri,
-                        target_range: target_selection_range,
-                        target_selection_range,
-                    }]));
-                }
-                
-                return None;
+        let config_guard = self.config.read().await;
+        let config = config_guard.as_ref()?;
+        let path = config.resolve_livewire_path(&lw.name)?;
+
+        if self.file_exists(&path).await {
+            if let Ok(target_uri) = Url::from_file_path(&path) {
+                let origin_selection_range = Range {
+                    start: Position { line: lw.line, character: lw.column },
+                    end: Position { line: lw.line, character: lw.end_column },
+                };
+                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                    origin_selection_range: Some(origin_selection_range),
+                    target_uri,
+                    target_range: Range::default(),
+                    target_selection_range: Range::default(),
+                }]));
             }
-            
-            // If JSON file doesn't exist and this is a single word (no dots, no spaces),
-            // fall back to checking common PHP translation files
-            if !translation_key.contains('.') {
-                info!("Laravel LSP: Falling back to common PHP files for single-word key: {}", translation_key);
-                
-                // Try common translation file names
-                let common_files = ["messages", "common", "app"];
-                
-                for file_name in &common_files {
-                    let php_paths = [
-                        root.join("lang/en").join(format!("{}.php", file_name)),
-                        root.join("resources/lang/en").join(format!("{}.php", file_name)),
-                    ];
-                    
-                    for php_path in &php_paths {
-                        if self.file_exists(php_path).await {
-                            info!("Laravel LSP: Found fallback PHP translation file: {:?}", php_path);
-                            
-                            let target_uri = Url::from_file_path(php_path).ok()?;
-                            
+        }
+        None
+    }
+
+    /// Create LocationLink for a directive reference from Salsa data
+    async fn create_directive_location_from_salsa(&self, dir: &DirectiveReferenceData) -> Option<GotoDefinitionResponse> {
+        if (dir.name == "extends" || dir.name == "include") && dir.arguments.is_some() {
+            let arguments = dir.arguments.as_ref().unwrap();
+            if let Some(view_name) = Self::extract_view_from_directive_args(arguments) {
+                self.try_init_config().await;
+
+                let config_guard = self.config.read().await;
+                let config = config_guard.as_ref()?;
+                let possible_paths = config.resolve_view_path(&view_name);
+
+                for path in possible_paths {
+                    if self.file_exists(&path).await {
+                        if let Ok(target_uri) = Url::from_file_path(&path) {
                             let origin_selection_range = Range {
-                                start: Position {
-                                    line: translation_match.row as u32,
-                                    character: translation_match.column as u32,
-                                },
-                                end: Position {
-                                    line: translation_match.row as u32,
-                                    character: translation_match.end_column as u32,
-                                },
+                                start: Position { line: dir.line, character: dir.column },
+                                end: Position { line: dir.line, character: dir.end_column },
                             };
-
-                            let target_selection_range = Range {
-                                start: Position { line: 0, character: 0 },
-                                end: Position { line: 0, character: 0 },
-                            };
-
                             return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                                 origin_selection_range: Some(origin_selection_range),
                                 target_uri,
-                                target_range: target_selection_range,
-                                target_selection_range,
+                                target_range: Range::default(),
+                                target_selection_range: Range::default(),
                             }]));
                         }
                     }
                 }
             }
-            
-            // Fall through to PHP file handling for single-word keys
         }
-
-        // PHP translation - parse the key: "messages.welcome" -> file: "messages.php", key: "welcome"
-        let parts: Vec<&str> = translation_key.split('.').collect();
-        if parts.is_empty() {
-            debug!("Laravel LSP: Translation key '{}' has no parts", translation_key);
-            return None;
-        }
-
-        let translation_file = parts[0];
-        
-        // Try both possible locations for PHP translation files
-        let php_paths = [
-            root.join("lang/en").join(format!("{}.php", translation_file)),
-            root.join("resources/lang/en").join(format!("{}.php", translation_file)),
-        ];
-
-        for translation_path in &php_paths {
-            if self.file_exists(translation_path).await {
-                info!("Laravel LSP: Found translation file: {:?}", translation_path);
-
-                let target_uri = Url::from_file_path(translation_path).ok()?;
-
-                let origin_selection_range = Range {
-                    start: Position {
-                        line: translation_match.row as u32,
-                        character: translation_match.column as u32,
-                    },
-                    end: Position {
-                        line: translation_match.row as u32,
-                        character: translation_match.end_column as u32,
-                    },
-                };
-
-                // Jump to the top of the translation file
-                // TODO: Parse the PHP file and find the exact nested key location
-                let target_selection_range = Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 0 },
-                };
-
-                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                    origin_selection_range: Some(origin_selection_range),
-                    target_uri,
-                    target_range: target_selection_range,
-                    target_selection_range,
-                }]));
-            }
-        }
-
-        info!("Laravel LSP: Translation file not found for key: {}", translation_key);
         None
     }
 
-    /// Create a go-to-definition location for a container binding call
-    /// Handles both app('string') and app(SomeClass::class) patterns
-    async fn create_binding_location(&self, binding_match: &BindingMatch<'_>) -> Option<GotoDefinitionResponse> {
-        let binding_name = binding_match.binding_name;
-        
-        info!("Laravel LSP: Looking for container binding: {} (is_class: {})", 
-              binding_name, binding_match.is_class_reference);
+    /// Create LocationLink for an env reference from Salsa data
+    async fn create_env_location_from_salsa(&self, env: &EnvReferenceData) -> Option<GotoDefinitionResponse> {
+        self.try_init_env_cache().await;
 
-        // If it's a class reference (Class::class), resolve directly to the class file
-        if binding_match.is_class_reference {
-            return self.resolve_class_binding(binding_match).await;
-        }
+        let env_cache_guard = self.env_cache.read().await;
+        let env_cache = env_cache_guard.as_ref()?;
 
-        // For string bindings, check the service provider registry
-        let registry_guard = self.service_provider_registry.read().await;
-        if let Some(registry) = registry_guard.as_ref() {
-            if let Some(binding_reg) = registry.get_binding(binding_name) {
-                info!("Laravel LSP: Found binding registration for '{}'", binding_name);
-                
-                // Always navigate to where the binding is registered (not the concrete class)
-                if let (Some(source_file), Some(source_line)) = (&binding_reg.source_file, binding_reg.source_line) {
-                    if let Ok(target_uri) = Url::from_file_path(source_file) {
-                        let origin_selection_range = Range {
-                            start: Position {
-                                line: binding_match.row as u32,
-                                character: binding_match.column as u32,
-                            },
-                            end: Position {
-                                line: binding_match.row as u32,
-                                character: binding_match.end_column as u32,
-                            },
-                        };
-
-                        let target_selection_range = Range {
-                            start: Position { line: source_line as u32, character: 0 },
-                            end: Position { line: source_line as u32, character: 0 },
-                        };
-
-                        info!("Laravel LSP: Navigating to binding registration at {:?}:{}", source_file, source_line);
-                        return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                            origin_selection_range: Some(origin_selection_range),
-                            target_uri,
-                            target_range: target_selection_range,
-                            target_selection_range,
-                        }]));
-                    }
-                } else {
-                    // Binding exists but has no source file (framework binding)
-                    // Return empty array to prevent Zed's fallback navigation
-                    info!("Laravel LSP: Binding '{}' exists (framework) but has no source file, returning empty", binding_name);
-                    return Some(GotoDefinitionResponse::Array(vec![]));
-                }
-            }
-        }
-
-        // No binding found - return empty array to prevent Zed's fallback navigation
-        info!("Laravel LSP: No binding found for '{}', returning empty to prevent fallback", binding_name);
-        Some(GotoDefinitionResponse::Array(vec![]))
-    }
-
-    /// Resolve a class reference binding (Class::class) to its file
-    async fn resolve_class_binding(&self, binding_match: &BindingMatch<'_>) -> Option<GotoDefinitionResponse> {
-        let class_name = binding_match.binding_name;
-        
-        let root_guard = self.root_path.read().await;
-        let root = root_guard.as_ref()?;
-        
-        // Use the existing resolve_class_to_file function
-        if let Some(file_path) = resolve_class_to_file(class_name, root) {
-            if let Ok(target_uri) = Url::from_file_path(&file_path) {
+        if let Some(env_var) = env_cache.get(&env.name) {
+            if let Ok(target_uri) = Url::from_file_path(&env_var.file_path) {
                 let origin_selection_range = Range {
-                    start: Position {
-                        line: binding_match.row as u32,
-                        character: binding_match.column as u32,
-                    },
-                    end: Position {
-                        line: binding_match.row as u32,
-                        character: binding_match.end_column as u32,
-                    },
+                    start: Position { line: env.line, character: env.column },
+                    end: Position { line: env.line, character: env.end_column },
                 };
-
-                let target_selection_range = Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 0 },
-                };
-
-                info!("Laravel LSP: Resolved class reference '{}' to {:?}", class_name, file_path);
-                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                    origin_selection_range: Some(origin_selection_range),
-                    target_uri,
-                    target_range: target_selection_range,
-                    target_selection_range,
-                }]));
-            }
-        }
-
-        // Class file not found - return empty array to prevent Zed's fallback
-        info!("Laravel LSP: Class file not found for '{}', returning empty to prevent fallback", class_name);
-        Some(GotoDefinitionResponse::Array(vec![]))
-    }
-
-    /// Create a go-to-definition location for an asset path
-    /// Resolves asset helpers like asset(), Vite::asset(), base_path(), etc. to actual files
-    async fn create_asset_location(&self, asset_match: &AssetMatch<'_>) -> Option<GotoDefinitionResponse> {
-        let root_guard = self.root_path.read().await;
-        let root = root_guard.as_ref()?;
-        
-        // Resolve the asset path based on helper type
-        let resolved_path = match asset_match.helper_type {
-            AssetHelperType::Asset => root.join("public").join(asset_match.path),
-            AssetHelperType::PublicPath => root.join("public").join(asset_match.path),
-            AssetHelperType::BasePath => root.join(asset_match.path),
-            AssetHelperType::AppPath => root.join("app").join(asset_match.path),
-            AssetHelperType::StoragePath => root.join("storage").join(asset_match.path),
-            AssetHelperType::DatabasePath => root.join("database").join(asset_match.path),
-            AssetHelperType::LangPath => {
-                // Try lang/ first (Laravel 9+), then resources/lang/ (older)
-                let lang_path = root.join("lang").join(asset_match.path);
-                if lang_path.exists() {
-                    lang_path
-                } else {
-                    root.join("resources/lang").join(asset_match.path)
-                }
-            },
-            AssetHelperType::ConfigPath => root.join("config").join(asset_match.path),
-            AssetHelperType::ResourcePath => root.join("resources").join(asset_match.path),
-            AssetHelperType::Mix => root.join("public").join(asset_match.path),
-            AssetHelperType::ViteAsset => root.join(asset_match.path),
-        };
-        
-        info!("Laravel LSP: Resolving asset '{}' ({:?}) to {:?}", 
-            asset_match.path, asset_match.helper_type, resolved_path);
-        
-        // Check if file exists
-        if self.file_exists(&resolved_path).await {
-            if let Ok(target_uri) = Url::from_file_path(&resolved_path) {
-                let origin_selection_range = Range {
-                    start: Position {
-                        line: asset_match.row as u32,
-                        character: asset_match.column as u32,
-                    },
-                    end: Position {
-                        line: asset_match.row as u32,
-                        character: asset_match.end_column as u32,
-                    },
-                };
-                
                 return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                     origin_selection_range: Some(origin_selection_range),
                     target_uri,
                     target_range: Range {
-                        start: Position { line: 0, character: 0 },
-                        end: Position { line: 0, character: 0 },
+                        start: Position { line: env_var.line as u32, character: env_var.column as u32 },
+                        end: Position { line: env_var.line as u32, character: (env_var.column + env_var.name.len()) as u32 },
                     },
                     target_selection_range: Range {
-                        start: Position { line: 0, character: 0 },
-                        end: Position { line: 0, character: 0 },
+                        start: Position { line: env_var.line as u32, character: env_var.column as u32 },
+                        end: Position { line: env_var.line as u32, character: (env_var.column + env_var.name.len()) as u32 },
                     },
                 }]));
             }
         }
-        
-        // File not found
-        info!("Laravel LSP: Asset file not found: {:?}", resolved_path);
         None
+    }
+
+    /// Create LocationLink for a config reference from Salsa data
+    async fn create_config_location_from_salsa(&self, config_ref: &ConfigReferenceData) -> Option<GotoDefinitionResponse> {
+        self.try_init_config().await;
+
+        let config_guard = self.config.read().await;
+        let project_config = config_guard.as_ref()?;
+
+        // Parse config key like "app.name" -> file: config/app.php
+        let parts: Vec<&str> = config_ref.key.split('.').collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        let config_file = parts[0];
+        let config_path = project_config.root.join("config").join(format!("{}.php", config_file));
+
+        if self.file_exists(&config_path).await {
+            if let Ok(target_uri) = Url::from_file_path(&config_path) {
+                let origin_selection_range = Range {
+                    start: Position { line: config_ref.line, character: config_ref.column },
+                    end: Position { line: config_ref.line, character: config_ref.end_column },
+                };
+                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                    origin_selection_range: Some(origin_selection_range),
+                    target_uri,
+                    target_range: Range::default(),
+                    target_selection_range: Range::default(),
+                }]));
+            }
+        }
+        None
+    }
+
+    /// Create LocationLink for a middleware reference from Salsa data
+    async fn create_middleware_location_from_salsa(&self, mw: &MiddlewareReferenceData) -> Option<GotoDefinitionResponse> {
+        let root_guard = self.root_path.read().await;
+        let root = root_guard.as_ref()?;
+
+        // Try to recover service_provider_registry if needed
+        if !self.try_init_service_provider_registry().await {
+            return None;
+        }
+
+        let registry_guard = self.service_provider_registry.read().await;
+        let registry = registry_guard.as_ref()?;
+
+        // Look up the middleware alias
+        let middleware_reg = registry.get_middleware(&mw.name)?;
+
+        // Try to find the middleware class file
+        let middleware_path = if let Some(file_path) = &middleware_reg.file_path {
+            Some(file_path.clone())
+        } else {
+            resolve_class_to_file(&middleware_reg.class_name, root)
+        };
+
+        if let Some(path) = middleware_path {
+            if self.file_exists(&path).await {
+                if let Ok(target_uri) = Url::from_file_path(&path) {
+                    let origin_selection_range = Range {
+                        start: Position { line: mw.line, character: mw.column },
+                        end: Position { line: mw.line, character: mw.end_column },
+                    };
+                    return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                        origin_selection_range: Some(origin_selection_range),
+                        target_uri,
+                        target_range: Range::default(),
+                        target_selection_range: Range::default(),
+                    }]));
+                }
+            }
+        }
+        None
+    }
+
+    /// Create LocationLink for a translation reference from Salsa data
+    async fn create_translation_location_from_salsa(&self, trans: &TranslationReferenceData) -> Option<GotoDefinitionResponse> {
+        let root_guard = self.root_path.read().await;
+        let root = root_guard.as_ref()?;
+
+        // Determine if this is a dotted key (PHP file) or text key (JSON file)
+        let is_dotted_key = trans.key.contains('.') && !trans.key.contains(' ');
+
+        let translation_path = if is_dotted_key {
+            // Dotted key: "validation.required" -> lang/en/validation.php
+            let parts: Vec<&str> = trans.key.split('.').collect();
+            if parts.is_empty() {
+                return None;
+            }
+            root.join("lang").join("en").join(format!("{}.php", parts[0]))
+        } else {
+            // Text key: "Welcome to our app" -> lang/en.json
+            root.join("lang").join("en.json")
+        };
+
+        if self.file_exists(&translation_path).await {
+            if let Ok(target_uri) = Url::from_file_path(&translation_path) {
+                let origin_selection_range = Range {
+                    start: Position { line: trans.line, character: trans.column },
+                    end: Position { line: trans.line, character: trans.end_column },
+                };
+                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                    origin_selection_range: Some(origin_selection_range),
+                    target_uri,
+                    target_range: Range::default(),
+                    target_selection_range: Range::default(),
+                }]));
+            }
+        }
+        None
+    }
+
+    /// Create LocationLink for an asset reference from Salsa data
+    async fn create_asset_location_from_salsa(&self, asset: &AssetReferenceData) -> Option<GotoDefinitionResponse> {
+        let root_guard = self.root_path.read().await;
+        let root = root_guard.as_ref()?;
+
+        // Determine the base path based on helper type
+        use salsa_impl::AssetHelperType;
+        let base_path = match asset.helper_type {
+            AssetHelperType::Asset | AssetHelperType::PublicPath | AssetHelperType::Mix => root.join("public"),
+            AssetHelperType::BasePath => root.clone(),
+            AssetHelperType::AppPath => root.join("app"),
+            AssetHelperType::StoragePath => root.join("storage"),
+            AssetHelperType::DatabasePath => root.join("database"),
+            AssetHelperType::LangPath => root.join("lang"),
+            AssetHelperType::ConfigPath => root.join("config"),
+            AssetHelperType::ResourcePath | AssetHelperType::ViteAsset => root.join("resources"),
+        };
+
+        let asset_path = base_path.join(&asset.path);
+
+        if self.file_exists(&asset_path).await {
+            if let Ok(target_uri) = Url::from_file_path(&asset_path) {
+                let origin_selection_range = Range {
+                    start: Position { line: asset.line, character: asset.column },
+                    end: Position { line: asset.line, character: asset.end_column },
+                };
+                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                    origin_selection_range: Some(origin_selection_range),
+                    target_uri,
+                    target_range: Range::default(),
+                    target_selection_range: Range::default(),
+                }]));
+            }
+        }
+        None
+    }
+
+    /// Create LocationLink for a binding reference from Salsa data
+    async fn create_binding_location_from_salsa(&self, binding: &BindingReferenceData) -> Option<GotoDefinitionResponse> {
+        let root_guard = self.root_path.read().await;
+        let root = root_guard.as_ref()?;
+
+        // Try to recover service_provider_registry if needed
+        if !self.try_init_service_provider_registry().await {
+            return None;
+        }
+
+        let registry_guard = self.service_provider_registry.read().await;
+        let registry = registry_guard.as_ref()?;
+
+        // Look up the binding
+        if let Some(binding_reg) = registry.get_binding(&binding.name) {
+            if let Some(file_path) = &binding_reg.file_path {
+                if self.file_exists(file_path).await {
+                    if let Ok(target_uri) = Url::from_file_path(file_path) {
+                        let origin_selection_range = Range {
+                            start: Position { line: binding.line, character: binding.column },
+                            end: Position { line: binding.line, character: binding.end_column },
+                        };
+                        return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                            origin_selection_range: Some(origin_selection_range),
+                            target_uri,
+                            target_range: Range::default(),
+                            target_selection_range: Range::default(),
+                        }]));
+                    }
+                }
+            }
+        }
+
+        // If it's a class reference, try to resolve the class to a file
+        if binding.is_class_reference {
+            if let Some(path) = resolve_class_to_file(&binding.name, root) {
+                if self.file_exists(&path).await {
+                    if let Ok(target_uri) = Url::from_file_path(&path) {
+                        let origin_selection_range = Range {
+                            start: Position { line: binding.line, character: binding.column },
+                            end: Position { line: binding.line, character: binding.end_column },
+                        };
+                        return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                            origin_selection_range: Some(origin_selection_range),
+                            target_uri,
+                            target_range: Range::default(),
+                            target_selection_range: Range::default(),
+                        }]));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Try to initialize env_cache if it's None and we haven't tried recently
+    /// Returns true if cache is now available, false otherwise
+    async fn try_init_env_cache(&self) -> bool {
+        const RETRY_COOLDOWN_SECS: u64 = 30;
+
+        // Check if cache already exists
+        if self.env_cache.read().await.is_some() {
+            return true;
+        }
+
+        // Check cooldown - don't retry too frequently
+        let now = std::time::Instant::now();
+        {
+            let last_attempt = self.env_cache_last_attempt.read().await;
+            if let Some(last) = *last_attempt {
+                if now.duration_since(last).as_secs() < RETRY_COOLDOWN_SECS {
+                    debug!("Laravel LSP: env_cache init skipped - cooldown active");
+                    return false;
+                }
+            }
+        }
+
+        // Update last attempt time
+        *self.env_cache_last_attempt.write().await = Some(now);
+
+        // Try to initialize
+        let root = self.root_path.read().await.clone();
+        if let Some(root_path) = root {
+            let mut env_cache = EnvFileCache::new(root_path.clone());
+            match env_cache.parse_all() {
+                Ok(()) => {
+                    info!("Laravel LSP: env_cache recovered - {} variables found",
+                          env_cache.variables.len());
+                    *self.env_cache.write().await = Some(env_cache);
+                    return true;
+                }
+                Err(e) => {
+                    tracing::warn!("Laravel LSP: Failed to initialize env_cache: {}", e);
+                }
+            }
+        } else {
+            debug!("Laravel LSP: Cannot init env_cache - no root path");
+        }
+
+        false
+    }
+
+    /// Try to initialize or refresh service_provider_registry if needed
+    /// Returns true if registry is now available, false otherwise
+    async fn try_init_service_provider_registry(&self) -> bool {
+        const RETRY_COOLDOWN_SECS: u64 = 30;
+
+        // Check if registry exists and doesn't need refresh
+        {
+            let registry_guard = self.service_provider_registry.read().await;
+            if let Some(registry) = registry_guard.as_ref() {
+                // Check if we need to refresh due to file changes
+                if !registry.needs_refresh() {
+                    return true;
+                }
+                info!("Laravel LSP: Service provider files changed, refreshing registry");
+            }
+        }
+
+        // Check cooldown - don't retry too frequently
+        let now = std::time::Instant::now();
+        {
+            let last_attempt = self.service_provider_registry_last_attempt.read().await;
+            if let Some(last) = *last_attempt {
+                if now.duration_since(last).as_secs() < RETRY_COOLDOWN_SECS {
+                    debug!("Laravel LSP: service_provider_registry init skipped - cooldown active");
+                    // Return true if we have a registry (even if stale), false if none
+                    return self.service_provider_registry.read().await.is_some();
+                }
+            }
+        }
+
+        // Update last attempt time
+        *self.service_provider_registry_last_attempt.write().await = Some(now);
+
+        // Try to initialize/refresh
+        let root = self.root_path.read().await.clone();
+        if let Some(root_path) = root {
+            match analyze_service_providers(&root_path).await {
+                Ok(registry) => {
+                    info!("Laravel LSP: service_provider_registry recovered - {} middleware aliases found",
+                          registry.middleware_aliases.len());
+                    *self.service_provider_registry.write().await = Some(registry);
+                    return true;
+                }
+                Err(e) => {
+                    tracing::warn!("Laravel LSP: Failed to initialize service_provider_registry: {}", e);
+                }
+            }
+        } else {
+            debug!("Laravel LSP: Cannot init service_provider_registry - no root path");
+        }
+
+        // Return true if we have a stale registry, false if none
+        self.service_provider_registry.read().await.is_some()
+    }
+
+    /// Try to initialize or refresh config if needed
+    /// Returns true if config is now available, false otherwise
+    async fn try_init_config(&self) -> bool {
+        const RETRY_COOLDOWN_SECS: u64 = 30;
+
+        // Check if config exists and doesn't need refresh
+        {
+            let config_guard = self.config.read().await;
+            if let Some(config) = config_guard.as_ref() {
+                // Check if we need to refresh due to file changes
+                if !config.needs_refresh() {
+                    return true;
+                }
+                info!("Laravel LSP: Config files changed, refreshing config");
+            }
+        }
+
+        // Check cooldown - don't retry too frequently
+        let now = std::time::Instant::now();
+        {
+            let last_attempt = self.config_last_attempt.read().await;
+            if let Some(last) = *last_attempt {
+                if now.duration_since(last).as_secs() < RETRY_COOLDOWN_SECS {
+                    debug!("Laravel LSP: config init skipped - cooldown active");
+                    // Return true if we have a config (even if stale), false if none
+                    return self.config.read().await.is_some();
+                }
+            }
+        }
+
+        // Update last attempt time
+        *self.config_last_attempt.write().await = Some(now);
+
+        // Try to initialize/refresh
+        let root = self.root_path.read().await.clone();
+        if let Some(root_path) = root {
+            match LaravelConfig::discover(&root_path) {
+                Ok(config) => {
+                    info!("Laravel LSP: config recovered - {} view paths found",
+                          config.view_paths.len());
+                    *self.config.write().await = Some(config);
+                    return true;
+                }
+                Err(e) => {
+                    tracing::warn!("Laravel LSP: Failed to initialize config: {}", e);
+                }
+            }
+        } else {
+            debug!("Laravel LSP: Cannot init config - no root path");
+        }
+
+        // Return true if we have a stale config, false if none
+        self.config.read().await.is_some()
     }
 
     /// Schedule debounced diagnostics for a file
@@ -1375,15 +928,15 @@ impl LaravelLanguageServer {
             documents: self.documents.clone(),
             root_path: self.root_path.clone(),
             config: self.config.clone(),
+            config_last_attempt: self.config_last_attempt.clone(),
             diagnostics: self.diagnostics.clone(),
             env_cache: self.env_cache.clone(),
+            env_cache_last_attempt: self.env_cache_last_attempt.clone(),
             service_provider_registry: self.service_provider_registry.clone(),
+            service_provider_registry_last_attempt: self.service_provider_registry_last_attempt.clone(),
             pending_diagnostics: self.pending_diagnostics.clone(),
-            pending_cache_updates: self.pending_cache_updates.clone(),
             debounce_delay_ms: self.debounce_delay_ms,
-            cache_debounce_ms: self.cache_debounce_ms,
-            performance_cache: self.performance_cache.clone(),
-            incremental_db: self.incremental_db.clone(),
+            salsa: self.salsa.clone(),
         }
     }
 
@@ -1464,6 +1017,8 @@ impl LaravelLanguageServer {
                 }
                 
                 // Check env() calls - warn if variable not defined
+                // Try to recover env_cache if needed
+                self.try_init_env_cache().await;
                 let env_cache_guard = self.env_cache.read().await;
                 if let Some(env_cache) = env_cache_guard.as_ref() {
                     if let Ok(env_calls) = find_env_calls(&tree, source, &lang) {
@@ -2288,12 +1843,6 @@ impl LanguageServer for LaravelLanguageServer {
                     }
                 }
                 
-                // Initialize incremental database
-                info!("========================================");
-                info!("🚀 Initializing incremental computation database");
-                info!("========================================");
-                self.initialize_incremental_database(&path).await;
-                
                 // Initialize service provider registry
                 info!("========================================");
                 info!("🛡️  Initializing service provider registry from root: {:?}", path);
@@ -2372,7 +1921,29 @@ impl LanguageServer for LaravelLanguageServer {
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
-        info!("Laravel LSP: Shutting down");
+        info!("Laravel LSP: Shutting down - cleaning up resources");
+
+        // Cancel all pending diagnostic tasks
+        {
+            let mut pending = self.pending_diagnostics.write().await;
+            for (uri, handle) in pending.drain() {
+                debug!("Cancelling pending diagnostics for: {}", uri);
+                handle.abort();
+            }
+        }
+
+        // Clear document cache
+        self.documents.write().await.clear();
+
+        // Clear diagnostics cache
+        self.diagnostics.write().await.clear();
+
+        // Shutdown Salsa actor
+        if let Err(e) = self.salsa.shutdown().await {
+            debug!("Salsa actor shutdown: {}", e);
+        }
+
+        info!("Laravel LSP: Shutdown complete");
         Ok(())
     }
 
@@ -2382,15 +1953,17 @@ impl LanguageServer for LaravelLanguageServer {
         let version = params.text_document.version;
 
         debug!("Laravel LSP: Document opened: {}", uri);
-        self.documents.write().await.insert(uri.clone(), text.clone());
+        self.documents.write().await.insert(uri.clone(), (text.clone(), version));
 
         // Try to discover Laravel config from this file if we don't have one yet
         if let Ok(file_path) = uri.to_file_path() {
             self.try_discover_from_file(&file_path).await;
-        }
 
-        // Update LRU cache with new file content
-        self.performance_cache.update_patterns(uri.clone(), text.clone(), version).await;
+            // Update Salsa database with new file content
+            if let Err(e) = self.salsa.update_file(file_path, version, text.clone()).await {
+                debug!("Failed to update Salsa database: {}", e);
+            }
+        }
 
         // Validate and publish diagnostics for Blade files
         self.validate_and_publish_diagnostics(&uri, &text).await;
@@ -2402,15 +1975,14 @@ impl LanguageServer for LaravelLanguageServer {
 
         if let Some(change) = params.content_changes.into_iter().next() {
             debug!("Laravel LSP: Document changed: {} (version: {})", uri, version);
-            self.documents.write().await.insert(uri.clone(), change.text.clone());
-            
-            // 🚀 Update LRU cache - automatic invalidation happens
-            self.performance_cache.update_patterns(uri.clone(), change.text.clone(), version).await;
-            
-            // Update incremental database with new file content
+            self.documents.write().await.insert(uri.clone(), (change.text.clone(), version));
+
+            // Update Salsa database with new file content
             if let Ok(file_path) = uri.to_file_path() {
-                self.incremental_db.update_file(file_path.clone(), change.text.clone(), 1).await;
-                
+                if let Err(e) = self.salsa.update_file(file_path.clone(), version, change.text.clone()).await {
+                    debug!("Failed to update Salsa database: {}", e);
+                }
+
                 // Check if this is an .env file and refresh env cache if needed
                 if let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) {
                     if file_name == ".env" || file_name == ".env.example" || file_name == ".env.local" {
@@ -2440,11 +2012,8 @@ impl LanguageServer for LaravelLanguageServer {
         }
         
         // Run cache update AND diagnostics on save
-        if let Some(text) = self.documents.read().await.get(&uri).cloned() {
+        if let Some((text, _version)) = self.documents.read().await.get(&uri).cloned() {
             info!("   ✅ Found document in cache, updating cache and running diagnostics...");
-            
-            // Update cache immediately (now that user saved)
-            let _version = 0; // Version doesn't matter for save operations
             let is_blade = uri.path().ends_with(".blade.php");
             let is_php = uri.path().ends_with(".php");
             
@@ -2464,15 +2033,26 @@ impl LanguageServer for LaravelLanguageServer {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         debug!("Laravel LSP: Document closed: {}", uri);
-        
+
         // Cancel any pending debounced diagnostics
         if let Some(handle) = self.pending_diagnostics.write().await.remove(&uri) {
             handle.abort();
         }
-        
+
         self.documents.write().await.remove(&uri);
-        
-        // File cleanup handled by performance cache automatically
+
+        // Clear diagnostics from our cache
+        self.diagnostics.write().await.remove(&uri);
+
+        // Remove from Salsa database
+        if let Ok(file_path) = uri.to_file_path() {
+            if let Err(e) = self.salsa.remove_file(file_path).await {
+                debug!("Failed to remove from Salsa database: {}", e);
+            }
+        }
+
+        // Publish empty diagnostics to clear them from the client
+        self.client.publish_diagnostics(uri, vec![], None).await;
     }
 
     async fn goto_definition(
@@ -2482,52 +2062,61 @@ impl LanguageServer for LaravelLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        // Get document content
-        let source = {
-            let documents = self.documents.read().await;
-            let Some(source) = documents.get(&uri) else {
-                return Ok(None);
-            };
-            source.clone()
-        };
-
-        // 🚀 Use LRU cache to get patterns and find goto definition
-        let patterns = self.performance_cache.get_patterns(&uri, 1).await.unwrap_or_default();
-        
-        // Find pattern at cursor position
-        for (pattern_type, pattern_list) in patterns.iter() {
-            for pattern_info in pattern_list {
-                let line = position.line as usize;
-                let character = position.character as usize;
-                
-                if pattern_info.row == line &&
-                   character >= pattern_info.col &&
-                   character <= pattern_info.col + pattern_info.text.len() {
-                    
-                    debug!("Goto definition: Found {} pattern at cursor", pattern_type);
-                    
-                    // For now, return basic location info
-                    // TODO: Implement proper goto-definition for each pattern type
-                    return Ok(None);
-                }
-            }
+        let is_php = uri.path().ends_with(".php");
+        if !is_php {
+            return Ok(None);
         }
 
-        // Final emergency fallback for legacy tree-sitter patterns
-        let is_php = uri.path().ends_with(".php") && !uri.path().ends_with(".blade.php");
-        if is_php {
-            debug!("Goto definition: Emergency fallback for PHP file");
-            if let Ok(tree) = parse_php(&source) {
-                let lang = language_php();
-                if let Ok(assets) = find_asset_calls(&tree, &source, &lang) {
-                    // Find asset match at cursor position
-                    if let Some(asset_match) = assets.iter().find(|m| {
-                        m.row == position.line as usize
-                            && position.character as usize >= m.column
-                            && position.character as usize <= m.end_column
-                    }) {
-                        info!("Laravel LSP: Found asset call (fallback): {} ({:?})", asset_match.path, asset_match.helper_type);
-                        return Ok(self.create_asset_location(&asset_match).await);
+        // Convert URI to file path for Salsa lookup
+        let file_path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+
+        // First, try to get patterns from Salsa (cached/incremental computation)
+        if let Ok(Some(patterns)) = self.salsa.get_patterns(file_path.clone()).await {
+            // Use find_at_position for efficient lookup
+            if let Some(pattern) = patterns.find_at_position(position.line, position.character) {
+                match pattern {
+                    PatternAtPosition::Component(comp) => {
+                        debug!("Laravel LSP: [Salsa] Found Blade component: {}", comp.name);
+                        return Ok(self.create_component_location_from_salsa(&comp).await);
+                    }
+                    PatternAtPosition::Livewire(lw) => {
+                        debug!("Laravel LSP: [Salsa] Found Livewire component: {}", lw.name);
+                        return Ok(self.create_livewire_location_from_salsa(&lw).await);
+                    }
+                    PatternAtPosition::Directive(dir) => {
+                        debug!("Laravel LSP: [Salsa] Found directive: @{}", dir.name);
+                        return Ok(self.create_directive_location_from_salsa(&dir).await);
+                    }
+                    PatternAtPosition::View(view) => {
+                        debug!("Laravel LSP: [Salsa] Found view call: {}", view.name);
+                        return Ok(self.create_view_location_from_salsa(&view).await);
+                    }
+                    PatternAtPosition::EnvRef(env) => {
+                        debug!("Laravel LSP: [Salsa] Found env call: {}", env.name);
+                        return Ok(self.create_env_location_from_salsa(&env).await);
+                    }
+                    PatternAtPosition::ConfigRef(config) => {
+                        debug!("Laravel LSP: [Salsa] Found config call: {}", config.key);
+                        return Ok(self.create_config_location_from_salsa(&config).await);
+                    }
+                    PatternAtPosition::Middleware(mw) => {
+                        debug!("Laravel LSP: [Salsa] Found middleware call: {}", mw.name);
+                        return Ok(self.create_middleware_location_from_salsa(&mw).await);
+                    }
+                    PatternAtPosition::Translation(trans) => {
+                        debug!("Laravel LSP: [Salsa] Found translation call: {}", trans.key);
+                        return Ok(self.create_translation_location_from_salsa(&trans).await);
+                    }
+                    PatternAtPosition::Asset(asset) => {
+                        debug!("Laravel LSP: [Salsa] Found asset call: {}", asset.path);
+                        return Ok(self.create_asset_location_from_salsa(&asset).await);
+                    }
+                    PatternAtPosition::Binding(binding) => {
+                        debug!("Laravel LSP: [Salsa] Found binding call: {}", binding.name);
+                        return Ok(self.create_binding_location_from_salsa(&binding).await);
                     }
                 }
             }
@@ -2568,16 +2157,7 @@ impl LanguageServer for LaravelLanguageServer {
 
 
 
-    async fn completion(&self, params: CompletionParams) -> jsonrpc::Result<Option<CompletionResponse>> {
-        let uri = params.text_document_position.text_document.uri;
-        let position = params.text_document_position.position;
-        
-        debug!("Laravel LSP: Completion requested at {:?}:{:?}", uri, position);
-        
-        // For now, return empty completions
-        // We'll implement this in a later phase
-        Ok(Some(CompletionResponse::Array(vec![])))
-    }
+    // NOTE: completion handler removed - capability not advertised in ServerCapabilities
 
     async fn code_lens(&self, params: CodeLensParams) -> jsonrpc::Result<Option<Vec<CodeLens>>> {
         let uri = params.text_document.uri;
@@ -2634,15 +2214,6 @@ impl LanguageServer for LaravelLanguageServer {
 }
 
 impl LaravelLanguageServer {
-
-    /// Get cache diagnostics for debugging
-    pub async fn get_cache_diagnostics(&self) -> String {
-        self.performance_cache.get_performance_report().await
-    }
-
-    // Removed: invalidate_file_cache - performance_cache handles invalidation automatically
-    // Removed: rebuild_view_references_map - old cache system removed
-
     /// Extract view name from a Blade file path
     async fn extract_view_name_from_path(&self, uri: &Url) -> Option<String> {
         let file_path = uri.to_file_path().ok()?;
@@ -2954,43 +2525,87 @@ impl LaravelLanguageServer {
         references
     }
 
-    /// Initialize incremental database with project configuration
-    async fn initialize_incremental_database(&self, root_path: &PathBuf) {
-        self.incremental_db.set_project_root(root_path.clone()).await;
-        
-        info!("Laravel LSP: Incremental database initialized for project: {}", root_path.display());
-    }
-
-    /// Get hover information using incremental computation
+    /// Get hover information using Salsa incremental computation
     async fn get_incremental_hover_info(&self, uri: &Url, line: u32, character: u32) -> Option<Hover> {
-        // Get current document content
-        let content = {
-            let documents = self.documents.read().await;
-            documents.get(uri)?.clone()
-        };
-
         // Convert to file path
         let file_path = uri.to_file_path().ok()?;
-        
-        // Check if this is a Blade file
-        if uri.path().contains(".blade.php") {
-            // Get hover info from incremental database
-            if let Some(hover_text) = self.incremental_db.get_blade_hover(
-                file_path, content, 1, line, character
-            ).await {
-                return Some(Hover {
-                    contents: HoverContents::Scalar(MarkedString::String(hover_text)),
-                    range: None,
-                });
-            }
-        } else {
-            // For regular PHP files, fall back to the old cached system
-            let version = 1;
-            return self.performance_cache.get_hover(uri.clone(), 
-                lsp_types::Position::new(line, character), version).await;
-        }
 
-        None
+        // Get patterns from Salsa
+        let patterns = self.salsa.get_patterns(file_path).await.ok()??;
+
+        // Find pattern at cursor position
+        let pattern = patterns.find_at_position(line, character)?;
+
+        // Generate hover text based on pattern type
+        let hover_text = match pattern {
+            PatternAtPosition::Component(comp) => {
+                format!("**Blade Component**: `<x-{}>`\n\nComponent: `{}`", comp.tag_name, comp.name)
+            }
+            PatternAtPosition::Livewire(lw) => {
+                format!("**Livewire Component**: `<livewire:{}>`\n\nClass: `App\\Livewire\\{}`",
+                    lw.name,
+                    Self::kebab_to_pascal_case(&lw.name))
+            }
+            PatternAtPosition::Directive(dir) => {
+                if dir.name == "extends" || dir.name == "include" {
+                    let view_name = dir.arguments.as_ref()
+                        .and_then(|args| Self::extract_view_from_directive_args(args))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    format!("**Blade Directive**: `@{}`\n\nView: `{}`", dir.name, view_name)
+                } else {
+                    format!("**Blade Directive**: `@{}`", dir.name)
+                }
+            }
+            PatternAtPosition::View(view) => {
+                format!("**View**: `{}`\n\nPath: `resources/views/{}.blade.php`",
+                    view.name,
+                    view.name.replace('.', "/"))
+            }
+            PatternAtPosition::EnvRef(env) => {
+                let fallback_info = if env.has_fallback { " (has fallback)" } else { "" };
+                format!("**Environment Variable**: `{}`{}", env.name, fallback_info)
+            }
+            PatternAtPosition::ConfigRef(config) => {
+                let parts: Vec<&str> = config.key.split('.').collect();
+                let file = parts.first().unwrap_or(&"config");
+                format!("**Config**: `{}`\n\nFile: `config/{}.php`", config.key, file)
+            }
+            PatternAtPosition::Middleware(mw) => {
+                format!("**Middleware**: `{}`", mw.name)
+            }
+            PatternAtPosition::Translation(trans) => {
+                format!("**Translation**: `{}`", trans.key)
+            }
+            PatternAtPosition::Asset(asset) => {
+                use salsa_impl::AssetHelperType;
+                let helper_name = match asset.helper_type {
+                    AssetHelperType::Asset => "asset()",
+                    AssetHelperType::PublicPath => "public_path()",
+                    AssetHelperType::BasePath => "base_path()",
+                    AssetHelperType::AppPath => "app_path()",
+                    AssetHelperType::StoragePath => "storage_path()",
+                    AssetHelperType::DatabasePath => "database_path()",
+                    AssetHelperType::LangPath => "lang_path()",
+                    AssetHelperType::ConfigPath => "config_path()",
+                    AssetHelperType::ResourcePath => "resource_path()",
+                    AssetHelperType::Mix => "mix()",
+                    AssetHelperType::ViteAsset => "Vite::asset()",
+                };
+                format!("**Asset Helper**: `{}`\n\nPath: `{}`", helper_name, asset.path)
+            }
+            PatternAtPosition::Binding(binding) => {
+                if binding.is_class_reference {
+                    format!("**Container Binding**: `{}`\n\n(Class reference)", binding.name)
+                } else {
+                    format!("**Container Binding**: `{}`", binding.name)
+                }
+            }
+        };
+
+        Some(Hover {
+            contents: HoverContents::Scalar(MarkedString::String(hover_text)),
+            range: None,
+        })
     }
 }
 
