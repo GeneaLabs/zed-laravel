@@ -37,6 +37,28 @@ cargo clippy
 cargo build --release
 ```
 
+**IMPORTANT - Binary for Local Development:**
+The `.zed/settings.json` configures Zed to use the local build directly:
+```json
+{
+  "lsp": {
+    "laravel-lsp": {
+      "binary": {
+        "path": "laravel-lsp/target/release/laravel-lsp"
+      }
+    }
+  }
+}
+```
+
+Development workflow:
+```bash
+cargo build --release
+# Then in Zed: Cmd+Shift+P → "zed: reload extensions"
+```
+
+No copying or symlinks needed - Zed reads the binary path from settings.
+
 ## Running Diagnostics (Important for Zed)
 
 When using Claude Code in Zed, it doesn't have direct access to LSP diagnostics. Always run these commands to check for errors:
@@ -108,6 +130,83 @@ Zed extensions follow the Extension API provided by Zed. Key concepts:
 - May need custom tree-sitter queries for Laravel-specific patterns
 - Extensions use the `zed_extension_api` crate and implement the `Extension` trait
 - Language features use LSP (Language Server Protocol) integration
+
+## LSP Architecture (laravel-lsp/)
+
+### Core Components
+
+| File | Purpose |
+|------|---------|
+| `main.rs` | LSP server, request handlers, Backend trait impl |
+| `salsa_impl.rs` | Salsa incremental computation actor |
+| `queries.rs` | Tree-sitter queries for pattern extraction |
+| `parser.rs` | PHP and Blade tree-sitter parsing |
+| `config.rs` | Laravel project configuration discovery |
+| `env_parser.rs` | .env file parsing |
+| `service_provider_analyzer.rs` | Middleware/binding extraction |
+| `middleware_parser.rs` | Kernel.php and bootstrap/app.php parsing |
+
+### Salsa Actor Pattern
+
+The LSP uses a dedicated thread for Salsa incremental computation to avoid lifetime issues with async code:
+
+```
+┌─────────────────┐     oneshot channel     ┌─────────────────┐
+│  LSP Handlers   │ ──────────────────────► │   SalsaActor    │
+│  (async/await)  │ ◄────────────────────── │ (dedicated      │
+│                 │        response         │  thread)        │
+└─────────────────┘                         └─────────────────┘
+```
+
+**Key pattern for adding new Salsa features:**
+1. Add `#[salsa::input]` type in `salsa_impl.rs`
+2. Add data transfer type (no lifetimes) for async boundary
+3. Add `SalsaRequest` variant with oneshot sender
+4. Add `SalsaHandle` method (async interface)
+5. Add handler method in `SalsaActor`
+6. Add helper method in `main.rs` to register data
+
+### Salsa Components
+
+| Component | Input Type | Data Transfer Type | Purpose |
+|-----------|------------|-------------------|---------|
+| File Patterns | `SourceFile` | `ParsedPatternsData` | Cached parsed patterns per file |
+| Config | `ConfigFile` | `LaravelConfigData` | Project configuration |
+| Project Files | `ProjectFiles` | `ViewReferenceLocationData` | Reference finding across project |
+| Service Providers | `ServiceProviderFile` | `MiddlewareRegistrationData`, `BindingRegistrationData` | Middleware/binding lookups |
+| Env Variables | `EnvFile` | `EnvVariableData` | Environment variable lookups |
+
+### Important Conventions
+
+- **Data transfer types**: Use `*Data` suffix (e.g., `EnvVariableData`) for types crossing async boundaries
+- **Salsa inputs**: Use `#[salsa::input]` for source data, store in `HashMap` for O(1) lookup
+- **Registration pattern**: Call `register_*_with_salsa()` after successful parsing
+- **Fallback pattern**: Use Salsa cache first, fall back to direct computation if unavailable
+- **Priority merging**: Framework=0, Package=1, App=2 (higher wins)
+
+### Request Flow Example
+
+```
+User hovers over view('users.index')
+    │
+    ▼
+Backend::hover() in main.rs
+    │
+    ▼
+salsa.get_parsed_patterns(file_path, content)
+    │
+    ▼
+SalsaActor checks cache, returns ParsedPatternsData
+    │
+    ▼
+Find matching pattern at cursor position
+    │
+    ▼
+Resolve view name to file path using config
+    │
+    ▼
+Return HoverContents with file location
+```
 
 ## Implementation Plan
 
@@ -202,3 +301,62 @@ When working on this project:
 - Zed Extension API documentation: https://zed.dev/docs/extensions
 - Existing Zed extensions for reference: https://github.com/zed-industries/extensions
 - Laravel VSCode extension (for feature reference): https://github.com/amiralizadeh9480/laravel-extra-intellisense
+
+---
+
+## Session State (2025-12-26)
+
+### Last Session Summary
+
+**Problem**: LSP was slow on startup - `parse_file_patterns` was taking ~1.8 seconds for a single `web.php` file.
+
+**Root Cause**: The tree-sitter query (1048 lines, 31KB) was being compiled 8+ times per file - once for each `find_*` function (find_view_calls, find_env_calls, find_config_calls, etc.).
+
+**Solution Implemented**: Single-pass extraction (Option 2 - best practice approach)
+
+### Changes Made
+
+1. **queries.rs** - Complete rewrite:
+   - Added `once_cell::Lazy` for global query caching (compile once, reuse forever)
+   - Created `ExtractedPhpPatterns` struct containing all PHP pattern types
+   - Created `ExtractedBladePatterns` struct containing all Blade pattern types
+   - Implemented `extract_all_php_patterns()` - single tree traversal extracts all patterns
+   - Implemented `extract_all_blade_patterns()` - single tree traversal for Blade
+   - Removed all individual `find_*` functions
+
+2. **salsa_impl.rs** - Updated `parse_file_patterns`:
+   - Now uses `extract_all_php_patterns()` instead of 8 separate function calls
+   - Now uses `extract_all_blade_patterns()` instead of 3 separate function calls
+   - Also updated `handle_get_patterns` for route/url/action extraction
+
+3. **Cargo.toml** - Added `once_cell = "1.19"` dependency
+
+### Performance Improvement
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Query compilations per file | 8+ | 1 (cached globally) |
+| Tree traversals per PHP file | 8 | 1 |
+| Expected speedup | - | ~5-10x for pattern extraction |
+
+### Current Status
+
+- Build: **Passing** (with some dead code warnings - expected)
+- Tests: **19 tests passing**
+- Ready to test in Zed
+
+### Next Steps (for next session)
+
+1. **Test in Zed** - Reload extensions and check new startup logs to verify performance improvement
+2. **Measure actual improvement** - Compare `salsa.get_patterns` time in logs (was ~1.8s)
+3. **If still slow** - Profile to find next bottleneck (could be in Salsa overhead, file I/O, etc.)
+4. **Consider further optimizations**:
+   - Lazy initialization of patterns (only parse when needed)
+   - Background parsing on file open
+   - Smaller/split query files if compilation is still slow on first use
+
+### Key Files Modified
+
+- `laravel-lsp/src/queries.rs` - Complete rewrite with single-pass extraction
+- `laravel-lsp/src/salsa_impl.rs` - Updated to use new extraction functions
+- `laravel-lsp/Cargo.toml` - Added once_cell dependency

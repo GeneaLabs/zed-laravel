@@ -26,6 +26,12 @@ Thumbs.db
 # Zed specific
 .zed/
 
+# Release binary directories (created by GitHub Actions)
+laravel-lsp-*/
+
+# Standalone binary (legacy)
+laravel-lsp-binary
+
 # Environment files
 .env
 .env.local

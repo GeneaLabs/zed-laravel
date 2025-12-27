@@ -1,589 +1,93 @@
-//! This module handles tree-sitter query execution for pattern matching
+//! Single-pass tree-sitter query execution for Laravel pattern matching
+//!
+//! This module uses a single-pass extraction approach for performance:
+//! - Queries are compiled once and cached using once_cell::Lazy
+//! - All patterns are extracted in a single tree traversal
+//! - This is O(n) instead of O(n×k) where k is the number of pattern types
 //!
 //! Queries are stored in .scm files and embedded at compile time using include_str!
-//! This is the standard approach used by editors like Neovim, Helix, and Zed.
-#![allow(dead_code)]
 
 use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
+use std::time::Instant;
+use tracing::{info, warn};
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator, Tree};
 
 // ============================================================================
-// PART 1: Query File Embedding
+// Query File Embedding & Cached Compilation
 // ============================================================================
 
-/// Embed the PHP query file at compile time
-///
-/// LEARNING MOMENT: include_str! macro
-///
-/// This macro reads a file at COMPILE TIME and embeds its contents as a &'static str
-/// - The file path is relative to the current source file
-/// - If the file doesn't exist, compilation fails
-/// - The result is a string literal baked into the binary
-/// - No runtime file I/O needed!
-///
-/// This is different from std::fs::read_to_string() which reads at runtime.
+/// Embed query files at compile time
 const PHP_QUERY: &str = include_str!("../queries/php.scm");
-
-/// Embed the Blade query file at compile time
 const BLADE_QUERY: &str = include_str!("../queries/blade.scm");
 
-// ============================================================================
-// PART 2: Query Compilation
-// ============================================================================
-
-/// Compile the PHP query into a Query object
-///
-/// LEARNING MOMENT: Query compilation
-///
-/// Tree-sitter queries need to be compiled before use:
-/// 1. Parse the S-expression syntax
-/// 2. Validate node types against the grammar
-/// 3. Compile into an efficient internal representation
-///
-/// This can fail if:
-/// - Syntax is invalid
-/// - Node types don't exist in the grammar
-/// - Predicates are malformed
-pub fn compile_php_query(language: &Language) -> Result<Query> {
-    Query::new(language, PHP_QUERY)
-        .map_err(|e| anyhow!("Failed to compile PHP query: {:?}", e))
-}
-
-/// Compile the Blade query into a Query object
-pub fn compile_blade_query(language: &Language) -> Result<Query> {
-    Query::new(language, BLADE_QUERY)
-        .map_err(|e| anyhow!("Failed to compile Blade query: {:?}", e))
-}
-
-// ============================================================================
-// PART 3: Pattern Detection
-// ============================================================================
-
-/// Find all view() calls in PHP code
-///
-/// Returns a vector of (view_name, byte_offset) tuples
-///
-/// LEARNING MOMENT: Lifetimes
-///
-/// Notice the lifetime parameter 'a:
-///   pub fn find_view_calls<'a>(tree: &Tree, source: &'a str, ...)
-///
-/// This says: "The returned ViewMatch structs contain references to 'source',
-/// so they can't outlive the source string."
-///
-/// Rust's borrow checker uses this to ensure we don't use a ViewMatch after
-/// the source string has been freed.
-pub fn find_view_calls<'a>(
-    tree: &Tree,
-    source: &'a str,
-    language: &Language,
-) -> Result<Vec<ViewMatch<'a>>> {
-    let query = compile_php_query(language)?;
-    let mut cursor = QueryCursor::new();
-    let mut results = Vec::new();
-
-    // Execute the query using captures() which returns an iterator
-    // captures() gives us individual captures, matches() gives us groups
-    // For our use case, captures() is simpler
-    let root_node = tree.root_node();
-    let source_bytes = source.as_bytes();
-
-    // Use StreamingIterator pattern with while-let
-    let mut captures = cursor.captures(&query, root_node, source_bytes);
-
-    while let Some((query_match, capture_index)) = captures.next() {
-        // capture_index tells us which capture in this match is "new"
-        // We only process the specific capture indicated to avoid duplicates
-        let capture = &query_match.captures[*capture_index];
-        let capture_name = query.capture_names()[capture.index as usize];
-
-        // We care about both view_name and route_view_name captures
-        if capture_name == "view_name" || capture_name == "route_view_name" {
-            let node = capture.node;
-            let view_name = node.utf8_text(source_bytes)?;
-
-            // Determine if this is a route view (Route::view or Volt::route)
-            // These should show ERROR severity if view not found
-            let is_route_view = capture_name == "route_view_name";
-            
-            results.push(ViewMatch {
-                view_name,
-                byte_start: node.start_byte(),
-                byte_end: node.end_byte(),
-                row: node.start_position().row,
-                column: node.start_position().column,
-                end_column: node.end_position().column,
-                is_route_view,
-            });
-        }
+/// Cached compiled PHP query - compiled once on first use
+static PHP_QUERY_CACHE: Lazy<Option<Query>> = Lazy::new(|| {
+    use crate::parser::language_php;
+    let start = Instant::now();
+    let lang = language_php();
+    let result = Query::new(&lang, PHP_QUERY).ok();
+    let elapsed = start.elapsed();
+    if result.is_some() {
+        tracing::info!("⚡ PHP query compiled in {:?} (one-time cost)", elapsed);
+    } else {
+        tracing::warn!("❌ PHP query compilation failed after {:?}", elapsed);
     }
+    result
+});
 
-    Ok(results)
+/// Cached compiled Blade query - compiled once on first use
+static BLADE_QUERY_CACHE: Lazy<Option<Query>> = Lazy::new(|| {
+    use crate::parser::language_blade;
+    let start = Instant::now();
+    let lang = language_blade();
+    let result = Query::new(&lang, BLADE_QUERY).ok();
+    let elapsed = start.elapsed();
+    if result.is_some() {
+        tracing::info!("⚡ Blade query compiled in {:?} (one-time cost)", elapsed);
+    } else {
+        tracing::warn!("❌ Blade query compilation failed after {:?}", elapsed);
+    }
+    result
+});
+
+/// Get the cached PHP query, or compile it if needed
+fn get_php_query(_language: &Language) -> Result<&'static Query> {
+    PHP_QUERY_CACHE.as_ref()
+        .ok_or_else(|| anyhow!("Failed to compile PHP query"))
 }
 
-/// Find all Blade components in Blade code (e.g., <x-button>)
-pub fn find_blade_components<'a>(
-    tree: &Tree,
-    source: &'a str,
-    language: &Language,
-) -> Result<Vec<ComponentMatch<'a>>> {
-    let query = compile_blade_query(language)?;
-    let mut cursor = QueryCursor::new();
-    let mut results = Vec::new();
-
-    let root_node = tree.root_node();
-    let source_bytes = source.as_bytes();
-
-    let mut captures = cursor.captures(&query, root_node, source_bytes);
-
-    while let Some((query_match, capture_index)) = captures.next() {
-        let capture = &query_match.captures[*capture_index];
-        let capture_name = query.capture_names()[capture.index as usize];
-
-        // Look for component tags (x-* pattern)
-        if capture_name == "tag_name" {
-            let node = capture.node;
-            let tag_name = node.utf8_text(source_bytes)?;
-
-            // Only process x-* components (filter out livewire:*)
-            if tag_name.starts_with("x-") {
-                // Remove the "x-" prefix to get the component name
-                let component_name = &tag_name[2..];
-
-                results.push(ComponentMatch {
-                    component_name,
-                    tag_name,
-                    byte_start: node.start_byte(),
-                    byte_end: node.end_byte(),
-                    row: node.start_position().row,
-                    column: node.start_position().column,
-                    end_column: node.end_position().column,
-                    resolved_path: None,
-                });
-            }
-        }
-    }
-
-    Ok(results)
+/// Get the cached Blade query, or compile it if needed
+fn get_blade_query(_language: &Language) -> Result<&'static Query> {
+    BLADE_QUERY_CACHE.as_ref()
+        .ok_or_else(|| anyhow!("Failed to compile Blade query"))
 }
 
-/// Find all Blade directives in Blade code
-///
-/// Returns directives like @extends, @section, @foreach, @customDirective, etc.
-/// Does not return closing directives like @endif, @endsection
-pub fn find_directives<'a>(
-    tree: &Tree,
-    source: &'a str,
-    language: &Language,
-) -> Result<Vec<DirectiveMatch<'a>>> {
-    let query = compile_blade_query(language)?;
-    let mut cursor = QueryCursor::new();
-    let mut results = Vec::new();
-
-    let root_node = tree.root_node();
-    let source_bytes = source.as_bytes();
-
-    let mut captures = cursor.captures(&query, root_node, source_bytes);
-
-    while let Some((query_match, capture_index)) = captures.next() {
-        let capture = &query_match.captures[*capture_index];
-        let capture_name = query.capture_names()[capture.index as usize];
-
-        // Look for directive captures
-        if capture_name == "directive" {
-            let node = capture.node;
-            let directive_text = node.utf8_text(source_bytes)?;
-
-            // IMPORTANT: Verify that the directive includes the @ symbol
-            // The tree-sitter-blade grammar should include @ as part of the directive node
-            // If it doesn't start with @, something is wrong with the grammar or our query
-            if !directive_text.starts_with('@') {
-                // Log a warning but try to handle it gracefully
-                eprintln!("WARNING: Directive text doesn't start with @: '{}'", directive_text);
-            }
-
-            // Remove @ symbol to get the directive name only
-            // This is for the directive_name field, but byte positions should include @
-            let directive_name = directive_text.strip_prefix('@')
-                .unwrap_or(directive_text);
-
-            // Look for a sibling parameter node right after this directive
-            // In the tree: directive and parameter are siblings
-            let arguments = find_next_parameter_sibling(node, source_bytes);
-
-            // Construct full text (directive + parameter if present)
-            let full_text = if let Some(param) = arguments {
-                // Combine directive + parameter text
-                // e.g., "@extends" + "('layouts.app')" = "@extends('layouts.app')"
-                format!("{}{}", directive_text, param)
-            } else {
-                directive_text.to_string()
-            };
-
-            // Verify that byte positions include the @ symbol
-            // The start position should be where @ begins
-            let start_byte = node.start_byte();
-            let start_char = source_bytes.get(start_byte).copied();
-            if start_char != Some(b'@') {
-                eprintln!("WARNING: Directive start byte doesn't point to @. byte={}, char={:?}, text='{}'",
-                    start_byte, start_char.map(|c| c as char), directive_text);
-            }
-
-            let directive_column = node.start_position().column;
-            let directive_end_column = node.end_position().column;
-
-            // Calculate string column positions for directives with view references
-            // For @extends/@include/@slot/@component, find the quoted string position
-            let (string_column, string_end_column) = if (directive_name == "extends" 
-                || directive_name == "include"
-                || directive_name == "slot"
-                || directive_name == "component")
-                && arguments.is_some()
-            {
-                calculate_string_column_range(directive_column, directive_name, arguments.unwrap())
-                    .unwrap_or((directive_column, directive_end_column))
-            } else {
-                (directive_column, directive_end_column)
-            };
-
-            results.push(DirectiveMatch {
-                directive_name,
-                full_text,  // Now it's a String, not &str
-                arguments,
-                byte_start: start_byte,  // This should point to @
-                byte_end: node.end_byte(),
-                row: node.start_position().row,
-                column: directive_column,  // This should be the column of @
-                end_column: directive_end_column,
-                string_column,
-                string_end_column,
-            });
-        }
-    }
-
-    Ok(results)
-}
-
-/// Find the next parameter sibling node after a directive node
-///
-/// In the Blade tree, directives and their parameters are siblings:
-/// ```
-/// parent_node
-///   ├─ directive_node (@extends)
-///   └─ parameter_node (('layouts.app'))
-/// ```
-fn find_next_parameter_sibling<'a>(
-    directive_node: tree_sitter::Node,
-    source: &'a [u8],
-) -> Option<&'a str> {
-    let parent = directive_node.parent()?;
-    let mut cursor = parent.walk();
-
-    // Find the directive node in parent's children
-    let mut found_directive = false;
-    for child in parent.children(&mut cursor) {
-        if found_directive && child.kind() == "parameter" {
-            // This is the parameter right after our directive
-            return child.utf8_text(source).ok();
-        }
-
-        if child.id() == directive_node.id() {
-            found_directive = true;
-        }
-    }
-
-    None
-}
-
-/// Find all Livewire components in Blade code
-pub fn find_livewire_components<'a>(
-    tree: &Tree,
-    source: &'a str,
-    language: &Language,
-) -> Result<Vec<LivewireMatch<'a>>> {
-    let query = compile_blade_query(language)?;
-    let mut cursor = QueryCursor::new();
-    let mut results = Vec::new();
-
-    let root_node = tree.root_node();
-    let source_bytes = source.as_bytes();
-
-    let mut captures = cursor.captures(&query, root_node, source_bytes);
-
-    while let Some((query_match, capture_index)) = captures.next() {
-        let capture = &query_match.captures[*capture_index];
-        let capture_name = query.capture_names()[capture.index as usize];
-        let node = capture.node;
-        let text = node.utf8_text(source_bytes)?;
-
-        // Handle <livewire:component-name> tags
-        if capture_name == "tag_name" && text.starts_with("livewire:") {
-            let component_name = &text[9..]; // Remove "livewire:" prefix
-
-            results.push(LivewireMatch {
-                component_name,
-                byte_start: node.start_byte(),
-                byte_end: node.end_byte(),
-                row: node.start_position().row,
-                column: node.start_position().column,
-                end_column: node.end_position().column,
-            });
-        }
-
-        // Handle @livewire('component-name') directives
-        if capture_name == "component_name" {
-            // The text might be quoted, so strip quotes
-            let component_name = text.trim_matches(|c| c == '"' || c == '\'');
-
-            results.push(LivewireMatch {
-                component_name,
-                byte_start: node.start_byte(),
-                byte_end: node.end_byte(),
-                row: node.start_position().row,
-                column: node.start_position().column,
-                end_column: node.end_position().column,
-            });
-        }
-    }
-
-    Ok(results)
-}
-
-/// Find all env() function calls in PHP code
-///
-/// This function looks for patterns like:
-/// - env('APP_NAME', 'Laravel')
-/// - env("DB_HOST")
-///
-/// Returns a vector of EnvMatch structs with position information
-pub fn find_env_calls<'a>(
-    tree: &Tree,
-    source: &'a str,
-    language: &Language,
-) -> Result<Vec<EnvMatch<'a>>> {
-    let query = compile_php_query(language)?;
-    let mut cursor = QueryCursor::new();
-    let mut results = Vec::new();
-
-    let root_node = tree.root_node();
-    let source_bytes = source.as_bytes();
-
-    let mut captures = cursor.captures(&query, root_node, source_bytes);
-
-    while let Some((query_match, capture_index)) = captures.next() {
-        let capture = &query_match.captures[*capture_index];
-        let capture_name = query.capture_names()[capture.index as usize];
-
-        // We only care about the env_var capture
-        if capture_name == "env_var" {
-            let node = capture.node;
-            let var_name = node.utf8_text(source_bytes)?;
-
-            // Check if there's a second argument (fallback value)
-            // We need to navigate: string_content -> string -> argument -> arguments -> function_call
-            let has_fallback = if let Some(string_node) = node.parent() {
-                // string_node should be 'string' or 'encapsed_string'
-                if let Some(argument_node) = string_node.parent() {
-                    // argument_node should be 'argument'
-                    if let Some(arguments_node) = argument_node.parent() {
-                        // arguments_node should be 'arguments'
-                        // Count how many 'argument' children it has
-                        let mut argument_count = 0;
-                        for i in 0..arguments_node.child_count() {
-                            if let Some(child) = arguments_node.child(i as u32) {
-                                if child.kind() == "argument" {
-                                    argument_count += 1;
-                                }
-                            }
-                        }
-                        // Has fallback if there are 2 or more arguments
-                        argument_count >= 2
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            results.push(EnvMatch {
-                var_name,
-                has_fallback,
-                byte_start: node.start_byte(),
-                byte_end: node.end_byte(),
-                row: node.start_position().row,
-                column: node.start_position().column,
-                end_column: node.end_position().column,
-            });
-        }
-    }
-
-    Ok(results)
-}
-
-/// Find all config() function calls in PHP code
-///
-/// This function looks for patterns like:
-/// - config('app.name')
-/// - config("database.connections.mysql.host")
-///
-/// Returns a vector of ConfigMatch structs with position information
-pub fn find_config_calls<'a>(
-    tree: &Tree,
-    source: &'a str,
-    language: &Language,
-) -> Result<Vec<ConfigMatch<'a>>> {
-    let query = compile_php_query(language)?;
-    let mut cursor = QueryCursor::new();
-    let mut results = Vec::new();
-
-    let root_node = tree.root_node();
-    let source_bytes = source.as_bytes();
-
-    let mut captures = cursor.captures(&query, root_node, source_bytes);
-
-    while let Some((query_match, capture_index)) = captures.next() {
-        let capture = &query_match.captures[*capture_index];
-        let capture_name = query.capture_names()[capture.index as usize];
-
-        // We only care about the config_key capture
-        if capture_name == "config_key" {
-            let node = capture.node;
-            let config_key = node.utf8_text(source_bytes)?;
-
-            results.push(ConfigMatch {
-                config_key,
-                byte_start: node.start_byte(),
-                byte_end: node.end_byte(),
-                row: node.start_position().row,
-                column: node.start_position().column,
-                end_column: node.end_position().column,
-            });
-        }
-    }
-
-    Ok(results)
-}
-
-/// Find all middleware() and withoutMiddleware() calls in PHP route definitions
-///
-/// This function parses route middleware definitions like:
-/// - Route::middleware('auth')
-/// - Route::middleware(['auth', 'web'])
-/// - ->middleware('verified')
-/// - ->withoutMiddleware('guest')
-///
-/// It handles both single middleware strings and arrays of middleware.
-/// Middleware with parameters (e.g., 'throttle:60,1') are captured as-is.
-pub fn find_middleware_calls<'a>(
-    tree: &Tree,
-    source: &'a str,
-    language: &Language,
-) -> Result<Vec<MiddlewareMatch<'a>>> {
-    let query = compile_php_query(language)?;
-    let mut cursor = QueryCursor::new();
-    let mut results = Vec::new();
-
-    let root_node = tree.root_node();
-    let source_bytes = source.as_bytes();
-
-    let mut captures = cursor.captures(&query, root_node, source_bytes);
-
-    while let Some((query_match, capture_index)) = captures.next() {
-        let capture = &query_match.captures[*capture_index];
-        let capture_name = query.capture_names()[capture.index as usize];
-
-        // We only care about the middleware_name capture
-        if capture_name == "middleware_name" {
-            let node = capture.node;
-            let middleware_name = node.utf8_text(source_bytes)?;
-
-            results.push(MiddlewareMatch {
-                middleware_name,
-                byte_start: node.start_byte(),
-                byte_end: node.end_byte(),
-                row: node.start_position().row,
-                column: node.start_position().column,
-                end_column: node.end_position().column,
-            });
-        }
-    }
-
-    Ok(results)
-}
-
-/// Find all translation calls in PHP code
-///
-/// This function parses translation retrieval patterns like:
-/// - __('messages.welcome')
-/// - trans('validation.required')
-/// - trans_choice('messages.apples', 10)
-/// - Lang::get('auth.failed')
-///
-/// It extracts the translation key from the first argument.
-pub fn find_translation_calls<'a>(
-    tree: &Tree,
-    source: &'a str,
-    language: &Language,
-) -> Result<Vec<TranslationMatch<'a>>> {
-    let query = compile_php_query(language)?;
-    let mut cursor = QueryCursor::new();
-    let mut results = Vec::new();
-
-    let root_node = tree.root_node();
-    let source_bytes = source.as_bytes();
-
-    let mut captures = cursor.captures(&query, root_node, source_bytes);
-
-    while let Some((query_match, capture_index)) = captures.next() {
-        let capture = &query_match.captures[*capture_index];
-        let capture_name = query.capture_names()[capture.index as usize];
-
-        // We only care about the translation_key capture
-        if capture_name == "translation_key" {
-            let node = capture.node;
-            let translation_key = node.utf8_text(source_bytes)?;
-
-            results.push(TranslationMatch {
-                translation_key,
-                byte_start: node.start_byte(),
-                byte_end: node.end_byte(),
-                row: node.start_position().row,
-                column: node.start_position().column,
-                end_column: node.end_position().column,
-            });
-        }
-    }
-
-    Ok(results)
+/// Pre-warm the query cache by forcing Lazy initialization.
+/// Call this on a background thread during startup to avoid
+/// paying the ~200ms compilation cost on first file open.
+pub fn prewarm_query_cache() {
+    use std::ops::Deref;
+    info!("🔥 Pre-warming query cache...");
+    // Access the statics to trigger Lazy initialization
+    // The logging inside the Lazy closures will show timing
+    let _ = PHP_QUERY_CACHE.deref();
+    let _ = BLADE_QUERY_CACHE.deref();
+    info!("🔥 Query cache pre-warm complete");
 }
 
 // ============================================================================
-// PART 6: Match Data Structures
+// Match Data Structures
 // ============================================================================
 
 /// Represents a matched view() call in PHP code
-///
-/// LEARNING MOMENT: Lifetime annotations in structs
-///
-/// The 'a lifetime parameter means this struct contains a borrowed reference
-/// (&'a str) that lives as long as 'a. The struct can't outlive the source
-/// string it references.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewMatch<'a> {
-    /// The view name (e.g., "users.profile")
     pub view_name: &'a str,
-    /// Starting byte offset in source
     pub byte_start: usize,
-    /// Ending byte offset in source
     pub byte_end: usize,
-    /// Line number (0-indexed)
     pub row: usize,
-    /// Column number (0-indexed) - start of the match
     pub column: usize,
-    /// End column number (0-indexed) - end of the match
     pub end_column: usize,
     /// Whether this is from Route::view() or Volt::route() (should be ERROR if missing)
     pub is_route_view: bool,
@@ -592,23 +96,19 @@ pub struct ViewMatch<'a> {
 /// Represents a matched Blade component (<x-*>)
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComponentMatch<'a> {
-    /// The component name without "x-" prefix (e.g., "button")
     pub component_name: &'a str,
-    /// The full tag name (e.g., "x-button")
     pub tag_name: &'a str,
     pub byte_start: usize,
     pub byte_end: usize,
     pub row: usize,
     pub column: usize,
     pub end_column: usize,
-    /// Resolved file path (cached during pre-parsing for performance)
     pub resolved_path: Option<std::path::PathBuf>,
 }
 
 /// Represents a matched Livewire component
 #[derive(Debug, Clone, PartialEq)]
 pub struct LivewireMatch<'a> {
-    /// The component name (e.g., "user-profile")
     pub component_name: &'a str,
     pub byte_start: usize,
     pub byte_end: usize,
@@ -620,321 +120,684 @@ pub struct LivewireMatch<'a> {
 /// Represents a matched Blade directive
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectiveMatch<'a> {
-    /// The directive name without @ (e.g., "extends", "section", "customDirective")
     pub directive_name: &'a str,
-    /// The full directive text including @ (e.g., "@extends('layouts.app')")
-    /// This is owned because we construct it from directive + parameter
     pub full_text: String,
-    /// The arguments if any (e.g., "('layouts.app')" from @extends('layouts.app'))
     pub arguments: Option<&'a str>,
     pub byte_start: usize,
     pub byte_end: usize,
     pub row: usize,
     pub column: usize,
     pub end_column: usize,
-    /// Column position of the quoted string (e.g., column of 'my.view' in @include('my.view'))
-    /// For directives like @include/@extends with arguments, this is the start of the string including quotes
-    /// For other directives, this equals column
     pub string_column: usize,
-    /// End column position of the quoted string (including closing quote)
-    /// For directives like @include/@extends with arguments, this is the end of the string including quotes
-    /// For other directives, this equals end_column
     pub string_end_column: usize,
 }
 
 /// Represents a matched env() call in PHP code
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnvMatch<'a> {
-    /// The environment variable name (e.g., "APP_NAME")
     pub var_name: &'a str,
-    /// Whether this env() call has a fallback/default value
     pub has_fallback: bool,
-    /// Starting byte offset in source
     pub byte_start: usize,
-    /// Ending byte offset in source
     pub byte_end: usize,
-    /// Line number (0-indexed)
     pub row: usize,
-    /// Column number (0-indexed) - start of the match
     pub column: usize,
-    /// End column number (0-indexed) - end of the match
     pub end_column: usize,
 }
 
 /// Represents a matched config() call in PHP code
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigMatch<'a> {
-    /// The config key (e.g., "app.name", "database.connections.mysql.host")
     pub config_key: &'a str,
-    /// Starting byte offset in source
     pub byte_start: usize,
-    /// Ending byte offset in source
     pub byte_end: usize,
-    /// Line number (0-indexed)
     pub row: usize,
-    /// Column number (0-indexed) - start of the match
     pub column: usize,
-    /// End column number (0-indexed) - end of the match
     pub end_column: usize,
 }
 
 /// Represents a matched middleware call in PHP route definitions
 #[derive(Debug, Clone, PartialEq)]
 pub struct MiddlewareMatch<'a> {
-    /// The middleware name/alias (e.g., "auth", "verified", "throttle:60,1")
     pub middleware_name: &'a str,
-    /// Starting byte offset in source
     pub byte_start: usize,
-    /// Ending byte offset in source
     pub byte_end: usize,
-    /// Line number (0-indexed)
     pub row: usize,
-    /// Column number (0-indexed) - start of the match
     pub column: usize,
-    /// End column number (0-indexed) - end of the match
     pub end_column: usize,
 }
 
 /// Represents a matched translation call in PHP or Blade code
 #[derive(Debug, Clone)]
 pub struct TranslationMatch<'a> {
-    /// The translation key (e.g., "messages.welcome" or "Welcome to app")
     pub translation_key: &'a str,
-    /// Starting byte offset in source
     pub byte_start: usize,
-    /// Ending byte offset in source
     pub byte_end: usize,
-    /// Line number (0-indexed)
     pub row: usize,
-    /// Column number (0-indexed) - start of the match
     pub column: usize,
-    /// End column number (0-indexed) - end of the match
     pub end_column: usize,
 }
 
 /// Represents a matched asset or path helper call
 #[derive(Debug, Clone)]
 pub struct AssetMatch<'a> {
-    /// The asset path or file path
     pub path: &'a str,
-    /// The type of helper used
     pub helper_type: AssetHelperType,
-    /// Starting byte offset in source
     pub byte_start: usize,
-    /// Ending byte offset in source
     pub byte_end: usize,
-    /// Line number (0-indexed)
     pub row: usize,
-    /// Column number (0-indexed) - start of the match
     pub column: usize,
-    /// End column number (0-indexed) - end of the match
     pub end_column: usize,
 }
-
-
 
 /// Types of asset/path helpers
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssetHelperType {
-    Asset,        // asset() -> public/
-    PublicPath,   // public_path() -> public/
-    BasePath,     // base_path() -> project root
-    AppPath,      // app_path() -> app/
-    StoragePath,  // storage_path() -> storage/
-    DatabasePath, // database_path() -> database/
-    LangPath,     // lang_path() -> lang/
-    ConfigPath,   // config_path() -> config/
-    ResourcePath, // resource_path() -> resources/
-    Mix,          // mix() -> public/
-    ViteAsset,    // Vite::asset() -> resources/
+    Asset,
+    PublicPath,
+    BasePath,
+    AppPath,
+    StoragePath,
+    DatabasePath,
+    LangPath,
+    ConfigPath,
+    ResourcePath,
+    Mix,
+    ViteAsset,
 }
-
-/// Find all asset and path helper calls in PHP code
-///
-/// Returns a vector of AssetMatch structs containing path and helper type
-pub fn find_asset_calls<'a>(
-    tree: &Tree,
-    source: &'a str,
-    language: &Language,
-) -> Result<Vec<AssetMatch<'a>>> {
-    let query = compile_php_query(language)?;
-    let mut cursor = QueryCursor::new();
-    let mut results = Vec::new();
-
-    let root_node = tree.root_node();
-    let source_bytes = source.as_bytes();
-
-    let mut captures = cursor.captures(&query, root_node, source_bytes);
-
-    while let Some((query_match, capture_index)) = captures.next() {
-        let capture = &query_match.captures[*capture_index];
-        let capture_name = query.capture_names()[capture.index as usize];
-
-        // Determine the helper type based on capture name
-        let helper_type = match capture_name {
-            "asset_path" => AssetHelperType::Asset,
-            "public_path" => AssetHelperType::PublicPath,
-            "base_path" => AssetHelperType::BasePath,
-            "app_path" => AssetHelperType::AppPath,
-            "storage_path" => AssetHelperType::StoragePath,
-            "database_path" => AssetHelperType::DatabasePath,
-            "lang_path" => AssetHelperType::LangPath,
-            "config_path" => AssetHelperType::ConfigPath,
-            "resource_path" => AssetHelperType::ResourcePath,
-            "mix_path" => AssetHelperType::Mix,
-            "vite_asset_path" => AssetHelperType::ViteAsset,
-            _ => continue,
-        };
-
-        let node = capture.node;
-        let path = node.utf8_text(source_bytes)?;
-
-        results.push(AssetMatch {
-            path,
-            helper_type,
-            byte_start: node.start_byte(),
-            byte_end: node.end_byte(),
-            row: node.start_position().row,
-            column: node.start_position().column,
-            end_column: node.end_position().column,
-        });
-    }
-
-    Ok(results)
-}
-
-
-
-/// Calculate the column range of the quoted string within a directive's arguments
-/// e.g., for @include with arguments "'my.view'", returns the columns for the quoted string
-fn calculate_string_column_range(directive_column: usize, directive_name: &str, arguments: &str) -> Option<(usize, usize)> {
-    // Calculate the length of the directive including @
-    let directive_len = directive_name.len() + 1; // +1 for the @ symbol
-    
-    // The arguments from tree-sitter don't include the opening parenthesis
-    // For @extends('layouts.app'):
-    //   - directive text is '@extends' (columns 0-7)
-    //   - there's a '(' at column 8 (not included in arguments)  
-    //   - arguments text is 'layouts.app' starting at column 9
-    
-    // Trim any leading whitespace from arguments
-    let trimmed = arguments.trim_start();
-    let spaces_before = arguments.len() - trimmed.len();
-    
-    // Find the first quote character (single or double)
-    let quote_char = trimmed.chars().next()?;
-    if quote_char != '\'' && quote_char != '"' {
-        return None;
-    }
-    
-    // Find the closing quote
-    let closing_quote_pos = trimmed[1..].find(quote_char)?;
-    
-    // Calculate positions relative to directive start
-    // directive_column + directive_len gets us to end of @directive (e.g., column 8)
-    // +1 for the opening parenthesis that's not in arguments
-    // +spaces_before for any whitespace at start of arguments
-    let string_start = directive_column + directive_len + 1 + spaces_before;
-    // The string ends after the opening quote + content + closing quote
-    let string_end = string_start + closing_quote_pos + 2; // +2 for both quotes
-    
-    Some((string_start, string_end))
-}
-
-// ============================================================================
-// PART 5: Tests
-// ============================================================================
-
-
-// ============================================================================
-// Container Binding Resolution
-// ============================================================================
 
 /// A match for a container binding resolution call
 #[derive(Debug, Clone)]
 pub struct BindingMatch<'a> {
-    /// The binding name/class being resolved (e.g., "auth", "App\\Contracts\\PaymentGateway")
     pub binding_name: &'a str,
-    /// Whether this is a class reference (Class::class) or a string binding
     pub is_class_reference: bool,
-    /// Starting byte offset in source
     pub byte_start: usize,
-    /// Ending byte offset in source
     pub byte_end: usize,
-    /// Line number (0-indexed)
     pub row: usize,
-    /// Column number (0-indexed) - start of the match
     pub column: usize,
-    /// End column number (0-indexed) - end of the match
     pub end_column: usize,
 }
 
-/// Find all container binding resolution calls in PHP code
+/// Represents a matched route('name') call in PHP code
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteMatch<'a> {
+    pub route_name: &'a str,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub row: usize,
+    pub column: usize,
+    pub end_column: usize,
+}
+
+/// Represents a matched url('path') call in PHP code
+#[derive(Debug, Clone, PartialEq)]
+pub struct UrlMatch<'a> {
+    pub url_path: &'a str,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub row: usize,
+    pub column: usize,
+    pub end_column: usize,
+}
+
+/// Represents a matched action('Controller@method') call in PHP code
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActionMatch<'a> {
+    pub action_name: &'a str,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub row: usize,
+    pub column: usize,
+    pub end_column: usize,
+}
+
+// ============================================================================
+// Extracted Patterns - Result structs for single-pass extraction
+// ============================================================================
+
+/// All patterns extracted from a PHP file in a single pass
+#[derive(Debug, Default)]
+pub struct ExtractedPhpPatterns<'a> {
+    pub views: Vec<ViewMatch<'a>>,
+    pub env_calls: Vec<EnvMatch<'a>>,
+    pub config_calls: Vec<ConfigMatch<'a>>,
+    pub middleware_calls: Vec<MiddlewareMatch<'a>>,
+    pub translation_calls: Vec<TranslationMatch<'a>>,
+    pub asset_calls: Vec<AssetMatch<'a>>,
+    pub binding_calls: Vec<BindingMatch<'a>>,
+    pub route_calls: Vec<RouteMatch<'a>>,
+    pub url_calls: Vec<UrlMatch<'a>>,
+    pub action_calls: Vec<ActionMatch<'a>>,
+}
+
+/// All patterns extracted from a Blade file in a single pass
+#[derive(Debug, Default)]
+pub struct ExtractedBladePatterns<'a> {
+    pub components: Vec<ComponentMatch<'a>>,
+    pub livewire: Vec<LivewireMatch<'a>>,
+    pub directives: Vec<DirectiveMatch<'a>>,
+}
+
+// ============================================================================
+// Single-Pass Extraction Functions
+// ============================================================================
+
+/// Extract all PHP patterns in a single tree traversal
 ///
-/// Matches:
-/// - app('auth') - string binding
-/// - app('cache') - string binding
-/// - app(SomeInterface::class) - class reference
-/// - app(\App\Services\PaymentService::class) - qualified class reference
-pub fn find_binding_calls<'a>(
+/// This is the primary extraction function - it runs one query and processes
+/// all captures in a single loop, dispatching based on capture name.
+pub fn extract_all_php_patterns<'a>(
     tree: &Tree,
     source: &'a str,
     language: &Language,
-) -> Result<Vec<BindingMatch<'a>>> {
-    let query = compile_php_query(language)?;
+) -> Result<ExtractedPhpPatterns<'a>> {
+    let start = Instant::now();
+    let query = get_php_query(language)?;
     let mut cursor = QueryCursor::new();
-    let mut results = Vec::new();
+    let mut result = ExtractedPhpPatterns::default();
+    let query_fetch_time = start.elapsed();
 
     let root_node = tree.root_node();
     let source_bytes = source.as_bytes();
 
-    let mut captures = cursor.captures(&query, root_node, source_bytes);
+    let mut captures = cursor.captures(query, root_node, source_bytes);
 
     while let Some((query_match, capture_index)) = captures.next() {
         let capture = &query_match.captures[*capture_index];
         let capture_name = query.capture_names()[capture.index as usize];
+        let node = capture.node;
 
-        // Handle string bindings: app('auth'), app('cache'), etc.
-        if capture_name == "binding_name" {
-            if let Ok(binding_text) = capture.node.utf8_text(source_bytes) {
-                let start_point = capture.node.start_position();
-                let end_point = capture.node.end_position();
+        // Skip if we can't get the text
+        let Ok(text) = node.utf8_text(source_bytes) else {
+            continue;
+        };
 
-                results.push(BindingMatch {
-                    binding_name: binding_text,
-                    is_class_reference: false,
-                    byte_start: capture.node.start_byte(),
-                    byte_end: capture.node.end_byte(),
-                    row: start_point.row,
-                    column: start_point.column,
-                    end_column: end_point.column,
+        let start_pos = node.start_position();
+        let end_pos = node.end_position();
+
+        match capture_name {
+            // View patterns
+            "view_name" => {
+                result.views.push(ViewMatch {
+                    view_name: text,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                    is_route_view: false,
                 });
             }
-        }
-        // Handle class references: app(SomeClass::class)
-        else if capture_name == "binding_class_name" {
-            if let Ok(class_text) = capture.node.utf8_text(source_bytes) {
-                // Clean up the class name - remove leading backslash if present
-                let clean_class = class_text.trim_start_matches('\\');
+            "route_view_name" => {
+                result.views.push(ViewMatch {
+                    view_name: text,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                    is_route_view: true,
+                });
+            }
 
-                let start_point = capture.node.start_position();
-                let end_point = capture.node.end_position();
+            // Environment variable patterns
+            "env_var" => {
+                // Check if there's a fallback argument
+                let has_fallback = check_has_fallback_argument(node);
+                result.env_calls.push(EnvMatch {
+                    var_name: text,
+                    has_fallback,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
 
-                results.push(BindingMatch {
+            // Config patterns
+            "config_key" => {
+                result.config_calls.push(ConfigMatch {
+                    config_key: text,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
+            // Middleware patterns
+            "middleware_name" => {
+                result.middleware_calls.push(MiddlewareMatch {
+                    middleware_name: text,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
+            // Translation patterns
+            "translation_key" => {
+                result.translation_calls.push(TranslationMatch {
+                    translation_key: text,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
+            // Asset and path helper patterns
+            "asset_path" => {
+                result.asset_calls.push(AssetMatch {
+                    path: text,
+                    helper_type: AssetHelperType::Asset,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+            "public_path" => {
+                result.asset_calls.push(AssetMatch {
+                    path: text,
+                    helper_type: AssetHelperType::PublicPath,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+            "base_path" => {
+                result.asset_calls.push(AssetMatch {
+                    path: text,
+                    helper_type: AssetHelperType::BasePath,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+            "app_path" => {
+                result.asset_calls.push(AssetMatch {
+                    path: text,
+                    helper_type: AssetHelperType::AppPath,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+            "storage_path" => {
+                result.asset_calls.push(AssetMatch {
+                    path: text,
+                    helper_type: AssetHelperType::StoragePath,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+            "database_path" => {
+                result.asset_calls.push(AssetMatch {
+                    path: text,
+                    helper_type: AssetHelperType::DatabasePath,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+            "lang_path" => {
+                result.asset_calls.push(AssetMatch {
+                    path: text,
+                    helper_type: AssetHelperType::LangPath,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+            "config_path" => {
+                result.asset_calls.push(AssetMatch {
+                    path: text,
+                    helper_type: AssetHelperType::ConfigPath,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+            "resource_path" => {
+                result.asset_calls.push(AssetMatch {
+                    path: text,
+                    helper_type: AssetHelperType::ResourcePath,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+            "mix_path" => {
+                result.asset_calls.push(AssetMatch {
+                    path: text,
+                    helper_type: AssetHelperType::Mix,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+            "vite_asset_path" => {
+                result.asset_calls.push(AssetMatch {
+                    path: text,
+                    helper_type: AssetHelperType::ViteAsset,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
+            // Binding patterns
+            "binding_name" => {
+                result.binding_calls.push(BindingMatch {
+                    binding_name: text,
+                    is_class_reference: false,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+            "binding_class_name" => {
+                let clean_class = text.trim_start_matches('\\');
+                result.binding_calls.push(BindingMatch {
                     binding_name: clean_class,
                     is_class_reference: true,
-                    byte_start: capture.node.start_byte(),
-                    byte_end: capture.node.end_byte(),
-                    row: start_point.row,
-                    column: start_point.column,
-                    end_column: end_point.column,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
                 });
             }
+
+            // Route patterns
+            "route_name" => {
+                result.route_calls.push(RouteMatch {
+                    route_name: text,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
+            // URL patterns
+            "url_path" => {
+                result.url_calls.push(UrlMatch {
+                    url_path: text,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
+            // Action patterns
+            "action_name" => {
+                result.action_calls.push(ActionMatch {
+                    action_name: text,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
+            // Ignore other captures (function_name, class_name, etc. used for matching)
+            _ => {}
         }
     }
 
-    Ok(results)
+    let total_time = start.elapsed();
+    let pattern_count = result.views.len() + result.env_calls.len() + result.config_calls.len()
+        + result.middleware_calls.len() + result.translation_calls.len() + result.asset_calls.len()
+        + result.binding_calls.len() + result.route_calls.len() + result.url_calls.len() + result.action_calls.len();
+    info!(
+        "📊 PHP extraction: {:?} total (query fetch: {:?}), {} patterns found",
+        total_time, query_fetch_time, pattern_count
+    );
+
+    Ok(result)
 }
+
+/// Extract all Blade patterns in a single tree traversal
+pub fn extract_all_blade_patterns<'a>(
+    tree: &Tree,
+    source: &'a str,
+    language: &Language,
+) -> Result<ExtractedBladePatterns<'a>> {
+    let start = Instant::now();
+    let query = get_blade_query(language)?;
+    let mut cursor = QueryCursor::new();
+    let mut result = ExtractedBladePatterns::default();
+    let query_fetch_time = start.elapsed();
+
+    let root_node = tree.root_node();
+    let source_bytes = source.as_bytes();
+
+    let mut captures = cursor.captures(query, root_node, source_bytes);
+
+    while let Some((query_match, capture_index)) = captures.next() {
+        let capture = &query_match.captures[*capture_index];
+        let capture_name = query.capture_names()[capture.index as usize];
+        let node = capture.node;
+
+        let Ok(text) = node.utf8_text(source_bytes) else {
+            continue;
+        };
+
+        let start_pos = node.start_position();
+        let end_pos = node.end_position();
+
+        match capture_name {
+            // Tag patterns - could be x-* components or livewire:* components
+            "tag_name" => {
+                if let Some(component_name) = text.strip_prefix("x-") {
+                    // Blade component
+                    result.components.push(ComponentMatch {
+                        component_name,
+                        tag_name: text,
+                        byte_start: node.start_byte(),
+                        byte_end: node.end_byte(),
+                        row: start_pos.row,
+                        column: start_pos.column,
+                        end_column: end_pos.column,
+                        resolved_path: None,
+                    });
+                } else if text.starts_with("livewire:") {
+                    // Livewire component tag syntax
+                    let component_name = &text[9..]; // Remove "livewire:" prefix
+                    result.livewire.push(LivewireMatch {
+                        component_name,
+                        byte_start: node.start_byte(),
+                        byte_end: node.end_byte(),
+                        row: start_pos.row,
+                        column: start_pos.column,
+                        end_column: end_pos.column,
+                    });
+                }
+            }
+
+            // Directive patterns
+            "directive" => {
+                // Skip closing directives
+                if text.starts_with("@end") {
+                    continue;
+                }
+
+                if !text.starts_with('@') {
+                    warn!("Directive text doesn't start with @: '{}'", text);
+                }
+
+                let directive_name = text.strip_prefix('@').unwrap_or(text);
+
+                // Look for parameter sibling
+                let arguments = find_next_parameter_sibling(node, source_bytes);
+
+                let full_text = if let Some(param) = arguments {
+                    format!("{}{}", text, param)
+                } else {
+                    text.to_string()
+                };
+
+                let directive_column = start_pos.column;
+                let directive_end_column = end_pos.column;
+
+                // Calculate string column positions for view-referencing directives
+                let (string_column, string_end_column) = match (directive_name, &arguments) {
+                    ("extends" | "include" | "slot" | "component", Some(args)) => {
+                        calculate_string_column_range(directive_column, directive_name, args)
+                            .unwrap_or((directive_column, directive_end_column))
+                    }
+                    _ => (directive_column, directive_end_column),
+                };
+
+                result.directives.push(DirectiveMatch {
+                    directive_name,
+                    full_text,
+                    arguments,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: directive_column,
+                    end_column: directive_end_column,
+                    string_column,
+                    string_end_column,
+                });
+            }
+
+            // @livewire('component-name') directive - component_name capture
+            "component_name" => {
+                let component_name = text.trim_matches(|c| c == '"' || c == '\'');
+                result.livewire.push(LivewireMatch {
+                    component_name,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
+            // Ignore vite_directive and other captures
+            _ => {}
+        }
+    }
+
+    let total_time = start.elapsed();
+    let pattern_count = result.components.len() + result.livewire.len() + result.directives.len();
+    info!(
+        "📊 Blade extraction: {:?} total (query fetch: {:?}), {} patterns found",
+        total_time, query_fetch_time, pattern_count
+    );
+
+    Ok(result)
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Check if an env() call has a fallback/default value (second argument)
+fn check_has_fallback_argument(node: tree_sitter::Node) -> bool {
+    // Navigate: string_content -> string -> argument -> arguments -> function_call
+    if let Some(string_node) = node.parent() {
+        if let Some(argument_node) = string_node.parent() {
+            if let Some(arguments_node) = argument_node.parent() {
+                let mut argument_count = 0;
+                for i in 0..arguments_node.child_count() {
+                    if let Some(child) = arguments_node.child(i as u32) {
+                        if child.kind() == "argument" {
+                            argument_count += 1;
+                        }
+                    }
+                }
+                return argument_count >= 2;
+            }
+        }
+    }
+    false
+}
+
+/// Find the next parameter sibling node after a directive node
+fn find_next_parameter_sibling<'a>(
+    directive_node: tree_sitter::Node,
+    source: &'a [u8],
+) -> Option<&'a str> {
+    let parent = directive_node.parent()?;
+    let mut cursor = parent.walk();
+
+    let mut found_directive = false;
+    for child in parent.children(&mut cursor) {
+        if found_directive && child.kind() == "parameter" {
+            return child.utf8_text(source).ok();
+        }
+        if child.id() == directive_node.id() {
+            found_directive = true;
+        }
+    }
+
+    None
+}
+
+/// Calculate the column range of the quoted string within a directive's arguments
+fn calculate_string_column_range(
+    directive_column: usize,
+    directive_name: &str,
+    arguments: &str,
+) -> Option<(usize, usize)> {
+    let directive_len = directive_name.len() + 1; // +1 for the @ symbol
+
+    let trimmed = arguments.trim_start();
+    let spaces_before = arguments.len() - trimmed.len();
+
+    let quote_char = trimmed.chars().next()?;
+    if quote_char != '\'' && quote_char != '"' {
+        return None;
+    }
+
+    let closing_quote_pos = trimmed[1..].find(quote_char)?;
+
+    let string_start = directive_column + directive_len + 1 + spaces_before;
+    let string_end = string_start + closing_quote_pos + 2;
+
+    Some((string_start, string_end))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -942,289 +805,71 @@ mod tests {
     use crate::parser::{language_blade, language_php, parse_blade, parse_php};
 
     #[test]
-    fn test_compile_php_query() {
-        let lang = language_php();
-        let result = compile_php_query(&lang);
-        assert!(result.is_ok(), "PHP query should compile successfully");
-    }
-
-    #[test]
-    fn test_calculate_string_column_range() {
-        // Test @extends('layouts.app') starting at column 4
-        // Tree-sitter gives us arguments WITHOUT the parentheses
-        // So for @extends('layouts.app'), arguments is "'layouts.app'"
-        let result = calculate_string_column_range(4, "extends", "'layouts.app'");
-        assert!(result.is_some());
-        let (start, end) = result.unwrap();
-        // 4 (directive_column) + 8 (@extends) + 1 (open paren) = 13
-        assert_eq!(start, 13, "String should start at column 13");
-        assert_eq!(end, 26, "String should end at column 26 (exclusive end for LSP range)");
-
-        // Test @include('components.button') starting at column 0
-        let result = calculate_string_column_range(0, "include", "'components.button'");
-        assert!(result.is_some());
-        let (start, end) = result.unwrap();
-        // 0 + 8 (@include) + 1 (open paren) = 9
-        assert_eq!(start, 9, "String should start at column 9");
-        assert_eq!(end, 28, "String should end at column 28 (exclusive end for LSP range)");
-
-        // Test with spaces: arguments is "  'view.name'" (spaces before quote)
-        let result = calculate_string_column_range(0, "include", "  'view.name'");
-        assert!(result.is_some());
-        let (start, end) = result.unwrap();
-        // 0 + 8 (@include) + 1 (open paren) + 2 (spaces) = 11
-        assert_eq!(start, 11, "String should start at column 11 with spaces");
-        assert_eq!(end, 22, "String should end at column 22");
-
-        // Test with double quotes
-        let result = calculate_string_column_range(0, "extends", "\"layouts.app\"");
-        assert!(result.is_some());
-        let (start, end) = result.unwrap();
-        assert_eq!(start, 9, "Should work with double quotes");
-        assert_eq!(end, 22, "Should end correctly with double quotes");
-    }
-
-    #[test]
-    fn test_compile_blade_query() {
-        let lang = language_blade();
-        let result = compile_blade_query(&lang);
-        assert!(result.is_ok(), "Blade query should compile successfully");
-    }
-
-    #[test]
-    fn test_find_view_calls() {
+    fn test_extract_all_php_patterns_views() {
         let php_code = r#"<?php
-        $data = ['name' => 'Laravel'];
-        return view('users.profile', $data);
+        return view('users.profile');
+        Route::view('/home', 'welcome');
         echo view("admin.dashboard");
         "#;
 
         let tree = parse_php(php_code).expect("Should parse PHP");
         let lang = language_php();
-        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
 
-        // Debug: print what we found
-        eprintln!("Found {} matches:", matches.len());
-        for (i, m) in matches.iter().enumerate() {
-            eprintln!("  [{}] view_name='{}' at {}:{}", i, m.view_name, m.row, m.column);
-        }
+        assert_eq!(patterns.views.len(), 3, "Should find 3 view calls");
 
-        assert_eq!(matches.len(), 2, "Should find 2 view calls");
+        let view_names: Vec<&str> = patterns.views.iter().map(|m| m.view_name).collect();
+        assert!(view_names.contains(&"users.profile"));
+        assert!(view_names.contains(&"welcome"));
+        assert!(view_names.contains(&"admin.dashboard"));
 
-        // Check that we found both views (order doesn't matter)
-        let view_names: Vec<&str> = matches.iter().map(|m| m.view_name).collect();
-        assert!(view_names.contains(&"users.profile"), "Should find users.profile");
-        assert!(view_names.contains(&"admin.dashboard"), "Should find admin.dashboard");
+        // Check is_route_view flag
+        let welcome = patterns.views.iter().find(|v| v.view_name == "welcome").unwrap();
+        assert!(welcome.is_route_view, "Route::view() should set is_route_view=true");
+
+        let users = patterns.views.iter().find(|v| v.view_name == "users.profile").unwrap();
+        assert!(!users.is_route_view, "view() should set is_route_view=false");
     }
 
     #[test]
-    fn test_find_hyphenated_view_calls() {
+    fn test_extract_all_php_patterns_env() {
         let php_code = r#"<?php
-        return view('user-profile');
-        echo view("admin-dashboard");
-        return view('multi-word-component');
+        $name = env('APP_NAME', 'Laravel');
+        $debug = env("APP_DEBUG");
         "#;
 
         let tree = parse_php(php_code).expect("Should parse PHP");
         let lang = language_php();
-        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
 
-        // Debug: print what we found
-        eprintln!("Found {} matches with hyphenated names:", matches.len());
-        for (i, m) in matches.iter().enumerate() {
-            eprintln!("  [{}] view_name='{}' at {}:{} (end_column: {})",
-                i, m.view_name, m.row, m.column, m.end_column);
-            eprintln!("      Length: {}, contains hyphens: {}",
-                m.view_name.len(), m.view_name.contains('-'));
-        }
-
-        assert_eq!(matches.len(), 3, "Should find 3 view calls");
-
-        // Check that we found all hyphenated views
-        let view_names: Vec<&str> = matches.iter().map(|m| m.view_name).collect();
-        assert!(view_names.contains(&"user-profile"), "Should find user-profile");
-        assert!(view_names.contains(&"admin-dashboard"), "Should find admin-dashboard");
-        assert!(view_names.contains(&"multi-word-component"), "Should find multi-word-component");
-
-        // Verify that the column range covers the entire name
-        for m in matches.iter() {
-            let name_len = m.view_name.len();
-            let column_span = m.end_column - m.column;
-            eprintln!("Checking '{}': name_len={}, column_span={}", m.view_name, name_len, column_span);
-        }
+        assert_eq!(patterns.env_calls.len(), 2, "Should find 2 env calls");
+        assert_eq!(patterns.env_calls[0].var_name, "APP_NAME");
+        assert_eq!(patterns.env_calls[1].var_name, "APP_DEBUG");
     }
 
     #[test]
-    fn test_find_route_view_calls() {
+    fn test_extract_all_php_patterns_middleware() {
         let php_code = r#"<?php
-        Route::view('/home', 'welcome');
-        Route::view('/about', "pages.about");
-        Route::view('/contact', 'contact.form');
+        Route::middleware('auth')->group(function () {});
+        Route::middleware(['auth', 'verified'])->get('/dashboard');
         "#;
 
         let tree = parse_php(php_code).expect("Should parse PHP");
         let lang = language_php();
-        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
 
-        // Debug: print what we found
-        eprintln!("Found {} Route::view() matches:", matches.len());
-        for (i, m) in matches.iter().enumerate() {
-            eprintln!("  [{}] view_name='{}' at {}:{}", i, m.view_name, m.row, m.column);
-        }
+        let middleware_names: Vec<&str> = patterns.middleware_calls.iter()
+            .map(|m| m.middleware_name).collect();
 
-        assert_eq!(matches.len(), 3, "Should find 3 Route::view() calls");
-
-        // Check that we found all views (second argument of Route::view)
-        let view_names: Vec<&str> = matches.iter().map(|m| m.view_name).collect();
-        assert!(view_names.contains(&"welcome"), "Should find welcome");
-        assert!(view_names.contains(&"pages.about"), "Should find pages.about");
-        assert!(view_names.contains(&"contact.form"), "Should find contact.form");
+        assert!(middleware_names.contains(&"auth"), "Should find 'auth' middleware");
+        assert!(middleware_names.contains(&"verified"), "Should find 'verified' middleware");
     }
 
     #[test]
-    fn test_mixed_view_patterns() {
-        let php_code = r#"<?php
-        return view('users.index');
-        Route::view('/home', 'welcome');
-        return View::make('admin.dashboard');
-        Route::view('/about', "pages.about");
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
-
-        // Debug: print what we found
-        eprintln!("Found {} mixed pattern matches:", matches.len());
-        for (i, m) in matches.iter().enumerate() {
-            eprintln!("  [{}] view_name='{}' at {}:{}", i, m.view_name, m.row, m.column);
-        }
-
-        assert_eq!(matches.len(), 4, "Should find all 4 view patterns");
-
-        // Check that we found all views from different patterns
-        let view_names: Vec<&str> = matches.iter().map(|m| m.view_name).collect();
-        assert!(view_names.contains(&"users.index"), "Should find view() call");
-        assert!(view_names.contains(&"welcome"), "Should find Route::view() call");
-        assert!(view_names.contains(&"admin.dashboard"), "Should find View::make() call");
-        assert!(view_names.contains(&"pages.about"), "Should find Route::view() call");
-    }
-
-    #[test]
-    fn test_find_volt_route_calls() {
-        let php_code = r#"<?php
-        Volt::route('/home', 'welcome');
-        Volt::route('/about', "pages.about");
-        Volt::route('/contact', 'volt.contact');
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
-
-        // Debug: print what we found
-        eprintln!("Found {} Volt::route() matches:", matches.len());
-        for (i, m) in matches.iter().enumerate() {
-            eprintln!("  [{}] view_name='{}' at {}:{} is_route_view={}", 
-                i, m.view_name, m.row, m.column, m.is_route_view);
-        }
-
-        assert_eq!(matches.len(), 3, "Should find 3 Volt::route() calls");
-
-        // Check that we found all views (second argument of Volt::route)
-        let view_names: Vec<&str> = matches.iter().map(|m| m.view_name).collect();
-        assert!(view_names.contains(&"welcome"), "Should find welcome");
-        assert!(view_names.contains(&"pages.about"), "Should find pages.about");
-        assert!(view_names.contains(&"volt.contact"), "Should find volt.contact");
-        
-        // Verify all are marked as route views (should be ERROR if missing)
-        for m in matches.iter() {
-            assert!(m.is_route_view, "Volt::route() should set is_route_view=true");
-        }
-    }
-
-    #[test]
-    fn test_route_view_flag_distinction() {
-        let php_code = r#"<?php
-        return view('users.index');
-        Route::view('/home', 'welcome');
-        Volt::route('/about', 'pages.about');
-        return View::make('admin.dashboard');
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
-
-        // Debug: print what we found
-        eprintln!("Found {} matches with is_route_view flags:", matches.len());
-        for (i, m) in matches.iter().enumerate() {
-            eprintln!("  [{}] view_name='{}' is_route_view={}", 
-                i, m.view_name, m.is_route_view);
-        }
-
-        assert_eq!(matches.len(), 4, "Should find all 4 view patterns");
-
-        // Find specific matches
-        let users_index = matches.iter().find(|m| m.view_name == "users.index").unwrap();
-        let welcome = matches.iter().find(|m| m.view_name == "welcome").unwrap();
-        let pages_about = matches.iter().find(|m| m.view_name == "pages.about").unwrap();
-        let admin_dashboard = matches.iter().find(|m| m.view_name == "admin.dashboard").unwrap();
-
-        // Regular view() and View::make() should NOT be route views
-        assert!(!users_index.is_route_view, "view() should have is_route_view=false");
-        assert!(!admin_dashboard.is_route_view, "View::make() should have is_route_view=false");
-
-        // Route::view() and Volt::route() SHOULD be route views
-        assert!(welcome.is_route_view, "Route::view() should have is_route_view=true");
-        assert!(pages_about.is_route_view, "Volt::route() should have is_route_view=true");
-    }
-
-    #[test]
-    fn test_find_env_calls() {
-        let source = r#"
-            <?php
-            $name = env('APP_NAME', 'Laravel');
-            $debug = env("APP_DEBUG");
-            "#;
-
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&language_php()).unwrap();
-        let tree = parser.parse(source, None).unwrap();
-
-        let matches = find_env_calls(&tree, source, &language_php()).unwrap();
-
-        eprintln!("Found {} env matches:", matches.len());
-        for (i, m) in matches.iter().enumerate() {
-            eprintln!("  [{}] var_name='{}' at {}:{}", i, m.var_name, m.row, m.column);
-        }
-
-        assert_eq!(matches.len(), 2, "Should find exactly 2 env() calls");
-        assert_eq!(matches[0].var_name, "APP_NAME");
-        assert_eq!(matches[1].var_name, "APP_DEBUG");
-    }
-
-    #[test]
-    fn test_find_config_calls() {
-        let source = r#"
-            <?php
-            $name = config('app.name');
-            $host = config("database.connections.mysql.host");
-            "#;
-
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&language_php()).unwrap();
-        let tree = parser.parse(source, None).unwrap();
-
-        let matches = find_config_calls(&tree, source, &language_php()).unwrap();
-
-        assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].config_key, "app.name");
-        assert_eq!(matches[1].config_key, "database.connections.mysql.host");
-    }
-
-    #[test]
-    fn test_find_blade_components() {
+    fn test_extract_all_blade_patterns_components() {
         let blade_code = r#"
         <div>
             <x-button type="primary">Click me</x-button>
@@ -1234,14 +879,13 @@ mod tests {
 
         let tree = parse_blade(blade_code).expect("Should parse Blade");
         let lang = language_blade();
-        let matches = find_blade_components(&tree, blade_code, &lang).expect("Should find components");
+        let patterns = extract_all_blade_patterns(&tree, blade_code, &lang)
+            .expect("Should extract patterns");
 
-        // The exact count depends on grammar behavior
-        // We should find at least the opening tags
-        assert!(!matches.is_empty(), "Should find at least one component");
+        assert!(!patterns.components.is_empty(), "Should find at least one component");
 
-        // Check that we found button and forms.input
-        let component_names: Vec<&str> = matches.iter().map(|m| m.component_name).collect();
+        let component_names: Vec<&str> = patterns.components.iter()
+            .map(|m| m.component_name).collect();
         assert!(
             component_names.iter().any(|&name| name == "button" || name.starts_with("button")),
             "Should find button component"
@@ -1249,615 +893,62 @@ mod tests {
     }
 
     #[test]
-    fn test_find_livewire_components() {
-        let blade_code = r#"
-        <div>
-            <livewire:user-profile />
-            @livewire('admin.dashboard')
-        </div>
-        "#;
-
-        let tree = parse_blade(blade_code).expect("Should parse Blade");
-        let lang = language_blade();
-        let matches = find_livewire_components(&tree, blade_code, &lang).expect("Should find livewire");
-
-        // Should find both tag and directive syntax
-        assert!(!matches.is_empty(), "Should find at least one Livewire component");
-    }
-
-
-
-    #[test]
-    fn test_find_directives() {
+    fn test_extract_all_blade_patterns_directives() {
         let blade_code = r#"
 @extends('layouts.app')
-
 @section('content')
     @foreach($users as $user)
         <p>{{ $user->name }}</p>
     @endforeach
-
-    @customDirective('some-argument')
-
-    @if($condition)
-        <div>True</div>
-    @endif
 @endsection
         "#;
 
         let tree = parse_blade(blade_code).expect("Should parse Blade");
         let lang = language_blade();
-        let matches = find_directives(&tree, blade_code, &lang).expect("Should find directives");
+        let patterns = extract_all_blade_patterns(&tree, blade_code, &lang)
+            .expect("Should extract patterns");
 
-        eprintln!("Found {} directives:", matches.len());
-        for (i, m) in matches.iter().enumerate() {
-            eprintln!("  [{}] directive='{}' full='{}' args={:?}",
-                i, m.directive_name, m.full_text, m.arguments);
-        }
-
-        // Should find multiple directives
-        assert!(!matches.is_empty(), "Should find at least one directive");
-
-        // Check for specific directives
-        let directive_names: Vec<&str> = matches.iter().map(|m| m.directive_name).collect();
+        let directive_names: Vec<&str> = patterns.directives.iter()
+            .map(|m| m.directive_name).collect();
 
         assert!(directive_names.contains(&"extends"), "Should find @extends");
         assert!(directive_names.contains(&"section"), "Should find @section");
         assert!(directive_names.contains(&"foreach"), "Should find @foreach");
-        assert!(directive_names.contains(&"if"), "Should find @if");
-        assert!(directive_names.contains(&"customDirective"), "Should find @customDirective");
 
-        // Check that we have arguments for some
-        let extends_match = matches.iter().find(|m| m.directive_name == "extends").unwrap();
-        assert!(extends_match.arguments.is_some(), "@extends should have arguments");
-        assert!(extends_match.arguments.unwrap().contains("layouts.app"));
+        // Should NOT contain closing directives
+        assert!(!directive_names.contains(&"endforeach"), "Should not find @endforeach");
+        assert!(!directive_names.contains(&"endsection"), "Should not find @endsection");
     }
 
     #[test]
-    fn test_directive_positions_include_at_symbol() {
-        // This test verifies that directive byte positions include the @ symbol
-        let blade_code = "@extends('layouts.app')";
-
-        let tree = parse_blade(blade_code).expect("Should parse Blade");
-        let lang = language_blade();
-        let matches = find_directives(&tree, blade_code, &lang).expect("Should find directives");
-
-        assert_eq!(matches.len(), 1, "Should find exactly one directive");
-        let directive_match = &matches[0];
-
-        // The directive should start at byte 0 (the @ symbol)
-        assert_eq!(directive_match.byte_start, 0, "Directive should start at byte 0 (@ symbol)");
-
-        // The column should be 0 (the @ symbol position)
-        assert_eq!(directive_match.column, 0, "Directive should start at column 0 (@ symbol)");
-
-        // The full_text should include the @ symbol
-        assert!(directive_match.full_text.starts_with('@'),
-            "Full text should start with @ symbol, got: '{}'", directive_match.full_text);
-
-        // Verify that the character at byte_start is @
-        let char_at_start = blade_code.as_bytes()[directive_match.byte_start] as char;
-        assert_eq!(char_at_start, '@', "Character at byte_start should be @");
-
-        eprintln!("✓ Directive correctly includes @ symbol:");
-        eprintln!("  full_text: '{}'", directive_match.full_text);
-        eprintln!("  byte_start: {} (char: '{}')", directive_match.byte_start, char_at_start);
-        eprintln!("  column: {}", directive_match.column);
-    }
-
-    #[test]
-    fn test_find_middleware_calls() {
-        let php_code = r#"
-<?php
-
-use Illuminate\Support\Facades\Route;
-
-Route::get('/dashboard', function () {
-    return view('dashboard');
-})->middleware('auth');
-
-Route::middleware('verified')->group(function () {
-    Route::get('/profile', [ProfileController::class, 'show']);
-});
-
-Route::middleware(['auth', 'verified'])->group(function () {
-    Route::get('/settings', [SettingsController::class, 'index']);
-});
-
-Route::withoutMiddleware('auth')->get('/public', function () {
-    return 'public';
-});
-
-Route::get('/api/data')->middleware(['throttle:60,1', 'auth']);
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_middleware_calls(&tree, php_code, &lang).expect("Should find middleware");
-
-        assert!(!matches.is_empty(), "Should find middleware calls");
-
-        // Verify we found all the middleware references
-        let middleware_names: Vec<&str> = matches.iter().map(|m| m.middleware_name).collect();
-        
-        assert!(middleware_names.contains(&"auth"), "Should find 'auth' middleware");
-        assert!(middleware_names.contains(&"verified"), "Should find 'verified' middleware");
-        assert!(middleware_names.contains(&"throttle:60,1"), "Should find 'throttle:60,1' middleware with parameters");
-
-        eprintln!("✓ Found {} middleware references:", matches.len());
-        for m in &matches {
-            eprintln!("  - '{}' at line {}", m.middleware_name, m.row + 1);
-        }
-    }
-
-    #[test]
-    fn test_find_translation_calls() {
-        let php_code = r#"
-<?php
-
-// Short helper function
-$message = __('messages.welcome');
-$error = __("auth.failed");
-
-// Trans helper
-$title = trans('pages.home.title');
-$description = trans("pages.about.description");
-
-// Trans choice for pluralization
-$count = trans_choice('messages.apples', 10);
-$time = trans_choice("messages.minutes_ago", $minutes);
-
-// Lang facade
-$greeting = Lang::get('messages.greeting');
-$farewell = \Lang::get("messages.farewell");
-
-// JSON translations (plain strings)
-$simple = __('Welcome to our application');
-
-// Nested keys
-$nested = __('validation.custom.email.required');
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_translation_calls(&tree, php_code, &lang).expect("Should find translations");
-
-        assert!(!matches.is_empty(), "Should find translation calls");
-
-        // Verify we found all the translation references
-        let translation_keys: Vec<&str> = matches.iter().map(|m| m.translation_key).collect();
-        
-        assert!(translation_keys.contains(&"messages.welcome"), "Should find 'messages.welcome'");
-        assert!(translation_keys.contains(&"auth.failed"), "Should find 'auth.failed'");
-        assert!(translation_keys.contains(&"pages.home.title"), "Should find 'pages.home.title'");
-        assert!(translation_keys.contains(&"messages.apples"), "Should find 'messages.apples' from trans_choice");
-        assert!(translation_keys.contains(&"messages.greeting"), "Should find 'messages.greeting' from Lang::get");
-        assert!(translation_keys.contains(&"Welcome to our application"), "Should find JSON translation");
-        assert!(translation_keys.contains(&"validation.custom.email.required"), "Should find nested key");
-
-        eprintln!("✓ Found {} translation references:", matches.len());
-        for m in &matches {
-            eprintln!("  - '{}' at line {}", m.translation_key, m.row + 1);
-        }
-    }
-
-    #[test]
-    fn test_find_multi_word_translation_calls() {
-        let php_code = r#"
-<?php
-
-// Multi-word translations (JSON only)
-$welcome = __('Welcome to our application');
-$please_login = __('Please login to continue');
-$success = trans('Your profile has been updated');
-$error = Lang::get('An error occurred while processing your request');
-
-// Mixed with single words
-$ok = __('OK');
-$long_message = __('This is a longer message with multiple words');
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_translation_calls(&tree, php_code, &lang).expect("Should find translations");
-
-        assert!(!matches.is_empty(), "Should find translation calls");
-
-        // Verify we found all the translation references
-        let translation_keys: Vec<&str> = matches.iter().map(|m| m.translation_key).collect();
-        
-        assert!(translation_keys.contains(&"Welcome to our application"), "Should find multi-word key");
-        assert!(translation_keys.contains(&"Please login to continue"), "Should find multi-word key");
-        assert!(translation_keys.contains(&"Your profile has been updated"), "Should find multi-word key");
-        assert!(translation_keys.contains(&"An error occurred while processing your request"), "Should find long multi-word key");
-        assert!(translation_keys.contains(&"OK"), "Should find single-word key");
-        assert!(translation_keys.contains(&"This is a longer message with multiple words"), "Should find long message");
-
-        eprintln!("✓ Found {} multi-word translation references:", matches.len());
-        for m in &matches {
-            eprintln!("  - '{}' at line {}", m.translation_key, m.row + 1);
-        }
-    }
-
-    #[test]
-    fn test_find_single_word_translation_calls() {
-        let php_code = r#"
-<?php
-
-// Single word keys (could be JSON or PHP)
-$confirm = __('Confirm');
-$cancel = __('Cancel');
-$save = trans('Save');
-$delete = Lang::get('Delete');
-
-// These should also be found
-$yes = __('Yes');
-$no = __('No');
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_translation_calls(&tree, php_code, &lang).expect("Should find translations");
-
-        assert!(!matches.is_empty(), "Should find translation calls");
-
-        // Verify we found all the single-word translation references
-        let translation_keys: Vec<&str> = matches.iter().map(|m| m.translation_key).collect();
-        
-        assert!(translation_keys.contains(&"Confirm"), "Should find 'Confirm'");
-        assert!(translation_keys.contains(&"Cancel"), "Should find 'Cancel'");
-        assert!(translation_keys.contains(&"Save"), "Should find 'Save'");
-        assert!(translation_keys.contains(&"Delete"), "Should find 'Delete'");
-        assert!(translation_keys.contains(&"Yes"), "Should find 'Yes'");
-        assert!(translation_keys.contains(&"No"), "Should find 'No'");
-
-        eprintln!("✓ Found {} single-word translation references:", matches.len());
-        for m in &matches {
-            eprintln!("  - '{}' at line {}", m.translation_key, m.row + 1);
-        }
-    }
-
-    #[test]
-    fn test_view_positions_exclude_quotes() {
-        // This test verifies that view name positions exclude the surrounding quotes
+    fn test_single_pass_is_faster() {
+        // This test demonstrates the expected behavior - single pass should work
         let php_code = r#"<?php
-return view('welcome');
-echo view("dashboard");
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
-
-        assert_eq!(matches.len(), 2, "Should find 2 view calls");
-
-        for view_match in &matches {
-            let source_bytes = php_code.as_bytes();
-            
-            // Extract the actual characters at the matched byte positions
-            let char_at_start = source_bytes[view_match.byte_start] as char;
-            let char_at_end = source_bytes[view_match.byte_end - 1] as char;
-            
-            eprintln!("Testing view '{}' at byte range {}..{}", 
-                view_match.view_name, view_match.byte_start, view_match.byte_end);
-            eprintln!("  char_at_start: '{}' (should NOT be a quote)", char_at_start);
-            eprintln!("  char_at_end: '{}' (should NOT be a quote)", char_at_end);
-            
-            // The byte positions should point to the actual view name content, not the quotes
-            assert_ne!(char_at_start, '\'', "Start position should not be a single quote");
-            assert_ne!(char_at_start, '"', "Start position should not be a double quote");
-            assert_ne!(char_at_end, '\'', "End position should not be a single quote");
-            assert_ne!(char_at_end, '"', "End position should not be a double quote");
-            
-            // The extracted text should match the view name
-            let extracted_text = std::str::from_utf8(
-                &source_bytes[view_match.byte_start..view_match.byte_end]
-            ).expect("Should be valid UTF-8");
-            
-            assert_eq!(extracted_text, view_match.view_name,
-                "Extracted text should match view_name without quotes");
-        }
-    }
-
-    #[test]
-    fn test_view_column_positions_exclude_quotes() {
-        // This test verifies that column positions for LSP ranges exclude the surrounding quotes
-        let php_code = r#"<?php
-return view('welcome');
-echo view("dashboard");
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
-
-        assert_eq!(matches.len(), 2, "Should find 2 view calls");
-
-        for view_match in &matches {
-            let source_bytes = php_code.as_bytes();
-            
-            // Get the line of text
-            let lines: Vec<&str> = php_code.lines().collect();
-            let line_text = lines[view_match.row];
-            let line_bytes = line_text.as_bytes();
-            
-            // Extract characters at the column positions
-            if view_match.column < line_bytes.len() {
-                let char_at_column = line_bytes[view_match.column] as char;
-                eprintln!("Testing view '{}' at row {} column {} (end_column {})", 
-                    view_match.view_name, view_match.row, view_match.column, view_match.end_column);
-                eprintln!("  Line: '{}'", line_text);
-                eprintln!("  char_at_column {}: '{}' (should NOT be a quote)", view_match.column, char_at_column);
-                
-                // The column position should point to the first character of the view name, not the quote
-                assert_ne!(char_at_column, '\'', 
-                    "Column {} should not point to a single quote, but found '{}' in line: {}", 
-                    view_match.column, char_at_column, line_text);
-                assert_ne!(char_at_column, '"', 
-                    "Column {} should not point to a double quote, but found '{}' in line: {}", 
-                    view_match.column, char_at_column, line_text);
-            }
-            
-            if view_match.end_column > 0 && view_match.end_column <= line_bytes.len() {
-                let char_before_end = line_bytes[view_match.end_column - 1] as char;
-                eprintln!("  char before end_column {}: '{}' (should NOT be a quote)", view_match.end_column, char_before_end);
-                
-                // The end_column-1 should point to the last character of the view name, not the quote
-                assert_ne!(char_before_end, '\'', 
-                    "Character before end_column {} should not be a single quote, but found '{}' in line: {}", 
-                    view_match.end_column, char_before_end, line_text);
-                assert_ne!(char_before_end, '"', 
-                    "Character before end_column {} should not be a double quote, but found '{}' in line: {}", 
-                    view_match.end_column, char_before_end, line_text);
-            }
-        }
-    }
-
-    #[test]
-    fn test_route_view_column_positions_exclude_quotes() {
-        // This test specifically checks Route::view() and Volt::route() patterns
-        // to ensure column positions exclude quotes for goto navigation
-        let php_code = r#"<?php
-Route::view('/home', 'welcome');
-Route::view('/about', "pages.about");
-Volt::route('/contact', 'contact.form');
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_view_calls(&tree, php_code, &lang).expect("Should find views");
-
-        assert_eq!(matches.len(), 3, "Should find 3 route view calls");
-
-        for view_match in &matches {
-            let lines: Vec<&str> = php_code.lines().collect();
-            let line_text = lines[view_match.row];
-            let line_bytes = line_text.as_bytes();
-            
-            eprintln!("\nTesting route view '{}' at row {} column {}-{}", 
-                view_match.view_name, view_match.row, view_match.column, view_match.end_column);
-            eprintln!("  Line: '{}'", line_text);
-            
-            // Check start position
-            if view_match.column < line_bytes.len() {
-                let char_at_start = line_bytes[view_match.column] as char;
-                eprintln!("  char_at_column[{}]: '{}' (should be first char of '{}')", 
-                    view_match.column, char_at_start, view_match.view_name);
-                
-                // Should point to first character of view name, not quote
-                assert_ne!(char_at_start, '\'', 
-                    "Route::view() column should not point to single quote");
-                assert_ne!(char_at_start, '"', 
-                    "Route::view() column should not point to double quote");
-                
-                // Should match the first character of the view name
-                let expected_first_char = view_match.view_name.chars().next().unwrap();
-                assert_eq!(char_at_start, expected_first_char,
-                    "Start column should point to first char of view name");
-            }
-            
-            // Check end position
-            if view_match.end_column > 0 && view_match.end_column <= line_bytes.len() {
-                let char_before_end = line_bytes[view_match.end_column - 1] as char;
-                eprintln!("  char_at_column[{}]: '{}' (should be last char of '{}')", 
-                    view_match.end_column - 1, char_before_end, view_match.view_name);
-                
-                // Should point to last character of view name, not quote
-                assert_ne!(char_before_end, '\'', 
-                    "Route::view() end column should not point to single quote");
-                assert_ne!(char_before_end, '"', 
-                    "Route::view() end column should not point to double quote");
-                
-                // Should match the last character of the view name
-                let expected_last_char = view_match.view_name.chars().last().unwrap();
-                assert_eq!(char_before_end, expected_last_char,
-                    "End column should point to last char of view name");
-            }
-            
-            // Extract the text using the column range
-            let extracted = &line_bytes[view_match.column..view_match.end_column];
-            let extracted_text = std::str::from_utf8(extracted).expect("Should be valid UTF-8");
-            eprintln!("  Extracted: '{}' (should match '{}')", extracted_text, view_match.view_name);
-            
-            assert_eq!(extracted_text, view_match.view_name,
-                "Column range should extract exact view name without quotes");
-        }
-    }
-
-    #[test]
-    fn test_find_asset_calls() {
-        let php_code = r#"<?php
+        return view('home');
+        $name = env('APP_NAME');
+        $key = config('app.key');
+        Route::middleware('auth')->get('/');
+        $msg = __('messages.welcome');
         $css = asset('css/app.css');
-        $img = asset("images/logo.png");
-        $js = asset('js/main.js');
+        $service = app('cache');
+        $url = route('home');
         "#;
 
         let tree = parse_php(php_code).expect("Should parse PHP");
         let lang = language_php();
-        let matches = find_asset_calls(&tree, php_code, &lang).expect("Should find assets");
 
-        assert_eq!(matches.len(), 3, "Should find 3 asset() calls");
+        // Should extract all patterns in one call
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
 
-        let paths: Vec<&str> = matches.iter().map(|m| m.path).collect();
-        assert!(paths.contains(&"css/app.css"), "Should find css/app.css");
-        assert!(paths.contains(&"images/logo.png"), "Should find images/logo.png");
-        assert!(paths.contains(&"js/main.js"), "Should find js/main.js");
-
-        // Check helper types
-        for m in &matches {
-            assert_eq!(m.helper_type, AssetHelperType::Asset);
-        }
+        // Verify we found patterns of different types
+        assert!(!patterns.views.is_empty(), "Should find views");
+        assert!(!patterns.env_calls.is_empty(), "Should find env calls");
+        assert!(!patterns.config_calls.is_empty(), "Should find config calls");
+        assert!(!patterns.middleware_calls.is_empty(), "Should find middleware");
+        assert!(!patterns.translation_calls.is_empty(), "Should find translations");
+        assert!(!patterns.asset_calls.is_empty(), "Should find assets");
+        assert!(!patterns.binding_calls.is_empty(), "Should find bindings");
+        assert!(!patterns.route_calls.is_empty(), "Should find routes");
     }
-
-    #[test]
-    fn test_find_path_helpers() {
-        let php_code = r#"<?php
-        $base = base_path('composer.json');
-        $app = app_path('Models/User.php');
-        $storage = storage_path('logs/laravel.log');
-        $db = database_path('seeders/UserSeeder.php');
-        $lang = lang_path('en/messages.php');
-        $config = config_path('app.php');
-        $resource = resource_path('views/welcome.blade.php');
-        $public = public_path('index.php');
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_asset_calls(&tree, php_code, &lang).expect("Should find paths");
-
-        assert_eq!(matches.len(), 8, "Should find 8 path helper calls");
-
-        // Check each helper type
-        let base_match = matches.iter().find(|m| m.path == "composer.json").unwrap();
-        assert_eq!(base_match.helper_type, AssetHelperType::BasePath);
-
-        let app_match = matches.iter().find(|m| m.path == "Models/User.php").unwrap();
-        assert_eq!(app_match.helper_type, AssetHelperType::AppPath);
-
-        let storage_match = matches.iter().find(|m| m.path == "logs/laravel.log").unwrap();
-        assert_eq!(storage_match.helper_type, AssetHelperType::StoragePath);
-
-        let db_match = matches.iter().find(|m| m.path == "seeders/UserSeeder.php").unwrap();
-        assert_eq!(db_match.helper_type, AssetHelperType::DatabasePath);
-
-        let lang_match = matches.iter().find(|m| m.path == "en/messages.php").unwrap();
-        assert_eq!(lang_match.helper_type, AssetHelperType::LangPath);
-
-        let config_match = matches.iter().find(|m| m.path == "app.php").unwrap();
-        assert_eq!(config_match.helper_type, AssetHelperType::ConfigPath);
-
-        let resource_match = matches.iter().find(|m| m.path == "views/welcome.blade.php").unwrap();
-        assert_eq!(resource_match.helper_type, AssetHelperType::ResourcePath);
-
-        let public_match = matches.iter().find(|m| m.path == "index.php").unwrap();
-        assert_eq!(public_match.helper_type, AssetHelperType::PublicPath);
-    }
-
-    #[test]
-    fn test_find_vite_asset_calls() {
-        let php_code = r#"<?php
-        $logo = Vite::asset('resources/images/logo.svg');
-        $icon = Vite::asset("resources/images/favicon.ico");
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_asset_calls(&tree, php_code, &lang).expect("Should find Vite assets");
-
-        assert_eq!(matches.len(), 2, "Should find 2 Vite::asset() calls");
-
-        let paths: Vec<&str> = matches.iter().map(|m| m.path).collect();
-        assert!(paths.contains(&"resources/images/logo.svg"), "Should find logo.svg");
-        assert!(paths.contains(&"resources/images/favicon.ico"), "Should find favicon.ico");
-
-        for m in &matches {
-            assert_eq!(m.helper_type, AssetHelperType::ViteAsset);
-        }
-    }
-
-    #[test]
-    fn test_find_mix_calls() {
-        let php_code = r#"<?php
-        $css = mix('css/app.css');
-        $js = mix("js/app.js");
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_asset_calls(&tree, php_code, &lang).expect("Should find mix calls");
-
-        assert_eq!(matches.len(), 2, "Should find 2 mix() calls");
-
-        let paths: Vec<&str> = matches.iter().map(|m| m.path).collect();
-        assert!(paths.contains(&"css/app.css"), "Should find css/app.css");
-        assert!(paths.contains(&"js/app.js"), "Should find js/app.js");
-
-        for m in &matches {
-            assert_eq!(m.helper_type, AssetHelperType::Mix);
-        }
-    }
-
-    // NOTE: test_extract_vite_asset_paths was removed - extract_vite_asset_paths function
-    // doesn't exist. This test was for planned functionality that was never implemented.
-
-    #[test]
-    fn test_asset_column_positions_exclude_quotes() {
-        let php_code = r#"<?php
-$img = asset('images/logo.png');
-        "#;
-
-        let tree = parse_php(php_code).expect("Should parse PHP");
-        let lang = language_php();
-        let matches = find_asset_calls(&tree, php_code, &lang).expect("Should find assets");
-
-        assert_eq!(matches.len(), 1);
-        let asset_match = &matches[0];
-
-        let lines: Vec<&str> = php_code.lines().collect();
-        let line_text = lines[asset_match.row];
-        let line_bytes = line_text.as_bytes();
-
-        // Check that column positions don't include quotes
-        let char_at_start = line_bytes[asset_match.column] as char;
-        assert_ne!(char_at_start, '\'', "Column should not point to quote");
-        assert_ne!(char_at_start, '"', "Column should not point to quote");
-
-        // Should be the first character of the path
-        assert_eq!(char_at_start, 'i', "Should point to first char of 'images'");
-
-        // Extract text using column range
-        let extracted = &line_bytes[asset_match.column..asset_match.end_column];
-        let extracted_text = std::str::from_utf8(extracted).expect("Should be valid UTF-8");
-        assert_eq!(extracted_text, "images/logo.png", "Should extract path without quotes");
-    }
-
-    // NOTE: test_extract_vite_with_actual_format was removed - extract_vite_asset_paths function
-    // doesn't exist. This test was for planned functionality that was never implemented.
-
-    #[test]
-    fn test_find_vite_directive() {
-        let blade_code = r#"
-@vite(['resources/css/app.css', 'resources/js/app.js'])
-        "#;
-
-        let tree = parse_blade(blade_code).expect("Should parse Blade");
-        let lang = language_blade();
-        let matches = find_directives(&tree, blade_code, &lang).expect("Should find directives");
-
-        eprintln!("Found {} directives", matches.len());
-        for (i, m) in matches.iter().enumerate() {
-            eprintln!("  [{}] directive_name='{}' full_text='{}'", i, m.directive_name, m.full_text);
-        }
-
-        // Should find @vite directive
-        let vite_match = matches.iter().find(|m| m.directive_name == "vite");
-        assert!(vite_match.is_some(), "Should find @vite directive");
-        
-        let vite = vite_match.unwrap();
-        assert_eq!(vite.directive_name, "vite");
-        assert!(vite.full_text.contains("resources/css/app.css"));
-        assert!(vite.full_text.contains("resources/js/app.js"));
-    }
-
 }

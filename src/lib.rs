@@ -1,10 +1,13 @@
+use std::fs;
 use std::path::PathBuf;
-use zed_extension_api::{self as zed, LanguageServerId, Result};
+use zed_extension_api::{self as zed, Result};
+
+// Extension version - used for versioned binary directory
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The main struct for our Laravel extension
-/// We'll expand this to manage LSP state in Phase 5
 struct LaravelExtension {
-    /// Whether we've downloaded/installed the language server
+    /// Cached path to the language server binary
     cached_binary_path: Option<String>,
 }
 
@@ -18,15 +21,12 @@ impl zed::Extension for LaravelExtension {
     }
 
     /// This method tells Zed what language server to use
-    /// Returns the command to start our Laravel Language Server
     fn language_server_command(
         &mut self,
-        language_server_id: &zed::LanguageServerId,
+        _language_server_id: &zed::LanguageServerId,
         worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
-        // For development, use the built binary from our project
-        // In production, this would download from GitHub releases
-        let binary_path = self.language_server_binary_path(language_server_id, worktree)?;
+        let binary_path = self.language_server_binary_path(worktree)?;
 
         Ok(zed::Command {
             command: binary_path,
@@ -35,115 +35,157 @@ impl zed::Extension for LaravelExtension {
         })
     }
 
-    /// Phase 5: Configure LSP initialization options
     fn language_server_initialization_options(
         &mut self,
         _language_server_id: &zed::LanguageServerId,
         _worktree: &zed::Worktree,
     ) -> Result<Option<zed::serde_json::Value>> {
-        // Future: Pass Laravel project configuration to the LSP
         Ok(None)
     }
 }
 
 impl LaravelExtension {
-    /// Get or install the language server binary
+    /// Get or download the language server binary
     ///
-    /// This follows the standard Zed extension pattern with development support:
-    /// 1. Check cached path
-    /// 2. Check absolute development path (hardcoded for local development)
-    /// 3. Try to find in system PATH using worktree.which()
-    /// 4. Check extension's working directory
-    /// 5. Check relative paths for local development
-    /// 6. In production, would download from GitHub releases
-    fn language_server_binary_path(
-        &mut self,
-        _language_server_id: &LanguageServerId,
-        worktree: &zed::Worktree,
-    ) -> Result<String> {
-        // Step 1: Check if we have a cached path
-        if let Some(path) = &self.cached_binary_path {
-            return Ok(path.clone());
+    /// Search order (optimized for development workflow):
+    /// 1. DEV MODE: Check cargo build output (laravel-lsp/target/release/)
+    ///    - Only exists when running as dev extension from source
+    ///    - Not cached - always checks fresh so rebuilds are picked up immediately
+    /// 2. Check cached path (for production, verify still exists)
+    /// 3. Check versioned extension directory (laravel-lsp-{VERSION}/)
+    /// 4. Try system PATH via worktree.which()
+    /// 5. Download from GitHub releases
+    fn language_server_binary_path(&mut self, worktree: &zed::Worktree) -> Result<String> {
+        // Step 1: DEV MODE - Check for cargo build output
+        // This path only exists when running as a dev extension from source.
+        // We check this FIRST and DON'T cache it, so rebuilds are picked up
+        // immediately after "zed: reload extensions".
+        let (os, _) = zed::current_platform();
+        let dev_binary = match os {
+            zed::Os::Windows => "laravel-lsp/target/release/laravel-lsp.exe",
+            _ => "laravel-lsp/target/release/laravel-lsp",
+        };
+
+        if fs::metadata(dev_binary).is_ok() {
+            // Don't cache - always check fresh for dev builds
+            return Ok(dev_binary.to_string());
         }
 
-        // Step 2: Check absolute development path (for local development)
-        // This allows development without environment variables or PATH setup
-        let dev_absolute_path = "/Users/mike/Developer/zed-laravel/laravel-lsp/target/release/laravel-lsp";
-        if std::path::Path::new(dev_absolute_path).exists() {
-            self.cached_binary_path = Some(dev_absolute_path.to_string());
-            return Ok(dev_absolute_path.to_string());
+        // Step 2: Check cached path (for production use)
+        if let Some(cached_path) = &self.cached_binary_path {
+            if fs::metadata(cached_path).is_ok() {
+                return Ok(cached_path.clone());
+            }
         }
 
-        // Step 3: Try to find "laravel-lsp" in the system PATH
-        // This is the standard Zed pattern for production
-        // worktree.which() returns Option<String>:
-        //   - Some(path) if the binary is found in PATH
-        //   - None if not found
+        let binary_name = Self::get_platform_binary_name();
+        let version_dir = format!("laravel-lsp-{}", VERSION);
+        let binary_path = format!("{}/{}", version_dir, binary_name);
+
+        // Step 3: Check versioned extension directory
+        if fs::metadata(&binary_path).is_ok() {
+            self.cached_binary_path = Some(binary_path.clone());
+            return Ok(binary_path);
+        }
+
+        // Step 4: Try system PATH
+        if let Some(path) = worktree.which(&binary_name) {
+            self.cached_binary_path = Some(path.clone());
+            return Ok(path);
+        }
+
+        // Also try generic name in PATH
         if let Some(path) = worktree.which("laravel-lsp") {
             self.cached_binary_path = Some(path.clone());
             return Ok(path);
         }
 
-        // Step 4: Check the extension's working directory for development binary
-        // For development, we copy the binary as "laravel-lsp-binary" to avoid
-        // conflict with the "laravel-lsp" directory name
-        let dev_binary_name = "laravel-lsp-binary";
-        let path = std::path::Path::new(dev_binary_name);
-        if path.exists() && path.is_file() {
-            self.cached_binary_path = Some(dev_binary_name.to_string());
-            return Ok(dev_binary_name.to_string());
+        // Step 5: Download from GitHub releases
+        let downloaded_path = self.download_binary(&binary_name, &version_dir)?;
+        self.cached_binary_path = Some(downloaded_path.clone());
+        Ok(downloaded_path)
+    }
+
+    /// Download the binary from GitHub releases
+    fn download_binary(&self, binary_name: &str, version_dir: &str) -> Result<String> {
+        let binary_path = format!("{}/{}", version_dir, binary_name);
+
+        // Check if already downloaded
+        if fs::metadata(&binary_path).is_ok() {
+            return Ok(binary_path);
         }
 
-        // Also check for the standard binary name (for production/download)
-        let binary_name = if cfg!(target_os = "windows") {
-            "laravel-lsp.exe"
-        } else {
-            "laravel-lsp"
+        let (os, _arch) = zed::current_platform();
+        let archive_ext = match os {
+            zed::Os::Windows => "zip",
+            _ => "tar.gz",
+        };
+        let archive_name = format!("{}.{}", binary_name, archive_ext);
+
+        // Repository URL - update this if you fork the project
+        let release_url = format!(
+            "https://github.com/GeneaLabs/zed-laravel/releases/download/v{}/{}",
+            VERSION,
+            archive_name
+        );
+
+        let file_type = match os {
+            zed::Os::Windows => zed::DownloadedFileType::Zip,
+            _ => zed::DownloadedFileType::GzipTar,
         };
 
-        let path = std::path::Path::new(binary_name);
-        if path.exists() && path.is_file() {
-            self.cached_binary_path = Some(binary_name.to_string());
-            return Ok(binary_name.to_string());
+        // Download and extract
+        zed::download_file(&release_url, version_dir, file_type)
+            .map_err(|e| format!(
+                "Failed to download Laravel LSP binary from release: {}.\n\
+                 \n\
+                 For development, copy the binary manually:\n\
+                   mkdir -p {} && cp laravel-lsp/target/release/laravel-lsp {}/\n\
+                 \n\
+                 Or add to PATH:\n\
+                   cp laravel-lsp/target/release/laravel-lsp ~/.local/bin/",
+                e, version_dir, version_dir
+            ))?;
+
+        // Verify extraction succeeded
+        if !fs::metadata(&binary_path).is_ok() {
+            return Err(format!(
+                "Binary not found after extraction. Expected at: {}\n\
+                 \n\
+                 For development, copy manually:\n\
+                   mkdir -p {} && cp laravel-lsp/target/release/laravel-lsp {}/{}",
+                binary_path, version_dir, version_dir, binary_name
+            ).into());
         }
 
-        // Step 5: Development fallback - check relative paths
-        // When developing locally, the binary might be in the project structure
-        let dev_binary_paths = vec![
-            // Check for a copied binary at the root
-            "./laravel-lsp-binary",
-            "laravel-lsp-binary",
-            // Check in the build output
-            "./laravel-lsp/target/release/laravel-lsp",
-            "../laravel-lsp/target/release/laravel-lsp",
-            "laravel-lsp/target/release/laravel-lsp",
-            // Windows variants
-            "./laravel-lsp/target/release/laravel-lsp.exe",
-            "../laravel-lsp/target/release/laravel-lsp.exe",
-            "laravel-lsp/target/release/laravel-lsp.exe",
-        ];
-
-        for path_str in dev_binary_paths {
-            let path = std::path::Path::new(path_str);
-            if path.exists() && path.is_file() {
-                self.cached_binary_path = Some(path_str.to_string());
-                return Ok(path_str.to_string());
+        // Make executable on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = fs::metadata(&binary_path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                let _ = fs::set_permissions(&binary_path, perms);
             }
         }
 
-        // Step 6: Not found - provide helpful error message
-        Err(format!(
-            "Laravel LSP binary not found.\n\
-             \n\
-             Make sure you've built it first:\n\
-                cd laravel-lsp && cargo build --release\n\
-             \n\
-             The extension looks in:\n\
-             1. /Users/mike/Developer/zed-laravel/laravel-lsp/target/release/laravel-lsp (dev path)\n\
-             2. System PATH for 'laravel-lsp'\n\
-             3. Extension directory\n\
-             4. Relative paths from extension location"
-        ).into())
+        Ok(binary_path)
+    }
+
+    /// Get platform-specific binary name
+    fn get_platform_binary_name() -> String {
+        let (os, arch) = zed::current_platform();
+        match (os, arch) {
+            (zed::Os::Windows, zed::Architecture::X8664) => "laravel-lsp-windows-x64.exe".to_string(),
+            (zed::Os::Windows, zed::Architecture::Aarch64) => "laravel-lsp-windows-arm64.exe".to_string(),
+            (zed::Os::Windows, _) => "laravel-lsp.exe".to_string(),
+            (zed::Os::Mac, zed::Architecture::Aarch64) => "laravel-lsp-macos-arm64".to_string(),
+            (zed::Os::Mac, zed::Architecture::X8664) => "laravel-lsp-macos-x64".to_string(),
+            (zed::Os::Mac, _) => "laravel-lsp".to_string(),
+            (zed::Os::Linux, zed::Architecture::X8664) => "laravel-lsp-linux-x64".to_string(),
+            (zed::Os::Linux, zed::Architecture::Aarch64) => "laravel-lsp-linux-arm64".to_string(),
+            (zed::Os::Linux, _) => "laravel-lsp".to_string(),
+        }
     }
 }
 

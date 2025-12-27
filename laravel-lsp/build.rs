@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 /// This build script runs before compilation and downloads the tree-sitter-blade grammar
@@ -83,7 +83,7 @@ fn download_and_extract_blade_grammar(dest: &PathBuf) {
 }
 
 /// Compiles the Blade grammar's C code using the cc crate
-fn compile_blade_grammar(grammar_dir: &PathBuf) {
+fn compile_blade_grammar(grammar_dir: &Path) {
     // Tree-sitter grammars are written in C and consist of:
     // - parser.c: The main parser logic (generated from grammar.js)
     // - scanner.c: Custom lexer for language-specific tokens (optional, hand-written)

@@ -11,9 +11,16 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+use lru::LruCache;
 use salsa::Setter;
 use tokio::sync::{mpsc, oneshot};
+use tracing::{info, warn};
+
+use crate::config::kebab_to_pascal_case;
 
 // ============================================================================
 // Database Definition
@@ -53,6 +60,81 @@ pub struct SourceFile {
     /// The file content
     #[returns(ref)]
     pub text: String,
+}
+
+/// Represents a configuration file (composer.json, config/*.php)
+#[salsa::input]
+pub struct ConfigFile {
+    /// The file path
+    #[returns(ref)]
+    pub path: PathBuf,
+
+    /// Version incremented when file changes
+    pub version: i32,
+
+    /// The file content
+    #[returns(ref)]
+    pub text: String,
+}
+
+/// Represents the project's registered files for reference finding
+/// Files are grouped by their source directory type
+#[salsa::input]
+pub struct ProjectFiles {
+    /// Version incremented when file list changes
+    pub version: i32,
+
+    /// PHP files in app/Http/Controllers
+    #[returns(ref)]
+    pub controller_files: Vec<PathBuf>,
+
+    /// Blade files in view paths
+    #[returns(ref)]
+    pub view_files: Vec<PathBuf>,
+
+    /// PHP files in app/Livewire
+    #[returns(ref)]
+    pub livewire_files: Vec<PathBuf>,
+
+    /// PHP files in routes/
+    #[returns(ref)]
+    pub route_files: Vec<PathBuf>,
+}
+
+/// Represents a service provider file with priority
+#[salsa::input]
+pub struct ServiceProviderFile {
+    /// The file path
+    #[returns(ref)]
+    pub path: PathBuf,
+
+    /// Version incremented when file changes
+    pub version: i32,
+
+    /// The file content
+    #[returns(ref)]
+    pub text: String,
+
+    /// Priority: 0=framework, 1=package, 2=app
+    pub priority: u8,
+}
+
+/// Represents an environment file (.env, .env.local, .env.example)
+#[salsa::input]
+pub struct EnvFile {
+    /// The file path
+    #[returns(ref)]
+    pub path: PathBuf,
+
+    /// Version incremented when file changes
+    pub version: i32,
+
+    /// The file content
+    #[returns(ref)]
+    pub text: String,
+
+    /// Priority: 0=.env.example, 1=.env.local, 2=.env (highest)
+    pub priority: u8,
 }
 
 // ============================================================================
@@ -120,6 +202,24 @@ pub struct AssetPath<'db> {
 pub struct BindingName<'db> {
     #[returns(ref)]
     pub name: String,
+}
+
+#[salsa::interned]
+pub struct RouteName<'db> {
+    #[returns(ref)]
+    pub name: String,
+}
+
+#[salsa::interned]
+pub struct UrlPath<'db> {
+    #[returns(ref)]
+    pub path: String,
+}
+
+#[salsa::interned]
+pub struct ActionName<'db> {
+    #[returns(ref)]
+    pub action: String,
 }
 
 // ============================================================================
@@ -246,7 +346,36 @@ pub struct BindingReference<'db> {
     pub end_column: u32,
 }
 
+/// A parsed route() call found in code
+#[salsa::tracked]
+pub struct RouteReference<'db> {
+    pub name: RouteName<'db>,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
+/// A parsed url() call found in code
+#[salsa::tracked]
+pub struct UrlReference<'db> {
+    pub path: UrlPath<'db>,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
+/// A parsed action() call found in code
+#[salsa::tracked]
+pub struct ActionReference<'db> {
+    pub action: ActionName<'db>,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
 /// All patterns found in a file
+/// Note: route_refs, url_refs, action_refs are parsed separately to keep field count under 12
+/// (Salsa's tuple-based Hash impl has a 12-element limit)
 #[salsa::tracked]
 pub struct ParsedPatterns<'db> {
     pub file: SourceFile,
@@ -272,19 +401,105 @@ pub struct ParsedPatterns<'db> {
     pub binding_refs: Vec<BindingReference<'db>>,
 }
 
+/// Parsed Laravel configuration (from composer.json, config/view.php, etc.)
+#[salsa::tracked]
+pub struct LaravelConfigRef<'db> {
+    /// Project root path
+    #[returns(ref)]
+    pub root: PathBuf,
+
+    /// View paths configured in config/view.php
+    #[returns(ref)]
+    pub view_paths: Vec<PathBuf>,
+
+    /// Component paths with optional namespace prefix
+    #[returns(ref)]
+    pub component_paths: Vec<(String, PathBuf)>,
+
+    /// Livewire component path (if Livewire is installed)
+    #[returns(ref)]
+    pub livewire_path: Option<PathBuf>,
+
+    /// Whether Livewire is installed (detected from composer.json)
+    pub has_livewire: bool,
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Parse @vite directive arguments and extract individual file paths with their positions
+///
+/// Handles both formats:
+/// - @vite('resources/css/app.css')
+/// - @vite(['resources/css/app.css', 'resources/js/app.js'])
+///
+/// Returns Vec of (path, line, column, end_column) for each file path
+fn parse_vite_directive_assets(args: &str, directive_row: usize, directive_col: usize, directive_len: usize) -> Vec<(String, u32, u32, u32)> {
+    let mut results = Vec::new();
+
+    // The args from tree-sitter typically include the parentheses content
+    // e.g., "(['resources/css/app.css', 'resources/js/app.js'])"
+    let args = args.trim();
+
+    // Track position within the arguments string
+    let mut pos = 0;
+    let chars: Vec<char> = args.chars().collect();
+
+    while pos < chars.len() {
+        // Find the start of a quoted string
+        let quote_char = match chars[pos] {
+            '\'' | '"' => chars[pos],
+            _ => {
+                pos += 1;
+                continue;
+            }
+        };
+
+        let quote_start = pos;
+        pos += 1; // Move past opening quote
+
+        // Find the end of the quoted string
+        let mut path_chars = Vec::new();
+        while pos < chars.len() && chars[pos] != quote_char {
+            path_chars.push(chars[pos]);
+            pos += 1;
+        }
+
+        if pos < chars.len() {
+            let path: String = path_chars.into_iter().collect();
+            if !path.is_empty() {
+                // Calculate column positions
+                // directive_col is where @ starts, add directive length (@vite = 5)
+                // then add position within args string
+                let col = (directive_col + directive_len + quote_start) as u32;
+                let end_col = col + path.len() as u32 + 2; // +2 for quotes
+
+                results.push((path, directive_row as u32, col, end_col));
+            }
+            pos += 1; // Move past closing quote
+        }
+    }
+
+    results
+}
+
 // ============================================================================
 // Query Functions - The actual computation
 // ============================================================================
 
 /// Parse a source file and extract all Laravel patterns
 /// This is automatically memoized by Salsa
+///
+/// Uses single-pass extraction for performance:
+/// - One query compilation (cached globally)
+/// - One tree traversal per language (PHP/Blade)
+/// - All patterns extracted in O(n) instead of O(n×k)
 #[salsa::tracked]
 pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatterns<'db> {
     use crate::parser::{parse_blade, parse_php, language_blade, language_php};
     use crate::queries::{
-        find_view_calls, find_blade_components, find_directives,
-        find_env_calls, find_livewire_components, find_config_calls,
-        find_middleware_calls, find_translation_calls, find_asset_calls, find_binding_calls,
+        extract_all_php_patterns, extract_all_blade_patterns,
         AssetHelperType as QueryAssetHelperType,
     };
 
@@ -303,14 +518,14 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
     let mut asset_refs = Vec::new();
     let mut binding_refs = Vec::new();
 
-    // Parse Blade files
+    // Parse Blade files - single pass extraction
     if is_blade {
         if let Ok(tree) = parse_blade(text) {
             let lang = language_blade();
 
-            // Extract Blade components
-            if let Ok(comps) = find_blade_components(&tree, text, &lang) {
-                for comp in comps {
+            if let Ok(blade_patterns) = extract_all_blade_patterns(&tree, text, &lang) {
+                // Process components
+                for comp in blade_patterns.components {
                     let name = ComponentName::new(db, comp.component_name.to_string());
                     let tag = ComponentName::new(db, comp.tag_name.to_string());
                     components.push(ComponentReference::new(
@@ -322,11 +537,9 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                         comp.end_column as u32,
                     ));
                 }
-            }
 
-            // Extract Livewire components
-            if let Ok(lw_comps) = find_livewire_components(&tree, text, &lang) {
-                for lw in lw_comps {
+                // Process Livewire components
+                for lw in blade_patterns.livewire {
                     let name = LivewireName::new(db, lw.component_name.to_string());
                     livewire_refs.push(LivewireReference::new(
                         db,
@@ -336,33 +549,51 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                         lw.end_column as u32,
                     ));
                 }
-            }
 
-            // Extract directives
-            if let Ok(dirs) = find_directives(&tree, text, &lang) {
-                for dir in dirs {
+                // Process directives
+                for dir in blade_patterns.directives {
+                    // Handle @vite specially - extract individual asset paths
+                    if dir.directive_name == "vite" {
+                        if let Some(args) = dir.arguments {
+                            let vite_assets = parse_vite_directive_assets(args, dir.row, dir.column, dir.directive_name.len() + 1);
+                            for (path, line, col, end_col) in vite_assets {
+                                let asset_path = AssetPath::new(db, path);
+                                asset_refs.push(AssetReference::new(
+                                    db,
+                                    asset_path,
+                                    AssetHelperType::ViteAsset,
+                                    line,
+                                    col,
+                                    end_col,
+                                ));
+                            }
+                        }
+                        continue; // Don't add @vite as a directive
+                    }
+
                     let name = DirectiveName::new(db, dir.directive_name.to_string());
                     let args = dir.arguments.map(|s| s.to_string());
+                    let full_end_column = dir.column + dir.full_text.len();
                     directives.push(DirectiveReference::new(
                         db,
                         name,
                         args,
                         dir.row as u32,
                         dir.column as u32,
-                        dir.end_column as u32,
+                        full_end_column as u32,
                     ));
                 }
             }
         }
     }
 
-    // Parse PHP (including Blade files for embedded PHP)
+    // Parse PHP (including Blade files for embedded PHP) - single pass extraction
     if let Ok(tree) = parse_php(text) {
         let lang = language_php();
 
-        // Extract view calls
-        if let Ok(view_calls) = find_view_calls(&tree, text, &lang) {
-            for view in view_calls {
+        if let Ok(php_patterns) = extract_all_php_patterns(&tree, text, &lang) {
+            // Process views
+            for view in php_patterns.views {
                 let name = ViewName::new(db, view.view_name.to_string());
                 views.push(ViewReference::new(
                     db,
@@ -373,11 +604,9 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                     view.is_route_view,
                 ));
             }
-        }
 
-        // Extract env calls
-        if let Ok(env_calls) = find_env_calls(&tree, text, &lang) {
-            for env in env_calls {
+            // Process env calls
+            for env in php_patterns.env_calls {
                 let name = EnvVarName::new(db, env.var_name.to_string());
                 env_refs.push(EnvReference::new(
                     db,
@@ -388,11 +617,9 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                     env.end_column as u32,
                 ));
             }
-        }
 
-        // Extract config calls
-        if let Ok(config_calls) = find_config_calls(&tree, text, &lang) {
-            for config in config_calls {
+            // Process config calls
+            for config in php_patterns.config_calls {
                 let key = ConfigKey::new(db, config.config_key.to_string());
                 config_refs.push(ConfigReference::new(
                     db,
@@ -402,11 +629,9 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                     config.end_column as u32,
                 ));
             }
-        }
 
-        // Extract middleware calls
-        if let Ok(middleware_calls) = find_middleware_calls(&tree, text, &lang) {
-            for mw in middleware_calls {
+            // Process middleware calls
+            for mw in php_patterns.middleware_calls {
                 let name = MiddlewareName::new(db, mw.middleware_name.to_string());
                 middleware_refs.push(MiddlewareReference::new(
                     db,
@@ -416,11 +641,9 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                     mw.end_column as u32,
                 ));
             }
-        }
 
-        // Extract translation calls
-        if let Ok(translation_calls) = find_translation_calls(&tree, text, &lang) {
-            for trans in translation_calls {
+            // Process translation calls
+            for trans in php_patterns.translation_calls {
                 let key = TranslationKey::new(db, trans.translation_key.to_string());
                 translation_refs.push(TranslationReference::new(
                     db,
@@ -430,11 +653,9 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                     trans.end_column as u32,
                 ));
             }
-        }
 
-        // Extract asset calls
-        if let Ok(asset_calls) = find_asset_calls(&tree, text, &lang) {
-            for asset in asset_calls {
+            // Process asset calls
+            for asset in php_patterns.asset_calls {
                 let path = AssetPath::new(db, asset.path.to_string());
                 let helper_type = match asset.helper_type {
                     QueryAssetHelperType::Asset => AssetHelperType::Asset,
@@ -458,11 +679,9 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                     asset.end_column as u32,
                 ));
             }
-        }
 
-        // Extract binding calls
-        if let Ok(binding_calls) = find_binding_calls(&tree, text, &lang) {
-            for binding in binding_calls {
+            // Process binding calls
+            for binding in php_patterns.binding_calls {
                 let name = BindingName::new(db, binding.binding_name.to_string());
                 binding_refs.push(BindingReference::new(
                     db,
@@ -473,6 +692,9 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                     binding.end_column as u32,
                 ));
             }
+
+            // Note: route_refs, url_refs, action_refs are extracted in handle_get_patterns
+            // to keep ParsedPatterns field count under Salsa's 12-element limit
         }
     }
 
@@ -480,6 +702,468 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
         db, file, views, components, directives, env_refs, config_refs, livewire_refs,
         middleware_refs, translation_refs, asset_refs, binding_refs,
     )
+}
+
+/// Parse composer.json to detect installed packages
+/// Returns (has_livewire, list of installed packages)
+#[salsa::tracked]
+pub fn parse_composer_json<'db>(db: &'db dyn Db, file: ConfigFile) -> (bool, Vec<String>) {
+    let text = file.text(db);
+
+    // Parse JSON to detect Livewire
+    let has_livewire = text.contains("\"livewire/livewire\"");
+
+    // Extract package names from require and require-dev
+    let mut packages = Vec::new();
+
+    // Simple extraction - look for package patterns in require sections
+    // This is a simplified version; could use serde_json for full parsing
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('"') && trimmed.contains('/') && trimmed.contains(':') {
+            // Extract package name from "vendor/package": "version"
+            if let Some(end) = trimmed.find(':') {
+                let name = trimmed[1..end-1].to_string();
+                if name.contains('/') {
+                    packages.push(name);
+                }
+            }
+        }
+    }
+
+    (has_livewire, packages)
+}
+
+/// Parse config/view.php to extract view paths
+#[salsa::tracked]
+pub fn parse_view_config<'db>(db: &'db dyn Db, file: ConfigFile, root: PathBuf) -> Vec<PathBuf> {
+    let text = file.text(db);
+    let mut paths = Vec::new();
+
+    // Look for resource_path('views') or base_path('some/path') patterns
+    // This reuses logic from config.rs but in a Salsa-compatible way
+
+    // Default: resources/views
+    if text.contains("resource_path") && text.contains("views") {
+        paths.push(root.join("resources/views"));
+    }
+
+    // Look for base_path calls
+    for line in text.lines() {
+        if line.contains("base_path") {
+            // Extract path from base_path('path')
+            if let Some(start) = line.find("base_path(") {
+                let rest = &line[start + 10..];
+                if let Some(quote_start) = rest.find(['\'', '"']) {
+                    let quote_char = rest.chars().nth(quote_start).unwrap();
+                    let path_start = quote_start + 1;
+                    if let Some(quote_end) = rest[path_start..].find(quote_char) {
+                        let path_str = &rest[path_start..path_start + quote_end];
+                        paths.push(root.join(path_str));
+                    }
+                }
+            }
+        }
+    }
+
+    // If no paths found, use default
+    if paths.is_empty() {
+        paths.push(root.join("resources/views"));
+    }
+
+    paths
+}
+
+/// Parse config/livewire.php to extract Livewire component path
+#[salsa::tracked]
+pub fn parse_livewire_config<'db>(db: &'db dyn Db, file: ConfigFile, root: PathBuf) -> Option<PathBuf> {
+    let text = file.text(db);
+
+    // Look for class_namespace patterns
+    if text.contains("App\\Livewire") || text.contains("App\\\\Livewire") {
+        return Some(root.join("app/Livewire"));
+    }
+
+    if text.contains("App\\Http\\Livewire") || text.contains("App\\\\Http\\\\Livewire") {
+        return Some(root.join("app/Http/Livewire"));
+    }
+
+    None
+}
+
+/// Build complete Laravel configuration from individual config files
+#[salsa::tracked]
+pub fn build_laravel_config<'db>(
+    db: &'db dyn Db,
+    root: PathBuf,
+    composer: Option<ConfigFile>,
+    view_config: Option<ConfigFile>,
+    livewire_config: Option<ConfigFile>,
+) -> LaravelConfigRef<'db> {
+    // Parse composer.json for Livewire detection
+    let has_livewire = composer
+        .map(|f| parse_composer_json(db, f).0)
+        .unwrap_or(false);
+
+    // Parse view config for view paths
+    let view_paths = view_config
+        .map(|f| parse_view_config(db, f, root.clone()))
+        .unwrap_or_else(|| vec![root.join("resources/views")]);
+
+    // Build component paths from view paths
+    let component_paths: Vec<(String, PathBuf)> = view_paths
+        .iter()
+        .map(|p| (String::new(), p.join("components")))
+        .collect();
+
+    // Parse livewire config for component path
+    let livewire_path = if has_livewire {
+        livewire_config
+            .and_then(|f| parse_livewire_config(db, f, root.clone()))
+            .or_else(|| {
+                // Default Livewire paths
+                let v3_path = root.join("app/Livewire");
+                let v2_path = root.join("app/Http/Livewire");
+                if v3_path.exists() {
+                    Some(v3_path)
+                } else if v2_path.exists() {
+                    Some(v2_path)
+                } else {
+                    Some(v3_path) // Default to v3 path
+                }
+            })
+    } else {
+        None
+    };
+
+    LaravelConfigRef::new(
+        db,
+        root,
+        view_paths,
+        component_paths,
+        livewire_path,
+        has_livewire,
+    )
+}
+
+// ============================================================================
+// Environment Variable Parsing (Salsa-based)
+// ============================================================================
+
+/// A parsed environment variable (Salsa tracked)
+#[salsa::tracked]
+pub struct ParsedEnvVar<'db> {
+    /// Variable name
+    pub name: EnvVarName<'db>,
+    /// Variable value
+    #[returns(ref)]
+    pub value: String,
+    /// Line number in source file (0-indexed)
+    pub line: u32,
+    /// Column of the variable name
+    pub column: u32,
+    /// Column where value starts
+    pub value_column: u32,
+    /// Whether this variable is commented out
+    pub is_commented: bool,
+    /// Priority of the source file (higher wins)
+    pub priority: u8,
+    /// Source file path
+    #[returns(ref)]
+    pub source_file: PathBuf,
+}
+
+/// Parse an environment file and extract all variables
+#[salsa::tracked]
+pub fn parse_env_source<'db>(db: &'db dyn Db, file: EnvFile) -> Vec<ParsedEnvVar<'db>> {
+    let text = file.text(db);
+    let path = file.path(db);
+    let priority = file.priority(db);
+    let mut variables = Vec::new();
+
+    for (line_idx, line) in text.lines().enumerate() {
+        // Skip empty lines
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Check if line is commented
+        let is_commented = line.trim_start().starts_with('#');
+        let working_line = if is_commented {
+            line.trim_start().trim_start_matches('#').trim_start()
+        } else {
+            line
+        };
+
+        // Parse VAR=value format
+        if let Some((name_part, value_part)) = working_line.split_once('=') {
+            let name = name_part.trim();
+
+            // Skip if not a valid variable name
+            if name.is_empty() || name.contains(' ') {
+                continue;
+            }
+
+            // Parse the value, handling quotes
+            let value = parse_env_value_internal(value_part.trim());
+
+            // Calculate column positions
+            let name_column = line.find(name).unwrap_or(0) as u32;
+            let value_column = line.find('=').map(|pos| pos + 1).unwrap_or(name_column as usize) as u32;
+
+            let var_name = EnvVarName::new(db, name.to_string());
+            variables.push(ParsedEnvVar::new(
+                db,
+                var_name,
+                value,
+                line_idx as u32,
+                name_column,
+                value_column,
+                is_commented,
+                priority,
+                path.clone(),
+            ));
+        }
+    }
+
+    variables
+}
+
+/// Parse an environment variable value, handling quotes
+fn parse_env_value_internal(value: &str) -> String {
+    let value = value.trim();
+
+    // Handle quoted values
+    if (value.starts_with('"') && value.ends_with('"'))
+        || (value.starts_with('\'') && value.ends_with('\''))
+    {
+        // Remove quotes
+        if value.len() >= 2 {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+
+    // Handle inline comments (# at end of line)
+    if let Some(hash_pos) = value.find(" #") {
+        return value[..hash_pos].trim().to_string();
+    }
+
+    value.to_string()
+}
+
+// ============================================================================
+// Service Provider Parsing (Salsa-based)
+// ============================================================================
+
+/// Binding type for container bindings
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum BindingTypeEnum {
+    Singleton,
+    Bind,
+    Instance,
+    Alias,
+}
+
+/// A parsed middleware registration (Salsa tracked)
+#[salsa::tracked]
+pub struct ParsedMiddlewareReg<'db> {
+    /// Middleware alias (e.g., "auth", "throttle")
+    pub alias: MiddlewareName<'db>,
+    /// Full class name
+    #[returns(ref)]
+    pub class_name: String,
+    /// Resolved file path (if found)
+    #[returns(ref)]
+    pub file_path: Option<PathBuf>,
+    /// Line in source file where registered
+    pub source_line: u32,
+    /// Priority (0=framework, 1=package, 2=app)
+    pub priority: u8,
+    /// Source file where registered
+    #[returns(ref)]
+    pub source_file: PathBuf,
+}
+
+/// A parsed container binding (Salsa tracked)
+#[salsa::tracked]
+pub struct ParsedBindingReg<'db> {
+    /// Abstract name or interface
+    pub abstract_name: BindingName<'db>,
+    /// Concrete class name
+    #[returns(ref)]
+    pub concrete_class: String,
+    /// Resolved file path (if found)
+    #[returns(ref)]
+    pub file_path: Option<PathBuf>,
+    /// Type of binding
+    pub binding_type: BindingTypeEnum,
+    /// Line in source file where registered
+    pub source_line: u32,
+    /// Priority (0=framework, 1=package, 2=app)
+    pub priority: u8,
+    /// Source file where registered
+    #[returns(ref)]
+    pub source_file: PathBuf,
+}
+
+/// Parsed service provider content
+#[salsa::tracked]
+pub struct ParsedServiceProvider<'db> {
+    /// Middleware registrations found in this provider
+    #[returns(ref)]
+    pub middleware: Vec<ParsedMiddlewareReg<'db>>,
+    /// Container bindings found in this provider
+    #[returns(ref)]
+    pub bindings: Vec<ParsedBindingReg<'db>>,
+}
+
+/// Parse a service provider file and extract middleware and bindings
+#[salsa::tracked]
+pub fn parse_service_provider_source<'db>(
+    db: &'db dyn Db,
+    file: ServiceProviderFile,
+    root: PathBuf,
+) -> ParsedServiceProvider<'db> {
+    use lazy_static::lazy_static;
+    use regex::Regex;
+
+    lazy_static! {
+        /// Matches middleware array entries: 'alias' => Class::class
+        static ref MIDDLEWARE_RE: Regex = Regex::new(
+            r#"['"]([^'"]+)['"]\s*=>\s*\\?([A-Za-z0-9_\\]+)::class"#
+        ).unwrap();
+
+        /// Matches $this->app->bind('name', ...) or ->singleton(...)
+        static ref BINDING_RE: Regex = Regex::new(
+            r#"\$this->app->(bind|singleton)\s*\(\s*['"]([^'"]+)['"](?:\s*,\s*(?:function|\[)?[^)]*\\?([A-Za-z0-9_\\]+)(?:::class)?)?\s*\)"#
+        ).unwrap();
+
+        /// Matches $this->app->alias('concrete', 'alias')
+        static ref ALIAS_RE: Regex = Regex::new(
+            r#"\$this->app->alias\s*\(\s*\\?([A-Za-z0-9_\\]+)(?:::class)?\s*,\s*['"]([^'"]+)['"]\s*\)"#
+        ).unwrap();
+    }
+
+    let text = file.text(db);
+    let path = file.path(db);
+    let priority = file.priority(db);
+
+    let mut middleware = Vec::new();
+    let mut bindings = Vec::new();
+
+    // Parse middleware registrations
+    for cap in MIDDLEWARE_RE.captures_iter(text) {
+        if let (Some(alias), Some(class)) = (cap.get(1), cap.get(2)) {
+            let alias_str = alias.as_str();
+            let class_str = class.as_str().trim_start_matches('\\');
+
+            // Calculate line number
+            let line = text[..alias.start()].lines().count() as u32;
+
+            // Resolve class to file path
+            let file_path = resolve_class_to_file_internal(class_str, &root);
+
+            let alias_name = MiddlewareName::new(db, alias_str.to_string());
+            middleware.push(ParsedMiddlewareReg::new(
+                db,
+                alias_name,
+                class_str.to_string(),
+                file_path,
+                line,
+                priority,
+                path.clone(),
+            ));
+        }
+    }
+
+    // Parse bind/singleton registrations
+    for cap in BINDING_RE.captures_iter(text) {
+        if let (Some(method), Some(name)) = (cap.get(1), cap.get(2)) {
+            let binding_type = match method.as_str() {
+                "singleton" => BindingTypeEnum::Singleton,
+                "bind" => BindingTypeEnum::Bind,
+                _ => BindingTypeEnum::Bind,
+            };
+
+            let abstract_name = name.as_str();
+            let concrete_class = cap.get(3)
+                .map(|m| m.as_str().trim_start_matches('\\'))
+                .unwrap_or(abstract_name);
+
+            let line = text[..name.start()].lines().count() as u32;
+            let file_path = resolve_class_to_file_internal(concrete_class, &root);
+
+            let binding_name = BindingName::new(db, abstract_name.to_string());
+            bindings.push(ParsedBindingReg::new(
+                db,
+                binding_name,
+                concrete_class.to_string(),
+                file_path,
+                binding_type,
+                line,
+                priority,
+                path.clone(),
+            ));
+        }
+    }
+
+    // Parse alias registrations
+    for cap in ALIAS_RE.captures_iter(text) {
+        if let (Some(concrete), Some(alias)) = (cap.get(1), cap.get(2)) {
+            let concrete_class = concrete.as_str().trim_start_matches('\\');
+            let alias_name = alias.as_str();
+
+            let line = text[..alias.start()].lines().count() as u32;
+            let file_path = resolve_class_to_file_internal(concrete_class, &root);
+
+            let binding_name = BindingName::new(db, alias_name.to_string());
+            bindings.push(ParsedBindingReg::new(
+                db,
+                binding_name,
+                concrete_class.to_string(),
+                file_path,
+                BindingTypeEnum::Alias,
+                line,
+                priority,
+                path.clone(),
+            ));
+        }
+    }
+
+    ParsedServiceProvider::new(db, middleware, bindings)
+}
+
+/// Resolve a class name to a file path using PSR-4 conventions
+fn resolve_class_to_file_internal(class_name: &str, root_path: &Path) -> Option<PathBuf> {
+    // Common namespace to directory mappings
+    let mappings = [
+        ("App\\", "app/"),
+        ("Illuminate\\", "vendor/laravel/framework/src/Illuminate/"),
+        ("Laravel\\", "vendor/laravel/"),
+    ];
+
+    for (namespace, dir) in &mappings {
+        if class_name.starts_with(namespace) {
+            let relative = class_name.strip_prefix(namespace)?;
+            let file_path = root_path
+                .join(dir)
+                .join(relative.replace('\\', "/"))
+                .with_extension("php");
+            if file_path.exists() {
+                return Some(file_path);
+            }
+        }
+    }
+
+    // Try direct class name as path
+    let direct_path = root_path
+        .join(class_name.replace('\\', "/"))
+        .with_extension("php");
+    if direct_path.exists() {
+        return Some(direct_path);
+    }
+
+    None
 }
 
 // ============================================================================
@@ -490,17 +1174,6 @@ impl LaravelDatabase {
     /// Create a new database instance
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Get or create a source file
-    pub fn get_or_create_file(&self, path: PathBuf, version: i32, text: String) -> SourceFile {
-        SourceFile::new(self, path, version, text)
-    }
-
-    /// Update a source file's content
-    pub fn update_file(&mut self, file: SourceFile, version: i32, text: String) {
-        file.set_version(self).to(version);
-        file.set_text(self).to(text);
     }
 }
 
@@ -604,107 +1277,484 @@ pub struct BindingReferenceData {
     pub end_column: u32,
 }
 
+/// Route reference data for transfer across async boundaries
+#[derive(Debug, Clone)]
+pub struct RouteReferenceData {
+    pub name: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
+/// URL reference data for transfer across async boundaries
+#[derive(Debug, Clone)]
+pub struct UrlReferenceData {
+    pub path: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
+/// Action reference data for transfer across async boundaries
+#[derive(Debug, Clone)]
+pub struct ActionReferenceData {
+    pub action: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
+/// Laravel configuration data for transfer across async boundaries
+#[derive(Debug, Clone)]
+pub struct LaravelConfigData {
+    pub root: PathBuf,
+    pub view_paths: Vec<PathBuf>,
+    pub component_paths: Vec<(String, PathBuf)>,
+    pub livewire_path: Option<PathBuf>,
+    pub has_livewire: bool,
+}
+
+impl LaravelConfigData {
+    /// Resolve a view name to possible file paths
+    ///
+    /// Returns all possible paths where this view could exist,
+    /// in order of priority.
+    pub fn resolve_view_path(&self, view_name: &str) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+
+        // Handle package views (e.g., "package::view.name")
+        let (namespace, actual_view) = if let Some(pos) = view_name.find("::") {
+            let namespace = &view_name[..pos];
+            let view = &view_name[pos + 2..];
+            (Some(namespace), view)
+        } else {
+            (None, view_name)
+        };
+
+        // Convert dots to path separators
+        let view_path = actual_view.replace('.', "/");
+
+        // Check each view path
+        for base_path in &self.view_paths {
+            let mut full_path = self.root.join(base_path).join(&view_path);
+            full_path.set_extension("blade.php");
+            paths.push(full_path);
+        }
+
+        // TODO: Handle namespaced views (would require package discovery)
+        if let Some(_ns) = namespace {
+            warn!("Namespaced views not fully supported yet: {}", view_name);
+        }
+
+        paths
+    }
+
+    /// Resolve a component name to file path
+    pub fn resolve_component_path(&self, component_name: &str) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+
+        // Component name uses dots: "forms.input" -> "forms/input.blade.php"
+        let component_path = component_name.replace('.', "/");
+
+        // Check each component path (Vec of tuples instead of HashMap)
+        for (_namespace, base_path) in &self.component_paths {
+            let mut full_path = self.root.join(base_path).join(&component_path);
+            full_path.set_extension("blade.php");
+            paths.push(full_path);
+        }
+
+        // If no component paths found, use default within view paths
+        if paths.is_empty() {
+            for view_path in &self.view_paths {
+                let mut full_path = self.root.join(view_path).join("components").join(&component_path);
+                full_path.set_extension("blade.php");
+                paths.push(full_path);
+            }
+        }
+
+        paths
+    }
+
+    /// Resolve a Livewire component name to file path
+    pub fn resolve_livewire_path(&self, component_name: &str) -> Option<PathBuf> {
+        let livewire_base = self.livewire_path.as_ref()?;
+
+        // Convert component name to PascalCase path
+        // "user-profile" -> "UserProfile.php"
+        // "admin.dashboard" -> "Admin/Dashboard.php"
+
+        let parts: Vec<&str> = component_name.split('.').collect();
+        let mut path = self.root.join(livewire_base);
+
+        for (i, part) in parts.iter().enumerate() {
+            let pascal_case = kebab_to_pascal_case(part);
+
+            if i == parts.len() - 1 {
+                // Last part becomes the PHP file
+                path.push(format!("{}.php", pascal_case));
+            } else {
+                // Other parts are directories
+                path.push(pascal_case);
+            }
+        }
+
+        Some(path)
+    }
+}
+
+/// Type of file that contains a view reference
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub enum FileReferenceType {
+    Controller,
+    BladeTemplate,
+    LivewireComponent,
+    Route,
+}
+
+/// View reference location data for transfer across async boundaries
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ViewReferenceLocationData {
+    /// The file that contains the reference
+    pub file_path: PathBuf,
+    /// The line number where the reference occurs (0-based)
+    pub line: u32,
+    /// The character position where the reference starts (0-based)
+    pub character: u32,
+    /// The type of file containing the reference
+    pub reference_type: FileReferenceType,
+    /// The view name being referenced
+    pub view_name: String,
+    /// Whether this is a route view (Route::view or response()->view)
+    pub is_route_view: bool,
+}
+
+/// Middleware registration data for transfer across async boundaries
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MiddlewareRegistrationData {
+    /// The middleware alias (e.g., "auth")
+    pub alias: String,
+    /// Fully qualified class name
+    pub class_name: String,
+    /// Resolved file path of the middleware class
+    pub file_path: Option<PathBuf>,
+    /// Source file where the alias is defined
+    pub source_file: Option<PathBuf>,
+    /// Line number in source file (0-based)
+    pub source_line: Option<usize>,
+    /// Priority: 0=framework, 1=package, 2=app
+    pub priority: u8,
+}
+
+/// Binding type enum for transfer
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum BindingTypeData {
+    Bind,
+    Singleton,
+    Scoped,
+    Alias,
+}
+
+/// Container binding data for transfer across async boundaries
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BindingRegistrationData {
+    /// The abstract/alias name
+    pub abstract_name: String,
+    /// Fully qualified concrete class name
+    pub concrete_class: String,
+    /// Resolved file path of the concrete class
+    pub file_path: Option<PathBuf>,
+    /// Binding type
+    pub binding_type: BindingTypeData,
+    /// Source file where the binding is defined
+    pub source_file: Option<PathBuf>,
+    /// Line number in source file (0-based)
+    pub source_line: Option<usize>,
+    /// Priority: 0=framework, 1=package, 2=app
+    pub priority: u8,
+}
+
+/// Environment variable data for transfer across async boundaries
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EnvVariableData {
+    /// The variable name (e.g., "APP_NAME")
+    pub name: String,
+    /// The value (e.g., "Laravel")
+    pub value: String,
+    /// Which file this was defined in
+    pub file_path: PathBuf,
+    /// Line number where defined (0-based)
+    pub line: usize,
+    /// Column where the variable name starts (0-based)
+    pub column: usize,
+    /// Column where the value starts (after the =)
+    pub value_column: usize,
+    /// Whether this variable is commented out
+    pub is_commented: bool,
+}
+
+// ============================================================================
+// Salsa-based Data Transfer Types (for new incremental parsing)
+// ============================================================================
+
+/// Parsed environment variable data from Salsa (for transfer across async boundaries)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParsedEnvVarData {
+    /// Variable name
+    pub name: String,
+    /// Variable value
+    pub value: String,
+    /// Line number (0-indexed)
+    pub line: u32,
+    /// Column of variable name
+    pub column: u32,
+    /// Column where value starts
+    pub value_column: u32,
+    /// Whether commented out
+    pub is_commented: bool,
+    /// Priority (0=.env.example, 1=.env.local, 2=.env)
+    pub priority: u8,
+    /// Source file path
+    pub source_file: PathBuf,
+}
+
+/// Parsed middleware data from Salsa (for transfer across async boundaries)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParsedMiddlewareData {
+    /// Middleware alias
+    pub alias: String,
+    /// Full class name
+    pub class_name: String,
+    /// Resolved file path
+    pub file_path: Option<PathBuf>,
+    /// Line in source file
+    pub source_line: u32,
+    /// Priority (0=framework, 1=package, 2=app)
+    pub priority: u8,
+    /// Source file path
+    pub source_file: PathBuf,
+}
+
+/// Parsed binding data from Salsa (for transfer across async boundaries)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParsedBindingData {
+    /// Abstract name or interface
+    pub abstract_name: String,
+    /// Concrete class name
+    pub concrete_class: String,
+    /// Resolved file path
+    pub file_path: Option<PathBuf>,
+    /// Binding type
+    pub binding_type: BindingTypeEnum,
+    /// Line in source file
+    pub source_line: u32,
+    /// Priority (0=framework, 1=package, 2=app)
+    pub priority: u8,
+    /// Source file path
+    pub source_file: PathBuf,
+}
+
+/// Entry in the sorted position index for fast lookup
+#[derive(Debug, Clone)]
+struct PositionEntry {
+    line: u32,
+    column: u32,
+    end_column: u32,
+    pattern: PatternAtPosition,
+}
+
 /// All parsed patterns for a file - plain data for transfer
+/// Uses Rc for efficient cloning when building the position index
 #[derive(Debug, Clone, Default)]
 pub struct ParsedPatternsData {
-    pub views: Vec<ViewReferenceData>,
-    pub components: Vec<ComponentReferenceData>,
-    pub directives: Vec<DirectiveReferenceData>,
-    pub env_refs: Vec<EnvReferenceData>,
-    pub config_refs: Vec<ConfigReferenceData>,
-    pub livewire_refs: Vec<LivewireReferenceData>,
-    pub middleware_refs: Vec<MiddlewareReferenceData>,
-    pub translation_refs: Vec<TranslationReferenceData>,
-    pub asset_refs: Vec<AssetReferenceData>,
-    pub binding_refs: Vec<BindingReferenceData>,
+    pub views: Vec<Arc<ViewReferenceData>>,
+    pub components: Vec<Arc<ComponentReferenceData>>,
+    pub directives: Vec<Arc<DirectiveReferenceData>>,
+    pub env_refs: Vec<Arc<EnvReferenceData>>,
+    pub config_refs: Vec<Arc<ConfigReferenceData>>,
+    pub livewire_refs: Vec<Arc<LivewireReferenceData>>,
+    pub middleware_refs: Vec<Arc<MiddlewareReferenceData>>,
+    pub translation_refs: Vec<Arc<TranslationReferenceData>>,
+    pub asset_refs: Vec<Arc<AssetReferenceData>>,
+    pub binding_refs: Vec<Arc<BindingReferenceData>>,
+    pub route_refs: Vec<Arc<RouteReferenceData>>,
+    pub url_refs: Vec<Arc<UrlReferenceData>>,
+    pub action_refs: Vec<Arc<ActionReferenceData>>,
+    /// Sorted index of all patterns by (line, column) for O(log n) lookup
+    sorted_positions: Vec<PositionEntry>,
 }
 
 /// A pattern found at a specific cursor position
+/// Uses Rc for cheap cloning (just increments reference count)
 #[derive(Debug, Clone)]
 pub enum PatternAtPosition {
-    View(ViewReferenceData),
-    Component(ComponentReferenceData),
-    Directive(DirectiveReferenceData),
-    EnvRef(EnvReferenceData),
-    ConfigRef(ConfigReferenceData),
-    Livewire(LivewireReferenceData),
-    Middleware(MiddlewareReferenceData),
-    Translation(TranslationReferenceData),
-    Asset(AssetReferenceData),
-    Binding(BindingReferenceData),
+    View(Arc<ViewReferenceData>),
+    Component(Arc<ComponentReferenceData>),
+    Directive(Arc<DirectiveReferenceData>),
+    EnvRef(Arc<EnvReferenceData>),
+    ConfigRef(Arc<ConfigReferenceData>),
+    Livewire(Arc<LivewireReferenceData>),
+    Middleware(Arc<MiddlewareReferenceData>),
+    Translation(Arc<TranslationReferenceData>),
+    Asset(Arc<AssetReferenceData>),
+    Binding(Arc<BindingReferenceData>),
+    Route(Arc<RouteReferenceData>),
+    Url(Arc<UrlReferenceData>),
+    Action(Arc<ActionReferenceData>),
 }
 
 impl ParsedPatternsData {
-    /// Find a pattern at the given cursor position (line, column)
-    /// Returns the first matching pattern, or None if no pattern at that position
-    pub fn find_at_position(&self, line: u32, column: u32) -> Option<PatternAtPosition> {
-        // Check components first (most common in Blade files)
+    /// Build the sorted position index from all pattern vectors
+    /// This should be called after populating the pattern vectors
+    pub fn build_position_index(&mut self) {
+        let mut entries = Vec::new();
+
+        // Add all patterns to the index
         for comp in &self.components {
-            if comp.line == line && column >= comp.column && column <= comp.end_column {
-                return Some(PatternAtPosition::Component(comp.clone()));
-            }
+            entries.push(PositionEntry {
+                line: comp.line,
+                column: comp.column,
+                end_column: comp.end_column,
+                pattern: PatternAtPosition::Component(comp.clone()),
+            });
         }
 
-        // Check Livewire components
         for lw in &self.livewire_refs {
-            if lw.line == line && column >= lw.column && column <= lw.end_column {
-                return Some(PatternAtPosition::Livewire(lw.clone()));
-            }
+            entries.push(PositionEntry {
+                line: lw.line,
+                column: lw.column,
+                end_column: lw.end_column,
+                pattern: PatternAtPosition::Livewire(lw.clone()),
+            });
         }
 
-        // Check directives (@extends, @include, etc.)
         for dir in &self.directives {
-            if dir.line == line && column >= dir.column && column <= dir.end_column {
-                return Some(PatternAtPosition::Directive(dir.clone()));
-            }
+            entries.push(PositionEntry {
+                line: dir.line,
+                column: dir.column,
+                end_column: dir.end_column,
+                pattern: PatternAtPosition::Directive(dir.clone()),
+            });
         }
 
-        // Check view calls
         for view in &self.views {
-            if view.line == line && column >= view.column && column <= view.end_column {
-                return Some(PatternAtPosition::View(view.clone()));
-            }
+            entries.push(PositionEntry {
+                line: view.line,
+                column: view.column,
+                end_column: view.end_column,
+                pattern: PatternAtPosition::View(view.clone()),
+            });
         }
 
-        // Check env calls
         for env in &self.env_refs {
-            if env.line == line && column >= env.column && column <= env.end_column {
-                return Some(PatternAtPosition::EnvRef(env.clone()));
-            }
+            entries.push(PositionEntry {
+                line: env.line,
+                column: env.column,
+                end_column: env.end_column,
+                pattern: PatternAtPosition::EnvRef(env.clone()),
+            });
         }
 
-        // Check config calls
         for config in &self.config_refs {
-            if config.line == line && column >= config.column && column <= config.end_column {
-                return Some(PatternAtPosition::ConfigRef(config.clone()));
-            }
+            entries.push(PositionEntry {
+                line: config.line,
+                column: config.column,
+                end_column: config.end_column,
+                pattern: PatternAtPosition::ConfigRef(config.clone()),
+            });
         }
 
-        // Check middleware calls
         for mw in &self.middleware_refs {
-            if mw.line == line && column >= mw.column && column <= mw.end_column {
-                return Some(PatternAtPosition::Middleware(mw.clone()));
-            }
+            entries.push(PositionEntry {
+                line: mw.line,
+                column: mw.column,
+                end_column: mw.end_column,
+                pattern: PatternAtPosition::Middleware(mw.clone()),
+            });
         }
 
-        // Check translation calls
         for trans in &self.translation_refs {
-            if trans.line == line && column >= trans.column && column <= trans.end_column {
-                return Some(PatternAtPosition::Translation(trans.clone()));
-            }
+            entries.push(PositionEntry {
+                line: trans.line,
+                column: trans.column,
+                end_column: trans.end_column,
+                pattern: PatternAtPosition::Translation(trans.clone()),
+            });
         }
 
-        // Check asset calls
         for asset in &self.asset_refs {
-            if asset.line == line && column >= asset.column && column <= asset.end_column {
-                return Some(PatternAtPosition::Asset(asset.clone()));
-            }
+            entries.push(PositionEntry {
+                line: asset.line,
+                column: asset.column,
+                end_column: asset.end_column,
+                pattern: PatternAtPosition::Asset(asset.clone()),
+            });
         }
 
-        // Check binding calls
         for binding in &self.binding_refs {
-            if binding.line == line && column >= binding.column && column <= binding.end_column {
-                return Some(PatternAtPosition::Binding(binding.clone()));
+            entries.push(PositionEntry {
+                line: binding.line,
+                column: binding.column,
+                end_column: binding.end_column,
+                pattern: PatternAtPosition::Binding(binding.clone()),
+            });
+        }
+
+        for route in &self.route_refs {
+            entries.push(PositionEntry {
+                line: route.line,
+                column: route.column,
+                end_column: route.end_column,
+                pattern: PatternAtPosition::Route(route.clone()),
+            });
+        }
+
+        for url in &self.url_refs {
+            entries.push(PositionEntry {
+                line: url.line,
+                column: url.column,
+                end_column: url.end_column,
+                pattern: PatternAtPosition::Url(url.clone()),
+            });
+        }
+
+        for action in &self.action_refs {
+            entries.push(PositionEntry {
+                line: action.line,
+                column: action.column,
+                end_column: action.end_column,
+                pattern: PatternAtPosition::Action(action.clone()),
+            });
+        }
+
+        // Sort by (line, column) for efficient binary search
+        entries.sort_by(|a, b| {
+            a.line.cmp(&b.line).then_with(|| a.column.cmp(&b.column))
+        });
+
+        self.sorted_positions = entries;
+    }
+
+    /// Find a pattern at the given cursor position (line, column)
+    /// Uses binary search for O(log n) lookup to find the line, then linear scan within line
+    pub fn find_at_position(&self, line: u32, column: u32) -> Option<PatternAtPosition> {
+        if self.sorted_positions.is_empty() {
+            return None;
+        }
+
+        // Binary search to find the first entry on or after target line
+        let start_idx = self.sorted_positions
+            .partition_point(|e| e.line < line);
+
+        // Scan entries on this line
+        for entry in &self.sorted_positions[start_idx..] {
+            // Stop when we've passed the target line
+            if entry.line > line {
+                break;
+            }
+
+            // Check if cursor is within this pattern's column range
+            if column >= entry.column && column <= entry.end_column {
+                return Some(entry.pattern.clone());
             }
         }
 
@@ -728,13 +1778,183 @@ pub enum SalsaRequest {
     /// Get parsed patterns for a file
     GetPatterns {
         path: PathBuf,
-        reply: oneshot::Sender<Option<ParsedPatternsData>>,
+        reply: oneshot::Sender<Option<Arc<ParsedPatternsData>>>,
     },
     /// Remove a file from the database
     RemoveFile {
         path: PathBuf,
         reply: oneshot::Sender<()>,
     },
+
+    // === Config Management ===
+
+    /// Register configuration files for the project
+    RegisterConfigFiles {
+        root_path: PathBuf,
+        composer_json: Option<String>,
+        view_config: Option<String>,
+        livewire_config: Option<String>,
+        reply: oneshot::Sender<()>,
+    },
+    /// Update a specific configuration file
+    UpdateConfigFile {
+        path: PathBuf,
+        text: String,
+        reply: oneshot::Sender<()>,
+    },
+    /// Get the current Laravel configuration
+    GetLaravelConfig {
+        reply: oneshot::Sender<Option<LaravelConfigData>>,
+    },
+
+    // === Reference Finding ===
+
+    /// Register project files for reference finding
+    /// Scans directories and registers all PHP/Blade files
+    RegisterProjectFiles {
+        root_path: PathBuf,
+        controller_paths: Vec<PathBuf>,
+        view_paths: Vec<PathBuf>,
+        livewire_path: Option<PathBuf>,
+        routes_path: PathBuf,
+        reply: oneshot::Sender<()>,
+    },
+    /// Find all references to a specific view across the project
+    FindViewReferences {
+        view_name: String,
+        reply: oneshot::Sender<Vec<ViewReferenceLocationData>>,
+    },
+
+    // === Service Provider Management ===
+
+    /// Register the service provider registry from the existing analyzer
+    RegisterServiceProviderRegistry {
+        middleware_aliases: std::collections::HashMap<String, MiddlewareRegistrationData>,
+        bindings: std::collections::HashMap<String, BindingRegistrationData>,
+        singletons: std::collections::HashMap<String, BindingRegistrationData>,
+        reply: oneshot::Sender<()>,
+    },
+    /// Get middleware by alias
+    GetMiddlewareByAlias {
+        alias: String,
+        reply: oneshot::Sender<Option<MiddlewareRegistrationData>>,
+    },
+    /// Get binding by name
+    GetBindingByName {
+        name: String,
+        reply: oneshot::Sender<Option<BindingRegistrationData>>,
+    },
+
+    // === Environment Variable Management ===
+
+    /// Register environment variables from the env cache
+    RegisterEnvVariables {
+        variables: std::collections::HashMap<String, EnvVariableData>,
+        reply: oneshot::Sender<()>,
+    },
+    /// Get an environment variable by name
+    GetEnvVariable {
+        name: String,
+        reply: oneshot::Sender<Option<EnvVariableData>>,
+    },
+    /// Get all environment variable names (for autocomplete)
+    GetEnvVariableNames {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+
+    // === Salsa-based Environment Variable Management (New) ===
+
+    /// Register a raw .env file for Salsa to parse
+    RegisterEnvSource {
+        path: PathBuf,
+        text: String,
+        priority: u8, // 0=.env.example, 1=.env.local, 2=.env
+        reply: oneshot::Sender<()>,
+    },
+    /// Get a parsed env variable from Salsa
+    GetParsedEnvVar {
+        name: String,
+        reply: oneshot::Sender<Option<ParsedEnvVarData>>,
+    },
+    /// Get all parsed env variables from Salsa
+    GetAllParsedEnvVars {
+        reply: oneshot::Sender<Vec<ParsedEnvVarData>>,
+    },
+
+    // === Salsa-based Service Provider Management (New) ===
+
+    /// Register a raw service provider file for Salsa to parse
+    RegisterServiceProviderSource {
+        path: PathBuf,
+        text: String,
+        priority: u8, // 0=framework, 1=package, 2=app
+        root_path: PathBuf,
+        reply: oneshot::Sender<()>,
+    },
+    /// Get middleware from Salsa-parsed service providers
+    GetParsedMiddleware {
+        alias: String,
+        reply: oneshot::Sender<Option<ParsedMiddlewareData>>,
+    },
+    /// Get all parsed middleware from Salsa
+    GetAllParsedMiddleware {
+        reply: oneshot::Sender<Vec<ParsedMiddlewareData>>,
+    },
+    /// Get binding from Salsa-parsed service providers
+    GetParsedBinding {
+        name: String,
+        reply: oneshot::Sender<Option<ParsedBindingData>>,
+    },
+    /// Get all parsed bindings from Salsa
+    GetAllParsedBindings {
+        reply: oneshot::Sender<Vec<ParsedBindingData>>,
+    },
+
+    // === Cache-based Registration ===
+
+    /// Register a middleware entry from disk cache
+    RegisterCachedMiddleware {
+        alias: String,
+        class: String,
+        class_file: Option<String>,
+        source_file: Option<String>,
+        line: u32,
+        reply: oneshot::Sender<()>,
+    },
+    /// Register a binding entry from disk cache
+    RegisterCachedBinding {
+        name: String,
+        class: String,
+        binding_type: String,
+        class_file: Option<String>,
+        source_file: Option<String>,
+        line: u32,
+        reply: oneshot::Sender<()>,
+    },
+
+    /// Register multiple middleware entries from disk cache (batch)
+    RegisterCachedMiddlewareBatch {
+        entries: Vec<(String, String, Option<String>, Option<String>, u32)>, // (alias, class, class_file, source_file, line)
+        reply: oneshot::Sender<()>,
+    },
+    /// Register multiple binding entries from disk cache (batch)
+    RegisterCachedBindingBatch {
+        entries: Vec<(String, String, String, Option<String>, Option<String>, u32)>, // (name, class, binding_type, class_file, source_file, line)
+        reply: oneshot::Sender<()>,
+    },
+
+    /// Register Laravel config from disk cache (bypasses parsing)
+    RegisterCachedConfig {
+        config: LaravelConfigData,
+        reply: oneshot::Sender<()>,
+    },
+
+    /// Register env variables from disk cache (bypasses parsing)
+    RegisterCachedEnvVars {
+        variables: std::collections::HashMap<String, String>,
+        reply: oneshot::Sender<()>,
+    },
+
     /// Shutdown the actor
     Shutdown,
 }
@@ -757,7 +1977,8 @@ impl SalsaHandle {
     }
 
     /// Get parsed patterns for a file
-    pub async fn get_patterns(&self, path: PathBuf) -> Result<Option<ParsedPatternsData>, &'static str> {
+    /// Returns Arc for efficient sharing without cloning the entire data structure
+    pub async fn get_patterns(&self, path: PathBuf) -> Result<Option<Arc<ParsedPatternsData>>, &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::GetPatterns { path, reply: reply_tx })
@@ -783,6 +2004,398 @@ impl SalsaHandle {
             .await
             .map_err(|_| "Salsa actor already disconnected")
     }
+
+    // === Config Methods ===
+
+    /// Register configuration files for the project
+    pub async fn register_config_files(
+        &self,
+        root_path: PathBuf,
+        composer_json: Option<String>,
+        view_config: Option<String>,
+        livewire_config: Option<String>,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterConfigFiles {
+                root_path,
+                composer_json,
+                view_config,
+                livewire_config,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Update a specific configuration file
+    pub async fn update_config_file(&self, path: PathBuf, text: String) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::UpdateConfigFile { path, text, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get the current Laravel configuration
+    pub async fn get_laravel_config(&self) -> Result<Option<LaravelConfigData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetLaravelConfig { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    // === Reference Finding Methods ===
+
+    /// Register project files for reference finding
+    /// Scans the provided directories and registers all PHP/Blade files with Salsa
+    pub async fn register_project_files(
+        &self,
+        root_path: PathBuf,
+        controller_paths: Vec<PathBuf>,
+        view_paths: Vec<PathBuf>,
+        livewire_path: Option<PathBuf>,
+        routes_path: PathBuf,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterProjectFiles {
+                root_path,
+                controller_paths,
+                view_paths,
+                livewire_path,
+                routes_path,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Find all references to a specific view across the project
+    /// Returns cached results when possible, only scanning changed files
+    pub async fn find_view_references(&self, view_name: String) -> Result<Vec<ViewReferenceLocationData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::FindViewReferences {
+                view_name,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    // === Service Provider Methods ===
+
+    /// Register the service provider registry from the existing analyzer
+    pub async fn register_service_provider_registry(
+        &self,
+        middleware_aliases: std::collections::HashMap<String, MiddlewareRegistrationData>,
+        bindings: std::collections::HashMap<String, BindingRegistrationData>,
+        singletons: std::collections::HashMap<String, BindingRegistrationData>,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterServiceProviderRegistry {
+                middleware_aliases,
+                bindings,
+                singletons,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get middleware by alias
+    pub async fn get_middleware_by_alias(&self, alias: String) -> Result<Option<MiddlewareRegistrationData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetMiddlewareByAlias { alias, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get binding by name
+    pub async fn get_binding_by_name(&self, name: String) -> Result<Option<BindingRegistrationData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetBindingByName { name, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    // === Environment Variable Methods ===
+
+    /// Register environment variables from the env cache
+    pub async fn register_env_variables(
+        &self,
+        variables: std::collections::HashMap<String, EnvVariableData>,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterEnvVariables {
+                variables,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get an environment variable by name
+    pub async fn get_env_variable(&self, name: String) -> Result<Option<EnvVariableData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetEnvVariable { name, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get all environment variable names (for autocomplete)
+    pub async fn get_env_variable_names(&self) -> Result<Vec<String>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetEnvVariableNames { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    // === Salsa-based Environment Variable Methods (New - Phase 1) ===
+
+    /// Register a raw .env file for Salsa to parse
+    /// This replaces the old EnvFileCache by having Salsa do the parsing
+    pub async fn register_env_source(
+        &self,
+        path: PathBuf,
+        text: String,
+        priority: u8,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterEnvSource {
+                path,
+                text,
+                priority,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get a parsed env variable from Salsa
+    /// Returns the highest-priority variable if multiple files define the same var
+    pub async fn get_parsed_env_var(&self, name: String) -> Result<Option<ParsedEnvVarData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetParsedEnvVar { name, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get all parsed env variables from Salsa (merged by priority)
+    pub async fn get_all_parsed_env_vars(&self) -> Result<Vec<ParsedEnvVarData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetAllParsedEnvVars { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    // === Salsa-based Service Provider Methods (New - Phase 1) ===
+
+    /// Register a raw service provider file for Salsa to parse
+    /// This replaces the old ServiceProviderRegistry by having Salsa do the parsing
+    pub async fn register_service_provider_source(
+        &self,
+        path: PathBuf,
+        text: String,
+        priority: u8,
+        root_path: PathBuf,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterServiceProviderSource {
+                path,
+                text,
+                priority,
+                root_path,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get middleware by alias from Salsa-parsed service providers
+    /// Returns the highest-priority middleware if multiple providers define the same alias
+    pub async fn get_parsed_middleware(&self, alias: String) -> Result<Option<ParsedMiddlewareData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetParsedMiddleware { alias, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get all parsed middleware from Salsa (merged by priority)
+    pub async fn get_all_parsed_middleware(&self) -> Result<Vec<ParsedMiddlewareData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetAllParsedMiddleware { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get binding by name from Salsa-parsed service providers
+    /// Returns the highest-priority binding if multiple providers define the same name
+    pub async fn get_parsed_binding(&self, name: String) -> Result<Option<ParsedBindingData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetParsedBinding { name, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get all parsed bindings from Salsa (merged by priority)
+    pub async fn get_all_parsed_bindings(&self) -> Result<Vec<ParsedBindingData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetAllParsedBindings { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    // === Cache-based Registration Methods ===
+
+    /// Register a middleware entry from disk cache
+    pub async fn register_cached_middleware(
+        &self,
+        alias: String,
+        class: String,
+        class_file: Option<String>,
+        source_file: Option<String>,
+        line: u32,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterCachedMiddleware {
+                alias,
+                class,
+                class_file,
+                source_file,
+                line,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Register a binding entry from disk cache
+    pub async fn register_cached_binding(
+        &self,
+        name: String,
+        class: String,
+        binding_type: String,
+        class_file: Option<String>,
+        source_file: Option<String>,
+        line: u32,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterCachedBinding {
+                name,
+                class,
+                binding_type,
+                class_file,
+                source_file,
+                line,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Register multiple middleware entries from disk cache (batch - single round-trip)
+    pub async fn register_cached_middleware_batch(
+        &self,
+        entries: Vec<(String, String, Option<String>, Option<String>, u32)>, // (alias, class, class_file, source_file, line)
+    ) -> Result<(), &'static str> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterCachedMiddlewareBatch {
+                entries,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Register multiple binding entries from disk cache (batch - single round-trip)
+    pub async fn register_cached_binding_batch(
+        &self,
+        entries: Vec<(String, String, String, Option<String>, Option<String>, u32)>, // (name, class, binding_type, class_file, source_file, line)
+    ) -> Result<(), &'static str> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterCachedBindingBatch {
+                entries,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Register Laravel config from disk cache (bypasses parsing)
+    pub async fn register_cached_config(&self, config: LaravelConfigData) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterCachedConfig {
+                config,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Register env variables from disk cache (bypasses parsing)
+    pub async fn register_cached_env_vars(&self, variables: std::collections::HashMap<String, String>) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterCachedEnvVars {
+                variables,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
 }
 
 /// The Salsa actor that owns the database and runs on a dedicated thread
@@ -791,6 +2404,63 @@ pub struct SalsaActor {
     receiver: mpsc::Receiver<SalsaRequest>,
     /// Map from path to SourceFile for efficient lookups and updates
     files: HashMap<PathBuf, SourceFile>,
+    /// LRU cache of converted pattern data to avoid repeated conversion
+    /// Key: file path, Value: (file version, cached patterns wrapped in Arc)
+    /// Limited to 256 entries to prevent unbounded memory growth
+    pattern_cache: LruCache<PathBuf, (i32, Arc<ParsedPatternsData>)>,
+
+    // === Config Management ===
+
+    /// Project root path
+    config_root: Option<PathBuf>,
+    /// Configuration files tracked by Salsa
+    config_files: HashMap<PathBuf, ConfigFile>,
+    /// Config file version counter (incremented on changes)
+    config_version: i32,
+    /// Cached Laravel config data (version, data)
+    config_cache: Option<(i32, LaravelConfigData)>,
+
+    // === Reference Finding ===
+
+    /// Project files input for reference finding
+    project_files: Option<ProjectFiles>,
+    /// Version counter for project files
+    project_files_version: i32,
+    /// Categorized file lists for quick lookup
+    controller_files: Vec<PathBuf>,
+    view_files: Vec<PathBuf>,
+    livewire_files: Vec<PathBuf>,
+    route_files: Vec<PathBuf>,
+
+    // === Service Provider Registry ===
+
+    /// Cached middleware aliases from service provider analysis
+    sp_middleware_aliases: HashMap<String, MiddlewareRegistrationData>,
+    /// Cached bindings from service provider analysis
+    sp_bindings: HashMap<String, BindingRegistrationData>,
+    /// Cached singletons from service provider analysis
+    sp_singletons: HashMap<String, BindingRegistrationData>,
+
+    // === Environment Variables ===
+
+    /// Cached environment variables
+    env_variables: HashMap<String, EnvVariableData>,
+
+    // === Salsa-based Environment Variable Tracking (New) ===
+
+    /// Env files registered with Salsa for incremental parsing
+    salsa_env_files: HashMap<PathBuf, EnvFile>,
+    /// Version counter for env files
+    salsa_env_version: i32,
+
+    // === Salsa-based Service Provider Tracking (New) ===
+
+    /// Service provider files registered with Salsa for incremental parsing
+    salsa_sp_files: HashMap<PathBuf, ServiceProviderFile>,
+    /// Version counter for service provider files
+    salsa_sp_version: i32,
+    /// Project root for service provider resolution
+    salsa_sp_root: Option<PathBuf>,
 }
 
 impl SalsaActor {
@@ -802,8 +2472,42 @@ impl SalsaActor {
             let mut actor = SalsaActor {
                 db: LaravelDatabase::new(),
                 receiver: rx,
-                files: HashMap::new(),
+                // Pre-allocate with reasonable capacity to avoid early reallocations
+                files: HashMap::with_capacity(64),
+                // LRU cache with 256 entry limit to prevent unbounded memory growth
+                pattern_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
+                // Config management
+                config_root: None,
+                config_files: HashMap::with_capacity(4),
+                config_version: 0,
+                config_cache: None,
+                // Reference finding
+                project_files: None,
+                project_files_version: 0,
+                controller_files: Vec::new(),
+                view_files: Vec::new(),
+                livewire_files: Vec::new(),
+                route_files: Vec::new(),
+                // Service provider registry
+                sp_middleware_aliases: HashMap::new(),
+                sp_bindings: HashMap::new(),
+                sp_singletons: HashMap::new(),
+                // Environment variables
+                env_variables: HashMap::new(),
+                // Salsa-based env tracking
+                salsa_env_files: HashMap::with_capacity(4),
+                salsa_env_version: 0,
+                // Salsa-based service provider tracking
+                salsa_sp_files: HashMap::with_capacity(32),
+                salsa_sp_version: 0,
+                salsa_sp_root: None,
             };
+
+            // Pre-warm query cache on actor thread (background)
+            // This runs before any file parsing requests arrive,
+            // moving the ~200ms compilation cost to startup
+            crate::queries::prewarm_query_cache();
+
             actor.run();
         });
 
@@ -824,8 +2528,177 @@ impl SalsaActor {
                 }
                 SalsaRequest::RemoveFile { path, reply } => {
                     self.files.remove(&path);
+                    self.pattern_cache.pop(&path);
                     let _ = reply.send(());
                 }
+
+                // === Config Handlers ===
+                SalsaRequest::RegisterConfigFiles {
+                    root_path,
+                    composer_json,
+                    view_config,
+                    livewire_config,
+                    reply,
+                } => {
+                    self.handle_register_config_files(
+                        root_path,
+                        composer_json,
+                        view_config,
+                        livewire_config,
+                    );
+                    let _ = reply.send(());
+                }
+                SalsaRequest::UpdateConfigFile { path, text, reply } => {
+                    self.handle_update_config_file(path, text);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::GetLaravelConfig { reply } => {
+                    let result = self.handle_get_laravel_config();
+                    let _ = reply.send(result);
+                }
+
+                // === Reference Finding Handlers ===
+                SalsaRequest::RegisterProjectFiles {
+                    root_path,
+                    controller_paths,
+                    view_paths,
+                    livewire_path,
+                    routes_path,
+                    reply,
+                } => {
+                    self.handle_register_project_files(
+                        root_path,
+                        controller_paths,
+                        view_paths,
+                        livewire_path,
+                        routes_path,
+                    );
+                    let _ = reply.send(());
+                }
+                SalsaRequest::FindViewReferences { view_name, reply } => {
+                    let result = self.handle_find_view_references(&view_name);
+                    let _ = reply.send(result);
+                }
+
+                // === Service Provider Handlers ===
+                SalsaRequest::RegisterServiceProviderRegistry {
+                    middleware_aliases,
+                    bindings,
+                    singletons,
+                    reply,
+                } => {
+                    self.handle_register_service_provider_registry(
+                        middleware_aliases,
+                        bindings,
+                        singletons,
+                    );
+                    let _ = reply.send(());
+                }
+                SalsaRequest::GetMiddlewareByAlias { alias, reply } => {
+                    let result = self.handle_get_middleware_by_alias(&alias);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetBindingByName { name, reply } => {
+                    let result = self.handle_get_binding_by_name(&name);
+                    let _ = reply.send(result);
+                }
+
+                // === Environment Variable Handlers ===
+                SalsaRequest::RegisterEnvVariables { variables, reply } => {
+                    self.handle_register_env_variables(variables);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::GetEnvVariable { name, reply } => {
+                    let result = self.handle_get_env_variable(&name);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetEnvVariableNames { reply } => {
+                    let result = self.handle_get_env_variable_names();
+                    let _ = reply.send(result);
+                }
+
+                // === Salsa-based Environment Variable Handlers (New) ===
+                SalsaRequest::RegisterEnvSource { path, text, priority, reply } => {
+                    self.handle_register_env_source(path, text, priority);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::GetParsedEnvVar { name, reply } => {
+                    let result = self.handle_get_parsed_env_var(&name);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetAllParsedEnvVars { reply } => {
+                    let result = self.handle_get_all_parsed_env_vars();
+                    let _ = reply.send(result);
+                }
+
+                // === Salsa-based Service Provider Handlers (New) ===
+                SalsaRequest::RegisterServiceProviderSource { path, text, priority, root_path, reply } => {
+                    self.handle_register_service_provider_source(path, text, priority, root_path);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::GetParsedMiddleware { alias, reply } => {
+                    let result = self.handle_get_parsed_middleware(&alias);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetAllParsedMiddleware { reply } => {
+                    let result = self.handle_get_all_parsed_middleware();
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetParsedBinding { name, reply } => {
+                    let result = self.handle_get_parsed_binding(&name);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetAllParsedBindings { reply } => {
+                    let result = self.handle_get_all_parsed_bindings();
+                    let _ = reply.send(result);
+                }
+
+                // === Cache-based Registration Handlers ===
+                SalsaRequest::RegisterCachedMiddleware { alias, class, class_file, source_file, line, reply } => {
+                    self.handle_register_cached_middleware(alias, class, class_file, source_file, line);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::RegisterCachedBinding { name, class, binding_type, class_file, source_file, line, reply } => {
+                    self.handle_register_cached_binding(name, class, binding_type, class_file, source_file, line);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::RegisterCachedMiddlewareBatch { entries, reply } => {
+                    for (alias, class, class_file, source_file, line) in entries {
+                        self.handle_register_cached_middleware(alias, class, class_file, source_file, line);
+                    }
+                    let _ = reply.send(());
+                }
+                SalsaRequest::RegisterCachedBindingBatch { entries, reply } => {
+                    for (name, class, binding_type, class_file, source_file, line) in entries {
+                        self.handle_register_cached_binding(name, class, binding_type, class_file, source_file, line);
+                    }
+                    let _ = reply.send(());
+                }
+                SalsaRequest::RegisterCachedConfig { config, reply } => {
+                    // Set config directly from cache, bypassing parsing
+                    self.config_root = Some(config.root.clone());
+                    self.config_cache = Some((self.config_version, config));
+                    tracing::info!("📋 Registered cached Laravel config");
+                    let _ = reply.send(());
+                }
+                SalsaRequest::RegisterCachedEnvVars { variables, reply } => {
+                    // Set env vars directly from cache
+                    let count = variables.len();
+                    for (name, value) in variables {
+                        self.env_variables.insert(name.clone(), EnvVariableData {
+                            name,
+                            value,
+                            file_path: PathBuf::from(".env"), // Placeholder
+                            line: 0,
+                            column: 0,
+                            value_column: 0,
+                            is_commented: false,
+                        });
+                    }
+                    tracing::debug!("Registered {} cached env variables", count);
+                    let _ = reply.send(());
+                }
+
                 SalsaRequest::Shutdown => {
                     break;
                 }
@@ -835,6 +2708,9 @@ impl SalsaActor {
 
     /// Handle file update - create or update the SourceFile
     fn handle_update_file(&mut self, path: PathBuf, version: i32, text: String) {
+        // Invalidate pattern cache for this file - will be recomputed on next get_patterns
+        self.pattern_cache.pop(&path);
+
         if let Some(file) = self.files.get(&path) {
             // Update existing file
             file.set_version(&mut self.db).to(version);
@@ -847,120 +2723,212 @@ impl SalsaActor {
     }
 
     /// Handle pattern query - parse file and extract patterns
-    fn handle_get_patterns(&self, path: &PathBuf) -> Option<ParsedPatternsData> {
+    /// Uses cached data if version matches, otherwise converts and caches
+    /// Returns Arc for efficient sharing without cloning the entire data structure
+    fn handle_get_patterns(&mut self, path: &PathBuf) -> Option<Arc<ParsedPatternsData>> {
+        let start = Instant::now();
         let file = self.files.get(path)?;
+        let version = file.version(&self.db);
+        let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
 
+        // Check cache first - return cached Arc if version matches (cheap clone)
+        if let Some((cached_version, cached_data)) = self.pattern_cache.get(path) {
+            if *cached_version == version {
+                info!("✅ Cache HIT for {} ({:?})", file_name, start.elapsed());
+                return Some(Arc::clone(cached_data));
+            }
+        }
+
+        // Cache miss or version mismatch - need to convert
         // This call is memoized by Salsa - it only re-parses if the file content changed
+        let parse_start = Instant::now();
         let patterns = parse_file_patterns(&self.db, *file);
+        let parse_time = parse_start.elapsed();
 
         // Convert Salsa types to plain data types for transfer
+        // Note: Cache intermediate interned values to avoid double lookups
+        // Wrap in Rc for cheap cloning when building position index
         let views = patterns.views(&self.db)
             .iter()
-            .map(|v| ViewReferenceData {
-                name: v.name(&self.db).name(&self.db).clone(),
-                line: v.line(&self.db),
-                column: v.column(&self.db),
-                end_column: v.end_column(&self.db),
-                is_route_view: v.is_route_view(&self.db),
+            .map(|v| {
+                let name = v.name(&self.db);
+                Arc::new(ViewReferenceData {
+                    name: name.name(&self.db).clone(),
+                    line: v.line(&self.db),
+                    column: v.column(&self.db),
+                    end_column: v.end_column(&self.db),
+                    is_route_view: v.is_route_view(&self.db),
+                })
             })
             .collect();
 
         let components = patterns.components(&self.db)
             .iter()
-            .map(|c| ComponentReferenceData {
-                name: c.name(&self.db).name(&self.db).clone(),
-                tag_name: c.tag_name(&self.db).name(&self.db).clone(),
-                line: c.line(&self.db),
-                column: c.column(&self.db),
-                end_column: c.end_column(&self.db),
+            .map(|c| {
+                let name = c.name(&self.db);
+                let tag = c.tag_name(&self.db);
+                Arc::new(ComponentReferenceData {
+                    name: name.name(&self.db).clone(),
+                    tag_name: tag.name(&self.db).clone(),
+                    line: c.line(&self.db),
+                    column: c.column(&self.db),
+                    end_column: c.end_column(&self.db),
+                })
             })
             .collect();
 
         let directives = patterns.directives(&self.db)
             .iter()
-            .map(|d| DirectiveReferenceData {
-                name: d.name(&self.db).name(&self.db).clone(),
-                arguments: d.arguments(&self.db).clone(),
-                line: d.line(&self.db),
-                column: d.column(&self.db),
-                end_column: d.end_column(&self.db),
+            .map(|d| {
+                let name = d.name(&self.db);
+                Arc::new(DirectiveReferenceData {
+                    name: name.name(&self.db).clone(),
+                    arguments: d.arguments(&self.db).clone(),
+                    line: d.line(&self.db),
+                    column: d.column(&self.db),
+                    end_column: d.end_column(&self.db),
+                })
             })
             .collect();
 
         let env_refs = patterns.env_refs(&self.db)
             .iter()
-            .map(|e| EnvReferenceData {
-                name: e.name(&self.db).name(&self.db).clone(),
-                has_fallback: e.has_fallback(&self.db),
-                line: e.line(&self.db),
-                column: e.column(&self.db),
-                end_column: e.end_column(&self.db),
+            .map(|e| {
+                let name = e.name(&self.db);
+                Arc::new(EnvReferenceData {
+                    name: name.name(&self.db).clone(),
+                    has_fallback: e.has_fallback(&self.db),
+                    line: e.line(&self.db),
+                    column: e.column(&self.db),
+                    end_column: e.end_column(&self.db),
+                })
             })
             .collect();
 
         let config_refs = patterns.config_refs(&self.db)
             .iter()
-            .map(|c| ConfigReferenceData {
-                key: c.key(&self.db).key(&self.db).clone(),
-                line: c.line(&self.db),
-                column: c.column(&self.db),
-                end_column: c.end_column(&self.db),
+            .map(|c| {
+                let key = c.key(&self.db);
+                Arc::new(ConfigReferenceData {
+                    key: key.key(&self.db).clone(),
+                    line: c.line(&self.db),
+                    column: c.column(&self.db),
+                    end_column: c.end_column(&self.db),
+                })
             })
             .collect();
 
         let livewire_refs = patterns.livewire_refs(&self.db)
             .iter()
-            .map(|lw| LivewireReferenceData {
-                name: lw.name(&self.db).name(&self.db).clone(),
-                line: lw.line(&self.db),
-                column: lw.column(&self.db),
-                end_column: lw.end_column(&self.db),
+            .map(|lw| {
+                let name = lw.name(&self.db);
+                Arc::new(LivewireReferenceData {
+                    name: name.name(&self.db).clone(),
+                    line: lw.line(&self.db),
+                    column: lw.column(&self.db),
+                    end_column: lw.end_column(&self.db),
+                })
             })
             .collect();
 
         let middleware_refs = patterns.middleware_refs(&self.db)
             .iter()
-            .map(|mw| MiddlewareReferenceData {
-                name: mw.name(&self.db).name(&self.db).clone(),
-                line: mw.line(&self.db),
-                column: mw.column(&self.db),
-                end_column: mw.end_column(&self.db),
+            .map(|mw| {
+                let name = mw.name(&self.db);
+                Arc::new(MiddlewareReferenceData {
+                    name: name.name(&self.db).clone(),
+                    line: mw.line(&self.db),
+                    column: mw.column(&self.db),
+                    end_column: mw.end_column(&self.db),
+                })
             })
             .collect();
 
         let translation_refs = patterns.translation_refs(&self.db)
             .iter()
-            .map(|t| TranslationReferenceData {
-                key: t.key(&self.db).key(&self.db).clone(),
-                line: t.line(&self.db),
-                column: t.column(&self.db),
-                end_column: t.end_column(&self.db),
+            .map(|t| {
+                let key = t.key(&self.db);
+                Arc::new(TranslationReferenceData {
+                    key: key.key(&self.db).clone(),
+                    line: t.line(&self.db),
+                    column: t.column(&self.db),
+                    end_column: t.end_column(&self.db),
+                })
             })
             .collect();
 
         let asset_refs = patterns.asset_refs(&self.db)
             .iter()
-            .map(|a| AssetReferenceData {
-                path: a.path(&self.db).path(&self.db).clone(),
-                helper_type: a.helper_type(&self.db),
-                line: a.line(&self.db),
-                column: a.column(&self.db),
-                end_column: a.end_column(&self.db),
+            .map(|a| {
+                let path = a.path(&self.db);
+                Arc::new(AssetReferenceData {
+                    path: path.path(&self.db).clone(),
+                    helper_type: a.helper_type(&self.db),
+                    line: a.line(&self.db),
+                    column: a.column(&self.db),
+                    end_column: a.end_column(&self.db),
+                })
             })
             .collect();
 
         let binding_refs = patterns.binding_refs(&self.db)
             .iter()
-            .map(|b| BindingReferenceData {
-                name: b.name(&self.db).name(&self.db).clone(),
-                is_class_reference: b.is_class_reference(&self.db),
-                line: b.line(&self.db),
-                column: b.column(&self.db),
-                end_column: b.end_column(&self.db),
+            .map(|b| {
+                let name = b.name(&self.db);
+                Arc::new(BindingReferenceData {
+                    name: name.name(&self.db).clone(),
+                    is_class_reference: b.is_class_reference(&self.db),
+                    line: b.line(&self.db),
+                    column: b.column(&self.db),
+                    end_column: b.end_column(&self.db),
+                })
             })
             .collect();
 
-        Some(ParsedPatternsData {
+        // Parse route, url, action patterns directly (not cached in Salsa to keep field count under 12)
+        // Uses single-pass extraction - query is cached globally so this is fast
+        use crate::parser::{parse_php, language_php};
+        use crate::queries::extract_all_php_patterns;
+
+        let text = file.text(&self.db);
+        let mut route_refs = Vec::new();
+        let mut url_refs = Vec::new();
+        let mut action_refs = Vec::new();
+
+        if let Ok(tree) = parse_php(text) {
+            let lang = language_php();
+
+            if let Ok(php_patterns) = extract_all_php_patterns(&tree, text, &lang) {
+                for r in php_patterns.route_calls {
+                    route_refs.push(Arc::new(RouteReferenceData {
+                        name: r.route_name.to_string(),
+                        line: r.row as u32,
+                        column: r.column as u32,
+                        end_column: r.end_column as u32,
+                    }));
+                }
+
+                for u in php_patterns.url_calls {
+                    url_refs.push(Arc::new(UrlReferenceData {
+                        path: u.url_path.to_string(),
+                        line: u.row as u32,
+                        column: u.column as u32,
+                        end_column: u.end_column as u32,
+                    }));
+                }
+
+                for a in php_patterns.action_calls {
+                    action_refs.push(Arc::new(ActionReferenceData {
+                        action: a.action_name.to_string(),
+                        line: a.row as u32,
+                        column: a.column as u32,
+                        end_column: a.end_column as u32,
+                    }));
+                }
+            }
+        }
+
+        let mut data = ParsedPatternsData {
             views,
             components,
             directives,
@@ -971,6 +2939,707 @@ impl SalsaActor {
             translation_refs,
             asset_refs,
             binding_refs,
-        })
+            route_refs,
+            url_refs,
+            action_refs,
+            sorted_positions: Vec::new(),
+        };
+
+        // Build the sorted position index for O(log n) lookups
+        data.build_position_index();
+
+        // Wrap in Arc for efficient sharing
+        let data = Arc::new(data);
+
+        // Cache the Arc for future requests (cheap Arc::clone on cache hit)
+        self.pattern_cache.put(path.clone(), (version, Arc::clone(&data)));
+
+        let total_time = start.elapsed();
+        info!(
+            "🔄 Cache MISS for {} - parse: {:?}, total: {:?}, middleware_count: {}",
+            file_name, parse_time, total_time, data.middleware_refs.len()
+        );
+
+        Some(data)
+    }
+
+    // === Config Handlers ===
+
+    /// Handle config file registration
+    fn handle_register_config_files(
+        &mut self,
+        root_path: PathBuf,
+        composer_json: Option<String>,
+        view_config: Option<String>,
+        livewire_config: Option<String>,
+    ) {
+        self.config_root = Some(root_path.clone());
+        self.config_version += 1;
+        self.config_cache = None; // Invalidate cache
+
+        // Register composer.json
+        if let Some(text) = composer_json {
+            let path = root_path.join("composer.json");
+            let file = ConfigFile::new(&self.db, path.clone(), self.config_version, text);
+            self.config_files.insert(path, file);
+        }
+
+        // Register config/view.php
+        if let Some(text) = view_config {
+            let path = root_path.join("config/view.php");
+            let file = ConfigFile::new(&self.db, path.clone(), self.config_version, text);
+            self.config_files.insert(path, file);
+        }
+
+        // Register config/livewire.php
+        if let Some(text) = livewire_config {
+            let path = root_path.join("config/livewire.php");
+            let file = ConfigFile::new(&self.db, path.clone(), self.config_version, text);
+            self.config_files.insert(path, file);
+        }
+    }
+
+    /// Handle config file update
+    fn handle_update_config_file(&mut self, path: PathBuf, text: String) {
+        self.config_version += 1;
+        self.config_cache = None; // Invalidate cache
+
+        if let Some(file) = self.config_files.get(&path) {
+            // Update existing file
+            file.set_version(&mut self.db).to(self.config_version);
+            file.set_text(&mut self.db).to(text);
+        } else {
+            // Create new file
+            let file = ConfigFile::new(&self.db, path.clone(), self.config_version, text);
+            self.config_files.insert(path, file);
+        }
+    }
+
+    /// Handle get Laravel config request
+    fn handle_get_laravel_config(&mut self) -> Option<LaravelConfigData> {
+        let root = self.config_root.clone()?;
+
+        // Check cache first
+        if let Some((cached_version, ref cached_data)) = self.config_cache {
+            if cached_version == self.config_version {
+                return Some(cached_data.clone());
+            }
+        }
+
+        // Get config files
+        let composer = self.config_files.get(&root.join("composer.json")).copied();
+        let view_config = self.config_files.get(&root.join("config/view.php")).copied();
+        let livewire_config = self.config_files.get(&root.join("config/livewire.php")).copied();
+
+        // Use Salsa query to build config
+        let config_ref = build_laravel_config(
+            &self.db,
+            root.clone(),
+            composer,
+            view_config,
+            livewire_config,
+        );
+
+        // Convert to data transfer type
+        let data = LaravelConfigData {
+            root: config_ref.root(&self.db).clone(),
+            view_paths: config_ref.view_paths(&self.db).clone(),
+            component_paths: config_ref.component_paths(&self.db).clone(),
+            livewire_path: config_ref.livewire_path(&self.db).clone(),
+            has_livewire: config_ref.has_livewire(&self.db),
+        };
+
+        // Cache the result
+        self.config_cache = Some((self.config_version, data.clone()));
+
+        Some(data)
+    }
+
+    // === Reference Finding Handlers ===
+
+    /// Handle project files registration
+    /// Scans directories and registers all PHP/Blade files with Salsa
+    fn handle_register_project_files(
+        &mut self,
+        root_path: PathBuf,
+        controller_paths: Vec<PathBuf>,
+        view_paths: Vec<PathBuf>,
+        livewire_path: Option<PathBuf>,
+        routes_path: PathBuf,
+    ) {
+        use walkdir::WalkDir;
+
+        self.project_files_version += 1;
+
+        // Clear existing file lists
+        self.controller_files.clear();
+        self.view_files.clear();
+        self.livewire_files.clear();
+        self.route_files.clear();
+
+        // Scan controller directories
+        for controller_path in &controller_paths {
+            let full_path = root_path.join(controller_path);
+            if full_path.exists() {
+                for entry in WalkDir::new(&full_path)
+                    .into_iter()
+                    .filter_entry(|e| e.file_name().to_str().map(|s| s != ".git").unwrap_or(true))
+                    .filter_map(|e| e.ok())
+                {
+                    if entry.file_type().is_file() {
+                        if let Some(ext) = entry.path().extension() {
+                            if ext == "php" {
+                                let path = entry.path().to_path_buf();
+                                self.controller_files.push(path.clone());
+                                self.ensure_file_registered(&path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Scan view directories (for Blade files)
+        for view_path in &view_paths {
+            let full_path = root_path.join(view_path);
+            if full_path.exists() {
+                for entry in WalkDir::new(&full_path)
+                    .into_iter()
+                    .filter_entry(|e| e.file_name().to_str().map(|s| s != ".git").unwrap_or(true))
+                    .filter_map(|e| e.ok())
+                {
+                    if entry.file_type().is_file() {
+                        if let Some(file_name) = entry.path().file_name() {
+                            if file_name.to_string_lossy().ends_with(".blade.php") {
+                                let path = entry.path().to_path_buf();
+                                self.view_files.push(path.clone());
+                                self.ensure_file_registered(&path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Scan Livewire directory
+        if let Some(lw_path) = &livewire_path {
+            let full_path = root_path.join(lw_path);
+            if full_path.exists() {
+                for entry in WalkDir::new(&full_path)
+                    .into_iter()
+                    .filter_entry(|e| e.file_name().to_str().map(|s| s != ".git").unwrap_or(true))
+                    .filter_map(|e| e.ok())
+                {
+                    if entry.file_type().is_file() {
+                        if let Some(ext) = entry.path().extension() {
+                            if ext == "php" {
+                                let path = entry.path().to_path_buf();
+                                self.livewire_files.push(path.clone());
+                                self.ensure_file_registered(&path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Scan routes directory
+        let full_routes_path = root_path.join(&routes_path);
+        if full_routes_path.exists() {
+            for entry in WalkDir::new(&full_routes_path)
+                .into_iter()
+                .filter_entry(|e| e.file_name().to_str().map(|s| s != ".git").unwrap_or(true))
+                .filter_map(|e| e.ok())
+            {
+                if entry.file_type().is_file() {
+                    if let Some(ext) = entry.path().extension() {
+                        if ext == "php" {
+                            let path = entry.path().to_path_buf();
+                            self.route_files.push(path.clone());
+                            self.ensure_file_registered(&path);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Create the ProjectFiles input
+        self.project_files = Some(ProjectFiles::new(
+            &self.db,
+            self.project_files_version,
+            self.controller_files.clone(),
+            self.view_files.clone(),
+            self.livewire_files.clone(),
+            self.route_files.clone(),
+        ));
+    }
+
+    /// Ensure a file is registered with Salsa (read from disk if needed)
+    fn ensure_file_registered(&mut self, path: &PathBuf) {
+        use std::collections::hash_map::Entry;
+        // Use entry API to avoid double lookup
+        if let Entry::Vacant(entry) = self.files.entry(path.clone()) {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let file = SourceFile::new(&self.db, path.clone(), 0, text);
+                entry.insert(file);
+            }
+        }
+    }
+
+    /// Handle find view references request
+    fn handle_find_view_references(&mut self, view_name: &str) -> Vec<ViewReferenceLocationData> {
+        let mut references = Vec::new();
+
+        // Search controller files
+        for path in &self.controller_files.clone() {
+            if let Some(patterns) = self.handle_get_patterns(path) {
+                for view_ref in &patterns.views {
+                    if view_ref.name == view_name {
+                        references.push(ViewReferenceLocationData {
+                            file_path: path.clone(),
+                            line: view_ref.line,
+                            character: view_ref.column,
+                            reference_type: FileReferenceType::Controller,
+                            view_name: view_ref.name.clone(),
+                            is_route_view: view_ref.is_route_view,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Search view files (for @extends, @include directives)
+        for path in &self.view_files.clone() {
+            if let Some(patterns) = self.handle_get_patterns(path) {
+                for directive in &patterns.directives {
+                    if directive.name == "extends" || directive.name == "include" {
+                        // Extract view name from directive arguments
+                        if let Some(ref args) = directive.arguments {
+                            let extracted = extract_view_from_args(args);
+                            if extracted.as_deref() == Some(view_name) {
+                                references.push(ViewReferenceLocationData {
+                                    file_path: path.clone(),
+                                    line: directive.line,
+                                    character: directive.column,
+                                    reference_type: FileReferenceType::BladeTemplate,
+                                    view_name: view_name.to_string(),
+                                    is_route_view: false,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Search Livewire files
+        for path in &self.livewire_files.clone() {
+            if let Some(patterns) = self.handle_get_patterns(path) {
+                for view_ref in &patterns.views {
+                    if view_ref.name == view_name {
+                        references.push(ViewReferenceLocationData {
+                            file_path: path.clone(),
+                            line: view_ref.line,
+                            character: view_ref.column,
+                            reference_type: FileReferenceType::LivewireComponent,
+                            view_name: view_ref.name.clone(),
+                            is_route_view: view_ref.is_route_view,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Search route files
+        for path in &self.route_files.clone() {
+            if let Some(patterns) = self.handle_get_patterns(path) {
+                for view_ref in &patterns.views {
+                    if view_ref.name == view_name {
+                        references.push(ViewReferenceLocationData {
+                            file_path: path.clone(),
+                            line: view_ref.line,
+                            character: view_ref.column,
+                            reference_type: FileReferenceType::Route,
+                            view_name: view_ref.name.clone(),
+                            is_route_view: view_ref.is_route_view,
+                        });
+                    }
+                }
+            }
+        }
+
+        references
+    }
+
+    // === Service Provider Handlers ===
+
+    /// Handle service provider registry registration
+    fn handle_register_service_provider_registry(
+        &mut self,
+        middleware_aliases: HashMap<String, MiddlewareRegistrationData>,
+        bindings: HashMap<String, BindingRegistrationData>,
+        singletons: HashMap<String, BindingRegistrationData>,
+    ) {
+        self.sp_middleware_aliases = middleware_aliases;
+        self.sp_bindings = bindings;
+        self.sp_singletons = singletons;
+    }
+
+    /// Handle get middleware by alias
+    fn handle_get_middleware_by_alias(&self, alias: &str) -> Option<MiddlewareRegistrationData> {
+        // Handle middleware with parameters (e.g., "throttle:60,1")
+        let base_alias = alias.split(':').next().unwrap_or(alias);
+        self.sp_middleware_aliases.get(base_alias).cloned()
+    }
+
+    /// Handle get binding by name
+    fn handle_get_binding_by_name(&self, name: &str) -> Option<BindingRegistrationData> {
+        // Check bindings first, then singletons
+        self.sp_bindings.get(name).cloned()
+            .or_else(|| self.sp_singletons.get(name).cloned())
+    }
+
+    // === Environment Variable Handlers ===
+
+    /// Handle env variables registration
+    fn handle_register_env_variables(&mut self, variables: HashMap<String, EnvVariableData>) {
+        self.env_variables = variables;
+    }
+
+    /// Handle get env variable by name
+    fn handle_get_env_variable(&self, name: &str) -> Option<EnvVariableData> {
+        self.env_variables.get(name).cloned()
+    }
+
+    /// Handle get all env variable names
+    fn handle_get_env_variable_names(&self) -> Vec<String> {
+        self.env_variables.keys().cloned().collect()
+    }
+
+    // === Salsa-based Environment Variable Handlers (New) ===
+
+    /// Handle registering a raw env file for Salsa to parse
+    fn handle_register_env_source(&mut self, path: PathBuf, text: String, priority: u8) {
+        use salsa::Setter;
+        self.salsa_env_version += 1;
+
+        if let Some(file) = self.salsa_env_files.get(&path) {
+            // Update existing file
+            file.set_version(&mut self.db).to(self.salsa_env_version);
+            file.set_text(&mut self.db).to(text);
+            file.set_priority(&mut self.db).to(priority);
+        } else {
+            // Create new file
+            let file = EnvFile::new(&self.db, path.clone(), self.salsa_env_version, text, priority);
+            self.salsa_env_files.insert(path, file);
+        }
+    }
+
+    /// Handle getting a parsed env variable by name from Salsa
+    fn handle_get_parsed_env_var(&self, name: &str) -> Option<ParsedEnvVarData> {
+        // Find the variable with the highest priority
+        let mut best: Option<ParsedEnvVarData> = None;
+
+        for env_file in self.salsa_env_files.values() {
+            let parsed_vars = parse_env_source(&self.db, *env_file);
+            for var in parsed_vars {
+                if var.name(&self.db).name(&self.db) == name {
+                    let data = ParsedEnvVarData {
+                        name: var.name(&self.db).name(&self.db).clone(),
+                        value: var.value(&self.db).clone(),
+                        line: var.line(&self.db),
+                        column: var.column(&self.db),
+                        value_column: var.value_column(&self.db),
+                        is_commented: var.is_commented(&self.db),
+                        priority: var.priority(&self.db),
+                        source_file: var.source_file(&self.db).clone(),
+                    };
+                    // Keep the one with highest priority
+                    match &best {
+                        Some(existing) if existing.priority >= data.priority => {}
+                        _ => best = Some(data),
+                    }
+                }
+            }
+        }
+
+        best
+    }
+
+    /// Handle getting all parsed env variables from Salsa
+    fn handle_get_all_parsed_env_vars(&self) -> Vec<ParsedEnvVarData> {
+        use std::collections::HashMap;
+
+        // Merge variables by name, higher priority wins
+        let mut merged: HashMap<String, ParsedEnvVarData> = HashMap::new();
+
+        for env_file in self.salsa_env_files.values() {
+            let parsed_vars = parse_env_source(&self.db, *env_file);
+            for var in parsed_vars {
+                let name = var.name(&self.db).name(&self.db).clone();
+                let data = ParsedEnvVarData {
+                    name: name.clone(),
+                    value: var.value(&self.db).clone(),
+                    line: var.line(&self.db),
+                    column: var.column(&self.db),
+                    value_column: var.value_column(&self.db),
+                    is_commented: var.is_commented(&self.db),
+                    priority: var.priority(&self.db),
+                    source_file: var.source_file(&self.db).clone(),
+                };
+
+                match merged.get(&name) {
+                    Some(existing) if existing.priority >= data.priority => {}
+                    _ => { merged.insert(name, data); }
+                }
+            }
+        }
+
+        merged.into_values().collect()
+    }
+
+    // === Salsa-based Service Provider Handlers (New) ===
+
+    /// Handle registering a raw service provider file for Salsa to parse
+    fn handle_register_service_provider_source(&mut self, path: PathBuf, text: String, priority: u8, root_path: PathBuf) {
+        use salsa::Setter;
+        self.salsa_sp_version += 1;
+        self.salsa_sp_root = Some(root_path);
+
+        if let Some(file) = self.salsa_sp_files.get(&path) {
+            // Update existing file
+            file.set_version(&mut self.db).to(self.salsa_sp_version);
+            file.set_text(&mut self.db).to(text);
+            file.set_priority(&mut self.db).to(priority);
+        } else {
+            // Create new file
+            let file = ServiceProviderFile::new(&self.db, path.clone(), self.salsa_sp_version, text, priority);
+            self.salsa_sp_files.insert(path, file);
+        }
+    }
+
+    /// Handle getting middleware by alias from Salsa-parsed service providers
+    fn handle_get_parsed_middleware(&self, alias: &str) -> Option<ParsedMiddlewareData> {
+        let root = self.salsa_sp_root.as_ref()?;
+        let mut best: Option<ParsedMiddlewareData> = None;
+
+        for sp_file in self.salsa_sp_files.values() {
+            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+            for mw in parsed.middleware(&self.db) {
+                if mw.alias(&self.db).name(&self.db) == alias {
+                    let data = ParsedMiddlewareData {
+                        alias: mw.alias(&self.db).name(&self.db).clone(),
+                        class_name: mw.class_name(&self.db).clone(),
+                        file_path: mw.file_path(&self.db).clone(),
+                        source_line: mw.source_line(&self.db),
+                        priority: mw.priority(&self.db),
+                        source_file: mw.source_file(&self.db).clone(),
+                    };
+                    // Keep the one with highest priority
+                    match &best {
+                        Some(existing) if existing.priority >= data.priority => {}
+                        _ => best = Some(data),
+                    }
+                }
+            }
+        }
+
+        best
+    }
+
+    /// Handle getting all parsed middleware from Salsa
+    fn handle_get_all_parsed_middleware(&self) -> Vec<ParsedMiddlewareData> {
+        let root = match self.salsa_sp_root.as_ref() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        let mut merged: HashMap<String, ParsedMiddlewareData> = HashMap::new();
+
+        for sp_file in self.salsa_sp_files.values() {
+            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+            for mw in parsed.middleware(&self.db) {
+                let alias = mw.alias(&self.db).name(&self.db).clone();
+                let data = ParsedMiddlewareData {
+                    alias: alias.clone(),
+                    class_name: mw.class_name(&self.db).clone(),
+                    file_path: mw.file_path(&self.db).clone(),
+                    source_line: mw.source_line(&self.db),
+                    priority: mw.priority(&self.db),
+                    source_file: mw.source_file(&self.db).clone(),
+                };
+
+                match merged.get(&alias) {
+                    Some(existing) if existing.priority >= data.priority => {}
+                    _ => { merged.insert(alias, data); }
+                }
+            }
+        }
+
+        merged.into_values().collect()
+    }
+
+    /// Handle getting a binding by name from Salsa-parsed service providers
+    fn handle_get_parsed_binding(&self, name: &str) -> Option<ParsedBindingData> {
+        let root = self.salsa_sp_root.as_ref()?;
+        let mut best: Option<ParsedBindingData> = None;
+
+        for sp_file in self.salsa_sp_files.values() {
+            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+            for binding in parsed.bindings(&self.db) {
+                if binding.abstract_name(&self.db).name(&self.db) == name {
+                    let data = ParsedBindingData {
+                        abstract_name: binding.abstract_name(&self.db).name(&self.db).clone(),
+                        concrete_class: binding.concrete_class(&self.db).clone(),
+                        file_path: binding.file_path(&self.db).clone(),
+                        binding_type: binding.binding_type(&self.db),
+                        source_line: binding.source_line(&self.db),
+                        priority: binding.priority(&self.db),
+                        source_file: binding.source_file(&self.db).clone(),
+                    };
+                    // Keep the one with highest priority
+                    match &best {
+                        Some(existing) if existing.priority >= data.priority => {}
+                        _ => best = Some(data),
+                    }
+                }
+            }
+        }
+
+        best
+    }
+
+    /// Handle getting all parsed bindings from Salsa
+    fn handle_get_all_parsed_bindings(&self) -> Vec<ParsedBindingData> {
+        let root = match self.salsa_sp_root.as_ref() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        let mut merged: HashMap<String, ParsedBindingData> = HashMap::new();
+
+        for sp_file in self.salsa_sp_files.values() {
+            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+            for binding in parsed.bindings(&self.db) {
+                let name = binding.abstract_name(&self.db).name(&self.db).clone();
+                let data = ParsedBindingData {
+                    abstract_name: name.clone(),
+                    concrete_class: binding.concrete_class(&self.db).clone(),
+                    file_path: binding.file_path(&self.db).clone(),
+                    binding_type: binding.binding_type(&self.db),
+                    source_line: binding.source_line(&self.db),
+                    priority: binding.priority(&self.db),
+                    source_file: binding.source_file(&self.db).clone(),
+                };
+
+                match merged.get(&name) {
+                    Some(existing) if existing.priority >= data.priority => {}
+                    _ => { merged.insert(name, data); }
+                }
+            }
+        }
+
+        merged.into_values().collect()
+    }
+
+    /// Handle registering a middleware entry from disk cache
+    fn handle_register_cached_middleware(
+        &mut self,
+        alias: String,
+        class: String,
+        class_file: Option<String>,
+        source_file: Option<String>,
+        line: u32,
+    ) {
+        // Store in the simple registry (same as register_service_provider_registry)
+        self.sp_middleware_aliases.insert(
+            alias.clone(),
+            MiddlewareRegistrationData {
+                alias,
+                class_name: class,
+                file_path: class_file.map(PathBuf::from),
+                source_file: source_file.map(PathBuf::from),
+                source_line: Some(line as usize),
+                priority: 2, // Cache entries have highest priority (app level)
+            },
+        );
+    }
+
+    /// Handle registering a binding entry from disk cache
+    fn handle_register_cached_binding(
+        &mut self,
+        name: String,
+        class: String,
+        binding_type: String,
+        class_file: Option<String>,
+        source_file: Option<String>,
+        line: u32,
+    ) {
+        let bt = match binding_type.as_str() {
+            "singleton" => BindingTypeData::Singleton,
+            "scoped" => BindingTypeData::Scoped,
+            "alias" => BindingTypeData::Alias,
+            _ => BindingTypeData::Bind,
+        };
+
+        // Store in the simple registry
+        self.sp_bindings.insert(
+            name.clone(),
+            BindingRegistrationData {
+                abstract_name: name,
+                concrete_class: class,
+                file_path: class_file.map(PathBuf::from),
+                binding_type: bt,
+                source_file: source_file.map(PathBuf::from),
+                source_line: Some(line as usize),
+                priority: 2, // Cache entries have highest priority (app level)
+            },
+        );
+    }
+}
+
+/// Extract view name from directive arguments (e.g., "('layouts.app')" -> "layouts.app")
+fn extract_view_from_args(args: &str) -> Option<String> {
+    let trimmed = args.trim().trim_matches('(').trim_matches(')').trim();
+    let unquoted = trimmed.trim_matches('\'').trim_matches('"');
+    if !unquoted.is_empty() && !unquoted.contains(',') {
+        Some(unquoted.to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod vite_tests {
+    use super::parse_vite_directive_assets;
+
+    #[test]
+    fn test_vite_singular_syntax() {
+        // @vite('resources/css/app.css') - args from tree-sitter
+        let args = "('resources/css/app.css')";
+        let results = parse_vite_directive_assets(args, 0, 0, 5);
+        
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "resources/css/app.css");
+    }
+
+    #[test]
+    fn test_vite_array_syntax() {
+        // @vite(['resources/css/app.css', 'resources/js/app.js'])
+        let args = "(['resources/css/app.css', 'resources/js/app.js'])";
+        let results = parse_vite_directive_assets(args, 0, 0, 5);
+        
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "resources/css/app.css");
+        assert_eq!(results[1].0, "resources/js/app.js");
+    }
+
+    #[test]
+    fn test_vite_double_quotes() {
+        let args = r#"("resources/css/app.css")"#;
+        let results = parse_vite_directive_assets(args, 0, 0, 5);
+        
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "resources/css/app.css");
     }
 }

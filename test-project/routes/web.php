@@ -57,14 +57,14 @@ Route::get('/test-bindings', function () {
     // ✅ Valid bindings - no diagnostic, navigate to bound class or registration
     $cache = app('cache'); // Navigate to CacheManager (framework binding)
     $config = app('config'); // Navigate to Repository (framework binding)
-    
+
     // ✅ Class references - always valid, navigate to class file
     $user = app(\App\Models\User::class); // Navigate to User.php
-    
+
     // Test various binding formats
     $db = app('db'); // Framework binding
     $events = app('events'); // Framework binding
-    
+
     return 'Testing bindings';
 });
 
@@ -72,6 +72,6 @@ Route::get('/test-binding-errors', function () {
     // ❌ ERROR diagnostic: binding not found
     $invalid = app('nonexistent'); // Should show error - binding not defined
     $custom = app('my.custom.service'); // Should show error - binding not defined
-    
+
     return 'Testing invalid bindings';
 });

@@ -4,7 +4,7 @@ description = "Laravel development support for Zed with go-to-definition for Bla
 version = "0.1.0"
 schema_version = 1
 authors = ["Mike"]
-repository = "https://github.com/yourusername/zed-laravel"
+repository = "https://github.com/GeneaLabs/zed-laravel"
 
 [language_servers.laravel-lsp]
 name = "Laravel LSP"

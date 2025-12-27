@@ -1,7 +1,7 @@
-/// This module provides tree-sitter parsers for PHP and Blade files.
-///
-/// Tree-sitter parsers convert source code into Abstract Syntax Trees (ASTs)
-/// that we can query to find patterns like view() calls and <x-component> tags.
+//! This module provides tree-sitter parsers for PHP and Blade files.
+//!
+//! Tree-sitter parsers convert source code into Abstract Syntax Trees (ASTs)
+//! that we can query to find patterns like view() calls and <x-component> tags.
 
 use tree_sitter::{Language, Parser};
 

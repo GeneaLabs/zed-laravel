@@ -225,15 +225,31 @@
 ; ============================================================================
 ; Pattern 7: route('route.name') function calls
 ; ============================================================================
-; For future implementation - route name navigation
+; Matches: route('home')
+;          route('admin.dashboard')
+;          route("user.profile", ['id' => 1])
 ;
-; (function_call_expression
-;   function: (name) @function_name
-;   arguments: (arguments
-;     (argument
-;       (string
-;         (string_value) @route_name)))
-;   (#eq? @function_name "route"))
+; Captures route name for navigation to route definition
+
+; Single-quoted strings
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @route_name)))
+  (#eq? @function_name "route"))
+
+; Double-quoted strings
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @route_name)))
+  (#eq? @function_name "route"))
 
 ; ============================================================================
 ; Pattern 8: Route::middleware('auth') - Static method calls with single middleware
@@ -496,15 +512,15 @@
   (#match? @method_name "^(get|has|choice)$"))
 
 ; ============================================================================
-; Pattern 16: app('binding') - Container binding resolution with strings
+; Pattern 16: app('binding') / resolve('binding') - Container binding resolution
 ; ============================================================================
-; Matches: app('auth')
-;          app("cache")
+; Matches: app('auth'), resolve('auth')
+;          app("cache"), resolve("cache")
 ;          app('App\Contracts\SomeInterface')
 ;
 ; This pattern captures container binding resolution using string identifiers
 
-; Single-quoted strings
+; app() - Single-quoted strings
 (function_call_expression
   function: (name) @function_name
   arguments: (arguments
@@ -514,7 +530,7 @@
         (string_content) @binding_name)))
   (#eq? @function_name "app"))
 
-; Double-quoted strings
+; app() - Double-quoted strings
 (function_call_expression
   function: (name) @function_name
   arguments: (arguments
@@ -524,15 +540,35 @@
         (string_content) @binding_name)))
   (#eq? @function_name "app"))
 
+; resolve() - Single-quoted strings
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @binding_name)))
+  (#eq? @function_name "resolve"))
+
+; resolve() - Double-quoted strings
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @binding_name)))
+  (#eq? @function_name "resolve"))
+
 ; ============================================================================
-; Pattern 17: app(SomeClass::class) - Container binding with class reference
+; Pattern 17: app(SomeClass::class) / resolve(Class::class) - Container binding with class reference
 ; ============================================================================
-; Matches: app(UserService::class)
+; Matches: app(UserService::class), resolve(UserService::class)
 ;          app(\App\Services\PaymentService::class)
 ;
 ; This pattern captures container resolution using ::class constants
 
-; Class name with ::class
+; app() - Class name with ::class
 (function_call_expression
   function: (name) @function_name
   arguments: (arguments
@@ -544,7 +580,7 @@
   (#eq? @function_name "app")
   (#eq? @constant_name "class"))
 
-; Qualified class name with ::class
+; app() - Qualified class name with ::class
 (function_call_expression
   function: (name) @function_name
   arguments: (arguments
@@ -555,6 +591,106 @@
         (name) @constant_name)))
   (#eq? @function_name "app")
   (#eq? @constant_name "class"))
+
+; resolve() - Class name with ::class
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (class_constant_access_expression
+        (name) @binding_class_name
+        (name) @constant_name)))
+  (#eq? @function_name "resolve")
+  (#eq? @constant_name "class"))
+
+; resolve() - Qualified class name with ::class
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (class_constant_access_expression
+        (qualified_name) @binding_class_name
+        (name) @constant_name)))
+  (#eq? @function_name "resolve")
+  (#eq? @constant_name "class"))
+
+; ============================================================================
+; Pattern 12b: Route::group(['middleware' => 'auth'], ...) - Group with middleware in options array
+; ============================================================================
+; Matches: Route::group(['middleware' => 'auth'], function() {...})
+;          Route::group(['middleware' => ['auth', 'verified']], function() {...})
+;
+; This captures middleware specified in the options array of Route::group()
+
+; Single middleware string in options array - single quotes key, single quotes value
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (array_creation_expression
+        (array_element_initializer
+          (string
+            (string_content) @_key)
+          (string
+            (string_content) @middleware_name)))))
+  (#eq? @class_name "Route")
+  (#eq? @method_name "group")
+  (#eq? @_key "middleware"))
+
+; Single middleware string in options array - single quotes key, double quotes value
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (array_creation_expression
+        (array_element_initializer
+          (string
+            (string_content) @_key)
+          (encapsed_string
+            (string_content) @middleware_name)))))
+  (#eq? @class_name "Route")
+  (#eq? @method_name "group")
+  (#eq? @_key "middleware"))
+
+; Array of middleware in options array - single quotes in nested array
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (array_creation_expression
+        (array_element_initializer
+          (string
+            (string_content) @_key)
+          (array_creation_expression
+            (array_element_initializer
+              (string
+                (string_content) @middleware_name)))))))
+  (#eq? @class_name "Route")
+  (#eq? @method_name "group")
+  (#eq? @_key "middleware"))
+
+; Array of middleware in options array - double quotes in nested array
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (array_creation_expression
+        (array_element_initializer
+          (string
+            (string_content) @_key)
+          (array_creation_expression
+            (array_element_initializer
+              (encapsed_string
+                (string_content) @middleware_name)))))))
+  (#eq? @class_name "Route")
+  (#eq? @method_name "group")
+  (#eq? @_key "middleware"))
 
 ; ============================================================================
 ; Pattern 13: Asset and Path Helpers
@@ -794,5 +930,119 @@
         (string_content) @vite_asset_path)))
   (#eq? @class_name "Vite")
   (#eq? @method_name "asset"))
+
+; ============================================================================
+; Pattern 18: url('path') - URL helper function
+; ============================================================================
+; Matches: url('home')
+;          url('/admin/dashboard')
+;          url("api/users")
+;
+; Captures URL path for navigation to public files or route definitions
+
+; Single-quoted strings
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @url_path)))
+  (#eq? @function_name "url"))
+
+; Double-quoted strings
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @url_path)))
+  (#eq? @function_name "url"))
+
+; ============================================================================
+; Pattern 19: action('Controller@method') - Controller action URLs
+; ============================================================================
+; Matches: action('UserController@show')
+;          action('App\Http\Controllers\AdminController@index')
+;          action([UserController::class, 'show'])
+;
+; Captures controller action for navigation
+
+; String syntax - single quotes
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @action_name)))
+  (#eq? @function_name "action"))
+
+; String syntax - double quotes
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @action_name)))
+  (#eq? @function_name "action"))
+
+; ============================================================================
+; Pattern 20: redirect()->route('name') - Redirect to named route
+; ============================================================================
+; Matches: redirect()->route('home')
+;          redirect()->route('user.profile', ['id' => 1])
+;
+; This captures the route name from redirect chains
+
+; Single-quoted strings
+(member_call_expression
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @route_name)))
+  (#eq? @method_name "route"))
+
+; Double-quoted strings (already captures route_name like the function)
+(member_call_expression
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @route_name)))
+  (#eq? @method_name "route"))
+
+; ============================================================================
+; Pattern 21: to_route('name') - Laravel 9+ redirect helper
+; ============================================================================
+; Matches: to_route('home')
+;          to_route('user.profile', ['id' => 1])
+;
+; This is a shorthand for redirect()->route()
+
+; Single-quoted strings
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @route_name)))
+  (#eq? @function_name "to_route"))
+
+; Double-quoted strings
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @route_name)))
+  (#eq? @function_name "to_route"))
 
 ; ============================================================================
