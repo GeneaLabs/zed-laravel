@@ -324,7 +324,7 @@ $js = mix('js/undefined.js');
 
 ## Quick Actions
 
-Instant file creation from diagnostic warnings. Click the lightbulb or press `Cmd+.` to see available fixes.
+Instant file creation from diagnostic warnings. Click the lightning icon or press `Cmd+.` to see available fixes.
 
 ### Create Missing Views
 
