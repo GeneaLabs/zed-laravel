@@ -11,24 +11,13 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use walkdir::WalkDir;
 
-// Our modules
-mod parser;
-mod queries;
-mod config;
-mod middleware_parser;
-mod cache_manager;
-
-// Salsa 0.25 implementation (incremental computation)
-mod salsa_impl;
-
-// Note: parser and queries modules are used by salsa_impl for pattern extraction
-// The diagnostics validation now uses Salsa-cached patterns instead of direct parsing
-use config::find_project_root;
-use middleware_parser::resolve_class_to_file;
-use cache_manager::{CacheManager, RescanType, ScanResult, MiddlewareEntry, BindingEntry, CachedLaravelConfig, CachedEnvVars};
+// Use the library crate for all modules
+use laravel_lsp::config::find_project_root;
+use laravel_lsp::middleware_parser::resolve_class_to_file;
+use laravel_lsp::cache_manager::{CacheManager, RescanType, ScanResult, MiddlewareEntry, BindingEntry, CachedLaravelConfig, CachedEnvVars};
 
 // Salsa 0.25 database - integrated via actor pattern for async compatibility
-use salsa_impl::{
+use laravel_lsp::salsa_impl::{
     SalsaActor, SalsaHandle, PatternAtPosition, LaravelConfigData,
     ViewReferenceData, ComponentReferenceData, DirectiveReferenceData,
     EnvReferenceData, ConfigReferenceData, LivewireReferenceData,
@@ -175,6 +164,38 @@ struct LaravelLanguageServer {
     last_goto_request: Arc<RwLock<HashMap<Url, (Position, Instant)>>>,
     /// Track which root we've fully initialized for (to avoid re-initialization on file open)
     initialized_root: Arc<RwLock<Option<PathBuf>>>,
+    /// Pending debounced Salsa updates per file (uri -> task handle)
+    /// Used to debounce did_change events before updating Salsa
+    pending_salsa_updates: Arc<RwLock<HashMap<Url, tokio::task::JoinHandle<()>>>>,
+    /// Configurable debounce delay for Salsa updates in milliseconds (default: 200ms)
+    /// Can be configured via LSP settings: { "laravel": { "debounceMs": 200 } }
+    salsa_debounce_ms: Arc<RwLock<u64>>,
+}
+
+/// Default Salsa debounce delay in milliseconds
+const DEFAULT_SALSA_DEBOUNCE_MS: u64 = 200;
+
+/// Settings structure for Laravel LSP configuration
+/// Configured via: { "lsp": { "laravel-lsp": { "settings": { "laravel": { ... } } } } }
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LaravelSettings {
+    /// Debounce delay for Salsa updates in milliseconds (default: 250)
+    /// Lower values = faster updates but more CPU usage during typing
+    /// Higher values = less CPU but slower feedback
+    #[serde(default = "default_debounce_ms")]
+    debounce_ms: u64,
+}
+
+fn default_debounce_ms() -> u64 {
+    DEFAULT_SALSA_DEBOUNCE_MS
+}
+
+/// Wrapper for the full settings object from Zed
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+struct LspSettings {
+    #[serde(default)]
+    laravel: LaravelSettings,
 }
 
 impl LaravelLanguageServer {
@@ -194,6 +215,19 @@ impl LaravelLanguageServer {
             cached_config: Arc::new(RwLock::new(None)),
             last_goto_request: Arc::new(RwLock::new(HashMap::new())),
             initialized_root: Arc::new(RwLock::new(None)),
+            pending_salsa_updates: Arc::new(RwLock::new(HashMap::new())),
+            salsa_debounce_ms: Arc::new(RwLock::new(DEFAULT_SALSA_DEBOUNCE_MS)),
+        }
+    }
+
+    /// Update settings from LSP configuration
+    async fn update_settings(&self, settings: &LspSettings) {
+        let new_debounce = settings.laravel.debounce_ms;
+        let old_debounce = *self.salsa_debounce_ms.read().await;
+
+        if new_debounce != old_debounce {
+            info!("⚙️  Updating Salsa debounce: {}ms → {}ms", old_debounce, new_debounce);
+            *self.salsa_debounce_ms.write().await = new_debounce;
         }
     }
 
@@ -1278,6 +1312,137 @@ impl LaravelLanguageServer {
     }
 
     // ========================================================================
+    // Debounced Salsa Updates (Cache Invalidation Architecture)
+    // ========================================================================
+
+    /// Queue a debounced Salsa update for a file
+    ///
+    /// This is the core of the cache invalidation architecture:
+    /// `did_change(file) → Debounce (configurable) → Update Salsa input → Queries recompute → UI updates`
+    ///
+    /// The debounce prevents excessive Salsa updates during rapid typing.
+    /// After the debounce delay (default 250ms, configurable via settings),
+    /// the file is updated in Salsa which triggers incremental recomputation
+    /// of all affected queries.
+    async fn queue_salsa_update(&self, uri: Url, content: String, version: i32) {
+        let debounce_ms = *self.salsa_debounce_ms.read().await;
+        let debounce_delay = Duration::from_millis(debounce_ms);
+
+        // Cancel any existing pending Salsa update for this file
+        if let Some(handle) = self.pending_salsa_updates.write().await.remove(&uri) {
+            handle.abort();
+        }
+
+        // Clone values needed for the async task
+        let uri_for_spawn = uri.clone();
+        let server = self.clone_for_spawn();
+
+        // Spawn a task that updates Salsa after debounce delay
+        let handle = tokio::spawn(async move {
+            // Wait for the debounce delay
+            sleep(debounce_delay).await;
+
+            debug!("⏰ Salsa debounce expired for {} - updating Salsa", uri_for_spawn);
+
+            // Execute the Salsa update based on file type
+            server.execute_salsa_update(&uri_for_spawn, &content, version).await;
+        });
+
+        // Store the task handle so we can cancel it if needed
+        self.pending_salsa_updates.write().await.insert(uri, handle);
+    }
+
+    /// Execute a Salsa update based on file type
+    ///
+    /// Determines the file type and calls the appropriate Salsa update method:
+    /// - SourceFile: PHP and Blade files (pattern extraction)
+    /// - ConfigFile: config/*.php, composer.json (view paths, namespaces)
+    /// - EnvFile: .env, .env.local, .env.example (environment variables)
+    /// - ServiceProviderFile: bootstrap/app.php, Providers/*.php (middleware, bindings)
+    async fn execute_salsa_update(&self, uri: &Url, content: &str, version: i32) {
+        let path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let path_str = path.to_string_lossy();
+
+        // Get root path for service provider registration
+        let root_path = self.root_path.read().await.clone();
+
+        // Determine file type and update appropriate Salsa input
+        if filename == "app.php" && path_str.contains("bootstrap") {
+            // bootstrap/app.php - Service provider file (middleware aliases)
+            if let Some(root) = root_path {
+                debug!("📦 Updating Salsa: ServiceProviderFile (bootstrap/app.php)");
+                if let Err(e) = self.salsa.register_service_provider_source(
+                    path.clone(),
+                    content.to_string(),
+                    2, // priority: app = 2
+                    root,
+                ).await {
+                    debug!("Failed to update service provider in Salsa: {}", e);
+                }
+            }
+        } else if path_str.contains("app/Providers") && filename.ends_with(".php") {
+            // App service provider - Service provider file
+            if let Some(root) = root_path {
+                debug!("📦 Updating Salsa: ServiceProviderFile ({})", filename);
+                if let Err(e) = self.salsa.register_service_provider_source(
+                    path.clone(),
+                    content.to_string(),
+                    2, // priority: app = 2
+                    root,
+                ).await {
+                    debug!("Failed to update service provider in Salsa: {}", e);
+                }
+            }
+        } else if filename.starts_with(".env") {
+            // Env file (.env, .env.local, .env.example)
+            let priority = match filename {
+                ".env" => 2,
+                ".env.local" => 1,
+                _ => 0, // .env.example
+            };
+            debug!("📦 Updating Salsa: EnvFile ({}, priority={})", filename, priority);
+            if let Err(e) = self.salsa.register_env_source(
+                path.clone(),
+                content.to_string(),
+                priority,
+            ).await {
+                debug!("Failed to update env file in Salsa: {}", e);
+            }
+        } else if path_str.contains("/config/") && filename.ends_with(".php") {
+            // Config file (config/*.php)
+            debug!("📦 Updating Salsa: ConfigFile ({})", filename);
+            if let Err(e) = self.salsa.update_config_file(path.clone(), content.to_string()).await {
+                debug!("Failed to update config file in Salsa: {}", e);
+            }
+            // Also invalidate the cached config so next lookup refetches
+            *self.cached_config.write().await = None;
+        } else if filename == "composer.json" {
+            // composer.json - Config file
+            debug!("📦 Updating Salsa: ConfigFile (composer.json)");
+            if let Err(e) = self.salsa.update_config_file(path.clone(), content.to_string()).await {
+                debug!("Failed to update config file in Salsa: {}", e);
+            }
+            // Also invalidate the cached config so next lookup refetches
+            *self.cached_config.write().await = None;
+        } else if filename.ends_with(".php") || filename.ends_with(".blade.php") {
+            // Source file (PHP or Blade) - pattern extraction
+            debug!("📦 Updating Salsa: SourceFile ({})", filename);
+            if let Err(e) = self.salsa.update_file(path.clone(), version, content.to_string()).await {
+                debug!("Failed to update source file in Salsa: {}", e);
+            }
+        }
+
+        // After Salsa update, re-run diagnostics for this file
+        // This ensures diagnostics reflect the latest Salsa state
+        self.validate_and_publish_diagnostics(uri, content).await;
+    }
+
+    // ========================================================================
     // Tree-sitter-based helper functions
     // ========================================================================
 
@@ -1799,7 +1964,7 @@ impl LaravelLanguageServer {
         let root = root_guard.as_ref()?;
 
         // Determine the base path based on helper type
-        use salsa_impl::AssetHelperType;
+        use laravel_lsp::salsa_impl::AssetHelperType;
         let base_path = match asset.helper_type {
             AssetHelperType::Asset | AssetHelperType::PublicPath | AssetHelperType::Mix => root.join("public"),
             AssetHelperType::BasePath => root.clone(),
@@ -2055,6 +2220,8 @@ impl LaravelLanguageServer {
             cached_config: self.cached_config.clone(),
             last_goto_request: self.last_goto_request.clone(),
             initialized_root: self.initialized_root.clone(),
+            pending_salsa_updates: self.pending_salsa_updates.clone(),
+            salsa_debounce_ms: self.salsa_debounce_ms.clone(),
         }
     }
 
@@ -2465,6 +2632,61 @@ impl LaravelLanguageServer {
             }
             drop(root_guard);
 
+            // Check asset() and related helper calls - error if file not found
+            let root_guard = self.root_path.read().await;
+            if let Some(root) = root_guard.as_ref() {
+                for asset_ref in &patterns.asset_refs {
+                    use laravel_lsp::salsa_impl::AssetHelperType;
+
+                    // Determine base path based on helper type
+                    let (base_path, helper_name) = match asset_ref.helper_type {
+                        AssetHelperType::Asset => (root.join("public"), "asset"),
+                        AssetHelperType::PublicPath => (root.join("public"), "public_path"),
+                        AssetHelperType::Mix => (root.join("public"), "mix"),
+                        AssetHelperType::BasePath => (root.clone(), "base_path"),
+                        AssetHelperType::AppPath => (root.join("app"), "app_path"),
+                        AssetHelperType::StoragePath => (root.join("storage"), "storage_path"),
+                        AssetHelperType::DatabasePath => (root.join("database"), "database_path"),
+                        AssetHelperType::LangPath => (root.join("lang"), "lang_path"),
+                        AssetHelperType::ConfigPath => (root.join("config"), "config_path"),
+                        AssetHelperType::ResourcePath => (root.join("resources"), "resource_path"),
+                        AssetHelperType::ViteAsset => (root.join("resources"), "@vite"),
+                    };
+
+                    let asset_path = base_path.join(&asset_ref.path);
+
+                    if !asset_path.exists() {
+                        let diagnostic = Diagnostic {
+                            range: Range {
+                                start: Position {
+                                    line: asset_ref.line,
+                                    character: asset_ref.column,
+                                },
+                                end: Position {
+                                    line: asset_ref.line,
+                                    character: asset_ref.end_column,
+                                },
+                            },
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            code: None,
+                            source: Some("laravel-lsp".to_string()),
+                            message: format!(
+                                "Asset file not found: '{}'\nExpected at: {}\nHelper: {}()",
+                                asset_ref.path,
+                                asset_path.to_string_lossy(),
+                                helper_name
+                            ),
+                            related_information: None,
+                            tags: None,
+                            code_description: None,
+                            data: None,
+                        };
+                        diagnostics.push(diagnostic);
+                    }
+                }
+            }
+            drop(root_guard);
+
             // Store and publish diagnostics for PHP files
             self.diagnostics.write().await.insert(uri.clone(), diagnostics.clone());
             self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
@@ -2643,6 +2865,61 @@ impl LaravelLanguageServer {
         }
         drop(root_guard);
 
+        // Check @vite and asset() calls in Blade files - error if file not found
+        let root_guard = self.root_path.read().await;
+        if let Some(root) = root_guard.as_ref() {
+            for asset_ref in &patterns.asset_refs {
+                use laravel_lsp::salsa_impl::AssetHelperType;
+
+                // Determine base path based on helper type
+                let (base_path, helper_name) = match asset_ref.helper_type {
+                    AssetHelperType::Asset => (root.join("public"), "asset"),
+                    AssetHelperType::PublicPath => (root.join("public"), "public_path"),
+                    AssetHelperType::Mix => (root.join("public"), "mix"),
+                    AssetHelperType::BasePath => (root.clone(), "base_path"),
+                    AssetHelperType::AppPath => (root.join("app"), "app_path"),
+                    AssetHelperType::StoragePath => (root.join("storage"), "storage_path"),
+                    AssetHelperType::DatabasePath => (root.join("database"), "database_path"),
+                    AssetHelperType::LangPath => (root.join("lang"), "lang_path"),
+                    AssetHelperType::ConfigPath => (root.join("config"), "config_path"),
+                    AssetHelperType::ResourcePath => (root.join("resources"), "resource_path"),
+                    AssetHelperType::ViteAsset => (root.join("resources"), "@vite"),
+                };
+
+                let asset_path = base_path.join(&asset_ref.path);
+
+                if !asset_path.exists() {
+                    let diagnostic = Diagnostic {
+                        range: Range {
+                            start: Position {
+                                line: asset_ref.line,
+                                character: asset_ref.column,
+                            },
+                            end: Position {
+                                line: asset_ref.line,
+                                character: asset_ref.end_column,
+                            },
+                        },
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        code: None,
+                        source: Some("laravel-lsp".to_string()),
+                        message: format!(
+                            "Asset file not found: '{}'\nExpected at: {}\nHelper: {}()",
+                            asset_ref.path,
+                            asset_path.to_string_lossy(),
+                            helper_name
+                        ),
+                        related_information: None,
+                        tags: None,
+                        code_description: None,
+                        data: None,
+                    };
+                    diagnostics.push(diagnostic);
+                }
+            }
+        }
+        drop(root_guard);
+
         // Store diagnostics for hover filtering
         self.diagnostics.write().await.insert(uri.clone(), diagnostics.clone());
 
@@ -2660,6 +2937,20 @@ impl LanguageServer for LaravelLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
         let init_start = std::time::Instant::now();
         info!("Laravel LSP: INITIALIZE");
+
+        // Read initial settings from initialization_options (if provided)
+        // These can be overridden at runtime via did_change_configuration
+        if let Some(init_options) = params.initialization_options {
+            match serde_json::from_value::<LspSettings>(init_options) {
+                Ok(settings) => {
+                    info!("⚙️  Initial settings: debounceMs={}ms", settings.laravel.debounce_ms);
+                    self.update_settings(&settings).await;
+                }
+                Err(e) => {
+                    debug!("Could not parse initialization_options: {}", e);
+                }
+            }
+        }
 
         // Store the root path - lightweight operation
         if let Some(root_uri) = params.root_uri {
@@ -2824,28 +3115,16 @@ impl LanguageServer for LaravelLanguageServer {
 
         if let Some(change) = params.content_changes.into_iter().next() {
             debug!("Laravel LSP: Document changed: {} (version: {})", uri, version);
+
+            // Store in documents buffer immediately (for goto_definition during debounce)
             self.documents.write().await.insert(uri.clone(), (change.text.clone(), version));
 
-            // Update Salsa database with new file content
-            if let Ok(file_path) = uri.to_file_path() {
-                if let Err(e) = self.salsa.update_file(file_path.clone(), version, change.text.clone()).await {
-                    debug!("Failed to update Salsa database: {}", e);
-                }
-
-                // Check if this is an .env file and refresh env cache if needed
-                if let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) {
-                    if file_name == ".env" || file_name == ".env.example" || file_name == ".env.local" {
-                        info!("Laravel LSP: .env file changed in buffer, refreshing environment cache");
-                        if let Some(root) = self.root_path.read().await.as_ref() {
-                            // Parse from buffer (unsaved changes) instead of disk
-                            self.refresh_env_cache_from_buffers(root).await;
-                        }
-                    }
-                }
-            }
-
-            // ONLY debounce diagnostics (200ms) - goto index updated immediately above
-            self.schedule_debounced_diagnostics(&uri, &change.text).await;
+            // Queue debounced Salsa update (250ms)
+            // This handles all file types: SourceFile, ConfigFile, EnvFile, ServiceProviderFile
+            // After debounce, execute_salsa_update will:
+            // 1. Determine file type and update appropriate Salsa input
+            // 2. Re-run diagnostics for this file
+            self.queue_salsa_update(uri, change.text, version).await;
         }
     }
 
@@ -2947,10 +3226,19 @@ impl LanguageServer for LaravelLanguageServer {
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
-        // Log for debugging - this notification is for editor/LSP settings changes,
-        // not file system changes. We don't currently have user-configurable settings,
-        // so we just acknowledge receipt. File-based rescans are triggered via did_save.
+        // Handle runtime configuration changes without requiring LSP restart
+        // Settings are configured via: { "lsp": { "laravel-lsp": { "settings": { "laravel": { ... } } } } }
         debug!("🔧 Configuration changed: {:?}", params.settings);
+
+        match serde_json::from_value::<LspSettings>(params.settings) {
+            Ok(settings) => {
+                info!("⚙️  Configuration updated: debounceMs={}ms", settings.laravel.debounce_ms);
+                self.update_settings(&settings).await;
+            }
+            Err(e) => {
+                debug!("Could not parse configuration settings: {}", e);
+            }
+        }
     }
 
     async fn goto_definition(
@@ -3201,7 +3489,7 @@ impl LaravelLanguageServer {
     /// Find all references to a specific view across the project
     /// Uses Salsa incremental computation for efficient cached lookups
     async fn find_all_references_to_view(&self, view_name: &str) -> Vec<ReferenceLocation> {
-        use salsa_impl::FileReferenceType;
+        use laravel_lsp::salsa_impl::FileReferenceType;
 
         debug!("Searching for references to view: {} (using Salsa cache)", view_name);
 

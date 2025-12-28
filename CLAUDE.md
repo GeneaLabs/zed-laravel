@@ -184,6 +184,57 @@ The LSP uses a dedicated thread for Salsa incremental computation to avoid lifet
 - **Fallback pattern**: Use Salsa cache first, fall back to direct computation if unavailable
 - **Priority merging**: Framework=0, Package=1, App=2 (higher wins)
 
+### Cache Invalidation Architecture (CRITICAL)
+
+**All file-derived features MUST use Salsa incremental computation:**
+
+```
+did_change(file) → Debounce 250ms → Update Salsa input → Queries recompute → UI updates
+```
+
+**Rules:**
+1. **Never bypass Salsa** - All file parsing goes through Salsa inputs
+2. **Update on edit, not just save** - Wire `did_change` to Salsa (debounced)
+3. **Salsa handles invalidation** - Don't manually track what needs recomputing
+4. **Pure query functions** - Queries derive from inputs, no side effects
+
+**Pattern Types (all extracted via Salsa queries):**
+
+| Pattern | Example | Extracted From | Target |
+|---------|---------|----------------|--------|
+| Views | `view('welcome')` | SourceFile | `resources/views/*.blade.php` |
+| Blade Components | `<x-button>` | SourceFile | `resources/views/components/*.blade.php` |
+| Blade Directives | `@include('partial')` | SourceFile | `resources/views/*.blade.php` |
+| Livewire | `<livewire:counter>` | SourceFile | `app/Livewire/*.php` |
+| Translations | `__('messages.key')` | SourceFile | `lang/*/*.php` |
+| Assets | `asset('css/app.css')` | SourceFile | `public/*` |
+| Vite | `@vite('resources/js/app.js')` | SourceFile | `resources/*` |
+| Routes | `route('home')` | SourceFile | Route name in `routes/*.php` |
+| Config | `config('app.name')` | SourceFile | `config/*.php` |
+| Env | `env('APP_NAME')` | SourceFile | `.env` |
+| Middleware | `->middleware('auth')` | SourceFile | Alias in registry |
+| Bindings | `app('cache')` | SourceFile | Binding in registry |
+
+**File Type → Salsa Input Mapping:**
+
+| File Pattern | Salsa Input | What It Provides |
+|--------------|-------------|------------------|
+| `*.php`, `*.blade.php` | `SourceFile` | Pattern extraction (views, components, etc.) |
+| `bootstrap/app.php`, `Providers/*.php` | `ServiceProviderFile` | Middleware aliases, container bindings |
+| `.env`, `.env.*` | `EnvFile` | Environment variable values |
+| `config/*.php`, `composer.json` | `ConfigFile` | View paths, namespaces, PSR-4 mappings |
+
+**Target Files (existence only):**
+- View files, component files, Livewire classes, translation files, assets
+- Tracked via file existence cache with 5-minute TTL
+- No Salsa input needed - just check if file exists
+
+**Adding New Features:**
+1. Define `#[salsa::input]` for source data
+2. Define `#[salsa::tracked]` query function (pure, no side effects)
+3. Ensure `did_change` updates the input (automatic via file type detection)
+4. Query results are automatically cached and incrementally updated
+
 ### Request Flow Example
 
 ```

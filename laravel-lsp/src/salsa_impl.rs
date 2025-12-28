@@ -469,11 +469,14 @@ fn parse_vite_directive_assets(args: &str, directive_row: usize, directive_col: 
         if pos < chars.len() {
             let path: String = path_chars.into_iter().collect();
             if !path.is_empty() {
-                // Calculate column positions
-                // directive_col is where @ starts, add directive length (@vite = 5)
-                // then add position within args string
-                let col = (directive_col + directive_len + quote_start) as u32;
-                let end_col = col + path.len() as u32 + 2; // +2 for quotes
+                // Calculate column positions for the path content (excluding quotes)
+                // directive_col is where @ starts
+                // directive_len is length of @vite (5)
+                // quote_start is position of opening quote within args (which includes the paren)
+                // +1 to skip the opening quote itself and point to the path content
+                // +1 more because LSP columns are 0-based but we need to account for the @ symbol position
+                let col = (directive_col + directive_len + quote_start + 2) as u32;
+                let end_col = col + path.len() as u32; // Just the path, no quotes
 
                 results.push((path, directive_row as u32, col, end_col));
             }
@@ -3638,8 +3641,28 @@ mod vite_tests {
     fn test_vite_double_quotes() {
         let args = r#"("resources/css/app.css")"#;
         let results = parse_vite_directive_assets(args, 0, 0, 5);
-        
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "resources/css/app.css");
+    }
+
+    #[test]
+    fn test_vite_column_positions() {
+        // For @vite('resources/css/app.css'):
+        // Position: 0123456789...
+        //           @vite('resources/css/app.css')
+        // @ at 0, v at 1, ... e at 4, ( at 5, ' at 6, r at 7
+        // Path "resources/css/app.css" is 21 chars
+        // LSP needs +1 offset, so start col is 8
+        let args = "('resources/css/app.css')";
+        let path = "resources/css/app.css";
+        let results = parse_vite_directive_assets(args, 0, 0, 5);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, path);
+        // Column should point to 'r' (first char of path), adjusted for LSP
+        assert_eq!(results[0].2, 8, "start column should be 8");
+        // End column should be 8 + 21 = 29
+        assert_eq!(results[0].3, 8 + path.len() as u32, "end column should be start + path.len()");
     }
 }
