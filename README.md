@@ -211,16 +211,6 @@ $config = config_path('app.php');
 $lang = lang_path('en/messages.php');
 ```
 
-### Code Lens
-
-**Reference counts** shown above Blade files, click to see all usages.
-
-```
-  3 references
-  ─────────────────────────────
-  // resources/views/components/button.blade.php
-```
-
 ---
 
 ## Diagnostics
@@ -343,12 +333,17 @@ $js = mix('js/undefined.js');
 - [ ] Validation rules
 - [ ] Eloquent model fields and relationships
 
+### Code Lens
+
+- [ ] Reference counts above Blade views ("3 references")
+- [ ] Click to show all usages
+
 ### InertiaJS Support
 
 - [ ] Go-to-definition for `Inertia::render('Page')`
 - [ ] Component path resolution
 
-### Enhanced Hover Information
+### Hover Information
 
 - [ ] Show actual `.env` values on hover
 - [ ] Show config values on hover

@@ -87,36 +87,6 @@ fn resolve_class_to_vendor_file(class_name: &str, root: &Path) -> Option<PathBuf
     None
 }
 
-/// A reference to a Laravel view from another file
-#[derive(Debug, Clone, serde::Serialize)]
-struct ReferenceLocation {
-    /// The file that contains the reference
-    file_path: PathBuf,
-    /// The URI of the file (for LSP operations)
-    uri: Url,
-    /// The line number where the reference occurs (0-based)
-    line: u32,
-    /// The character position where the reference starts (0-based)
-    character: u32,
-    /// The type of reference (controller, component, livewire, route, etc.)
-    reference_type: ReferenceType,
-    /// The actual text that was matched
-    matched_text: String,
-}
-
-/// Types of references we can find to Laravel views
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-enum ReferenceType {
-    /// Reference from a controller method (view() call)
-    Controller,
-    /// Reference from a Livewire component
-    LivewireComponent,
-    /// Reference from a route definition
-    Route,
-    /// Reference from another Blade template (@extends, @include)
-    BladeTemplate,
-}
-
 // Removed: Old cache structures (FileReferences, ParsedMatches, ReferenceCache)
 // These have been replaced by the high-performance PerformanceCache system
 
@@ -3011,11 +2981,6 @@ impl LanguageServer for LaravelLanguageServer {
                 // We support go-to-definition
                 definition_provider: Some(OneOf::Left(true)),
                 
-                // We support code lenses for showing references
-                code_lens_provider: Some(CodeLensOptions {
-                    resolve_provider: Some(false),
-                }),
-                
                 // We need to sync document content and receive save notifications
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
@@ -3426,148 +3391,11 @@ impl LanguageServer for LaravelLanguageServer {
 
     // NOTE: completion handler removed - capability not advertised in ServerCapabilities
 
-    async fn code_lens(&self, params: CodeLensParams) -> jsonrpc::Result<Option<Vec<CodeLens>>> {
-        let uri = params.text_document.uri;
-
-        // Only provide code lenses for Blade files
-        if let Ok(file_path) = uri.to_file_path() {
-            if let Some(extension) = file_path.extension() {
-                if extension != "php" || !file_path.to_string_lossy().contains(".blade.") {
-                    return Ok(None);
-                }
-            } else {
-                return Ok(None);
-            }
-        }
-
-        debug!("Laravel LSP: Providing code lenses for: {}", uri);
-
-        // Extract view name from file path
-        let view_name = match self.extract_view_name_from_path(&uri).await {
-            Some(name) => name,
-            None => {
-                debug!("Could not extract view name from path: {}", uri);
-                return Ok(None);
-            }
-        };
-
-        // Find all references to this view
-        let references = self.find_all_references_to_view(&view_name).await;
-
-        if references.is_empty() {
-            return Ok(None);
-        }
-
-        // Create a code lens at the top of the file
-        let code_lens = CodeLens {
-            range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 0 },
-            },
-            command: Some(Command {
-                title: format!("{} reference{}", references.len(), if references.len() == 1 { "" } else { "s" }),
-                command: "laravel.showReferences".to_string(),
-                arguments: Some(vec![
-                    serde_json::to_value(&uri).unwrap(),
-                    serde_json::to_value(Position { line: 0, character: 0 }).unwrap(),
-                    serde_json::to_value(&references).unwrap(),
-                ]),
-            }),
-            data: None,
-        };
-
-        Ok(Some(vec![code_lens]))
-    }
+    // NOTE: code_lens handler removed - Zed doesn't support custom LSP commands
 }
 
-impl LaravelLanguageServer {
-    /// Extract view name from a Blade file path
-    async fn extract_view_name_from_path(&self, uri: &Url) -> Option<String> {
-        let file_path = uri.to_file_path().ok()?;
-        debug!("Extracting view name from file path: {:?}", file_path);
-
-        let config = self.get_cached_config().await?;
-        debug!("Laravel config root: {:?}", config.root);
-        debug!("View paths: {:?}", config.view_paths);
-
-        for views_path in &config.view_paths {
-            // Convert relative view path to absolute path
-            let absolute_views_path = config.root.join(views_path);
-            debug!("Checking against absolute view path: {:?}", absolute_views_path);
-            
-            if let Ok(relative_path) = file_path.strip_prefix(&absolute_views_path) {
-                debug!("File is within view path, relative path: {:?}", relative_path);
-                let mut view_name = relative_path.to_string_lossy().to_string();
-                debug!("Initial view name: {}", view_name);
-                
-                // Remove .blade.php extension
-                if view_name.ends_with(".blade.php") {
-                    view_name = view_name[..view_name.len() - 10].to_string();
-                    debug!("After removing .blade.php extension: {}", view_name);
-                } else {
-                    debug!("Warning: View name doesn't end with .blade.php: {}", view_name);
-                }
-                
-                // Convert path separators to dots
-                view_name = view_name.replace(std::path::MAIN_SEPARATOR, ".");
-                view_name = view_name.replace('/', ".");
-                debug!("Final view name after path conversion: {}", view_name);
-                
-                return Some(view_name);
-            } else {
-                debug!("File path {:?} is not within view path {:?}", file_path, absolute_views_path);
-            }
-        }
-        
-        debug!("Could not extract view name - file is not in any configured view path");
-        None
-    }
-
-    /// Find all references to a specific view across the project
-    /// Uses Salsa incremental computation for efficient cached lookups
-    async fn find_all_references_to_view(&self, view_name: &str) -> Vec<ReferenceLocation> {
-        use laravel_lsp::salsa_impl::FileReferenceType;
-
-        debug!("Searching for references to view: {} (using Salsa cache)", view_name);
-
-        // Use Salsa-based reference finding exclusively
-        match self.salsa.find_view_references(view_name.to_string()).await {
-            Ok(salsa_refs) => {
-                // Convert Salsa references to ReferenceLocation
-                let references: Vec<ReferenceLocation> = salsa_refs
-                    .into_iter()
-                    .filter_map(|r| {
-                        let uri = Url::from_file_path(&r.file_path).ok()?;
-                        let reference_type = match r.reference_type {
-                            FileReferenceType::Controller => ReferenceType::Controller,
-                            FileReferenceType::BladeTemplate => ReferenceType::BladeTemplate,
-                            FileReferenceType::LivewireComponent => ReferenceType::LivewireComponent,
-                            FileReferenceType::Route => ReferenceType::Route,
-                        };
-                        Some(ReferenceLocation {
-                            file_path: r.file_path,
-                            uri,
-                            line: r.line,
-                            character: r.character,
-                            reference_type,
-                            matched_text: r.view_name,
-                        })
-                    })
-                    .collect();
-
-                debug!("Found {} total references for view: {} (from Salsa cache)", references.len(), view_name);
-                references
-            }
-            Err(e) => {
-                debug!("Salsa reference lookup failed: {}", e);
-                Vec::new()
-            }
-        }
-    }
-
-    // ❌ REMOVED: get_incremental_hover_info
-    // Hover capability removed - navigation is handled by goto_definition only.
-}
+// ❌ REMOVED: code_lens helper methods (extract_view_name_from_path, find_all_references_to_view)
+// Zed doesn't support custom LSP commands, so code lens was not functional.
 
 
 
