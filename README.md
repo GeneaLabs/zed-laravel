@@ -1,280 +1,433 @@
-# Zed Laravel Extension
+# Laravel for Zed
 
-A high-performance Zed editor extension that provides Laravel development support with **20-50x performance improvements** over traditional LSP implementations. This extension is written in Rust and provides features like instant "go-to-definition" for Blade templates, Livewire components, and all Laravel patterns.
+A language server extension that brings Laravel intelligence to [Zed](https://zed.dev). Click through to Blade views, Livewire components, config files, and more.
 
-> **Performance-First Architecture**: Built with query caching, incremental parsing, and intelligent debouncing for instant hover and navigation responses.
+## Installation
 
-## 🚀 Performance Optimizations
+### From Zed Extensions (Coming Soon)
 
-### Core Performance Features
-- **Query Caching**: Compiled tree-sitter queries cached globally (10-15x speedup)
-- **Incremental Parsing**: Only re-parse changed sections (5-20x speedup)
-- **Two-Tier Debouncing**: 50ms cache updates, 200ms diagnostics
-- **Pattern Registry**: Future-proof architecture for adding new features
-- **Tree Caching**: Reuse syntax trees for minimal overhead
+Search for "Laravel" in Zed's extension panel.
 
-### Performance Results
-| Metric | Before Optimization | After Optimization | Improvement |
-|--------|-------------------|-------------------|-------------|
-| Hover Response | 400-800ms | 2-15ms | **20-50x faster** |
-| Typing Lag | 1.5-2.5s CPU/sec | 0ms during typing | **Eliminated** |
-| Cache Update | N/A | 40-100ms after 50ms pause | **Intelligent** |
-| Memory Usage | Growing (.leak()) | Bounded growth | **Controlled** |
-
-## ✅ Implemented Features
-
-### Goto Linking & Hover Information
-Navigate to resources and see rich hover information with file validation:
-- [x] **Blade Directives** - @extends, @section, @include, etc.
-- [x] **Blade Components** - `<x-button>`, `<x-forms.input>`
-- [x] **Livewire Components** - `<livewire:user-profile>`
-- [x] **Views** - `view('welcome')`, `View::make('dashboard')`
-- [x] **Routes** - Route definitions and references
-- [x] **Configs** - `config('app.name')` with file existence
-- [x] **Middleware** - Middleware class resolution
-- [x] **Translations** - `__('message')`, `trans('auth.login')`
-- [x] **App Bindings** - `app('UserService')`, `resolve('cache')`
-- [x] **Assets** - `asset('css/app.css')`, `mix('js/app.js')`
-- [x] **Env Variables** - `env('APP_NAME')` with cached values
-- [x] **Vite Assets** - `@vite(['resources/css/app.css'])`
-
-## 🔮 Upcoming Features
-
-### Auto Completion (Future)
-Intelligent autocompletion with validation:
-- [ ] **Inertia Pages** - Page component resolution
-- [ ] **Validation Rules** - Laravel validation rules
-- [ ] **Eloquent** - Database fields, relationships, scopes
-- [ ] **Route Names** - Named route autocompletion
-- [ ] **Config Keys** - Available configuration options
-- [ ] **Translation Keys** - Available translation strings
-
-### Enhanced Hover Information (Future)
-- [ ] **Documentation Links** - Direct links to Laravel docs
-- [ ] **Method Signatures** - Parameter information
-- [ ] **Return Types** - Expected return values
-- [ ] **Usage Examples** - Code snippets
-
-## 🏗️ Architecture
-
-### Generic Pattern Registry
-Adding new Laravel patterns requires only **1 line of code**:
-
-```rust
-// Add to pattern registry:
-("inertia", find_inertia_patterns),  // ✅ Done!
-
-// Everything else is automatic:
-// ✅ Query caching, ✅ Incremental parsing, ✅ Debouncing
-// ✅ Goto definition, ✅ Hover, ✅ Future features
-```
-
-### Performance-First Design
-- **Lazy Evaluation**: Parse only when needed
-- **Smart Caching**: Invalidate only changed sections  
-- **Debounced Updates**: Batch operations for smooth typing
-- **Memory Efficient**: Controlled growth, no memory leaks
-
-## 📦 Installation
-
-### Prerequisites
-- [Zed Editor](https://zed.dev/) installed
-- Rust toolchain (for building from source)
-- Laravel project to test with
-
-### Quick Install
-
-1. **Clone and build:**
-   ```bash
-   git clone https://github.com/yourusername/zed-laravel.git
-   cd zed-laravel
-   ./build.sh
-   ```
-
-2. **Install to system:**
-   ```bash
-   ./install.sh
-   ```
-
-3. **Install extension in Zed:**
-   - Open Zed editor
-   - Press `Cmd+Shift+P` (Mac) or `Ctrl+Shift+P` (Linux/Windows)
-   - Type: `zed: install dev extension`
-   - Select the `zed-laravel` directory
-
-4. **Restart Zed** to activate the extension
-
-### Manual Installation
-
-If you prefer manual installation:
+### From Source
 
 ```bash
-# Build the LSP binary
-cd laravel-lsp && cargo build --release
-cp target/release/laravel-lsp ~/.local/bin/
-
-# Build the extension WASM
-cargo build --release --target wasm32-wasip2
-cp target/wasm32-wasip2/release/zed_laravel.wasm extension.wasm
-
-# Install extension in Zed (steps 3-4 above)
+git clone https://github.com/GeneaLabs/zed-laravel.git
+cd zed-laravel
+cargo build --release
 ```
 
-## 🚀 Usage
-
-### Hover Information
-Hover over any Laravel pattern to see instant information:
-
-- **Environment Variables**: Shows current values from `.env` files
-- **Config Keys**: Displays file existence and key paths  
-- **View Names**: Shows Blade file locations
-- **Components**: Links to component class files
-- **Translations**: Shows language file locations
-- **Assets**: Validates asset file existence
-
-### Goto Definition
-Click (or `Cmd+Click`) on any Laravel pattern to navigate:
-
-- **Views**: Jump to `.blade.php` files
-- **Components**: Navigate to component classes  
-- **Configs**: Open configuration files
-- **Middleware**: Jump to middleware classes
-- **Translations**: Open language files
-- **Assets**: Navigate to asset files
-
-### Example Usage
-
-```php
-<?php
-// Hover over these patterns for instant information:
-
-$name = env('APP_NAME', 'Laravel');        // Shows actual .env value
-$config = config('app.timezone');          // Shows config/app.php status  
-$view = view('welcome');                   // Links to welcome.blade.php
-$message = __('auth.login');               // Shows lang file location
-$asset = asset('css/app.css');             // Validates file existence
-
-// Cmd+Click to navigate to the actual files!
-```
-
-```blade
-{{-- Blade templates support all patterns --}}
-@extends('layouts.app')                    {{-- Navigate to layout --}}
-
-<x-card title="Hello">                     {{-- Jump to component --}}
-  <p>{{ __('Welcome!') }}</p>             {{-- Show translation file --}}
-  <img src="{{ asset('logo.png') }}">     {{-- Validate asset --}}
-</x-card>
-
-<livewire:user-profile />                  {{-- Navigate to Livewire class --}}
-
-@vite(['resources/css/app.css'])           {{-- Each asset is clickable --}}
-```
-
-### Performance Features in Action
-
-- **⚡ Zero lag while typing** - All parsing is debounced
-- **🔥 Instant hover** - Responses in 2-15ms from cache  
-- **🚀 Fast navigation** - Goto definition with no delay
-- **🧠 Smart caching** - Updates only after you pause typing
-- **📊 Memory efficient** - No memory leaks from string interning
-
-## 🛠️ Development
-
-### Project Structure
-```
-zed-laravel/
-├── src/                    # Zed extension (Rust → WASM)
-├── laravel-lsp/           # LSP server (Rust binary)  
-│   ├── src/main.rs       # Main LSP implementation
-│   ├── src/parser.rs     # Tree-sitter parsers
-│   ├── src/queries.rs    # Pattern detection queries
-│   └── queries/          # Tree-sitter query files
-├── examples/              # Test files for development
-├── build.sh              # Build both extension and LSP
-├── install.sh            # Install to system
-└── README.md             # This file
-```
-
-### Adding New Laravel Patterns
-
-Thanks to our pattern registry system, adding support for new Laravel patterns is trivial:
-
-1. **Implement the pattern matcher:**
-   ```rust
-   fn find_inertia_patterns(tree: &Tree, source: &str, _query: &Query) -> Result<Vec<Box<dyn PatternMatch>>> {
-       // Your pattern detection logic here
-       // Return Vec<InertiaMatch> wrapped as Box<dyn PatternMatch>
-   }
-   ```
-
-2. **Register the pattern:**
-   ```rust
-   // Add ONE line to the registry:
-   ("inertia", find_inertia_patterns),
-   ```
-
-3. **Done!** The following work automatically:
-   - ✅ Query caching and performance optimizations
-   - ✅ Incremental parsing 
-   - ✅ Debounced updates
-   - ✅ Goto definition support
-   - ✅ Hover information support
-   - ✅ Future features (completion, diagnostics, etc.)
-
-### Building from Source
-
-```bash
-# Install Rust targets
-rustup target add wasm32-wasip2
-
-# Build everything
-./build.sh
-
-# Install locally  
-./install.sh
-```
-
-### Running Tests
-
-```bash
-# Test LSP binary
-cd laravel-lsp && cargo test
-
-# Test with sample files
-cargo run -- --help
-```
-
-## 🤝 Contributing
-
-We welcome contributions! The codebase includes extensive comments explaining Rust concepts, making it a great learning project.
-
-### Areas for Contribution
-- **New Laravel Patterns**: Inertia.js, Validation rules, Eloquent relations
-- **Enhanced Hover**: Documentation links, method signatures
-- **Autocompletion**: Intelligent suggestions for Laravel patterns  
-- **Diagnostics**: Better error detection and suggestions
-- **Performance**: Further optimizations and benchmarking
-
-### Development Setup
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes  
-4. Test with `./build.sh && ./install.sh`
-5. Submit a pull request
-
-## 📄 License
-
-MIT License - feel free to use this in your own projects!
-
-## 🙋‍♂️ Support
-
-- **Issues**: [GitHub Issues](https://github.com/yourusername/zed-laravel/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/zed-laravel/discussions)  
-- **Performance Reports**: We'd love to hear about your performance improvements!
+Then in Zed: `Cmd+Shift+P` → "zed: install dev extension" → select the `zed-laravel` directory.
 
 ---
 
-**Version**: v2024-12-24-OPTIMIZED  
-**Performance**: 20-50x improvement over unoptimized implementations  
-**Status**: Production ready with extensive Laravel project testing
+## Implemented Features
+
+### Views
+
+**Go-to-definition** for view references. Click to open the Blade file.
+
+```php
+// Click on 'users.profile' to open resources/views/users/profile.blade.php
+return view('users.profile', ['user' => $user]);
+
+// Also works with View facade
+View::make('dashboard');
+
+// And route view definitions
+Route::view('/welcome', 'welcome');
+```
+
+### Blade Components
+
+**Go-to-definition** for `<x-*>` component tags.
+
+```blade
+{{-- Click on 'button' to open app/View/Components/Button.php --}}
+<x-button type="submit">Save</x-button>
+
+{{-- Nested components work too --}}
+<x-forms.input name="email" />
+
+{{-- Opens app/View/Components/Forms/Input.php --}}
+```
+
+### Livewire Components
+
+**Go-to-definition** for Livewire tags and directives.
+
+```blade
+{{-- Click to open app/Livewire/UserProfile.php --}}
+<livewire:user-profile :user="$user" />
+
+{{-- Nested namespaces --}}
+<livewire:admin.dashboard />
+
+{{-- Directive syntax --}}
+@livewire('counter')
+```
+
+### Blade Directives
+
+**Go-to-definition** for layout and include directives.
+
+```blade
+{{-- Click to open resources/views/layouts/app.blade.php --}}
+@extends('layouts.app')
+
+{{-- Click to open the partial --}}
+@include('partials.header')
+
+{{-- Section and slot references --}}
+@section('content')
+@slot('title')
+```
+
+### Configuration
+
+**Go-to-definition** for config keys. Opens the config file.
+
+```php
+// Click 'app.name' to open config/app.php
+$appName = config('app.name');
+
+// Nested keys
+$driver = config('database.default');
+$mailHost = config('mail.mailers.smtp.host');
+```
+
+### Environment Variables
+
+**Go-to-definition** for env() calls. Opens `.env` at the variable location.
+
+```php
+// Click 'APP_NAME' to jump to .env
+$name = env('APP_NAME', 'Laravel');
+
+// Works with any env variable
+$debug = env('APP_DEBUG', false);
+$dbHost = env('DB_HOST', '127.0.0.1');
+```
+
+### Routes
+
+**Go-to-definition** for named routes. Finds the route definition.
+
+```php
+// Click 'users.show' to find where it's defined in routes/*.php
+$url = route('users.show', $user);
+
+// Works with redirect helpers
+return redirect()->route('dashboard');
+return to_route('login');
+
+// And URL generation
+URL::route('home');
+Route::has('admin.panel');
+```
+
+### Translations
+
+**Go-to-definition** for translation keys. Opens the language file.
+
+```php
+// Click 'auth.failed' to open lang/en/auth.php
+$message = __('auth.failed');
+
+// Alternative helpers
+trans('messages.welcome');
+trans_choice('items.count', 5);
+Lang::get('validation.required');
+```
+
+```blade
+{{-- Works in Blade too --}}
+{{ __('Welcome to our app') }}
+@lang('messages.greeting')
+```
+
+### Middleware
+
+**Go-to-definition** for middleware aliases. Opens the middleware class.
+
+```php
+// Click 'auth' to open app/Http/Middleware/Authenticate.php
+Route::middleware('auth')->group(function () {
+    // ...
+});
+
+// Array syntax
+Route::middleware(['auth', 'verified'])->get('/dashboard', ...);
+
+// Chained
+Route::get('/profile', ...)->middleware('auth');
+```
+
+### Service Container Bindings
+
+**Go-to-definition** for app() and resolve() calls.
+
+```php
+// Click to find where 'cache' is bound
+$cache = app('cache');
+
+// Class-based resolution
+$payment = app(PaymentGateway::class);
+$service = resolve(UserService::class);
+```
+
+### Assets
+
+**Go-to-definition** for asset helpers. Opens the file if it exists.
+
+```php
+// Click to open public/css/app.css
+$css = asset('css/app.css');
+
+// Mix assets
+$js = mix('js/app.js');
+```
+
+```blade
+{{-- Vite assets - each path is clickable --}}
+@vite(['resources/css/app.css', 'resources/js/app.js'])
+
+<link href="{{ asset('favicon.ico') }}">
+<script src="{{ mix('js/vendor.js') }}"></script>
+```
+
+### Path Helpers
+
+**Go-to-definition** for Laravel path helpers.
+
+```php
+// Each opens the referenced file/directory
+$public = public_path('assets/logo.png');
+$storage = storage_path('logs/laravel.log');
+$app = app_path('Models/User.php');
+$base = base_path('routes/api.php');
+$database = database_path('seeders/UserSeeder.php');
+$resource = resource_path('views/welcome.blade.php');
+$config = config_path('app.php');
+$lang = lang_path('en/messages.php');
+```
+
+### Code Lens
+
+**Reference counts** shown above Blade files, click to see all usages.
+
+```
+  3 references
+  ─────────────────────────────
+  // resources/views/components/button.blade.php
+```
+
+---
+
+## Diagnostics
+
+Real-time validation with inline warnings and errors.
+
+### Missing Views
+
+```php
+// ERROR: View file not found
+return view('users.missing');  // ← Red underline
+
+// Shows: "View file not found: 'users.missing'
+//        Expected at: resources/views/users/missing.blade.php"
+```
+
+```blade
+{{-- WARNING: Missing layout --}}
+@extends('layouts.missing')
+
+{{-- WARNING: Missing partial --}}
+@include('partials.undefined')
+```
+
+### Missing Blade Components
+
+```blade
+{{-- WARNING: Component class not found --}}
+<x-undefined-component />
+
+{{-- Shows: "Blade component not found: 'undefined-component'
+            Expected at: app/View/Components/UndefinedComponent.php" --}}
+```
+
+### Missing Livewire Components
+
+```blade
+{{-- WARNING: Livewire class not found --}}
+<livewire:missing-component />
+
+{{-- Shows: "Livewire component not found: 'missing-component'
+            Expected at: app/Livewire/MissingComponent.php" --}}
+```
+
+### Undefined Environment Variables
+
+```php
+// WARNING: No fallback, will return null
+$key = env('UNDEFINED_VAR');
+
+// INFO: Has fallback, safe to use
+$key = env('UNDEFINED_VAR', 'default');
+```
+
+### Invalid Middleware
+
+```php
+// ERROR: Middleware not found
+Route::middleware('undefined-middleware')->group(...);
+
+// Shows: "Middleware 'undefined-middleware' not found
+//        Expected at: app/Http/Middleware/UndefinedMiddleware.php
+//
+//        Create the middleware or add an alias in bootstrap/app.php"
+```
+
+### Missing Translations
+
+```php
+// ERROR: Translation file not found
+$msg = __('undefined.key');
+```
+
+```blade
+{{-- ERROR: Translation not found --}}
+{{ __('missing.translation') }}
+
+{{-- WARNING: @lang directive --}}
+@lang('undefined.message')
+```
+
+### Undefined Container Bindings
+
+```php
+// ERROR: Binding not found
+$service = app('undefined-service');
+
+// Shows: "Container binding 'undefined-service' not found
+//
+//        Define this binding in a service provider's register() method"
+```
+
+### Missing Assets
+
+```php
+// ERROR: Asset file not found
+$css = asset('css/missing.css');
+$js = mix('js/undefined.js');
+```
+
+```blade
+{{-- WARNING: Vite asset not found --}}
+@vite(['resources/css/missing.css'])
+
+{{-- Shows: "Asset file not found: 'resources/css/missing.css'
+            Expected at: /path/to/project/resources/css/missing.css
+            Helper: @vite()" --}}
+```
+
+---
+
+## Planned Features
+
+### Auto-Completion
+
+- [ ] Route names when typing `route('...')`
+- [ ] Config keys when typing `config('...')`
+- [ ] Translation keys when typing `__('...')`
+- [ ] Blade component names when typing `<x-...`
+- [ ] Validation rules
+- [ ] Eloquent model fields and relationships
+
+### InertiaJS Support
+
+- [ ] Go-to-definition for `Inertia::render('Page')`
+- [ ] Component path resolution
+
+### Enhanced Hover Information
+
+- [ ] Show actual `.env` values on hover
+- [ ] Show config values on hover
+- [ ] Links to Laravel documentation
+
+---
+
+## Requirements
+
+- [Zed Editor](https://zed.dev)
+- A Laravel project
+
+The extension automatically detects Laravel projects by looking for `composer.json` with Laravel dependencies.
+
+---
+
+## Configuration
+
+No configuration required. The extension automatically discovers:
+
+- View paths from `config/view.php`
+- Component namespaces from `composer.json`
+- Middleware aliases from `app/Http/Kernel.php` or `bootstrap/app.php`
+- Service bindings from service providers
+
+---
+
+## Performance
+
+Built with performance in mind:
+
+- **Instant responses** - Go-to-definition in 2-15ms
+- **No typing lag** - File parsing is debounced
+- **Incremental updates** - Only re-parses changed files
+- **Query caching** - Tree-sitter queries compiled once
+
+---
+
+## Development
+
+```bash
+# Build the LSP server
+cd laravel-lsp && cargo build --release
+
+# Run tests
+cargo test
+
+# Build for release
+./build.sh
+```
+
+### Project Structure
+
+```
+zed-laravel/
+├── src/                    # Zed extension (Rust → WASM)
+├── laravel-lsp/            # Language server (Rust)
+│   ├── src/
+│   │   ├── main.rs         # LSP handlers
+│   │   ├── queries.rs      # Pattern extraction
+│   │   ├── parser.rs       # Tree-sitter parsing
+│   │   └── config.rs       # Laravel project discovery
+│   └── queries/            # Tree-sitter query files
+└── extension.toml          # Extension manifest
+```
+
+---
+
+## Contributing
+
+Contributions welcome! Areas of interest:
+
+- New Laravel pattern support (Inertia, Folio, etc.)
+- Auto-completion implementation
+- Diagnostics for common mistakes
+- Performance improvements
+
+---
+
+## License
+
+MIT
