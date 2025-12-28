@@ -1,14 +1,45 @@
-# Laravel for Zed
+<p align="center">
+  <img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="300" alt="Laravel">
+</p>
 
-A language server extension that brings Laravel intelligence to [Zed](https://zed.dev). Click through to Blade views, Livewire components, config files, and more.
+<h1 align="center">Laravel for Zed</h1>
+
+<p align="center">
+  <strong>Cmd+Click your way through Laravel projects</strong><br>
+  Views • Components • Livewire • Routes • Config • Translations • and more
+</p>
+
+<p align="center">
+  <a href="#-features">Features</a> •
+  <a href="#-diagnostics">Diagnostics</a> •
+  <a href="#-quick-actions">Quick Actions</a> •
+  <a href="#%EF%B8%8F-configuration">Configuration</a> •
+  <a href="#-roadmap">Roadmap</a>
+</p>
+
+---
+
+## What You Get
+
+| Feature | What it does |
+|---------|--------------|
+| **Go-to-Definition** | Cmd+Click on `view('welcome')`, `<x-button>`, `config('app.name')`, etc. to jump to the source |
+| **Diagnostics** | Real-time warnings when views, components, or translations don't exist |
+| **Quick Actions** | One-click file creation for missing views, components, middleware, and more |
+
+---
 
 ## Installation
 
-### From Zed Extensions (Coming Soon)
+<details>
+<summary><strong>From Zed Extensions</strong> (Coming Soon)</summary>
 
 Search for "Laravel" in Zed's extension panel.
 
-### From Source
+</details>
+
+<details>
+<summary><strong>From Source</strong></summary>
 
 ```bash
 git clone https://github.com/GeneaLabs/zed-laravel.git
@@ -18,189 +49,169 @@ cargo build --release
 
 Then in Zed: `Cmd+Shift+P` → "zed: install dev extension" → select the `zed-laravel` directory.
 
+</details>
+
 ---
 
-## Implemented Features
+## ✨ Features
 
-### Views
+Cmd+Click (or Cmd+D) on any of these patterns to jump directly to the source file.
 
-**Go-to-definition** for view references. Click to open the Blade file.
+<details>
+<summary><strong>Views</strong> — <code>view()</code>, <code>View::make()</code>, <code>Route::view()</code></summary>
 
 ```php
-// Click on 'users.profile' to open resources/views/users/profile.blade.php
 return view('users.profile', ['user' => $user]);
+//           ^^^^^^^^^^^^^^ Cmd+Click → resources/views/users/profile.blade.php
 
-// Also works with View facade
 View::make('dashboard');
-
-// And route view definitions
 Route::view('/welcome', 'welcome');
 ```
 
-### Blade Components
+</details>
 
-**Go-to-definition** for `<x-*>` component tags.
+<details>
+<summary><strong>Blade Components</strong> — <code>&lt;x-*&gt;</code> tags</summary>
 
 ```blade
-{{-- Click on 'button' to open app/View/Components/Button.php --}}
 <x-button type="submit">Save</x-button>
+{{-- ^^^^^^ Cmd+Click → app/View/Components/Button.php --}}
 
-{{-- Nested components work too --}}
 <x-forms.input name="email" />
-
-{{-- Opens app/View/Components/Forms/Input.php --}}
+{{-- ^^^^^^^^^^^ Cmd+Click → app/View/Components/Forms/Input.php --}}
 ```
 
-### Livewire Components
+</details>
 
-**Go-to-definition** for Livewire tags and directives.
+<details>
+<summary><strong>Livewire</strong> — <code>&lt;livewire:*&gt;</code> and <code>@livewire()</code></summary>
 
 ```blade
-{{-- Click to open app/Livewire/UserProfile.php --}}
 <livewire:user-profile :user="$user" />
+{{-- ^^^^^^^^^^^^ Cmd+Click → app/Livewire/UserProfile.php --}}
 
-{{-- Nested namespaces --}}
 <livewire:admin.dashboard />
-
-{{-- Directive syntax --}}
 @livewire('counter')
 ```
 
-### Blade Directives
+</details>
 
-**Go-to-definition** for layout and include directives.
+<details>
+<summary><strong>Blade Directives</strong> — <code>@extends</code>, <code>@include</code>, <code>@section</code></summary>
 
 ```blade
-{{-- Click to open resources/views/layouts/app.blade.php --}}
 @extends('layouts.app')
+{{-- ^^^^^^^^^^^ Cmd+Click → resources/views/layouts/app.blade.php --}}
 
-{{-- Click to open the partial --}}
 @include('partials.header')
-
-{{-- Section and slot references --}}
 @section('content')
-@slot('title')
 ```
 
-### Configuration
+</details>
 
-**Go-to-definition** for config keys. Opens the config file.
+<details>
+<summary><strong>Config</strong> — <code>config()</code></summary>
 
 ```php
-// Click 'app.name' to open config/app.php
 $appName = config('app.name');
+//                 ^^^^^^^^ Cmd+Click → config/app.php
 
-// Nested keys
 $driver = config('database.default');
 $mailHost = config('mail.mailers.smtp.host');
 ```
 
-### Environment Variables
+</details>
 
-**Go-to-definition** for env() calls. Opens `.env` at the variable location.
+<details>
+<summary><strong>Environment</strong> — <code>env()</code></summary>
 
 ```php
-// Click 'APP_NAME' to jump to .env
 $name = env('APP_NAME', 'Laravel');
+//          ^^^^^^^^ Cmd+Click → .env (jumps to the line)
 
-// Works with any env variable
 $debug = env('APP_DEBUG', false);
-$dbHost = env('DB_HOST', '127.0.0.1');
 ```
 
-### Routes
+</details>
 
-**Go-to-definition** for named routes. Finds the route definition.
+<details>
+<summary><strong>Routes</strong> — <code>route()</code>, <code>to_route()</code>, <code>URL::route()</code></summary>
 
 ```php
-// Click 'users.show' to find where it's defined in routes/*.php
 $url = route('users.show', $user);
+//           ^^^^^^^^^^^ Cmd+Click → routes/web.php (at the definition)
 
-// Works with redirect helpers
 return redirect()->route('dashboard');
 return to_route('login');
-
-// And URL generation
-URL::route('home');
-Route::has('admin.panel');
 ```
 
-### Translations
+</details>
 
-**Go-to-definition** for translation keys. Opens the language file.
+<details>
+<summary><strong>Translations</strong> — <code>__()</code>, <code>trans()</code>, <code>@lang</code></summary>
 
 ```php
-// Click 'auth.failed' to open lang/en/auth.php
 $message = __('auth.failed');
+//             ^^^^^^^^^^^ Cmd+Click → lang/en/auth.php
 
-// Alternative helpers
 trans('messages.welcome');
-trans_choice('items.count', 5);
 Lang::get('validation.required');
 ```
 
 ```blade
-{{-- Works in Blade too --}}
 {{ __('Welcome to our app') }}
 @lang('messages.greeting')
 ```
 
-### Middleware
+</details>
 
-**Go-to-definition** for middleware aliases. Opens the middleware class.
+<details>
+<summary><strong>Middleware</strong> — Route middleware aliases</summary>
 
 ```php
-// Click 'auth' to open app/Http/Middleware/Authenticate.php
 Route::middleware('auth')->group(function () {
-    // ...
+//                 ^^^^ Cmd+Click → app/Http/Middleware/Authenticate.php
 });
 
-// Array syntax
 Route::middleware(['auth', 'verified'])->get('/dashboard', ...);
-
-// Chained
-Route::get('/profile', ...)->middleware('auth');
 ```
 
-### Service Container Bindings
+</details>
 
-**Go-to-definition** for app() and resolve() calls.
+<details>
+<summary><strong>Service Container</strong> — <code>app()</code>, <code>resolve()</code></summary>
 
 ```php
-// Click to find where 'cache' is bound
 $cache = app('cache');
+//           ^^^^^^^ Cmd+Click → finds where 'cache' is bound
 
-// Class-based resolution
 $payment = app(PaymentGateway::class);
 $service = resolve(UserService::class);
 ```
 
-### Assets
+</details>
 
-**Go-to-definition** for asset helpers. Opens the file if it exists.
+<details>
+<summary><strong>Assets</strong> — <code>asset()</code>, <code>mix()</code>, <code>@vite</code></summary>
 
 ```php
-// Click to open public/css/app.css
 $css = asset('css/app.css');
+//           ^^^^^^^^^^^^ Cmd+Click → public/css/app.css
 
-// Mix assets
 $js = mix('js/app.js');
 ```
 
 ```blade
-{{-- Vite assets - each path is clickable --}}
 @vite(['resources/css/app.css', 'resources/js/app.js'])
-
-<link href="{{ asset('favicon.ico') }}">
-<script src="{{ mix('js/vendor.js') }}"></script>
+{{--   ^^^^^^^^^^^^^^^^^^^^^^^ Each path is clickable --}}
 ```
 
-### Path Helpers
+</details>
 
-**Go-to-definition** for Laravel path helpers.
+<details>
+<summary><strong>Path Helpers</strong> — <code>app_path()</code>, <code>base_path()</code>, etc.</summary>
 
 ```php
-// Each opens the referenced file/directory
 $public = public_path('assets/logo.png');
 $storage = storage_path('logs/laravel.log');
 $app = app_path('Models/User.php');
@@ -211,254 +222,213 @@ $config = config_path('app.php');
 $lang = lang_path('en/messages.php');
 ```
 
+</details>
+
 ---
 
-## Diagnostics
+## 🔍 Diagnostics
 
-Real-time validation with inline warnings and errors.
+Real-time validation as you type. Missing files show inline warnings so you catch issues before running your app.
 
-### Missing Views
+<details>
+<summary><strong>Missing Views</strong></summary>
 
 ```php
-// ERROR: View file not found
-return view('users.missing');  // ← Red underline
-
-// Shows: "View file not found: 'users.missing'
-//        Expected at: resources/views/users/missing.blade.php"
+return view('users.missing');
+//          ^^^^^^^^^^^^^^^ ⚠️ View file not found: 'users.missing'
+//                             Expected at: resources/views/users/missing.blade.php
 ```
 
 ```blade
-{{-- WARNING: Missing layout --}}
-@extends('layouts.missing')
-
-{{-- WARNING: Missing partial --}}
-@include('partials.undefined')
+@extends('layouts.missing')  {{-- ⚠️ Layout not found --}}
+@include('partials.undefined')  {{-- ⚠️ Partial not found --}}
 ```
 
-### Missing Blade Components
+</details>
+
+<details>
+<summary><strong>Missing Components</strong></summary>
 
 ```blade
-{{-- WARNING: Component class not found --}}
 <x-undefined-component />
+{{-- ⚠️ Blade component not found: 'undefined-component'
+        Expected at: resources/views/components/undefined-component.blade.php --}}
 
-{{-- Shows: "Blade component not found: 'undefined-component'
-            Expected at: app/View/Components/UndefinedComponent.php" --}}
-```
-
-### Missing Livewire Components
-
-```blade
-{{-- WARNING: Livewire class not found --}}
 <livewire:missing-component />
-
-{{-- Shows: "Livewire component not found: 'missing-component'
-            Expected at: app/Livewire/MissingComponent.php" --}}
+{{-- ⚠️ Livewire component not found: 'missing-component'
+        Expected at: app/Livewire/MissingComponent.php --}}
 ```
 
-### Undefined Environment Variables
+</details>
+
+<details>
+<summary><strong>Undefined Environment Variables</strong></summary>
 
 ```php
-// WARNING: No fallback, will return null
 $key = env('UNDEFINED_VAR');
+//         ^^^^^^^^^^^^^ ⚠️ No fallback provided - will return null if not set
 
-// INFO: Has fallback, safe to use
-$key = env('UNDEFINED_VAR', 'default');
+$key = env('UNDEFINED_VAR', 'default');  // ✅ Has fallback, safe
 ```
 
-### Invalid Middleware
+</details>
+
+<details>
+<summary><strong>Invalid Middleware</strong></summary>
 
 ```php
-// ERROR: Middleware not found
 Route::middleware('undefined-middleware')->group(...);
-
-// Shows: "Middleware 'undefined-middleware' not found
-//        Expected at: app/Http/Middleware/UndefinedMiddleware.php
-//
-//        Create the middleware or add an alias in bootstrap/app.php"
+//                ^^^^^^^^^^^^^^^^^^^^^^ ⚠️ Middleware 'undefined-middleware' not found
+//                                          Expected at: app/Http/Middleware/UndefinedMiddleware.php
 ```
 
-### Missing Translations
+</details>
+
+<details>
+<summary><strong>Missing Translations</strong></summary>
 
 ```php
-// ERROR: Translation file not found
 $msg = __('undefined.key');
+//         ^^^^^^^^^^^^^ ⚠️ Translation not found
+
+@lang('undefined.message')  {{-- ⚠️ Translation not found --}}
 ```
 
-```blade
-{{-- ERROR: Translation not found --}}
-{{ __('missing.translation') }}
+</details>
 
-{{-- WARNING: @lang directive --}}
-@lang('undefined.message')
-```
-
-### Undefined Container Bindings
+<details>
+<summary><strong>Undefined Bindings</strong></summary>
 
 ```php
-// ERROR: Binding not found
 $service = app('undefined-service');
-
-// Shows: "Container binding 'undefined-service' not found
-//
-//        Define this binding in a service provider's register() method"
+//             ^^^^^^^^^^^^^^^^^^^ ⚠️ Container binding 'undefined-service' not found
+//                                    Define in a service provider's register() method
 ```
 
-### Missing Assets
+</details>
+
+<details>
+<summary><strong>Missing Assets</strong></summary>
 
 ```php
-// ERROR: Asset file not found
-$css = asset('css/missing.css');
-$js = mix('js/undefined.js');
+$css = asset('css/missing.css');  // ⚠️ Asset file not found
+
+@vite(['resources/css/missing.css'])  {{-- ⚠️ Vite asset not found --}}
 ```
 
-```blade
-{{-- WARNING: Vite asset not found --}}
-@vite(['resources/css/missing.css'])
-
-{{-- Shows: "Asset file not found: 'resources/css/missing.css'
-            Expected at: /path/to/project/resources/css/missing.css
-            Helper: @vite()" --}}
-```
+</details>
 
 ---
 
-## Quick Actions
+## ⚡ Quick Actions
 
-Instant file creation from diagnostic warnings. Click the lightning icon or press `Cmd+.` to see available fixes.
+See a warning? Press `Cmd+.` or click the lightning icon to instantly create the missing file.
 
-### Create Missing Views
+<details>
+<summary><strong>Create Views</strong></summary>
 
 ```php
-// Diagnostic: View file not found: 'users.profile'
 return view('users.profile');
-// Quick Action: "Create view: users.profile"
-// Creates: resources/views/users/profile.blade.php
+//          ^^^^^^^^^^^^^^^ ⚠️ View file not found
+//                          ⚡ "Create view: users.profile"
+//                          → Creates resources/views/users/profile.blade.php
 ```
 
-### Create Missing Components
+</details>
+
+<details>
+<summary><strong>Create Blade Components</strong></summary>
 
 ```blade
-{{-- Diagnostic: Blade component not found: 'button' --}}
 <x-button>Click me</x-button>
-
-{{-- Quick Actions:
-     1. "Create component: button"
+{{-- ⚠️ Component not found
+     ⚡ "Create component: button"
         → resources/views/components/button.blade.php
-
-     2. "Create component with class: button"
+     ⚡ "Create component with class: button"
         → resources/views/components/button.blade.php
         → app/View/Components/Button.php
 --}}
 ```
 
-### Create Missing Livewire Components
+</details>
+
+<details>
+<summary><strong>Create Livewire Components</strong></summary>
 
 ```blade
-{{-- Diagnostic: Livewire component not found: 'counter' --}}
 <livewire:counter />
-
-{{-- Quick Action: "Create Livewire: counter"
-     Creates both:
-     → app/Livewire/Counter.php
-     → resources/views/livewire/counter.blade.php
+{{-- ⚠️ Livewire component not found
+     ⚡ "Create Livewire: counter"
+        → app/Livewire/Counter.php
+        → resources/views/livewire/counter.blade.php
 --}}
 ```
 
-### Create Missing Middleware
+</details>
+
+<details>
+<summary><strong>Create Middleware</strong></summary>
 
 ```php
-// Diagnostic: Middleware 'custom' not found
 Route::middleware('custom')->group(...);
-// Quick Action: "Create middleware: custom"
-// Creates: app/Http/Middleware/Custom.php
+//                ^^^^^^^^ ⚠️ Middleware not found
+//                         ⚡ "Create middleware: custom"
+//                         → app/Http/Middleware/Custom.php
 ```
 
-### Create Missing Translations
+</details>
+
+<details>
+<summary><strong>Create Translations</strong></summary>
 
 ```php
-// Diagnostic: Translation not found: 'messages.welcome'
 __('messages.welcome');
-
-// If file exists: "Add translation: messages.welcome"
-// If file missing: "Create translation: messages.welcome"
-// Creates/updates: lang/en/messages.php
+// ⚠️ Translation not found
+// ⚡ "Create translation: messages.welcome" → lang/en/messages.php
+// ⚡ "Add translation: messages.welcome" (if file exists)
 ```
 
-### Create Missing Config
+</details>
+
+<details>
+<summary><strong>Create Config</strong></summary>
 
 ```php
-// Diagnostic: Config not found: 'custom.setting'
 config('custom.setting');
-
-// If file exists: "Add config: custom.setting"
-// If file missing: "Create config: custom.setting"
-// Creates/updates: config/custom.php
+// ⚠️ Config not found
+// ⚡ "Create config: custom.setting" → config/custom.php
 ```
 
-### Create Missing Environment Variables
+</details>
+
+<details>
+<summary><strong>Create Environment Variables</strong></summary>
 
 ```php
-// Diagnostic: Environment variable 'CUSTOM_KEY' not found
 env('CUSTOM_KEY');
-
-// Quick Actions:
-// - "Add env var: CUSTOM_KEY" (if .env exists)
-// - "Create .env with CUSTOM_KEY" (if .env missing)
-// - "Copy .env.example to .env" (if .env.example exists)
+// ⚠️ Environment variable not found
+// ⚡ "Add env var: CUSTOM_KEY" (if .env exists)
+// ⚡ "Create .env with CUSTOM_KEY" (if .env missing)
+// ⚡ "Copy .env.example to .env" (if .env.example exists)
 ```
 
----
-
-## Planned Features
-
-### Auto-Completion
-
-- [ ] Route names when typing `route('...')`
-- [ ] Config keys when typing `config('...')`
-- [ ] Translation keys when typing `__('...')`
-- [ ] Blade component names when typing `<x-...`
-- [ ] Validation rules
-- [ ] Eloquent model fields and relationships
-
-### Code Lens
-
-- [ ] Reference counts above Blade views ("3 references")
-- [ ] Click to show all usages
-
-### InertiaJS Support
-
-- [ ] Go-to-definition for `Inertia::render('Page')`
-- [ ] Component path resolution
-
-### Hover Information
-
-- [ ] Show actual `.env` values on hover
-- [ ] Show config values on hover
-- [ ] Links to Laravel documentation
+</details>
 
 ---
 
-## Requirements
+## ⚙️ Configuration
 
-- [Zed Editor](https://zed.dev)
-- A Laravel project
-
-The extension automatically detects Laravel projects by looking for `composer.json` with Laravel dependencies.
-
----
-
-## Configuration
-
-No configuration required. The extension automatically discovers:
+**Zero config required.** The extension automatically discovers your Laravel project structure:
 
 - View paths from `config/view.php`
 - Component namespaces from `composer.json`
-- Middleware aliases from `app/Http/Kernel.php` or `bootstrap/app.php`
-- Service bindings from service providers
+- Middleware aliases from `bootstrap/app.php` or `app/Http/Kernel.php`
+- Service bindings from your providers
 
-### Optional Settings
+<details>
+<summary><strong>Optional: Tune Performance</strong></summary>
 
-The default settings work well for most users. Only configure if you want to tune performance.
+Add to your Zed `settings.json` if you want to adjust the diagnostic update timing:
 
 ```json
 {
@@ -476,28 +446,65 @@ The default settings work well for most users. Only configure if you want to tun
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `debounceMs` | `200` | Delay (ms) before updating diagnostics while typing. |
+| `debounceMs` | `200` | How long to wait after you stop typing before updating diagnostics |
 
-**When to adjust `debounceMs`:**
+**When to adjust:**
 
-- **Lower (50-100ms)**: Diagnostics update sooner after you stop typing. Good for fast machines where you want near-instant feedback.
-- **Default (200ms)**: Balances responsiveness with efficiency. Long enough to skip brief pauses mid-thought, short enough to feel instant when you stop to read.
-- **Higher (300-500ms)**: Waits longer after you stop typing before updating. Good for slower machines or large projects to reduce unnecessary recomputation during brief pauses.
+| Value | When to use |
+|-------|-------------|
+| **50-100ms** | Fast machine, want instant feedback |
+| **200ms** *(default)* | Good balance — skips brief pauses mid-thought, feels instant when you stop to read |
+| **300-500ms** | Slower machine or large project, reduce CPU during quick pauses |
 
----
-
-## Performance
-
-Built with performance in mind:
-
-- **Instant responses** - Go-to-definition in 2-15ms
-- **No typing lag** - File parsing is debounced
-- **Incremental updates** - Only re-parses changed files
-- **Query caching** - Tree-sitter queries compiled once
+</details>
 
 ---
 
-## Development
+## 🚀 Roadmap
+
+<details>
+<summary><strong>Auto-Completion</strong> (Planned)</summary>
+
+- [ ] Route names: `route('█')`
+- [ ] Config keys: `config('█')`
+- [ ] Translation keys: `__('█')`
+- [ ] Component names: `<x-█`
+- [ ] Validation rules
+- [ ] Eloquent fields and relationships
+
+</details>
+
+<details>
+<summary><strong>Hover Information</strong> (Planned)</summary>
+
+- [ ] Show actual `.env` values
+- [ ] Show resolved config values
+- [ ] Links to Laravel docs
+
+</details>
+
+<details>
+<summary><strong>More Framework Support</strong> (Planned)</summary>
+
+- [ ] Inertia.js: `Inertia::render('Page')`
+- [ ] Folio page routing
+- [ ] Volt components
+
+</details>
+
+---
+
+## Requirements
+
+- [Zed Editor](https://zed.dev)
+- A Laravel project (auto-detected via `composer.json`)
+
+---
+
+## Contributing
+
+<details>
+<summary><strong>Development Setup</strong></summary>
 
 ```bash
 # Build the LSP server
@@ -506,11 +513,11 @@ cd laravel-lsp && cargo build --release
 # Run tests
 cargo test
 
-# Build for release
-./build.sh
+# Reload in Zed
+Cmd+Shift+P → "zed: reload extensions"
 ```
 
-### Project Structure
+**Project Structure:**
 
 ```
 zed-laravel/
@@ -520,20 +527,18 @@ zed-laravel/
 │   │   ├── main.rs         # LSP handlers
 │   │   ├── queries.rs      # Pattern extraction
 │   │   ├── parser.rs       # Tree-sitter parsing
-│   │   └── config.rs       # Laravel project discovery
+│   │   └── config.rs       # Project discovery
 │   └── queries/            # Tree-sitter query files
 └── extension.toml          # Extension manifest
 ```
 
----
+</details>
 
-## Contributing
+**Areas of interest:**
 
-Contributions welcome! Areas of interest:
-
-- New Laravel pattern support (Inertia, Folio, etc.)
-- Auto-completion implementation
-- Diagnostics for common mistakes
+- New Laravel patterns (Inertia, Folio, Volt)
+- Auto-completion
+- More diagnostics
 - Performance improvements
 
 ---
