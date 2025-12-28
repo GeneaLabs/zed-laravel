@@ -92,10 +92,28 @@ fn resolve_class_to_vendor_file(class_name: &str, root: &Path) -> Option<PathBuf
 
 /// Result of checking if a translation exists
 struct TranslationCheck {
-    /// Whether the translation exists
+    /// Whether the translation key exists
     exists: bool,
     /// Whether this is a dotted key (validation.required) vs text key ("Welcome")
     is_dotted_key: bool,
+    /// The expected file path for this translation
+    expected_path: Option<PathBuf>,
+    /// Whether the translation file exists (separate from whether the key exists)
+    file_exists: bool,
+    /// The nested key within the file (for dotted keys like "validation.required" → "required")
+    nested_key: Option<String>,
+}
+
+/// Result of checking if a config key exists
+struct ConfigCheck {
+    /// Whether the config key exists
+    exists: bool,
+    /// The expected file path for this config (e.g., config/app.php)
+    expected_path: Option<PathBuf>,
+    /// Whether the config file exists (separate from whether the key exists)
+    file_exists: bool,
+    /// The nested key within the file (e.g., "app.name" → "name")
+    nested_key: Option<String>,
 }
 
 /// The main Laravel Language Server struct
@@ -166,6 +184,685 @@ struct LspSettings {
     laravel: LaravelSettings,
 }
 
+// ============================================================================
+// Code Action types
+// ============================================================================
+
+/// Types of files that can be created via code actions
+#[derive(Debug, Clone)]
+enum FileActionType {
+    View,
+    /// Anonymous Blade component (view only)
+    BladeComponent,
+    /// Blade component with both view and PHP class
+    BladeComponentWithClass,
+    Livewire,
+    Middleware,
+    /// PHP translation file (e.g., lang/en/messages.php)
+    TranslationPhp,
+    /// JSON translation file (e.g., lang/en.json)
+    TranslationJson,
+    /// PHP config file (e.g., config/app.php)
+    ConfigPhp,
+    /// Environment variable in .env file
+    EnvVar,
+}
+
+/// Represents a file creation action parsed from a diagnostic
+#[derive(Debug, Clone)]
+struct FileAction {
+    action_type: FileActionType,
+    name: String,
+    target_path: PathBuf,
+    /// Whether the target file already exists (relevant for translations/config/env)
+    file_exists: bool,
+    /// Path to copy from (for .env.example → .env)
+    copy_from: Option<PathBuf>,
+}
+
+impl FileAction {
+    /// Parse a diagnostic message into FileAction(s)
+    /// Returns a Vec because some diagnostics (like "Blade component not found")
+    /// can offer multiple actions (create view only OR create view with class)
+    fn from_diagnostic(message: &str) -> Vec<Self> {
+        let target_path = match LaravelLanguageServer::extract_expected_path(message) {
+            Some(path) => path,
+            None => return Vec::new(),
+        };
+
+        if message.starts_with("View file not found") {
+            vec![FileAction {
+                action_type: FileActionType::View,
+                name: LaravelLanguageServer::extract_name_from_diagnostic(message, "View file not found: '", "'")
+                    .unwrap_or("view")
+                    .to_string(),
+                target_path: PathBuf::from(target_path),
+                file_exists: false,
+                copy_from: None,
+            }]
+        } else if message.starts_with("Blade component not found") {
+            // Offer two options: create view only OR create view with class
+            let name = LaravelLanguageServer::extract_name_from_diagnostic(message, "Blade component not found: '", "'")
+                .unwrap_or("component")
+                .to_string();
+            let path = PathBuf::from(target_path);
+
+            vec![
+                // Option 1: Create anonymous component (view only)
+                FileAction {
+                    action_type: FileActionType::BladeComponent,
+                    name: name.clone(),
+                    target_path: path.clone(),
+                    file_exists: false,
+                    copy_from: None,
+                },
+                // Option 2: Create component with PHP class
+                FileAction {
+                    action_type: FileActionType::BladeComponentWithClass,
+                    name,
+                    target_path: path,
+                    file_exists: false,
+                    copy_from: None,
+                },
+            ]
+        } else if message.starts_with("Livewire component not found") {
+            vec![FileAction {
+                action_type: FileActionType::Livewire,
+                name: LaravelLanguageServer::extract_name_from_diagnostic(message, "Livewire component not found: '", "'")
+                    .unwrap_or("component")
+                    .to_string(),
+                target_path: PathBuf::from(target_path),
+                file_exists: false,
+                copy_from: None,
+            }]
+        } else if message.starts_with("Middleware") && message.contains("not found") {
+            vec![FileAction {
+                action_type: FileActionType::Middleware,
+                name: LaravelLanguageServer::extract_name_from_diagnostic(message, "Middleware '", "'")
+                    .unwrap_or("middleware")
+                    .to_string(),
+                target_path: PathBuf::from(target_path),
+                file_exists: false,
+                copy_from: None,
+            }]
+        } else if message.starts_with("Translation not found") {
+            // Extract the translation key from the message
+            let key = LaravelLanguageServer::extract_name_from_diagnostic(message, "Translation not found: '", "'")
+                .unwrap_or("key")
+                .to_string();
+
+            // Determine if it's PHP or JSON based on the file extension
+            let path = PathBuf::from(target_path);
+            let is_php = path.extension().map(|e| e == "php").unwrap_or(false);
+
+            // Check if the file exists from the message
+            let file_exists = message.contains("not found in file");
+
+            vec![FileAction {
+                action_type: if is_php { FileActionType::TranslationPhp } else { FileActionType::TranslationJson },
+                name: key,
+                target_path: path,
+                file_exists,
+                copy_from: None,
+            }]
+        } else if message.starts_with("Config not found") {
+            // Extract the config key from the message
+            let key = LaravelLanguageServer::extract_name_from_diagnostic(message, "Config not found: '", "'")
+                .unwrap_or("key")
+                .to_string();
+
+            let path = PathBuf::from(target_path);
+
+            // Check if the file exists from the message
+            let file_exists = message.contains("not found in file");
+
+            vec![FileAction {
+                action_type: FileActionType::ConfigPhp,
+                name: key,
+                target_path: path,
+                file_exists,
+                copy_from: None,
+            }]
+        } else if message.starts_with("Environment variable") {
+            // Extract the env var name from the message
+            let name = LaravelLanguageServer::extract_name_from_diagnostic(message, "Environment variable '", "'")
+                .unwrap_or("VAR")
+                .to_string();
+
+            let path = PathBuf::from(target_path);
+
+            // Check if .env exists (from message "not found in file" vs "file not found")
+            // "not found in file" → file exists, var is missing
+            // "file not found" → file doesn't exist
+            let file_exists = message.contains("not found in file");
+
+            // Check if there's a "Copy from:" line for .env.example
+            let copy_from = LaravelLanguageServer::extract_copy_from_path(message);
+
+            vec![FileAction {
+                action_type: FileActionType::EnvVar,
+                name,
+                target_path: path,
+                file_exists,
+                copy_from,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get the title for the code action
+    fn title(&self) -> String {
+        match self.action_type {
+            FileActionType::View => format!("Create view: {}", self.name),
+            FileActionType::BladeComponent => format!("Create component: {}", self.name),
+            FileActionType::BladeComponentWithClass => format!("Create component with class: {}", self.name),
+            FileActionType::Livewire => format!("Create Livewire: {}", self.name),
+            FileActionType::Middleware => format!("Create middleware: {}", self.name),
+            FileActionType::TranslationPhp | FileActionType::TranslationJson => {
+                if self.file_exists {
+                    format!("Add translation: {}", self.name)
+                } else {
+                    format!("Create translation: {}", self.name)
+                }
+            }
+            FileActionType::ConfigPhp => {
+                if self.file_exists {
+                    format!("Add config: {}", self.name)
+                } else {
+                    format!("Create config: {}", self.name)
+                }
+            }
+            FileActionType::EnvVar => {
+                if self.copy_from.is_some() {
+                    "Copy .env.example to .env".to_string()
+                } else if self.file_exists {
+                    format!("Add env var: {}", self.name)
+                } else {
+                    format!("Create .env with {}", self.name)
+                }
+            }
+        }
+    }
+
+    /// Get the Blade component PHP class path
+    /// e.g., "button" -> "app/View/Components/Button.php"
+    /// e.g., "forms.input" -> "app/View/Components/Forms/Input.php"
+    fn get_component_class_path(&self, root: &Path) -> PathBuf {
+        let parts: Vec<&str> = self.name.split('.').collect();
+        let mut path = root.join("app/View/Components");
+
+        for (i, part) in parts.iter().enumerate() {
+            let pascal = Self::kebab_to_pascal_case_static(part);
+            if i == parts.len() - 1 {
+                path.push(format!("{}.php", pascal));
+            } else {
+                path.push(pascal);
+            }
+        }
+        path
+    }
+
+    /// Convert kebab-case to PascalCase (static version for use in FileAction)
+    fn kebab_to_pascal_case_static(s: &str) -> String {
+        s.split('-')
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(first) => first.to_uppercase().chain(chars).collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// Get the Blade component PHP class template
+    fn get_component_class_template(&self) -> String {
+        // For nested components like "forms.input":
+        // - Class name: last segment in PascalCase ("Input")
+        // - Namespace: App\View\Components + intermediate segments ("App\View\Components\Forms")
+        let parts: Vec<&str> = self.name.split('.').collect();
+        let class_name = Self::kebab_to_pascal_case_static(parts.last().unwrap_or(&self.name.as_str()));
+
+        let namespace = if parts.len() > 1 {
+            let namespace_parts: Vec<String> = parts[..parts.len() - 1]
+                .iter()
+                .map(|p| Self::kebab_to_pascal_case_static(p))
+                .collect();
+            format!("App\\View\\Components\\{}", namespace_parts.join("\\"))
+        } else {
+            "App\\View\\Components".to_string()
+        };
+
+        // View name for the render method (keeps original format with dots)
+        let view_name = &self.name;
+
+        format!(
+            r#"<?php
+
+namespace {};
+
+use Closure;
+use Illuminate\Contracts\View\View;
+use Illuminate\View\Component;
+
+class {} extends Component
+{{
+    /**
+     * Create a new component instance.
+     */
+    public function __construct()
+    {{
+        //
+    }}
+
+    /**
+     * Get the view / contents that represent the component.
+     */
+    public function render(): View|Closure|string
+    {{
+        return view('components.{}');
+    }}
+}}
+"#,
+            namespace, class_name, view_name
+        )
+    }
+
+    /// Get the Livewire Blade view path for a component
+    /// e.g., "counter" -> "resources/views/livewire/counter.blade.php"
+    /// e.g., "admin.dashboard" -> "resources/views/livewire/admin/dashboard.blade.php"
+    fn get_livewire_view_path(&self, root: &Path) -> PathBuf {
+        // Convert dots to path separators, keep kebab-case
+        let view_path = self.name.replace('.', "/");
+        root.join("resources/views/livewire")
+            .join(format!("{}.blade.php", view_path))
+    }
+
+    /// Get the Livewire Blade view template content
+    fn get_livewire_view_template() -> String {
+        "<div>\n    {{-- Component content --}}\n</div>\n".to_string()
+    }
+
+    /// Build a CodeAction that creates a file with the given content
+    fn build_code_action(
+        &self,
+        template: String,
+        diagnostic: &Diagnostic,
+        root: Option<&Path>,
+    ) -> Option<CodeActionOrCommand> {
+        let file_uri = Url::from_file_path(&self.target_path).ok()?;
+
+        // Handle different action types
+        let workspace_edit = if let FileActionType::Livewire = self.action_type {
+            // Livewire creates TWO files: PHP class and Blade view
+            let root = root?;
+            let view_path = self.get_livewire_view_path(root);
+            let view_uri = Url::from_file_path(&view_path).ok()?;
+            let view_template = Self::get_livewire_view_template();
+
+            WorkspaceEdit {
+                changes: None,
+                document_changes: Some(DocumentChanges::Operations(vec![
+                    // Create PHP class file
+                    DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                        uri: file_uri.clone(),
+                        options: Some(CreateFileOptions {
+                            overwrite: Some(false),
+                            ignore_if_exists: Some(true),
+                        }),
+                        annotation_id: None,
+                    })),
+                    DocumentChangeOperation::Edit(TextDocumentEdit {
+                        text_document: OptionalVersionedTextDocumentIdentifier {
+                            uri: file_uri,
+                            version: None,
+                        },
+                        edits: vec![OneOf::Left(TextEdit {
+                            range: Range {
+                                start: Position { line: 0, character: 0 },
+                                end: Position { line: 0, character: 0 },
+                            },
+                            new_text: template,
+                        })],
+                    }),
+                    // Create Blade view file
+                    DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                        uri: view_uri.clone(),
+                        options: Some(CreateFileOptions {
+                            overwrite: Some(false),
+                            ignore_if_exists: Some(true),
+                        }),
+                        annotation_id: None,
+                    })),
+                    DocumentChangeOperation::Edit(TextDocumentEdit {
+                        text_document: OptionalVersionedTextDocumentIdentifier {
+                            uri: view_uri,
+                            version: None,
+                        },
+                        edits: vec![OneOf::Left(TextEdit {
+                            range: Range {
+                                start: Position { line: 0, character: 0 },
+                                end: Position { line: 0, character: 0 },
+                            },
+                            new_text: view_template,
+                        })],
+                    }),
+                ])),
+                change_annotations: None,
+            }
+        } else if let FileActionType::BladeComponentWithClass = self.action_type {
+            // Create both the Blade view and the PHP class
+            let root = root?;
+            let class_path = self.get_component_class_path(root);
+            let class_uri = Url::from_file_path(&class_path).ok()?;
+            let class_template = self.get_component_class_template();
+            let view_template = "@props([])\n\n<div>\n    {{ $slot }}\n</div>\n".to_string();
+
+            WorkspaceEdit {
+                changes: None,
+                document_changes: Some(DocumentChanges::Operations(vec![
+                    // Create Blade view file (target_path is the view)
+                    DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                        uri: file_uri.clone(),
+                        options: Some(CreateFileOptions {
+                            overwrite: Some(false),
+                            ignore_if_exists: Some(true),
+                        }),
+                        annotation_id: None,
+                    })),
+                    DocumentChangeOperation::Edit(TextDocumentEdit {
+                        text_document: OptionalVersionedTextDocumentIdentifier {
+                            uri: file_uri,
+                            version: None,
+                        },
+                        edits: vec![OneOf::Left(TextEdit {
+                            range: Range {
+                                start: Position { line: 0, character: 0 },
+                                end: Position { line: 0, character: 0 },
+                            },
+                            new_text: view_template,
+                        })],
+                    }),
+                    // Create PHP class file
+                    DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                        uri: class_uri.clone(),
+                        options: Some(CreateFileOptions {
+                            overwrite: Some(false),
+                            ignore_if_exists: Some(true),
+                        }),
+                        annotation_id: None,
+                    })),
+                    DocumentChangeOperation::Edit(TextDocumentEdit {
+                        text_document: OptionalVersionedTextDocumentIdentifier {
+                            uri: class_uri,
+                            version: None,
+                        },
+                        edits: vec![OneOf::Left(TextEdit {
+                            range: Range {
+                                start: Position { line: 0, character: 0 },
+                                end: Position { line: 0, character: 0 },
+                            },
+                            new_text: class_template,
+                        })],
+                    }),
+                ])),
+                change_annotations: None,
+            }
+        } else if let FileActionType::EnvVar = self.action_type {
+            // EnvVar has special handling
+            if let Some(copy_from) = &self.copy_from {
+                // Copy .env.example to .env
+                self.build_copy_file_edit(copy_from, &file_uri)?
+            } else if self.file_exists {
+                // Append env var to existing .env
+                self.build_key_insert_edit(&file_uri)?
+            } else {
+                // Create new .env with just this var
+                WorkspaceEdit {
+                    changes: None,
+                    document_changes: Some(DocumentChanges::Operations(vec![
+                        DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                            uri: file_uri.clone(),
+                            options: Some(CreateFileOptions {
+                                overwrite: Some(false),
+                                ignore_if_exists: Some(true),
+                            }),
+                            annotation_id: None,
+                        })),
+                        DocumentChangeOperation::Edit(TextDocumentEdit {
+                            text_document: OptionalVersionedTextDocumentIdentifier {
+                                uri: file_uri,
+                                version: None,
+                            },
+                            edits: vec![OneOf::Left(TextEdit {
+                                range: Range {
+                                    start: Position { line: 0, character: 0 },
+                                    end: Position { line: 0, character: 0 },
+                                },
+                                new_text: template,
+                            })],
+                        }),
+                    ])),
+                    change_annotations: None,
+                }
+            }
+        } else if self.file_exists && matches!(self.action_type, FileActionType::TranslationPhp | FileActionType::TranslationJson | FileActionType::ConfigPhp) {
+            // For translations/config with existing files, we insert rather than create
+            self.build_key_insert_edit(&file_uri)?
+        } else {
+            // Standard file creation
+            WorkspaceEdit {
+                changes: None,
+                document_changes: Some(DocumentChanges::Operations(vec![
+                    // Step 1: Create the file
+                    DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                        uri: file_uri.clone(),
+                        options: Some(CreateFileOptions {
+                            overwrite: Some(false),
+                            ignore_if_exists: Some(true),
+                        }),
+                        annotation_id: None,
+                    })),
+                    // Step 2: Insert content into the new file
+                    DocumentChangeOperation::Edit(TextDocumentEdit {
+                        text_document: OptionalVersionedTextDocumentIdentifier {
+                            uri: file_uri,
+                            version: None,
+                        },
+                        edits: vec![OneOf::Left(TextEdit {
+                            range: Range {
+                                start: Position { line: 0, character: 0 },
+                                end: Position { line: 0, character: 0 },
+                            },
+                            new_text: template,
+                        })],
+                    }),
+                ])),
+                change_annotations: None,
+            }
+        };
+
+        let code_action = CodeAction {
+            title: self.title(),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diagnostic.clone()]),
+            edit: Some(workspace_edit),
+            command: None,
+            is_preferred: Some(true),
+            disabled: None,
+            data: None,
+        };
+
+        Some(CodeActionOrCommand::CodeAction(code_action))
+    }
+
+    /// Build a WorkspaceEdit to insert a key into an existing file (translations or config)
+    fn build_key_insert_edit(&self, file_uri: &Url) -> Option<WorkspaceEdit> {
+        // Read the existing file content
+        let content = std::fs::read_to_string(&self.target_path).ok()?;
+        let lines: Vec<&str> = content.lines().collect();
+
+        // For the key, we need to extract just the last part for dotted keys
+        // e.g., "messages.welcome" → "welcome" for PHP, but full key for JSON
+        let key_for_insert = match self.action_type {
+            FileActionType::TranslationPhp | FileActionType::ConfigPhp => {
+                // For PHP files, use the nested key (last part after the dot)
+                self.name.split('.').last().unwrap_or(&self.name)
+            }
+            _ => &self.name,
+        };
+
+        // Find insertion point and create the edit
+        let (insert_line, insert_char, new_text) = match self.action_type {
+            FileActionType::TranslationJson => {
+                // Find the last line with content before the closing }
+                // Insert: "key": "key",
+                let mut insert_line = 0;
+                let mut found_closing = false;
+
+                for (i, line) in lines.iter().enumerate().rev() {
+                    let trimmed = line.trim();
+                    if trimmed == "}" {
+                        found_closing = true;
+                        insert_line = i;
+                    } else if found_closing && !trimmed.is_empty() {
+                        // Found a line with content before the closing brace
+                        // We need to add a comma to this line if it doesn't have one
+                        break;
+                    }
+                }
+
+                if !found_closing {
+                    return None;
+                }
+
+                // Insert before the closing brace with proper indentation
+                let indent = "    ";
+                let escaped_key = key_for_insert.replace('\\', "\\\\").replace('"', "\\\"");
+                (
+                    insert_line as u32,
+                    0,
+                    format!("{}\"{}\": \"{}\",\n", indent, escaped_key, escaped_key),
+                )
+            }
+            FileActionType::TranslationPhp => {
+                // Find the last line with ]; and insert before it
+                // Insert: 'key' => 'key',
+                let mut insert_line = 0;
+
+                for (i, line) in lines.iter().enumerate().rev() {
+                    if line.trim().starts_with("];") || line.trim() == "];" {
+                        insert_line = i;
+                        break;
+                    }
+                }
+
+                // Insert before the closing bracket with proper indentation
+                let indent = "    ";
+                let escaped_key = key_for_insert.replace('\\', "\\\\").replace('\'', "\\'");
+                (
+                    insert_line as u32,
+                    0,
+                    format!("{}'{}' => '{}',\n", indent, escaped_key, escaped_key),
+                )
+            }
+            FileActionType::ConfigPhp => {
+                // Find the last line with ]; and insert before it
+                // Insert: 'key' => '', (empty string value for config)
+                let mut insert_line = 0;
+
+                for (i, line) in lines.iter().enumerate().rev() {
+                    if line.trim().starts_with("];") || line.trim() == "];" {
+                        insert_line = i;
+                        break;
+                    }
+                }
+
+                // Insert before the closing bracket with proper indentation
+                let indent = "    ";
+                let escaped_key = key_for_insert.replace('\\', "\\\\").replace('\'', "\\'");
+                (
+                    insert_line as u32,
+                    0,
+                    format!("{}'{}' => '',\n", indent, escaped_key),
+                )
+            }
+            FileActionType::EnvVar => {
+                // Append: KEY=\n at end of file (with newline before if file doesn't end with one)
+                let line_count = lines.len();
+                let needs_newline = !content.ends_with('\n') && !content.is_empty();
+
+                // Insert at end of file
+                let insert_line = line_count;
+                let prefix = if needs_newline { "\n" } else { "" };
+                (
+                    insert_line as u32,
+                    0,
+                    format!("{}{}=\n", prefix, self.name),
+                )
+            }
+            _ => return None,
+        };
+
+        Some(WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Edit(TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier {
+                        uri: file_uri.clone(),
+                        version: None,
+                    },
+                    edits: vec![OneOf::Left(TextEdit {
+                        range: Range {
+                            start: Position { line: insert_line, character: insert_char },
+                            end: Position { line: insert_line, character: insert_char },
+                        },
+                        new_text,
+                    })],
+                }),
+            ])),
+            change_annotations: None,
+        })
+    }
+
+    /// Build a WorkspaceEdit that copies a source file to the target (for .env.example → .env)
+    fn build_copy_file_edit(&self, source: &Path, target_uri: &Url) -> Option<WorkspaceEdit> {
+        // Read the source file content
+        let content = std::fs::read_to_string(source).ok()?;
+
+        Some(WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Operations(vec![
+                // Create the target file
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: target_uri.clone(),
+                    options: Some(CreateFileOptions {
+                        overwrite: Some(false),
+                        ignore_if_exists: Some(true),
+                    }),
+                    annotation_id: None,
+                })),
+                // Insert the copied content
+                DocumentChangeOperation::Edit(TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier {
+                        uri: target_uri.clone(),
+                        version: None,
+                    },
+                    edits: vec![OneOf::Left(TextEdit {
+                        range: Range {
+                            start: Position { line: 0, character: 0 },
+                            end: Position { line: 0, character: 0 },
+                        },
+                        new_text: content,
+                    })],
+                }),
+            ])),
+            change_annotations: None,
+        })
+    }
+}
+
 impl LaravelLanguageServer {
     fn new(client: Client) -> Self {
         Self {
@@ -197,25 +894,6 @@ impl LaravelLanguageServer {
             info!("⚙️  Updating Salsa debounce: {}ms → {}ms", old_debounce, new_debounce);
             *self.salsa_debounce_ms.write().await = new_debounce;
         }
-    }
-
-    /// Check if a position has a diagnostic (yellow squiggle).
-    /// Returns true if there's a diagnostic at this position.
-    async fn has_diagnostic_at_position(&self, uri: &Url, position: Position) -> bool {
-        let diagnostics_guard = self.diagnostics.read().await;
-        let Some(file_diagnostics) = diagnostics_guard.get(uri) else {
-            return false;
-        };
-
-        // Check if any diagnostic range contains this position
-        file_diagnostics.iter().any(|diagnostic| {
-            let range = diagnostic.range;
-            // Check if position is within the diagnostic range
-            (position.line > range.start.line ||
-             (position.line == range.start.line && position.character >= range.start.character)) &&
-            (position.line < range.end.line ||
-             (position.line == range.end.line && position.character <= range.end.character))
-        })
     }
 
     /// Register config files with Salsa for incremental computation
@@ -621,27 +1299,6 @@ impl LaravelLanguageServer {
         }
 
         needs_rescans
-    }
-
-    /// Run background rescans and save cache (called from initialized())
-    async fn run_background_rescans(&self, root: &Path, needs_rescans: Vec<RescanType>) {
-        for rescan_type in needs_rescans {
-            match rescan_type {
-                RescanType::Vendor => self.rescan_vendor_providers(root).await,
-                RescanType::App => self.rescan_app_providers(root).await,
-                RescanType::NodeModules => self.rescan_node_modules(root).await,
-            }
-        }
-
-        // Save updated cache
-        if let Some(ref cache) = *self.cache.read().await {
-            if let Err(e) = cache.save() {
-                warn!("Failed to save cache: {}", e);
-            }
-        }
-
-        // Re-validate open documents with new data
-        self.revalidate_open_documents().await;
     }
 
     /// Rescan vendor directory (framework + packages)
@@ -1120,35 +1777,6 @@ impl LaravelLanguageServer {
         *self.initialized_root.write().await = Some(discovered_root);
     }
 
-    /// Refresh the env cache and re-validate open documents
-    async fn refresh_env_cache_from_buffers(&self, root: &Path) {
-        // Register with Salsa (handles buffer vs disk automatically)
-        self.register_env_files_with_salsa(root).await;
-
-        // Re-validate all open PHP documents since env vars changed
-        info!("Laravel LSP: Re-validating all open documents due to .env change");
-        let documents = self.documents.read().await;
-        for (doc_uri, (doc_text, _version)) in documents.iter() {
-            if doc_uri.path().ends_with(".php") {
-                self.validate_and_publish_diagnostics(doc_uri, doc_text).await;
-            }
-        }
-    }
-
-    /// Check if a file exists either in editor buffers (unsaved) or on disk
-    async fn file_exists(&self, path: &PathBuf) -> bool {
-        // First check if file is open in editor (includes unsaved files)
-        if let Ok(uri) = Url::from_file_path(path) {
-            let documents = self.documents.read().await;
-            if documents.contains_key(&uri) {
-                return true;
-            }
-        }
-
-        // Fall back to disk check
-        path.exists()
-    }
-
     /// Check if a file exists with async I/O and TTL caching
     ///
     /// This method improves goto_definition performance by:
@@ -1271,12 +1899,6 @@ impl LaravelLanguageServer {
         }
 
         None
-    }
-
-    /// Clear the file exists cache
-    /// Call this periodically or when files change significantly
-    async fn clear_file_exists_cache(&self) {
-        self.file_exists_cache.write().await.clear();
     }
 
     // ========================================================================
@@ -1443,6 +2065,254 @@ impl LaravelLanguageServer {
     }
 
     // ========================================================================
+    // Code Action helpers
+    // ========================================================================
+
+    /// Extract the expected file path from a diagnostic message
+    /// e.g., "View file not found: 'welcome'\nExpected at: /path/to/view.blade.php"
+    /// Returns: Some("/path/to/view.blade.php")
+    fn extract_expected_path(message: &str) -> Option<&str> {
+        // Look for "Expected at: " and extract the path after it
+        const MARKER: &str = "\nExpected at: ";
+        if let Some(idx) = message.find(MARKER) {
+            let after = &message[idx + MARKER.len()..];
+            // Path ends at newline or end of string
+            let end = after.find('\n').unwrap_or(after.len());
+            Some(&after[..end])
+        } else {
+            None
+        }
+    }
+
+    /// Extract a name from a diagnostic message between prefix and suffix
+    /// e.g., extract_name_from_diagnostic("View file not found: 'welcome'", "View file not found: '", "'")
+    /// Returns: Some("welcome")
+    fn extract_name_from_diagnostic<'a>(message: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+        if let Some(start) = message.find(prefix) {
+            let after_prefix = &message[start + prefix.len()..];
+            if let Some(end) = after_prefix.find(suffix) {
+                return Some(&after_prefix[..end]);
+            }
+        }
+        None
+    }
+
+    /// Extract the "Copy from:" path from a diagnostic message (for .env.example → .env)
+    /// e.g., "...\nCopy from: /path/to/.env.example"
+    /// Returns: Some(PathBuf("/path/to/.env.example"))
+    fn extract_copy_from_path(message: &str) -> Option<PathBuf> {
+        const MARKER: &str = "\nCopy from: ";
+        if let Some(idx) = message.find(MARKER) {
+            let after = &message[idx + MARKER.len()..];
+            // Path ends at newline or end of string
+            let end = after.find('\n').unwrap_or(after.len());
+            Some(PathBuf::from(&after[..end]))
+        } else {
+            None
+        }
+    }
+
+    /// Get the content for a new file using Laravel's stub system
+    /// Priority: 1. stubs/*.stub (user customized)
+    ///           2. vendor/.../stubs/*.stub (framework/package default)
+    ///           3. Fallback template
+    async fn get_stub_content(&self, action: &FileAction) -> String {
+        // These types don't use stubs - they use simple templates or generate their own
+        if matches!(action.action_type,
+            FileActionType::TranslationPhp | FileActionType::TranslationJson |
+            FileActionType::ConfigPhp | FileActionType::EnvVar |
+            FileActionType::BladeComponentWithClass
+        ) {
+            return Self::fallback_template(action);
+        }
+
+        let root = self.root_path.read().await;
+
+        // Get stub paths based on action type
+        let (custom_stub, framework_stub): (&str, Option<&str>) = match action.action_type {
+            FileActionType::View => (
+                "stubs/view.stub",
+                Some("vendor/laravel/framework/src/Illuminate/Foundation/Console/stubs/view.stub"),
+            ),
+            FileActionType::BladeComponent => (
+                "stubs/component.stub",
+                None, // No framework stub for anonymous components
+            ),
+            FileActionType::Livewire => (
+                "stubs/livewire.stub",
+                Some("vendor/livewire/livewire/src/Commands/stubs/component.stub"),
+            ),
+            FileActionType::Middleware => (
+                "stubs/middleware.stub",
+                Some("vendor/laravel/framework/src/Illuminate/Routing/Console/stubs/middleware.stub"),
+            ),
+            // These types handled above (early return)
+            FileActionType::TranslationPhp | FileActionType::TranslationJson |
+            FileActionType::ConfigPhp | FileActionType::EnvVar |
+            FileActionType::BladeComponentWithClass => {
+                return Self::fallback_template(action);
+            }
+        };
+
+        if let Some(root) = root.as_ref() {
+            // 1. Check user's customized stub
+            let custom_path = root.join(custom_stub);
+            if custom_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&custom_path) {
+                    return Self::replace_stub_placeholders(&content, action);
+                }
+            }
+
+            // 2. Check framework/package stub
+            if let Some(fw_stub) = framework_stub {
+                let fw_path = root.join(fw_stub);
+                if fw_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&fw_path) {
+                        return Self::replace_stub_placeholders(&content, action);
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback to built-in template
+        Self::fallback_template(action)
+    }
+
+    /// Replace common stub placeholders with actual values
+    fn replace_stub_placeholders(content: &str, action: &FileAction) -> String {
+        let class_name = Self::kebab_to_pascal_case(&action.name);
+        let view_name = action.name.replace('.', "/");
+
+        content
+            .replace("{{ class }}", &class_name)
+            .replace("{{class}}", &class_name)
+            .replace("{{ name }}", &action.name)
+            .replace("{{name}}", &action.name)
+            .replace("{{ view }}", &view_name)
+            .replace("{{view}}", &view_name)
+    }
+
+    /// Get fallback template when no stub is available
+    fn fallback_template(action: &FileAction) -> String {
+        match action.action_type {
+            FileActionType::View => "<div>\n    \n</div>\n".to_string(),
+            FileActionType::BladeComponent => "@props([])\n\n<div>\n    {{ $slot }}\n</div>\n".to_string(),
+            FileActionType::Livewire => {
+                // For nested components like "admin.dashboard" or "admin.user-profile":
+                // - Class name: last segment in PascalCase ("Dashboard", "UserProfile")
+                // - Namespace: App\Livewire + intermediate segments ("App\Livewire\Admin")
+                // - View: dots preserved ("livewire.admin.dashboard")
+                let parts: Vec<&str> = action.name.split('.').collect();
+                let class_name = Self::kebab_to_pascal_case(parts.last().unwrap_or(&action.name.as_str()));
+
+                // Build namespace from intermediate segments
+                let namespace = if parts.len() > 1 {
+                    let namespace_parts: Vec<String> = parts[..parts.len() - 1]
+                        .iter()
+                        .map(|p| Self::kebab_to_pascal_case(p))
+                        .collect();
+                    format!("App\\Livewire\\{}", namespace_parts.join("\\"))
+                } else {
+                    "App\\Livewire".to_string()
+                };
+
+                // View name keeps dots (e.g., "admin.dashboard" -> "livewire.admin.dashboard")
+                let view_name = &action.name;
+
+                format!(
+                    r#"<?php
+
+namespace {};
+
+use Livewire\Component;
+
+class {} extends Component
+{{
+    public function render()
+    {{
+        return view('livewire.{}');
+    }}
+}}
+"#,
+                    namespace, class_name, view_name
+                )
+            }
+            FileActionType::Middleware => {
+                let class_name = Self::kebab_to_pascal_case(&action.name);
+                format!(
+                    r#"<?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use Symfony\Component\HttpFoundation\Response;
+
+class {}
+{{
+    /**
+     * Handle an incoming request.
+     */
+    public function handle(Request $request, Closure $next): Response
+    {{
+        return $next($request);
+    }}
+}}
+"#,
+                    class_name
+                )
+            }
+            FileActionType::TranslationPhp => {
+                // For PHP files, the key is the nested key (e.g., "welcome" from "messages.welcome")
+                let key = action.name.split('.').last().unwrap_or(&action.name);
+                let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
+                format!(
+                    r#"<?php
+
+return [
+    '{}' => '{}',
+];
+"#,
+                    escaped_key, escaped_key
+                )
+            }
+            FileActionType::TranslationJson => {
+                // For JSON files, use the full key as both key and value
+                let escaped_key = action.name.replace('\\', "\\\\").replace('"', "\\\"");
+                format!(
+                    r#"{{
+    "{}": "{}"
+}}
+"#,
+                    escaped_key, escaped_key
+                )
+            }
+            FileActionType::ConfigPhp => {
+                // For config files, use nested key with empty string value
+                let key = action.name.split('.').last().unwrap_or(&action.name);
+                let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
+                format!(
+                    r#"<?php
+
+return [
+    '{}' => '',
+];
+"#,
+                    escaped_key
+                )
+            }
+            FileActionType::EnvVar => {
+                // For .env files, just the KEY= line
+                format!("{}=\n", action.name)
+            }
+            // This type generates its own template in build_code_action()
+            FileActionType::BladeComponentWithClass => {
+                String::new()
+            }
+        }
+    }
+
+    // ========================================================================
     // Translation validation helpers
     // ========================================================================
 
@@ -1455,6 +2325,9 @@ impl LaravelLanguageServer {
         let is_multi_word = translation_key.contains(' ');
 
         let mut exists = false;
+        let mut expected_path: Option<PathBuf> = None;
+        let mut file_exists = false;
+        let mut nested_key: Option<String> = None;
 
         if is_multi_word || (!is_dotted_key && !translation_key.contains('.')) {
             // Text key: check JSON files for the KEY, not just file existence
@@ -1463,10 +2336,16 @@ impl LaravelLanguageServer {
                 root.join("resources/lang/en.json"),
             ];
 
+            // Set the expected path to the first option (preferred location)
+            expected_path = Some(json_paths[0].clone());
+            nested_key = Some(translation_key.to_string());
+
             for json_path in &json_paths {
                 if json_path.exists() {
+                    file_exists = true;
+                    expected_path = Some(json_path.clone());
                     // Parse JSON and check if key exists
-                    if let Ok(content) = std::fs::read_to_string(&json_path) {
+                    if let Ok(content) = std::fs::read_to_string(json_path) {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                             if json.get(translation_key).is_some() {
                                 exists = true;
@@ -1474,6 +2353,7 @@ impl LaravelLanguageServer {
                             }
                         }
                     }
+                    break; // Use the first existing file
                 }
             }
         } else if is_dotted_key {
@@ -1481,14 +2361,22 @@ impl LaravelLanguageServer {
             let parts: Vec<&str> = translation_key.split('.').collect();
             if !parts.is_empty() {
                 let file_name = parts[0];
+                // The nested key is everything after the first dot
+                nested_key = Some(parts[1..].join("."));
+
                 let php_paths = [
                     root.join("lang/en").join(format!("{}.php", file_name)),
                     root.join("resources/lang/en").join(format!("{}.php", file_name)),
                 ];
 
+                // Set the expected path to the first option (preferred location)
+                expected_path = Some(php_paths[0].clone());
+
                 for php_path in &php_paths {
                     if php_path.exists() {
-                        exists = true;
+                        file_exists = true;
+                        exists = true; // For PHP, we only check file existence currently
+                        expected_path = Some(php_path.clone());
                         break;
                     }
                 }
@@ -1498,6 +2386,9 @@ impl LaravelLanguageServer {
         TranslationCheck {
             exists,
             is_dotted_key,
+            expected_path,
+            file_exists,
+            nested_key,
         }
     }
 
@@ -1513,20 +2404,38 @@ impl LaravelLanguageServer {
         end_column: u32,
         dotted_severity: DiagnosticSeverity,
     ) -> Diagnostic {
+        let expected_path_str = check.expected_path.as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
         let (severity, message) = if check.is_dotted_key {
+            let action_hint = if check.file_exists {
+                format!("\nKey '{}' not found in file", check.nested_key.as_deref().unwrap_or(translation_key))
+            } else {
+                "\nFile does not exist".to_string()
+            };
             (
                 dotted_severity,
                 format!(
-                    "Translation not found for '{}'",
-                    translation_key
+                    "Translation not found: '{}'\nExpected at: {}{}",
+                    translation_key,
+                    expected_path_str,
+                    action_hint
                 )
             )
         } else {
+            let action_hint = if check.file_exists {
+                format!("\nKey '{}' not found in file", translation_key)
+            } else {
+                "\nFile does not exist".to_string()
+            };
             (
                 DiagnosticSeverity::INFORMATION,
                 format!(
-                    "Translation not found, displayed as '{}'",
-                    translation_key
+                    "Translation not found: '{}'\nExpected at: {}{}",
+                    translation_key,
+                    expected_path_str,
+                    action_hint
                 )
             )
         };
@@ -1537,6 +2446,87 @@ impl LaravelLanguageServer {
                 end: Position { line, character: end_column },
             },
             severity: Some(severity),
+            code: None,
+            source: Some("laravel-lsp".to_string()),
+            message,
+            related_information: None,
+            tags: None,
+            code_description: None,
+            data: None,
+        }
+    }
+
+    // ========================================================================
+    // Config validation helpers
+    // ========================================================================
+
+    /// Check if a config file/key exists for the given key
+    ///
+    /// Config keys like "app.name" look in config/app.php
+    fn check_config_file(root: &Path, config_key: &str) -> ConfigCheck {
+        // Config keys are always dotted (e.g., "app.name", "database.connections.mysql")
+        let parts: Vec<&str> = config_key.split('.').collect();
+
+        if parts.is_empty() {
+            return ConfigCheck {
+                exists: false,
+                expected_path: None,
+                file_exists: false,
+                nested_key: None,
+            };
+        }
+
+        let file_name = parts[0];
+        let nested_key = if parts.len() > 1 {
+            Some(parts[1..].join("."))
+        } else {
+            None
+        };
+
+        let config_path = root.join("config").join(format!("{}.php", file_name));
+        let file_exists = config_path.exists();
+
+        // For now, we only check file existence, not key existence within the file
+        // (Parsing PHP arrays to check for keys would be complex)
+        ConfigCheck {
+            exists: file_exists,
+            expected_path: Some(config_path),
+            file_exists,
+            nested_key,
+        }
+    }
+
+    /// Create a diagnostic for a missing config
+    fn create_config_diagnostic(
+        config_key: &str,
+        check: &ConfigCheck,
+        line: u32,
+        column: u32,
+        end_column: u32,
+    ) -> Diagnostic {
+        let expected_path_str = check.expected_path.as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let action_hint = if check.file_exists {
+            format!("\nKey '{}' not found in file", check.nested_key.as_deref().unwrap_or(config_key))
+        } else {
+            "\nFile does not exist".to_string()
+        };
+
+        let message = format!(
+            "Config not found: '{}'\nExpected at: {}{}",
+            config_key,
+            expected_path_str,
+            action_hint
+        );
+
+        Diagnostic {
+            range: Range {
+                start: Position { line, character: column },
+                end: Position { line, character: end_column },
+            },
+            severity: Some(DiagnosticSeverity::WARNING),
             code: None,
             source: Some("laravel-lsp".to_string()),
             message,
@@ -2175,39 +3165,6 @@ impl LaravelLanguageServer {
         None
     }
 
-    /// Schedule debounced diagnostics for a file
-    ///
-    /// This method cancels any pending diagnostics for the file and schedules
-    /// a new task to run diagnostics after the debounce delay.
-    /// This updates diagnostics as you type (after a pause) and on save.
-    async fn schedule_debounced_diagnostics(&self, uri: &Url, source: &str) {
-        let debounce_delay = Duration::from_millis(self.debounce_delay_ms);
-        
-        // Cancel any existing pending diagnostic task for this file
-        if let Some(handle) = self.pending_diagnostics.write().await.remove(uri) {
-            handle.abort();
-        }
-        
-        // Clone values needed for the async task
-        let uri_for_spawn = uri.clone();
-        let source_for_spawn = source.to_string();
-        let server = self.clone_for_spawn();
-        
-        // Spawn a task that runs diagnostics after debounce delay
-        let handle = tokio::spawn(async move {
-            // Wait for the debounce delay
-            sleep(debounce_delay).await;
-            
-            info!("⏰ Debounce expired for {} - running diagnostics", uri_for_spawn);
-            
-            // Run diagnostics on the debounced content
-            server.validate_and_publish_diagnostics(&uri_for_spawn, &source_for_spawn).await;
-        });
-        
-        // Store the task handle so we can cancel it if needed
-        self.pending_diagnostics.write().await.insert(uri.clone(), handle);
-    }
-    
     /// Clone server for spawning async tasks
     fn clone_for_spawn(&self) -> Self {
         LaravelLanguageServer {
@@ -2335,6 +3292,7 @@ impl LaravelLanguageServer {
             }
 
             // Check env() calls using Salsa patterns - warn if variable not defined
+            let root_for_env = self.root_path.read().await;
             for env_ref in &patterns.env_refs {
                 let env_exists = self.salsa.get_parsed_env_var(env_ref.name.clone()).await
                     .ok()
@@ -2342,24 +3300,70 @@ impl LaravelLanguageServer {
                     .is_some();
 
                 if !env_exists {
-                    // Show WARNING if no fallback (likely to break)
-                    // Show INFO if there's a fallback (safe default)
-                    let (severity, message) = if env_ref.has_fallback {
-                        (
-                            DiagnosticSeverity::INFORMATION,
-                            format!(
-                                "Environment variable '{}' not found in .env files (using fallback value)",
-                                env_ref.name
-                            )
-                        )
+                    // Determine paths based on root
+                    let (env_path, env_example_path) = if let Some(root) = root_for_env.as_ref() {
+                        let env = root.join(".env");
+                        let env_example = root.join(".env.example");
+                        (Some(env), Some(env_example))
                     } else {
-                        (
-                            DiagnosticSeverity::WARNING,
+                        (None, None)
+                    };
+
+                    // Check file existence
+                    let env_exists = env_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+                    let env_example_exists = env_example_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+
+                    // Build the message with Expected at: and optionally Copy from:
+                    // Format varies based on whether .env file exists:
+                    // - .env exists: "not found in file" → append to file
+                    // - .env doesn't exist + .env.example: "file not found" + "Copy from:" → copy
+                    // - .env doesn't exist: "file not found" → create new
+                    let (severity, message) = if env_ref.has_fallback {
+                        let mut msg = if env_exists {
                             format!(
-                                "Environment variable '{}' not found in .env files and has no fallback\nDefine it in .env, .env.example, or .env.local",
+                                "Environment variable '{}' not found in file (using fallback value)",
                                 env_ref.name
                             )
-                        )
+                        } else {
+                            format!(
+                                "Environment variable '{}' file not found (using fallback value)",
+                                env_ref.name
+                            )
+                        };
+                        // Add Expected at: for code action
+                        if let Some(ref p) = env_path {
+                            msg.push_str(&format!("\nExpected at: {}", p.display()));
+                        }
+                        // If .env doesn't exist but .env.example does, add Copy from:
+                        if !env_exists && env_example_exists {
+                            if let Some(ref p) = env_example_path {
+                                msg.push_str(&format!("\nCopy from: {}", p.display()));
+                            }
+                        }
+                        (DiagnosticSeverity::INFORMATION, msg)
+                    } else {
+                        let mut msg = if env_exists {
+                            format!(
+                                "Environment variable '{}' not found in file and has no fallback",
+                                env_ref.name
+                            )
+                        } else {
+                            format!(
+                                "Environment variable '{}' file not found and has no fallback",
+                                env_ref.name
+                            )
+                        };
+                        // Add Expected at: for code action
+                        if let Some(ref p) = env_path {
+                            msg.push_str(&format!("\nExpected at: {}", p.display()));
+                        }
+                        // If .env doesn't exist but .env.example does, add Copy from:
+                        if !env_exists && env_example_exists {
+                            if let Some(ref p) = env_example_path {
+                                msg.push_str(&format!("\nCopy from: {}", p.display()));
+                            }
+                        }
+                        (DiagnosticSeverity::WARNING, msg)
                     };
 
                     let diagnostic = Diagnostic {
@@ -2385,6 +3389,7 @@ impl LaravelLanguageServer {
                     diagnostics.push(diagnostic);
                 }
             }
+            drop(root_for_env);
 
             // Check middleware calls using Salsa patterns - warn about undefined middleware or missing class files
             let root_guard = self.root_path.read().await;
@@ -2525,6 +3530,24 @@ impl LaravelLanguageServer {
                             trans_ref.column,
                             trans_ref.end_column,
                             DiagnosticSeverity::ERROR, // ERROR for dotted keys in PHP
+                        ));
+                    }
+                }
+            }
+            drop(root_guard);
+
+            // Check config calls using Salsa patterns - warn about missing config files
+            let root_guard = self.root_path.read().await;
+            if let Some(root) = root_guard.as_ref() {
+                for config_ref in &patterns.config_refs {
+                    let check = Self::check_config_file(root, &config_ref.key);
+                    if !check.exists {
+                        diagnostics.push(Self::create_config_diagnostic(
+                            &config_ref.key,
+                            &check,
+                            config_ref.line,
+                            config_ref.column,
+                            config_ref.end_column,
                         ));
                     }
                 }
@@ -2774,11 +3797,13 @@ impl LaravelLanguageServer {
         }
 
         // Check Blade components (<x-button>) using Salsa patterns
+        let root_for_components = self.root_path.read().await;
         for comp_ref in &patterns.components {
             let possible_paths = config.resolve_component_path(&comp_ref.name);
-            let exists = possible_paths.iter().any(|p| p.exists());
+            let view_exists = possible_paths.iter().any(|p| p.exists());
 
-            if !exists {
+            if !view_exists {
+                // View not found - offer to create view (anonymous) or view+class
                 let expected_path = possible_paths.first()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| "unknown".to_string());
@@ -2809,7 +3834,10 @@ impl LaravelLanguageServer {
                 };
                 diagnostics.push(diagnostic);
             }
+            // Note: We intentionally don't create a diagnostic when the view exists
+            // but the PHP class doesn't - anonymous components are valid in Laravel
         }
+        drop(root_for_components);
 
         // Check Livewire components using Salsa patterns
         for lw_ref in &patterns.livewire_refs {
@@ -3004,7 +4032,10 @@ impl LanguageServer for LaravelLanguageServer {
                 
                 // ❌ REMOVED: Preparsing on every keystroke in did_change
                 // This was causing autocomplete slowness due to heavy tree-sitter queries.
-                
+
+                // ✅ Code actions for quick fixes (create missing views, etc.)
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+
                 ..Default::default()
             },
             ..Default::default()
@@ -3392,6 +4423,55 @@ impl LanguageServer for LaravelLanguageServer {
     // NOTE: completion handler removed - capability not advertised in ServerCapabilities
 
     // NOTE: code_lens handler removed - Zed doesn't support custom LSP commands
+
+    /// Handle code action requests (quick fixes like "Create missing view")
+    async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> jsonrpc::Result<Option<CodeActionResponse>> {
+        let uri = &params.text_document.uri;
+        let context = &params.context;
+
+        // Early return if no diagnostics in context
+        if context.diagnostics.is_empty() {
+            return Ok(None);
+        }
+
+        info!("🔧 code_action called for {} with {} diagnostics",
+            uri, context.diagnostics.len());
+
+        let mut actions = Vec::new();
+
+        // Get root path for Livewire (needs to calculate view path)
+        let root_guard = self.root_path.read().await;
+        let root = root_guard.as_ref().map(|p| p.as_path());
+
+        // Process each diagnostic to see if we can offer a fix
+        for diagnostic in &context.diagnostics {
+            // Check if this is our diagnostic (source: laravel-lsp)
+            if diagnostic.source.as_deref() != Some("laravel-lsp") {
+                continue;
+            }
+
+            // Parse diagnostic into FileAction(s) - may return multiple options
+            let file_actions = FileAction::from_diagnostic(&diagnostic.message);
+            for file_action in file_actions {
+                let template = self.get_stub_content(&file_action).await;
+
+                if let Some(code_action) = file_action.build_code_action(template, diagnostic, root) {
+                    actions.push(code_action);
+                }
+            }
+        }
+        drop(root_guard);
+
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            info!("🔧 Returning {} code actions", actions.len());
+            Ok(Some(actions))
+        }
+    }
 }
 
 // ❌ REMOVED: code_lens helper methods (extract_view_name_from_path, find_all_references_to_view)

@@ -322,6 +322,93 @@ $js = mix('js/undefined.js');
 
 ---
 
+## Quick Actions
+
+Instant file creation from diagnostic warnings. Click the lightbulb or press `Cmd+.` to see available fixes.
+
+### Create Missing Views
+
+```php
+// Diagnostic: View file not found: 'users.profile'
+return view('users.profile');
+// Quick Action: "Create view: users.profile"
+// Creates: resources/views/users/profile.blade.php
+```
+
+### Create Missing Components
+
+```blade
+{{-- Diagnostic: Blade component not found: 'button' --}}
+<x-button>Click me</x-button>
+
+{{-- Quick Actions:
+     1. "Create component: button"
+        → resources/views/components/button.blade.php
+
+     2. "Create component with class: button"
+        → resources/views/components/button.blade.php
+        → app/View/Components/Button.php
+--}}
+```
+
+### Create Missing Livewire Components
+
+```blade
+{{-- Diagnostic: Livewire component not found: 'counter' --}}
+<livewire:counter />
+
+{{-- Quick Action: "Create Livewire: counter"
+     Creates both:
+     → app/Livewire/Counter.php
+     → resources/views/livewire/counter.blade.php
+--}}
+```
+
+### Create Missing Middleware
+
+```php
+// Diagnostic: Middleware 'custom' not found
+Route::middleware('custom')->group(...);
+// Quick Action: "Create middleware: custom"
+// Creates: app/Http/Middleware/Custom.php
+```
+
+### Create Missing Translations
+
+```php
+// Diagnostic: Translation not found: 'messages.welcome'
+__('messages.welcome');
+
+// If file exists: "Add translation: messages.welcome"
+// If file missing: "Create translation: messages.welcome"
+// Creates/updates: lang/en/messages.php
+```
+
+### Create Missing Config
+
+```php
+// Diagnostic: Config not found: 'custom.setting'
+config('custom.setting');
+
+// If file exists: "Add config: custom.setting"
+// If file missing: "Create config: custom.setting"
+// Creates/updates: config/custom.php
+```
+
+### Create Missing Environment Variables
+
+```php
+// Diagnostic: Environment variable 'CUSTOM_KEY' not found
+env('CUSTOM_KEY');
+
+// Quick Actions:
+// - "Add env var: CUSTOM_KEY" (if .env exists)
+// - "Create .env with CUSTOM_KEY" (if .env missing)
+// - "Copy .env.example to .env" (if .env.example exists)
+```
+
+---
+
 ## Planned Features
 
 ### Auto-Completion
