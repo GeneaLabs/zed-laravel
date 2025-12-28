@@ -355,59 +355,76 @@ When working on this project:
 
 ---
 
-## Session State (2025-12-26)
+## Session State (2025-12-28)
 
 ### Last Session Summary
 
-**Problem**: LSP was slow on startup - `parse_file_patterns` was taking ~1.8 seconds for a single `web.php` file.
+**Focus**: Blade component code actions and README restructure
 
-**Root Cause**: The tree-sitter query (1048 lines, 31KB) was being compiled 8+ times per file - once for each `find_*` function (find_view_calls, find_env_calls, find_config_calls, etc.).
+### Code Actions Implemented
 
-**Solution Implemented**: Single-pass extraction (Option 2 - best practice approach)
+All quick actions (code actions) are now complete:
 
-### Changes Made
+| Diagnostic | Quick Action(s) |
+|------------|-----------------|
+| View file not found | "Create view: {name}" |
+| Blade component not found | 1. "Create component: {name}" (view only)<br>2. "Create component with class: {name}" (view + PHP class) |
+| Livewire component not found | "Create Livewire: {name}" (creates PHP class + Blade view) |
+| Middleware not found | "Create middleware: {name}" |
+| Translation not found | "Create translation: {key}" or "Add translation: {key}" |
+| Config not found | "Create config: {key}" or "Add config: {key}" |
+| Environment variable not found | "Create .env with {VAR}" or "Add env var: {VAR}" or "Copy .env.example to .env" |
 
-1. **queries.rs** - Complete rewrite:
-   - Added `once_cell::Lazy` for global query caching (compile once, reuse forever)
-   - Created `ExtractedPhpPatterns` struct containing all PHP pattern types
-   - Created `ExtractedBladePatterns` struct containing all Blade pattern types
-   - Implemented `extract_all_php_patterns()` - single tree traversal extracts all patterns
-   - Implemented `extract_all_blade_patterns()` - single tree traversal for Blade
-   - Removed all individual `find_*` functions
+### Key Architecture Changes
 
-2. **salsa_impl.rs** - Updated `parse_file_patterns`:
-   - Now uses `extract_all_php_patterns()` instead of 8 separate function calls
-   - Now uses `extract_all_blade_patterns()` instead of 3 separate function calls
-   - Also updated `handle_get_patterns` for route/url/action extraction
+1. **`FileAction::from_diagnostic()` returns `Vec<Self>`** - Allows multiple actions per diagnostic (e.g., Blade component offers both anonymous and class-based options)
 
-3. **Cargo.toml** - Added `once_cell = "1.19"` dependency
+2. **Removed `BladeComponentClass` type** - User decided no diagnostic should show when view exists but class doesn't (anonymous components are valid)
 
-### Performance Improvement
+3. **Cleaned up dead code** - Removed 6 unused methods:
+   - `has_diagnostic_at_position()`
+   - `run_background_rescans()`
+   - `refresh_env_cache_from_buffers()`
+   - `file_exists()`
+   - `clear_file_exists_cache()`
+   - `schedule_debounced_diagnostics()`
 
-| Metric | Before | After |
-|--------|--------|-------|
-| Query compilations per file | 8+ | 1 (cached globally) |
-| Tree traversals per PHP file | 8 | 1 |
-| Expected speedup | - | ~5-10x for pattern extraction |
+### README Restructured
+
+Completely rewrote `/Users/mike/Developer/zed-laravel/README.md`:
+- Centered hero with Laravel logo
+- Navigation TOC at top
+- Collapsible `<details>` sections throughout
+- Laravel developer perspective (familiar terminology)
+- ⚡ lightning emoji for quick actions (Zed's icon)
+- Configuration section with `debounceMs` setting documented
 
 ### Current Status
 
-- Build: **Passing** (with some dead code warnings - expected)
-- Tests: **19 tests passing**
-- Ready to test in Zed
-
-### Next Steps (for next session)
-
-1. **Test in Zed** - Reload extensions and check new startup logs to verify performance improvement
-2. **Measure actual improvement** - Compare `salsa.get_patterns` time in logs (was ~1.8s)
-3. **If still slow** - Profile to find next bottleneck (could be in Salsa overhead, file I/O, etc.)
-4. **Consider further optimizations**:
-   - Lazy initialization of patterns (only parse when needed)
-   - Background parsing on file open
-   - Smaller/split query files if compilation is still slow on first use
+- Build: **Passing** (no warnings)
+- Tests: **112 tests passing** (35 unit + 77 integration)
 
 ### Key Files Modified
 
-- `laravel-lsp/src/queries.rs` - Complete rewrite with single-pass extraction
-- `laravel-lsp/src/salsa_impl.rs` - Updated to use new extraction functions
-- `laravel-lsp/Cargo.toml` - Added once_cell dependency
+- `laravel-lsp/src/main.rs` - Code action refactoring, dead code removal
+- `README.md` - Complete restructure with collapsible sections
+
+### Configuration Setting
+
+```json
+{
+  "lsp": {
+    "laravel-lsp": {
+      "settings": {
+        "laravel": {
+          "debounceMs": 200
+        }
+      }
+    }
+  }
+}
+```
+
+- **50-100ms**: Fast machine, instant feedback
+- **200ms** (default): Balanced - skips brief pauses, feels instant when you stop
+- **300-500ms**: Slower machine/large project, reduce CPU
