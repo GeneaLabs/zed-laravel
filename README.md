@@ -456,6 +456,34 @@ No configuration required. The extension automatically discovers:
 - Middleware aliases from `app/Http/Kernel.php` or `bootstrap/app.php`
 - Service bindings from service providers
 
+### Optional Settings
+
+The default settings work well for most users. Only configure if you want to tune performance.
+
+```json
+{
+  "lsp": {
+    "laravel-lsp": {
+      "settings": {
+        "laravel": {
+          "debounceMs": 200
+        }
+      }
+    }
+  }
+}
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `debounceMs` | `200` | Delay (ms) before updating diagnostics while typing. |
+
+**When to adjust `debounceMs`:**
+
+- **Lower (50-100ms)**: Diagnostics update sooner after you stop typing. Good for fast machines where you want near-instant feedback.
+- **Default (200ms)**: Balances responsiveness with efficiency. Long enough to skip brief pauses mid-thought, short enough to feel instant when you stop to read.
+- **Higher (300-500ms)**: Waits longer after you stop typing before updating. Good for slower machines or large projects to reduce unnecessary recomputation during brief pauses.
+
 ---
 
 ## Performance
