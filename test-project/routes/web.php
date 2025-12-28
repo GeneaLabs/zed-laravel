@@ -1,6 +1,7 @@
 <?php
 
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\URL;
 use Laravel\Fortify\Features;
 use Livewire\Volt\Volt;
 
@@ -11,6 +12,8 @@ Route::view('test', 'test1');
 Route::view('dashboard', 'dashboard')
     ->middleware(['auth', 'verified'])
     ->name('dashboard');
+
+
 
 Route::middleware(['auth'])->group(function () {
     Route::redirect('settings', 'settings/profile');
@@ -74,4 +77,37 @@ Route::get('/test-binding-errors', function () {
     $custom = app('my.custom.service'); // Should show error - binding not defined
 
     return 'Testing invalid bindings';
+});
+
+// Test new route name patterns (Patterns 22-25)
+Route::get('/test-route-patterns', function () {
+    // Pattern 22: Route::has() - Check if named route exists
+    if (Route::has('home')) {
+        // Navigate to route definition
+    }
+    if (Route::has('dashboard')) {
+        // Navigate to route definition
+    }
+
+    // Pattern 23: URL::route() - Generate URL to named route
+    $homeUrl = URL::route('home');
+    $dashboardUrl = URL::route('dashboard');
+
+    // Pattern 24: Route::is() / Route::currentRouteNamed()
+    if (Route::is('home')) {
+        // Check if current route is 'home'
+    }
+    if (Route::currentRouteNamed('dashboard')) {
+        // Check if current route is 'dashboard'
+    }
+
+    // Pattern 25: $request->routeIs()
+    if (request()->routeIs('home')) {
+        // Check if current request matches 'home' route
+    }
+    if (request()->routeIs('profile.*')) {
+        // Wildcard pattern matching
+    }
+
+    return 'Testing route name patterns';
 });

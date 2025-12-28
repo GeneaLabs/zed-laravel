@@ -461,6 +461,9 @@
 ; Pattern 15: Lang::get('translation.key') - Facade method
 ; ============================================================================
 ; Matches: Lang::get('messages.welcome')
+;          Lang::has('messages.welcome')
+;          Lang::hasForLocale('messages.welcome', 'es')
+;          Lang::choice('messages.apples', 10)
 ;          \Lang::get("validation.email")
 
 ; Single-quoted strings
@@ -473,7 +476,7 @@
       (string
         (string_content) @translation_key)))
   (#eq? @class_name "Lang")
-  (#match? @method_name "^(get|has|choice)$"))
+  (#match? @method_name "^(get|has|hasForLocale|choice)$"))
 
 ; Double-quoted strings
 (scoped_call_expression
@@ -485,7 +488,7 @@
       (encapsed_string
         (string_content) @translation_key)))
   (#eq? @class_name "Lang")
-  (#match? @method_name "^(get|has|choice)$"))
+  (#match? @method_name "^(get|has|hasForLocale|choice)$"))
 
 ; Also match fully qualified Lang class - single quotes
 (scoped_call_expression
@@ -497,7 +500,7 @@
       (string
         (string_content) @translation_key)))
   (#match? @class_name ".*Lang$")
-  (#match? @method_name "^(get|has|choice)$"))
+  (#match? @method_name "^(get|has|hasForLocale|choice)$"))
 
 ; Also match fully qualified Lang class - double quotes
 (scoped_call_expression
@@ -509,7 +512,7 @@
       (encapsed_string
         (string_content) @translation_key)))
   (#match? @class_name ".*Lang$")
-  (#match? @method_name "^(get|has|choice)$"))
+  (#match? @method_name "^(get|has|hasForLocale|choice)$"))
 
 ; ============================================================================
 ; Pattern 16: app('binding') / resolve('binding') - Container binding resolution
@@ -1044,5 +1047,130 @@
       (encapsed_string
         (string_content) @route_name)))
   (#eq? @function_name "to_route"))
+
+; ============================================================================
+; Pattern 22: Route::has('name') - Check if named route exists
+; ============================================================================
+; Matches: Route::has('admin.dashboard')
+;          Route::has('user.profile')
+;
+; Used to check if a named route exists before generating URLs
+
+; Single-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @route_name)))
+  (#eq? @class_name "Route")
+  (#eq? @method_name "has"))
+
+; Double-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @route_name)))
+  (#eq? @class_name "Route")
+  (#eq? @method_name "has"))
+
+; ============================================================================
+; Pattern 23: URL::route('name') - Generate URL to named route
+; ============================================================================
+; Matches: URL::route('home')
+;          URL::route('user.profile', ['id' => 1])
+;
+; Alternative to route() helper for generating URLs
+
+; Single-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @route_name)))
+  (#eq? @class_name "URL")
+  (#eq? @method_name "route"))
+
+; Double-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @route_name)))
+  (#eq? @class_name "URL")
+  (#eq? @method_name "route"))
+
+; ============================================================================
+; Pattern 24: Route::is('name') / Route::currentRouteNamed('name')
+; ============================================================================
+; Matches: Route::is('admin.*')
+;          Route::is('user.profile')
+;          Route::currentRouteNamed('dashboard')
+;
+; Used to check if the current route matches a pattern
+
+; Single-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @route_name)))
+  (#eq? @class_name "Route")
+  (#match? @method_name "^(is|currentRouteNamed)$"))
+
+; Double-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @route_name)))
+  (#eq? @class_name "Route")
+  (#match? @method_name "^(is|currentRouteNamed)$"))
+
+; ============================================================================
+; Pattern 25: $request->routeIs('name') - Request route checking
+; ============================================================================
+; Matches: $request->routeIs('profile')
+;          $request->routeIs('admin.*')
+;
+; Check if the current request matches a route name pattern
+
+; Single-quoted strings
+(member_call_expression
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @route_name)))
+  (#eq? @method_name "routeIs"))
+
+; Double-quoted strings
+(member_call_expression
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @route_name)))
+  (#eq? @method_name "routeIs"))
 
 ; ============================================================================

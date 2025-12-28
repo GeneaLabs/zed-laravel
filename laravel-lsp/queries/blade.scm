@@ -94,3 +94,16 @@
 ;   (directive_argument
 ;     (string) @view_name)
 ;   (#eq? @directive_name "@include"))
+
+; ============================================================================
+; Pattern 6: PHP content inside Blade echo statements {{ ... }}
+; ============================================================================
+; Matches: {{ __("Welcome to our app") }}
+;          {{ $user->name }}
+;          {!! $rawHtml !!}
+;
+; This captures the PHP content inside echo statements so we can
+; parse it for function calls like __(), env(), config(), etc.
+
+(php_statement
+  (php_only) @echo_php_content)

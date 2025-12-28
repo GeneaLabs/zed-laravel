@@ -15,4 +15,4 @@ pub mod salsa_impl;
 
 // Re-export commonly used types
 pub use config::find_project_root;
-pub use queries::{ExtractedPhpPatterns, ExtractedBladePatterns};
+pub use queries::{ExtractedPhpPatterns, ExtractedBladePatterns, EchoPhpMatch};

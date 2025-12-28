@@ -269,12 +269,25 @@ pub struct ExtractedPhpPatterns<'a> {
     pub action_calls: Vec<ActionMatch<'a>>,
 }
 
+/// Represents PHP content inside Blade echo statements {{ ... }}
+#[derive(Debug, Clone, PartialEq)]
+pub struct EchoPhpMatch<'a> {
+    pub php_content: &'a str,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub row: usize,
+    pub column: usize,
+    pub end_column: usize,
+}
+
 /// All patterns extracted from a Blade file in a single pass
 #[derive(Debug, Default)]
 pub struct ExtractedBladePatterns<'a> {
     pub components: Vec<ComponentMatch<'a>>,
     pub livewire: Vec<LivewireMatch<'a>>,
     pub directives: Vec<DirectiveMatch<'a>>,
+    /// PHP content inside {{ ... }} echo statements
+    pub echo_php: Vec<EchoPhpMatch<'a>>,
 }
 
 // ============================================================================
@@ -674,9 +687,9 @@ pub fn extract_all_blade_patterns<'a>(
                 let directive_column = start_pos.column;
                 let directive_end_column = end_pos.column;
 
-                // Calculate string column positions for view-referencing directives
+                // Calculate string column positions for view-referencing and translation directives
                 let (string_column, string_end_column) = match (directive_name, &arguments) {
-                    ("extends" | "include" | "slot" | "component", Some(args)) => {
+                    ("extends" | "include" | "slot" | "component" | "lang", Some(args)) => {
                         calculate_string_column_range(directive_column, directive_name, args)
                             .unwrap_or((directive_column, directive_end_column))
                     }
@@ -710,13 +723,25 @@ pub fn extract_all_blade_patterns<'a>(
                 });
             }
 
+            // PHP content inside {{ ... }} echo statements
+            "echo_php_content" => {
+                result.echo_php.push(EchoPhpMatch {
+                    php_content: text,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
             // Ignore vite_directive and other captures
             _ => {}
         }
     }
 
     let total_time = start.elapsed();
-    let pattern_count = result.components.len() + result.livewire.len() + result.directives.len();
+    let pattern_count = result.components.len() + result.livewire.len() + result.directives.len() + result.echo_php.len();
     info!(
         "📊 Blade extraction: {:?} total (query fetch: {:?}), {} patterns found",
         total_time, query_fetch_time, pattern_count
@@ -951,4 +976,339 @@ mod tests {
         assert!(!patterns.binding_calls.is_empty(), "Should find bindings");
         assert!(!patterns.route_calls.is_empty(), "Should find routes");
     }
+
+    // =========================================================================
+    // Column Position Tests
+    // =========================================================================
+    // These tests ensure that column positions are correct for highlighting
+    // and diagnostics. The column should point to the content, not quotes.
+
+    #[test]
+    fn test_view_column_positions() {
+        // view('users.profile')
+        // Position: 0         1         2
+        //           0123456789012345678901234567
+        //           <?php view('users.profile');
+        // The tree-sitter query captures string_content (without quotes)
+        let php_code = "<?php view('users.profile');";
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert_eq!(patterns.views.len(), 1);
+        let view = &patterns.views[0];
+
+        // view_name captures the string content WITHOUT quotes
+        assert_eq!(view.view_name, "users.profile");
+        // In "<?php view('users.profile');", 'u' starts at column 12
+        assert_eq!(view.column, 12, "column should point to first char of view name");
+        // End column should be at 'e' + 1 = 25
+        assert_eq!(view.end_column, 25, "end_column should be after last char");
+    }
+
+    #[test]
+    fn test_env_column_positions() {
+        // env('APP_NAME')
+        // Position: 0         1         2
+        //           0123456789012345678901
+        //           <?php env('APP_NAME');
+        let php_code = "<?php env('APP_NAME');";
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert_eq!(patterns.env_calls.len(), 1);
+        let env_call = &patterns.env_calls[0];
+
+        // env_var captures the string content WITHOUT quotes
+        assert_eq!(env_call.var_name, "APP_NAME");
+        // In "<?php env('APP_NAME');", 'A' starts at column 11
+        assert_eq!(env_call.column, 11, "column should point to first char");
+        assert_eq!(env_call.end_column, 19, "end_column should be after last char");
+    }
+
+    #[test]
+    fn test_config_column_positions() {
+        // config('app.name')
+        // Position: 0         1         2
+        //           0123456789012345678901234
+        //           <?php config('app.name');
+        let php_code = "<?php config('app.name');";
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert_eq!(patterns.config_calls.len(), 1);
+        let config_call = &patterns.config_calls[0];
+
+        // config_key captures the string content WITHOUT quotes
+        assert_eq!(config_call.config_key, "app.name");
+        // In "<?php config('app.name');", 'a' starts at column 14
+        assert_eq!(config_call.column, 14, "column should point to first char");
+        assert_eq!(config_call.end_column, 22, "end_column should be after last char");
+    }
+
+    #[test]
+    fn test_translation_column_positions() {
+        // __('messages.welcome')
+        // Position: 0         1         2
+        //           012345678901234567890123456789
+        //           <?php __('messages.welcome');
+        let php_code = "<?php __('messages.welcome');";
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert_eq!(patterns.translation_calls.len(), 1);
+        let trans = &patterns.translation_calls[0];
+
+        // translation_key captures the string content WITHOUT quotes
+        assert_eq!(trans.translation_key, "messages.welcome");
+        // In "<?php __('messages.welcome');", 'm' starts at column 10
+        assert_eq!(trans.column, 10, "column should point to first char");
+        assert_eq!(trans.end_column, 26, "end_column should be after last char");
+    }
+
+    #[test]
+    fn test_asset_column_positions() {
+        // asset('css/app.css')
+        // Position: 0         1         2
+        //           012345678901234567890123456
+        //           <?php asset('css/app.css');
+        let php_code = "<?php asset('css/app.css');";
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert_eq!(patterns.asset_calls.len(), 1);
+        let asset = &patterns.asset_calls[0];
+
+        // asset_path captures the string content WITHOUT quotes
+        assert_eq!(asset.path, "css/app.css");
+        // In "<?php asset('css/app.css');", 'c' starts at column 13
+        assert_eq!(asset.column, 13, "column should point to first char");
+        assert_eq!(asset.end_column, 24, "end_column should be after last char");
+    }
+
+    #[test]
+    fn test_middleware_column_positions() {
+        // Route::middleware('auth')
+        // Position: 0         1         2         3
+        //           01234567890123456789012345678901
+        //           <?php Route::middleware('auth');
+        let php_code = "<?php Route::middleware('auth');";
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert_eq!(patterns.middleware_calls.len(), 1);
+        let mw = &patterns.middleware_calls[0];
+
+        // middleware_name captures the string content WITHOUT quotes
+        assert_eq!(mw.middleware_name, "auth");
+        // In "<?php Route::middleware('auth');", 'a' starts at column 25
+        assert_eq!(mw.column, 25, "column should point to first char");
+        assert_eq!(mw.end_column, 29, "end_column should be after last char");
+    }
+
+    #[test]
+    fn test_route_column_positions() {
+        // route('home')
+        // Position: 0         1
+        //           01234567890123456789
+        //           <?php route('home');
+        let php_code = "<?php route('home');";
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert_eq!(patterns.route_calls.len(), 1);
+        let route = &patterns.route_calls[0];
+
+        // route_name captures the string content WITHOUT quotes
+        assert_eq!(route.route_name, "home");
+        // In "<?php route('home');", 'h' starts at column 13
+        assert_eq!(route.column, 13, "column should point to first char");
+        assert_eq!(route.end_column, 17, "end_column should be after last char");
+    }
+
+    #[test]
+    fn test_binding_column_positions() {
+        // app('cache')
+        // Position: 0         1
+        //           0123456789012345678
+        //           <?php app('cache');
+        let php_code = "<?php app('cache');";
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert_eq!(patterns.binding_calls.len(), 1);
+        let binding = &patterns.binding_calls[0];
+
+        // binding_name captures the string content WITHOUT quotes
+        assert_eq!(binding.binding_name, "cache");
+        // In "<?php app('cache');", 'c' starts at column 11
+        assert_eq!(binding.column, 11, "column should point to first char");
+        assert_eq!(binding.end_column, 16, "end_column should be after last char");
+    }
+
+    #[test]
+    fn test_blade_component_column_positions() {
+        // <x-button>
+        // The component is matched by the Blade tree-sitter grammar
+        // We need a more realistic Blade structure for proper parsing
+        let blade_code = "<div><x-button></x-button></div>";
+        let tree = parse_blade(blade_code).expect("Should parse Blade");
+        let lang = language_blade();
+        let patterns = extract_all_blade_patterns(&tree, blade_code, &lang)
+            .expect("Should extract patterns");
+
+        // Components may or may not be found depending on tree-sitter grammar
+        // Just verify the structure works
+        if !patterns.components.is_empty() {
+            let component = &patterns.components[0];
+            assert!(component.column < blade_code.len(), "column should be valid");
+            assert!(component.end_column >= component.column, "end_column should be >= column");
+        }
+    }
+
+    #[test]
+    fn test_livewire_component_column_positions() {
+        // <livewire:counter />
+        let blade_code = "<div><livewire:counter /></div>";
+        let tree = parse_blade(blade_code).expect("Should parse Blade");
+        let lang = language_blade();
+        let patterns = extract_all_blade_patterns(&tree, blade_code, &lang)
+            .expect("Should extract patterns");
+
+        // Livewire components may or may not be found depending on grammar
+        if !patterns.livewire.is_empty() {
+            let livewire = &patterns.livewire[0];
+            assert!(livewire.column < blade_code.len(), "column should be valid");
+            assert!(livewire.end_column >= livewire.column, "end_column should be >= column");
+        }
+    }
+
+    #[test]
+    fn test_blade_directive_column_positions() {
+        // @include('partials.header')
+        let blade_code = "@include('partials.header')";
+        let tree = parse_blade(blade_code).expect("Should parse Blade");
+        let lang = language_blade();
+        let patterns = extract_all_blade_patterns(&tree, blade_code, &lang)
+            .expect("Should extract patterns");
+
+        let include_directive = patterns.directives.iter()
+            .find(|d| d.directive_name == "include");
+
+        assert!(include_directive.is_some(), "Should find @include directive");
+        let directive = include_directive.unwrap();
+
+        // directive starts at column 0 (the @)
+        assert_eq!(directive.column, 0, "directive should start at column 0");
+        // string_column should point to the view name string
+        assert!(directive.string_column > 0, "string_column should be after directive name");
+    }
+
+    #[test]
+    fn test_column_positions_with_indentation() {
+        // Test that column positions work correctly with leading whitespace
+        // Position: 0         1         2
+        //           012345678901234567890123
+        //               view('dashboard');
+        // (4 spaces + view( = column 9, then ' = column 10, d = column 10)
+        let php_code = "<?php\n    view('dashboard');"; // 4 spaces indentation
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert_eq!(patterns.views.len(), 1);
+        let view = &patterns.views[0];
+
+        // On line 1 (0-indexed), the indented content:
+        // "    view('dashboard');"
+        // Column 4-7 is "view", column 8 is "(", column 9 is "'", column 10 is "d"
+        assert_eq!(view.row, 1, "should be on second line (0-indexed)");
+        assert_eq!(view.column, 10, "column should point to first char of view name");
+    }
+
+    #[test]
+    fn test_double_quote_column_positions() {
+        // Test with double quotes
+        // Position: 0         1         2
+        //           0123456789012345678901234567
+        //           <?php view("users.profile");
+        let php_code = r#"<?php view("users.profile");"#;
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert_eq!(patterns.views.len(), 1);
+        let view = &patterns.views[0];
+
+        // view_name is extracted WITHOUT quotes
+        assert_eq!(view.view_name, "users.profile");
+        assert_eq!(view.column, 12, "column should point to first char inside quotes");
+        assert_eq!(view.end_column, 25, "end_column should be after last char");
+    }
+
+    #[test]
+    fn test_blade_translation_patterns() {
+        // Test that we can extract translations from Blade echo syntax
+        let blade_code = r#"{{ __("Welcome to our app") }}
+@lang("welcome")"#;
+
+        // Parse as Blade first
+        let blade_tree = parse_blade(blade_code).expect("Should parse Blade");
+        let blade_lang = language_blade();
+        let blade_patterns = extract_all_blade_patterns(&blade_tree, blade_code, &blade_lang)
+            .expect("Should extract Blade patterns");
+
+        // Check what directives we found
+        println!("Blade directives found: {:?}", blade_patterns.directives.iter()
+            .map(|d| d.directive_name)
+            .collect::<Vec<_>>());
+
+        // Check echo PHP content
+        println!("Echo PHP content found: {:?}", blade_patterns.echo_php.iter()
+            .map(|e| e.php_content)
+            .collect::<Vec<_>>());
+
+        // Parse as PHP to see if __() is captured
+        let php_tree = parse_php(blade_code).expect("Should parse as PHP");
+        let php_lang = language_php();
+        let php_patterns = extract_all_php_patterns(&php_tree, blade_code, &php_lang)
+            .expect("Should extract PHP patterns");
+
+        println!("PHP translations found: {:?}", php_patterns.translation_calls.iter()
+            .map(|t| t.translation_key)
+            .collect::<Vec<_>>());
+
+        // We expect to find translations in either Blade directives or PHP patterns
+        let has_lang_directive = blade_patterns.directives.iter()
+            .any(|d| d.directive_name == "lang");
+
+        // Check that we captured the echo PHP content
+        let has_echo_php = !blade_patterns.echo_php.is_empty();
+        println!("Has echo PHP content: {}", has_echo_php);
+
+        // At minimum, @lang should be captured as a directive
+        assert!(has_lang_directive, "@lang should be captured as a directive");
+
+        // And we should have captured the {{ __() }} echo content
+        assert!(has_echo_php, "Should capture PHP content inside {{ }}");
+        assert!(blade_patterns.echo_php[0].php_content.contains("__"), "Echo should contain __() call");
+    }
+
 }

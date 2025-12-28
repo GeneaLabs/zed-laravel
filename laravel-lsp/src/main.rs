@@ -120,14 +120,12 @@ enum ReferenceType {
 // Removed: Old cache structures (FileReferences, ParsedMatches, ReferenceCache)
 // These have been replaced by the high-performance PerformanceCache system
 
-/// Result of checking if a translation file exists
+/// Result of checking if a translation exists
 struct TranslationCheck {
-    /// Whether the translation file exists
+    /// Whether the translation exists
     exists: bool,
     /// Whether this is a dotted key (validation.required) vs text key ("Welcome")
     is_dotted_key: bool,
-    /// Expected file location for error messages
-    expected_location: String,
 }
 
 /// The main Laravel Language Server struct
@@ -1487,10 +1485,9 @@ impl LaravelLanguageServer {
         let is_multi_word = translation_key.contains(' ');
 
         let mut exists = false;
-        let mut expected_location = String::new();
 
         if is_multi_word || (!is_dotted_key && !translation_key.contains('.')) {
-            // Text key: check JSON files
+            // Text key: check JSON files for the KEY, not just file existence
             let json_paths = [
                 root.join("lang/en.json"),
                 root.join("resources/lang/en.json"),
@@ -1498,13 +1495,16 @@ impl LaravelLanguageServer {
 
             for json_path in &json_paths {
                 if json_path.exists() {
-                    exists = true;
-                    break;
+                    // Parse JSON and check if key exists
+                    if let Ok(content) = std::fs::read_to_string(&json_path) {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                            if json.get(translation_key).is_some() {
+                                exists = true;
+                                break;
+                            }
+                        }
+                    }
                 }
-            }
-
-            if !exists {
-                expected_location = "lang/en.json or resources/lang/en.json".to_string();
             }
         } else if is_dotted_key {
             // Dotted key: check PHP file based on first segment
@@ -1522,21 +1522,16 @@ impl LaravelLanguageServer {
                         break;
                     }
                 }
-
-                if !exists {
-                    expected_location = format!("lang/en/{}.php or resources/lang/en/{}.php", file_name, file_name);
-                }
             }
         }
 
         TranslationCheck {
             exists,
             is_dotted_key,
-            expected_location,
         }
     }
 
-    /// Create a diagnostic for a missing translation file
+    /// Create a diagnostic for a missing translation
     ///
     /// - `dotted_severity`: Severity for dotted keys (ERROR in PHP, WARNING in @lang)
     /// - Text keys always get INFORMATION severity
@@ -1552,18 +1547,16 @@ impl LaravelLanguageServer {
             (
                 dotted_severity,
                 format!(
-                    "Translation file not found for key '{}'\nExpected at: {}",
-                    translation_key,
-                    check.expected_location
+                    "Translation not found for '{}'",
+                    translation_key
                 )
             )
         } else {
             (
                 DiagnosticSeverity::INFORMATION,
                 format!(
-                    "Translation file not found for key '{}'\nCreate {} to add this translation",
-                    translation_key,
-                    check.expected_location
+                    "Translation not found, displayed as '{}'",
+                    translation_key
                 )
             )
         };
@@ -1733,6 +1726,7 @@ impl LaravelLanguageServer {
             }
         }
 
+        // Note: @lang is now handled as Translation patterns (see parse_file_patterns in salsa_impl.rs)
         // Note: @vite is handled as Asset patterns, not Directive patterns
         // See parse_file_patterns in salsa_impl.rs
 
@@ -1947,14 +1941,55 @@ impl LaravelLanguageServer {
                     start: Position { line: trans.line, character: trans.column },
                     end: Position { line: trans.line, character: trans.end_column },
                 };
+
+                // Find the line number of the key in the file
+                let target_range = if !is_dotted_key {
+                    // For JSON files, find the line where the key is defined
+                    Self::find_json_key_location(&translation_path, &trans.key)
+                        .unwrap_or_default()
+                } else {
+                    // For PHP files, default to start (could be enhanced later)
+                    Range::default()
+                };
+
                 return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                     origin_selection_range: Some(origin_selection_range),
                     target_uri,
-                    target_range: Range::default(),
-                    target_selection_range: Range::default(),
+                    target_range,
+                    target_selection_range: target_range,
                 }]));
             }
         }
+        None
+    }
+
+    /// Find the line and column of a key in a JSON translation file
+    fn find_json_key_location(json_path: &Path, key: &str) -> Option<Range> {
+        let content = std::fs::read_to_string(json_path).ok()?;
+
+        // Search for the key pattern: "key": or "key" :
+        // We look for the key surrounded by quotes at the start of a JSON property
+        let search_pattern = format!("\"{}\"", key);
+
+        for (line_num, line) in content.lines().enumerate() {
+            if let Some(col) = line.find(&search_pattern) {
+                // Found the key, position cursor at the start of the key (after the opening quote)
+                let start_col = col + 1; // Skip the opening quote
+                let end_col = start_col + key.len();
+
+                return Some(Range {
+                    start: Position {
+                        line: line_num as u32,
+                        character: start_col as u32,
+                    },
+                    end: Position {
+                        line: line_num as u32,
+                        character: end_col as u32,
+                    },
+                });
+            }
+        }
+
         None
     }
 
@@ -3329,7 +3364,8 @@ impl LanguageServer for LaravelLanguageServer {
                 self.create_livewire_location_from_salsa(&lw).await
             }
             PatternAtPosition::Directive(dir) => {
-                debug!("Laravel LSP: Found directive: {}", dir.name);
+                info!("🎯 Laravel LSP: Found directive: {} with args {:?} at {}:{}-{}",
+                    dir.name, dir.arguments, dir.line, dir.column, dir.end_column);
                 self.create_directive_location_from_salsa(&dir).await
             }
             PatternAtPosition::EnvRef(env) => {
@@ -3349,7 +3385,8 @@ impl LanguageServer for LaravelLanguageServer {
                 result
             }
             PatternAtPosition::Translation(trans) => {
-                debug!("Laravel LSP: Found translation: {}", trans.key);
+                info!("🎯 Laravel LSP: Found translation pattern: '{}' at {}:{}-{}",
+                    trans.key, trans.line, trans.column, trans.end_column);
                 self.create_translation_location_from_salsa(&trans).await
             }
             PatternAtPosition::Asset(asset) => {

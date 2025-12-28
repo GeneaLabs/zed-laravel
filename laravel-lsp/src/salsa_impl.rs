@@ -428,6 +428,89 @@ pub struct LaravelConfigRef<'db> {
 // Helper Functions
 // ============================================================================
 
+/// Extract a string value from directive arguments like ('welcome') or ("welcome")
+///
+/// Returns (string_value, start_offset, end_offset) if found
+fn extract_string_from_args(args: &str) -> Option<(String, usize, usize)> {
+    // Find the first quote character (single or double)
+    let chars: Vec<char> = args.chars().collect();
+    let mut i = 0;
+
+    // Skip until we find a quote
+    while i < chars.len() {
+        if chars[i] == '\'' || chars[i] == '"' {
+            break;
+        }
+        i += 1;
+    }
+
+    if i >= chars.len() {
+        return None;
+    }
+
+    let quote_char = chars[i];
+    let start_pos = i + 1; // Position after opening quote
+    i += 1;
+
+    // Find the closing quote
+    let mut content = String::new();
+    while i < chars.len() && chars[i] != quote_char {
+        content.push(chars[i]);
+        i += 1;
+    }
+
+    if content.is_empty() {
+        return None;
+    }
+
+    let end_pos = i; // Position of closing quote
+
+    Some((content, start_pos, end_pos))
+}
+
+/// Extract translation key from PHP content inside {{ ... }} Blade echo statements
+///
+/// Handles common translation functions:
+/// - __("Welcome to our app")
+/// - __('messages.welcome')
+/// - trans("messages.welcome")
+/// - trans_choice("messages.items", $count)
+/// - @lang("messages.welcome")
+///
+/// Returns (translation_key, start_offset, end_offset) if found
+fn extract_translation_from_echo(php_content: &str) -> Option<(String, usize, usize)> {
+    use regex::Regex;
+
+    // Match translation function calls: __(), trans(), trans_choice()
+    // We need separate patterns for single and double quotes since regex crate doesn't support backreferences
+    static TRANS_REGEX_SINGLE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r#"(?:__|trans|trans_choice)\s*\(\s*'([^']+)'"#).unwrap()
+    });
+    static TRANS_REGEX_DOUBLE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r#"(?:__|trans|trans_choice)\s*\(\s*"([^"]+)""#).unwrap()
+    });
+
+    // Try single quotes first
+    if let Some(captures) = TRANS_REGEX_SINGLE.captures(php_content) {
+        let key_match = captures.get(1)?;
+        let trans_key = key_match.as_str().to_string();
+        let start_offset = key_match.start();
+        let end_offset = key_match.end();
+        return Some((trans_key, start_offset, end_offset));
+    }
+
+    // Try double quotes
+    if let Some(captures) = TRANS_REGEX_DOUBLE.captures(php_content) {
+        let key_match = captures.get(1)?;
+        let trans_key = key_match.as_str().to_string();
+        let start_offset = key_match.start();
+        let end_offset = key_match.end();
+        return Some((trans_key, start_offset, end_offset));
+    }
+
+    None
+}
+
 /// Parse @vite directive arguments and extract individual file paths with their positions
 ///
 /// Handles both formats:
@@ -574,6 +657,32 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                         continue; // Don't add @vite as a directive
                     }
 
+                    // Handle @lang specially - extract as translation reference
+                    if dir.directive_name == "lang" {
+                        if let Some(args) = dir.arguments {
+                            // Extract the translation key from the arguments
+                            // Args look like: ('welcome') or ("welcome")
+                            if let Some((trans_key, start_offset, end_offset)) = extract_string_from_args(args) {
+                                let key = TranslationKey::new(db, trans_key);
+                                // Calculate column positions: directive_column + @lang + offset into args
+                                // @lang is 5 chars, plus 1 for @
+                                let base_col = dir.column + 6; // position after @lang
+                                let col = base_col + start_offset;
+                                let end_col = base_col + end_offset;
+                                info!("📍 @lang translation: key='{}' row={} col={}-{} (args={:?})",
+                                    key.key(db), dir.row, col, end_col, args);
+                                translation_refs.push(TranslationReference::new(
+                                    db,
+                                    key,
+                                    dir.row as u32,
+                                    col as u32,
+                                    end_col as u32,
+                                ));
+                            }
+                        }
+                        continue; // Don't add @lang as a directive
+                    }
+
                     let name = DirectiveName::new(db, dir.directive_name.to_string());
                     let args = dir.arguments.map(|s| s.to_string());
                     let full_end_column = dir.column + dir.full_text.len();
@@ -585,6 +694,30 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                         dir.column as u32,
                         full_end_column as u32,
                     ));
+                }
+
+                // Process PHP content inside {{ ... }} echo statements
+                // Extract translation calls like __("Welcome"), trans("key"), etc.
+                info!("🔍 Processing {} echo PHP snippets", blade_patterns.echo_php.len());
+                for echo in blade_patterns.echo_php {
+                    info!("🔍 Echo PHP content: {:?} at row {} col {}", echo.php_content, echo.row, echo.column);
+                    if let Some((trans_key, start_offset, end_offset)) = extract_translation_from_echo(&echo.php_content) {
+                        info!("✅ Found translation '{}' at offsets {}-{}", trans_key, start_offset, end_offset);
+                        let key = TranslationKey::new(db, trans_key.clone());
+                        // Calculate column positions relative to the echo statement
+                        let col = echo.column + start_offset;
+                        let end_col = echo.column + end_offset;
+                        info!("📍 Translation ref: row={} col={}-{}", echo.row, col, end_col);
+                        translation_refs.push(TranslationReference::new(
+                            db,
+                            key,
+                            echo.row as u32,
+                            col as u32,
+                            end_col as u32,
+                        ));
+                    } else {
+                        info!("❌ No translation found in echo content");
+                    }
                 }
             }
         }
@@ -3644,6 +3777,31 @@ mod vite_tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "resources/css/app.css");
+    }
+
+    #[test]
+    fn test_extract_translation_from_echo() {
+        // Test the regex extraction
+        let content = r#"__("Welcome to our app")"#;
+        let result = super::extract_translation_from_echo(content);
+        assert!(result.is_some(), "Should extract translation from __()");
+        let (key, start, end) = result.unwrap();
+        assert_eq!(key, "Welcome to our app");
+        println!("Extracted: key='{}', start={}, end={}", key, start, end);
+
+        // Test with single quotes
+        let content2 = "__('messages.welcome')";
+        let result2 = super::extract_translation_from_echo(content2);
+        assert!(result2.is_some(), "Should extract translation from __() with single quotes");
+        let (key2, _, _) = result2.unwrap();
+        assert_eq!(key2, "messages.welcome");
+
+        // Test trans()
+        let content3 = "trans('auth.failed')";
+        let result3 = super::extract_translation_from_echo(content3);
+        assert!(result3.is_some(), "Should extract translation from trans()");
+        let (key3, _, _) = result3.unwrap();
+        assert_eq!(key3, "auth.failed");
     }
 
     #[test]
