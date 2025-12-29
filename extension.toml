@@ -1,14 +1,14 @@
 id = "laravel"
 name = "Laravel"
 description = "Laravel development support for Zed with go-to-definition for Blade, Livewire, and Flux components"
-version = "0.1.1"
+version = "0.1.2"
 schema_version = 1
 authors = ["Mike"]
 repository = "https://github.com/GeneaLabs/zed-laravel"
 
 [lib]
 kind = "Rust"
-version = "0.1.1"
+version = "0.1.2"
 
 [language_servers.laravel-lsp]
 name = "Laravel LSP"
