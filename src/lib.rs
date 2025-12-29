@@ -124,7 +124,7 @@ impl LaravelExtension {
 
         // Repository URL - update this if you fork the project
         let release_url = format!(
-            "https://github.com/GeneaLabs/zed-laravel/releases/download/v{}/{}",
+            "https://github.com/GeneaLabs/zed-laravel/releases/download/{}/{}",
             VERSION,
             archive_name
         );
