@@ -1,10 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 120 120">
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <defs>
-    <linearGradient id="zedGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#8B5CF6"/>
-      <stop offset="100%" style="stop-color:#6366F1"/>
+    <linearGradient id="laravelGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FF2D20"/>
+      <stop offset="100%" style="stop-color:#E3342F"/>
     </linearGradient>
   </defs>
-  <rect width="120" height="120" rx="24" fill="url(#zedGrad)"/>
-  <text x="60" y="78" font-family="system-ui, -apple-system, sans-serif" font-size="56" font-weight="700" fill="white" text-anchor="middle">L</text>
+  <!-- Zed-style angular background -->
+  <path d="M24 8 L104 8 L120 24 L120 104 L104 120 L24 120 L8 104 L8 24 Z" fill="url(#laravelGrad)"/>
+  <!-- Stylized L with angular cut like Zed's Z -->
+  <path d="M40 32 L56 32 L56 80 L88 80 L88 96 L40 96 Z" fill="white"/>
+  <!-- Angular accent cut -->
+  <path d="M56 80 L72 64 L72 80 Z" fill="url(#laravelGrad)"/>
 </svg>

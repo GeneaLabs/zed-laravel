@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo.svg" width="120" height="120" alt="Laravel for Zed">
+  <img src="docs/logo.svg" width="128" height="128" alt="Laravel for Zed">
 </p>
 
 <h1 align="center">Laravel for Zed</h1>
@@ -36,9 +36,29 @@ Search **"Laravel"** in Zed Extensions and click Install.
 
 ## Configuration
 
-**Zero config required.** The extension auto-discovers your Laravel project.
+The extension works out of the box with zero configuration. It automatically discovers your Laravel project structure, including view paths, component namespaces, route files, and service providers.
 
-For database autocomplete (`exists:`, `unique:`), configure your `.env`:
+**Optional settings** can be added to your Zed `settings.json`:
+
+```json
+{
+  "lsp": {
+    "laravel-lsp": {
+      "settings": {
+        "laravel": {
+          "debounceMs": 200
+        }
+      }
+    }
+  }
+}
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `debounceMs` | `200` | Delay before diagnostics update after typing. Lower values (50-100ms) give faster feedback on fast machines. Higher values (300-500ms) reduce CPU usage on slower machines or large projects. |
+
+**Database autocomplete** (`exists:`, `unique:` rules) requires a working database connection. Configure in your `.env`:
 
 ```env
 DB_CONNECTION=mysql
@@ -48,20 +68,15 @@ DB_USERNAME=root
 DB_PASSWORD=secret
 ```
 
-## Roadmap
-
-**Done:** Go-to-definition, validation autocomplete (90+ rules), database table/column autocomplete, diagnostics, quick actions
-
-**Planned:** Component autocomplete (`<x-▌`), Eloquent fields, hover docs, Inertia/Folio/Volt support
+Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
 ## Features
 
 ### Go-to-Definition
 
-Cmd+Click on any highlighted pattern to jump to its source file:
+Navigate your Laravel codebase by Cmd+Clicking (or `Cmd+D`) on any recognized pattern. The extension understands Laravel's conventions and jumps directly to the source file, whether it's a view, component, route, config key, or translation.
 
 ```php
-// Controller
 class UserController extends Controller
 {
     public function show(User $user)
@@ -73,7 +88,6 @@ class UserController extends Controller
 ```
 
 ```blade
-{{-- Blade template --}}
 @extends('layouts.app')
 {{--      ^^^^^^^^^^^ → resources/views/layouts/app.blade.php --}}
 
@@ -85,9 +99,8 @@ class UserController extends Controller
 ```
 
 ```php
-// Routes, config, translations
 $url = route('users.show', $user);
-//           ^^^^^^^^^^^^ → routes/web.php (at Route::get('/users/{user}', ...)->name('users.show'))
+//           ^^^^^^^^^^^^ → routes/web.php
 
 $name = config('app.name');
 //             ^^^^^^^^^^ → config/app.php
@@ -96,10 +109,12 @@ $message = __('auth.failed');
 //            ^^^^^^^^^^^^ → lang/en/auth.php
 ```
 
-**All supported patterns:**
+**Supported patterns:**
 `view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `<livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()`
 
 ### Autocomplete
+
+Get intelligent suggestions as you type. The extension provides context-aware completions for validation rules, database schemas, config keys, routes, translations, and environment variables. Completions include helpful metadata like resolved values and source file locations.
 
 ```php
 $request->validate([
@@ -123,18 +138,16 @@ $message = __('auth.');
 //                  ^ translation keys with values
 ```
 
-### Diagnostics & Quick Actions
+### Diagnostics
 
-Real-time warnings with one-click fixes (`Cmd+.`):
+See problems in real-time as you type. The extension validates your Laravel code against your actual project structure, highlighting missing views, undefined components, invalid validation rules, and other issues before you run your application.
 
 ```php
 return view('users.dashboard');
-//          ^^^^^^^^^^^^^^^^^ ⚠️ View not found
-//                            ⚡ Quick fix: Create view
+//          ^^^^^^^^^^^^^^^^^ ⚠️ View not found: resources/views/users/dashboard.blade.php
 
 Route::middleware('admin-only')->group(...);
 //                ^^^^^^^^^^^^ ⚠️ Middleware not found
-//                             ⚡ Quick fix: Create middleware
 
 $request->validate([
     'email' => 'required|emal|unique:users',
@@ -144,14 +157,53 @@ $request->validate([
 
 ```blade
 <x-dashboard-widget />
-{{-- ^^^^^^^^^^^^^^^^ ⚠️ Component not found
+{{-- ^^^^^^^^^^^^^^^^ ⚠️ Component not found --}}
+
+<livewire:admin-panel />
+{{--       ^^^^^^^^^^^ ⚠️ Livewire component not found --}}
+```
+
+### Quick Actions
+
+Fix problems with a single click. When you see a warning, press `Cmd+.` to open quick actions. The extension offers to create missing files with the correct Laravel structure—views, components, middleware, translations, and more.
+
+```php
+return view('users.dashboard');
+//          ^^^^^^^^^^^^^^^^^ ⚠️ View not found
+//                            ⚡ Create view: users.dashboard
+
+Route::middleware('admin-only')->group(...);
+//                ^^^^^^^^^^^^ ⚠️ Middleware not found
+//                             ⚡ Create middleware: admin-only
+```
+
+```blade
+<x-dashboard-widget />
+{{-- ⚠️ Component not found
      ⚡ Create component (anonymous)
      ⚡ Create component with class --}}
 
 <livewire:admin-panel />
-{{--       ^^^^^^^^^^^ ⚠️ Livewire component not found
-           ⚡ Create Livewire component --}}
+{{-- ⚠️ Livewire component not found
+     ⚡ Create Livewire component --}}
 ```
+
+**Available quick actions:**
+- Create missing views
+- Create Blade components (anonymous or with class)
+- Create Livewire components
+- Create middleware
+- Add translations to existing files
+- Add environment variables to `.env`
+
+## Planned Features
+
+- Component name autocomplete (`<x-▌`)
+- Eloquent model field and relationship autocomplete
+- Hover documentation with resolved values
+- Inertia.js support (`Inertia::render('Page')`)
+- Folio page routing
+- Volt component support
 
 ## Contributing
 
