@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.svg" width="120" height="120" alt="Laravel for Zed">
+</p>
+
 <h1 align="center">Laravel for Zed</h1>
 
 <p align="center">
@@ -5,9 +9,17 @@
 </p>
 
 <p align="center">
-<a href="https://github.com/GeneaLabs/zed-laravel/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+<a href="https://github.com/GeneaLabs/zed-laravel/actions/workflows/release.yml"><img src="https://github.com/GeneaLabs/zed-laravel/actions/workflows/release.yml/badge.svg" alt="Build Status"></a>
+<a href="https://github.com/GeneaLabs/zed-laravel/releases"><img src="https://img.shields.io/github/v/release/GeneaLabs/zed-laravel?label=version" alt="Latest Release"></a>
+<img src="https://img.shields.io/github/downloads/GeneaLabs/zed-laravel/total" alt="Downloads">
+<img src="https://img.shields.io/github/stars/GeneaLabs/zed-laravel?style=flat" alt="GitHub Stars">
+</p>
+
+<p align="center">
+<img src="https://img.shields.io/badge/Laravel-FF2D20?logo=laravel&logoColor=white" alt="Laravel">
 <img src="https://img.shields.io/badge/Zed-Extension-8B5CF6" alt="Zed Extension">
-<img src="https://img.shields.io/badge/community-project-orange" alt="Community Project">
+<img src="https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white" alt="Rust">
+<a href="https://github.com/GeneaLabs/zed-laravel/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
 </p>
 
 <p align="center">
@@ -16,190 +28,141 @@
 
 ---
 
-**🔗 Go-to-Definition** — Cmd+Click on `view()`, `route()`, `<x-component>` to jump to source
-**💡 Smart Autocomplete** — Validation rules, database tables, config keys, routes, translations
-**⚡ Quick Actions** — Create missing views, components, middleware with one click
-
-<!-- TODO: Add demo GIF here
-<p align="center">
-<img src="docs/demo.gif" alt="Laravel for Zed in action" width="600">
-</p>
--->
-
 ## Install
 
 Search **"Laravel"** in Zed Extensions and click Install.
 
-<details>
-<summary>Build from source</summary>
+**From source:** Clone the repo, run `cargo build --release` in `laravel-lsp/`, then use "zed: install dev extension".
 
-```bash
-git clone https://github.com/GeneaLabs/zed-laravel.git
-cd zed-laravel/laravel-lsp && cargo build --release
-```
-Then in Zed: `Cmd+Shift+P` → "zed: install dev extension" → select the `zed-laravel` folder.
+## Configuration
 
-</details>
+**Zero config required.** The extension auto-discovers your Laravel project.
 
-## 🔗 Go-to-Definition
-
-Cmd+Click (or `Cmd+D`) on any pattern to jump to its source:
-
-| Pattern | Jumps to |
-|---------|----------|
-| `view('users.profile')` | `resources/views/users/profile.blade.php` |
-| `<x-button>` | `resources/views/components/button.blade.php` |
-| `<livewire:counter>` | `app/Livewire/Counter.php` |
-| `@extends('layouts.app')` | `resources/views/layouts/app.blade.php` |
-| `route('users.show')` | Route definition in `routes/*.php` |
-| `config('app.name')` | `config/app.php` |
-| `env('APP_KEY')` | `.env` at the matching line |
-| `__('auth.failed')` | `lang/en/auth.php` |
-| `->middleware('auth')` | Middleware class |
-| `app('cache')` | Service container binding |
-| `asset('css/app.css')` | `public/css/app.css` |
-| `@vite('resources/js/app.js')` | Vite entry point |
-
-<details>
-<summary>More patterns</summary>
-
-**Views**: `view()`, `View::make()`, `Route::view()`
-**Blade**: `@include`, `@extends`, `@component`, `@each`
-**Routes**: `route()`, `to_route()`, `Route::has()`, `URL::route()`
-**Config**: `config()`, `Config::get()`, `Config::string()`, `Config::boolean()`
-**Translations**: `__()`, `trans()`, `trans_choice()`, `Lang::get()`, `@lang()`
-**Paths**: `app_path()`, `base_path()`, `resource_path()`, `storage_path()`, `public_path()`
-
-</details>
-
-## 💡 Autocomplete
-
-Start typing to get intelligent suggestions:
-
-| Context | Suggestions |
-|---------|-------------|
-| `exists:▌` | Database tables and connections |
-| `exists:users,▌` | Column names for `users` table |
-| `'required\|▌'` | All 90+ Laravel validation rules |
-| `config('▌` | Config keys with resolved values |
-| `route('▌` | Named routes with file locations |
-| `__('▌` | Translation keys with values |
-| `env('▌` | Environment variables from `.env` |
-
-<details>
-<summary>Database autocomplete setup</summary>
-
-Database table/column autocomplete requires a working database connection. Configure in `.env`:
+For database autocomplete (`exists:`, `unique:`), configure your `.env`:
 
 ```env
 DB_CONNECTION=mysql
 DB_HOST=127.0.0.1
-DB_DATABASE=your_database
+DB_DATABASE=myapp
 DB_USERNAME=root
-DB_PASSWORD=
+DB_PASSWORD=secret
 ```
-
-Supports MySQL, PostgreSQL, SQLite, and SQL Server.
-
-</details>
-
-## ⚡ Diagnostics & Quick Actions
-
-Real-time warnings as you type. Press `Cmd+.` on any warning to fix it:
-
-| Problem | Fix |
-|---------|-----|
-| Missing view: `view('missing')` | ⚡ Create view |
-| Missing component: `<x-missing>` | ⚡ Create component (with or without class) |
-| Missing Livewire: `<livewire:missing>` | ⚡ Create Livewire component |
-| Missing middleware: `->middleware('custom')` | ⚡ Create middleware |
-| Missing translation: `__('missing.key')` | ⚡ Add to translation file |
-| Invalid validation rule: `'required\|typo'` | Highlights the invalid rule |
-| Missing env variable: `env('MISSING')` | ⚡ Add to .env |
-| `env()` outside config files | Warning (breaks config caching) |
-
-## Configuration
-
-**Zero config required.** The extension auto-discovers your Laravel project structure.
-
-<details>
-<summary>Optional settings</summary>
-
-Adjust diagnostic timing in Zed's `settings.json`:
-
-```json
-{
-  "lsp": {
-    "laravel-lsp": {
-      "settings": {
-        "laravel": {
-          "debounceMs": 200
-        }
-      }
-    }
-  }
-}
-```
-
-| Value | Use case |
-|-------|----------|
-| 50-100ms | Fast machine, instant feedback |
-| 200ms | Default — balanced |
-| 300-500ms | Slower machine, reduce CPU |
-
-</details>
 
 ## Roadmap
 
-<details>
-<summary>See what's coming</summary>
+**Done:** Go-to-definition, validation autocomplete (90+ rules), database table/column autocomplete, diagnostics, quick actions
 
-**Planned:**
-- [ ] Component name autocomplete: `<x-▌`
-- [ ] Eloquent field and relationship autocomplete
-- [ ] Hover documentation with resolved values
-- [ ] Inertia.js: `Inertia::render('Page')`
-- [ ] Folio and Volt support
+**Planned:** Component autocomplete (`<x-▌`), Eloquent fields, hover docs, Inertia/Folio/Volt support
 
-**Done:**
-- [x] Go-to-definition for views, components, routes, config, translations
-- [x] Validation rule autocomplete (90+ rules)
-- [x] Database table/column autocomplete
-- [x] Real-time diagnostics
-- [x] Quick actions for file creation
+## Features
 
-</details>
+### Go-to-Definition
+
+Cmd+Click on any highlighted pattern to jump to its source file:
+
+```php
+// Controller
+class UserController extends Controller
+{
+    public function show(User $user)
+    {
+        return view('users.profile', compact('user'));
+        //          ^^^^^^^^^^^^^^^ → resources/views/users/profile.blade.php
+    }
+}
+```
+
+```blade
+{{-- Blade template --}}
+@extends('layouts.app')
+{{--      ^^^^^^^^^^^ → resources/views/layouts/app.blade.php --}}
+
+<x-button type="submit">Save</x-button>
+{{-- ^^^^ → resources/views/components/button.blade.php --}}
+
+<livewire:user-settings :user="$user" />
+{{--       ^^^^^^^^^^^^^ → app/Livewire/UserSettings.php --}}
+```
+
+```php
+// Routes, config, translations
+$url = route('users.show', $user);
+//           ^^^^^^^^^^^^ → routes/web.php (at Route::get('/users/{user}', ...)->name('users.show'))
+
+$name = config('app.name');
+//             ^^^^^^^^^^ → config/app.php
+
+$message = __('auth.failed');
+//            ^^^^^^^^^^^^ → lang/en/auth.php
+```
+
+**All supported patterns:**
+`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `<livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()`
+
+### Autocomplete
+
+```php
+$request->validate([
+    'email' => 'required|email|exists:',
+    //                               ^ database tables appear here
+
+    'email' => 'required|email|exists:users,',
+    //                                     ^ column names appear here
+
+    'name' => 'required|',
+    //                  ^ 90+ validation rules appear here
+]);
+
+$name = config('app.');
+//                  ^ config keys with resolved values
+
+$url = route('users.');
+//                  ^ named routes from routes/*.php
+
+$message = __('auth.');
+//                  ^ translation keys with values
+```
+
+### Diagnostics & Quick Actions
+
+Real-time warnings with one-click fixes (`Cmd+.`):
+
+```php
+return view('users.dashboard');
+//          ^^^^^^^^^^^^^^^^^ ⚠️ View not found
+//                            ⚡ Quick fix: Create view
+
+Route::middleware('admin-only')->group(...);
+//                ^^^^^^^^^^^^ ⚠️ Middleware not found
+//                             ⚡ Quick fix: Create middleware
+
+$request->validate([
+    'email' => 'required|emal|unique:users',
+    //                   ^^^^ ❌ Unknown validation rule: 'emal'
+]);
+```
+
+```blade
+<x-dashboard-widget />
+{{-- ^^^^^^^^^^^^^^^^ ⚠️ Component not found
+     ⚡ Create component (anonymous)
+     ⚡ Create component with class --}}
+
+<livewire:admin-panel />
+{{--       ^^^^^^^^^^^ ⚠️ Livewire component not found
+           ⚡ Create Livewire component --}}
+```
 
 ## Contributing
 
-<details>
-<summary>Development setup</summary>
-
 ```bash
-cd laravel-lsp && cargo build --release
-cargo test
+cd laravel-lsp && cargo build --release && cargo test
 ```
 
 Reload in Zed: `Cmd+Shift+P` → "zed: reload extensions"
 
-**Structure:**
-```
-zed-laravel/
-├── src/                    # Zed extension (Rust → WASM)
-├── laravel-lsp/            # Language server
-│   └── src/
-│       ├── main.rs         # LSP handlers
-│       ├── queries.rs      # Pattern extraction
-│       └── database.rs     # DB connectivity
-└── extension.toml
-```
-
-</details>
-
-**Want to help?** New Laravel patterns, autocomplete improvements, and performance optimizations welcome.
-
 ---
 
 <p align="center">
-<a href="https://github.com/GeneaLabs/zed-laravel/blob/main/LICENSE">MIT License</a> · Made by <a href="https://github.com/GeneaLabs">GeneaLabs</a>
+<a href="https://github.com/GeneaLabs/zed-laravel/blob/main/LICENSE">MIT</a> · <a href="https://github.com/GeneaLabs">GeneaLabs</a>
 </p>
