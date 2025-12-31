@@ -132,6 +132,12 @@ $name = env('APP_NAME', 'Laravel');
 $debug = env('APP_DEBUG', false);
 ```
 
+**Autocomplete** — Type `env('` and get suggestions from:
+- Your `.env` file
+- System environment variables
+
+Also works in `.env` files (type `${`) and `phpunit.xml` (`<env name="`).
+
 </details>
 
 <details>
@@ -270,6 +276,27 @@ $key = env('UNDEFINED_VAR');
 
 $key = env('UNDEFINED_VAR', 'default');  // ✅ Has fallback, safe
 ```
+
+</details>
+
+<details>
+<summary><strong>env() Outside Config Files</strong></summary>
+
+Using `env()` outside of config files breaks Laravel's config caching (`php artisan config:cache`):
+
+```php
+// ❌ In a controller, service, or model:
+$name = env('APP_NAME');
+//      ^^^^^^^^^^^^^^ ⚠️ env() should only be used in config files
+
+// ✅ In config/app.php:
+'name' => env('APP_NAME', 'Laravel'),
+
+// ✅ Then use config() elsewhere:
+$name = config('app.name');
+```
+
+See [Laravel Configuration Caching](https://laravel.com/docs/configuration#configuration-caching).
 
 </details>
 
@@ -463,8 +490,12 @@ Add to your Zed `settings.json` if you want to adjust the diagnostic update timi
 ## 🚀 Roadmap
 
 <details>
-<summary><strong>Auto-Completion</strong> (Planned)</summary>
+<summary><strong>Auto-Completion</strong></summary>
 
+**Done:**
+- [x] Environment variables: `env('█')`, `${█}` in .env, `<env name="█">` in phpunit.xml
+
+**Planned:**
 - [ ] Route names: `route('█')`
 - [ ] Config keys: `config('█')`
 - [ ] Translation keys: `__('█')`

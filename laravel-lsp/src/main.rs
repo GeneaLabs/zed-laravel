@@ -2072,6 +2072,104 @@ impl LaravelLanguageServer {
     }
 
     // ========================================================================
+    // Completion helpers
+    // ========================================================================
+
+    /// Check if cursor is inside env('...') or env("...") in PHP/Blade
+    /// Returns the partial text typed so far (for filtering completions)
+    ///
+    /// Example: `env('APP_` with cursor at end returns Some("APP_")
+    fn get_env_call_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Look for env(' or env(" before cursor
+        // Find the last occurrence in case there are multiple on the line
+        let env_single = before_cursor.rfind("env('");
+        let env_double = before_cursor.rfind("env(\"");
+
+        let (start_pos, quote_char) = match (env_single, env_double) {
+            (Some(s), Some(d)) => {
+                if s > d { (s + 5, '\'') } else { (d + 5, '"') }
+            }
+            (Some(s), None) => (s + 5, '\''),
+            (None, Some(d)) => (d + 5, '"'),
+            (None, None) => return None,
+        };
+
+        // Check that there's no closing quote between start and cursor
+        let after_env = &before_cursor[start_pos..];
+        if after_env.contains(quote_char) {
+            return None;
+        }
+
+        Some(after_env.to_string())
+    }
+
+    /// Check if cursor is inside ${...} in .env files
+    /// Returns the partial text typed so far (for filtering completions)
+    ///
+    /// Example: `NEW_VAR=${APP` with cursor at end returns Some("APP")
+    fn get_env_interpolation_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Look for ${ before cursor (last occurrence)
+        let start_pos = before_cursor.rfind("${")? + 2;
+
+        // Check that there's no closing } between start and cursor
+        let after_interpolation = &before_cursor[start_pos..];
+        if after_interpolation.contains('}') {
+            return None;
+        }
+
+        Some(after_interpolation.to_string())
+    }
+
+    /// Check if cursor is inside <env name="..."> in PHPUnit XML files
+    /// Returns the partial text typed so far (for filtering completions)
+    ///
+    /// Example: `<env name="APP_` with cursor at end returns Some("APP_")
+    fn get_phpunit_env_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Look for <env name=" before cursor (last occurrence)
+        // Handle both <env name=" and <server name=" (PHPUnit uses both)
+        let env_pattern = before_cursor.rfind("<env name=\"");
+        let server_pattern = before_cursor.rfind("<server name=\"");
+
+        let start_pos = match (env_pattern, server_pattern) {
+            (Some(e), Some(s)) => {
+                if e > s { e + 11 } else { s + 14 } // "<env name=\"" = 11, "<server name=\"" = 14
+            }
+            (Some(e), None) => e + 11,
+            (None, Some(s)) => s + 14,
+            (None, None) => return None,
+        };
+
+        // Check that there's no closing " between start and cursor
+        let after_pattern = &before_cursor[start_pos..];
+        if after_pattern.contains('"') {
+            return None;
+        }
+
+        Some(after_pattern.to_string())
+    }
+
+    // ========================================================================
     // Code Action helpers
     // ========================================================================
 
@@ -4071,12 +4169,17 @@ impl LanguageServer for LaravelLanguageServer {
                 // We only support goto_definition (Option+click navigation).
                 // Hover popups are redundant - the underline already indicates navigability.
 
-                // ❌ REMOVED: completion_provider
-                // We don't implement autocomplete, so don't advertise it.
-                // This prevents Zed from calling us for every completion request.
-                
-                // ❌ REMOVED: Preparsing on every keystroke in did_change
-                // This was causing autocomplete slowness due to heavy tree-sitter queries.
+                // ✅ Completion provider for env var autocomplete
+                // Only triggers inside env('...') calls in PHP/Blade and ${...} in .env files
+                // This is lightweight - just string matching + Salsa cache lookup, no tree-sitter
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![
+                        "'".to_string(),  // env('
+                        "\"".to_string(), // env("
+                        "{".to_string(),  // ${
+                    ]),
+                    ..Default::default()
+                }),
 
                 // ✅ Code actions for quick fixes (create missing views, etc.)
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
@@ -4515,6 +4618,125 @@ impl LanguageServer for LaravelLanguageServer {
         } else {
             info!("🔧 Returning {} code actions", actions.len());
             Ok(Some(actions))
+        }
+    }
+
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> jsonrpc::Result<Option<CompletionResponse>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        info!("📝 completion called for {}:{}:{}", uri, position.line, position.character);
+
+        // Get document content
+        let documents = self.documents.read().await;
+        let (content, _version) = match documents.get(uri) {
+            Some(doc) => doc.clone(),
+            None => {
+                debug!("   Document not found in cache");
+                return Ok(None);
+            }
+        };
+        drop(documents);
+
+        // Get the current line
+        let lines: Vec<&str> = content.lines().collect();
+        let line_text = match lines.get(position.line as usize) {
+            Some(line) => *line,
+            None => return Ok(None),
+        };
+
+        // Determine context based on file type
+        let path = uri.path();
+        let is_env_file = path.contains(".env");
+        let is_phpunit_file = path.ends_with("phpunit.xml")
+            || path.ends_with("phpunit.xml.dist")
+            || path.ends_with("phpunit.dist.xml");
+
+        let filter_prefix = if is_env_file {
+            // In .env files, check for ${...} interpolation
+            Self::get_env_interpolation_context(line_text, position.character)
+        } else if is_phpunit_file {
+            // In PHPUnit XML files, check for <env name="..."> or <server name="...">
+            Self::get_phpunit_env_context(line_text, position.character)
+        } else {
+            // In PHP/Blade files, check for env('...') calls
+            Self::get_env_call_context(line_text, position.character)
+        };
+
+        // If not in a valid context, return no completions
+        let filter_prefix = match filter_prefix {
+            Some(prefix) => prefix,
+            None => {
+                debug!("   Not in env completion context");
+                return Ok(None);
+            }
+        };
+
+        debug!("   Filter prefix: '{}'", filter_prefix);
+
+        // Get all env vars from Salsa (.env files)
+        let env_vars = match self.salsa.get_all_parsed_env_vars().await {
+            Ok(vars) => vars,
+            Err(e) => {
+                debug!("   Failed to get env vars: {}", e);
+                Vec::new()
+            }
+        };
+
+        // Build completion items, filtering by prefix
+        let filter_upper = filter_prefix.to_uppercase();
+
+        // Track which var names we've seen (from .env files)
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // First, add .env file vars (project-specific, higher priority)
+        let mut items: Vec<CompletionItem> = env_vars
+            .into_iter()
+            .filter(|v| !v.is_commented)
+            .filter(|v| v.name.to_uppercase().starts_with(&filter_upper))
+            .map(|v| {
+                seen_names.insert(v.name.clone());
+                let source_file = v.source_file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(".env");
+
+                CompletionItem {
+                    label: v.name.clone(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail: Some(format!("{} (from {})", v.value, source_file)),
+                    documentation: None,
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        // Then, add system env vars (lower priority, only if not already in .env)
+        for (name, value) in std::env::vars() {
+            if !seen_names.contains(&name) && name.to_uppercase().starts_with(&filter_upper) {
+                items.push(CompletionItem {
+                    label: name,
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail: Some(format!("{} (from system)", value)),
+                    documentation: None,
+                    ..Default::default()
+                });
+            }
+        }
+
+        debug!("   Returning {} completion items", items.len());
+
+        if items.is_empty() {
+            Ok(None)
+        } else {
+            // Use CompletionList to have more control over behavior
+            Ok(Some(CompletionResponse::List(CompletionList {
+                is_incomplete: false,
+                items,
+            })))
         }
     }
 }
