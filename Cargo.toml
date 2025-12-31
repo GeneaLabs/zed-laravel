@@ -2,7 +2,7 @@
 name = "zed-laravel"
 version = "0.1.2"
 edition = "2021"
-authors = ["Mike"]
+authors = ["Mike Bronner <mike@genealabs.com>"]
 license = "MIT"
 description = "Laravel development support for Zed editor"
 

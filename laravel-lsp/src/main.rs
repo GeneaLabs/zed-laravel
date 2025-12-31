@@ -2004,13 +2004,20 @@ impl LaravelLanguageServer {
                 debug!("Failed to update env file in Salsa: {}", e);
             }
         } else if path_str.contains("/config/") && filename.ends_with(".php") {
-            // Config file (config/*.php)
+            // Config file (config/*.php) - needs BOTH ConfigFile AND SourceFile treatment
+            // ConfigFile: for config discovery (view paths, namespaces, etc.)
+            // SourceFile: for pattern extraction (env() calls, etc.)
             debug!("📦 Updating Salsa: ConfigFile ({})", filename);
             if let Err(e) = self.salsa.update_config_file(path.clone(), content.to_string()).await {
                 debug!("Failed to update config file in Salsa: {}", e);
             }
             // Also invalidate the cached config so next lookup refetches
             *self.cached_config.write().await = None;
+            // Also update as SourceFile for pattern extraction (env() diagnostics)
+            debug!("📦 Updating Salsa: SourceFile ({}) for pattern extraction", filename);
+            if let Err(e) = self.salsa.update_file(path.clone(), version, content.to_string()).await {
+                debug!("Failed to update source file in Salsa: {}", e);
+            }
         } else if filename == "composer.json" {
             // composer.json - Config file
             debug!("📦 Updating Salsa: ConfigFile (composer.json)");
@@ -3231,7 +3238,7 @@ return [
                 // Fall back to empty patterns - file might not be in Salsa yet
                 // Ensure Salsa has the file before proceeding
                 let _ = self.salsa.update_file(file_path.clone(), 0, source.to_string()).await;
-                match self.salsa.get_patterns(file_path).await {
+                match self.salsa.get_patterns(file_path.clone()).await {
                     Ok(Some(p)) => p,
                     _ => return,
                 }
@@ -3390,6 +3397,44 @@ return [
                 }
             }
             drop(root_for_env);
+
+            // Warn about env() usage outside config files (configuration caching issue)
+            // Per Laravel docs: "you should ensure you are only calling the env function
+            // from within your application's configuration (config) files"
+            // https://laravel.com/docs/12.x/configuration#configuration-caching
+            let is_config_file = file_path.to_string_lossy().contains("/config/");
+            if !is_config_file && !patterns.env_refs.is_empty() {
+                for env_ref in &patterns.env_refs {
+                    let diagnostic = Diagnostic {
+                        range: Range {
+                            start: Position {
+                                line: env_ref.line,
+                                character: env_ref.column,
+                            },
+                            end: Position {
+                                line: env_ref.line,
+                                character: env_ref.end_column,
+                            },
+                        },
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        code: None,
+                        source: Some("laravel-lsp".to_string()),
+                        message: format!(
+                            "Avoid using env() outside of config files.\n\n\
+                            When config is cached (`php artisan config:cache`), the .env file \
+                            is not loaded and env() will return null.\n\n\
+                            Instead, use config() to access this value:\n\
+                            config('your_config.{}')",
+                            env_ref.name.to_lowercase()
+                        ),
+                        related_information: None,
+                        tags: None,
+                        code_description: None,
+                        data: None,
+                    };
+                    diagnostics.push(diagnostic);
+                }
+            }
 
             // Check middleware calls using Salsa patterns - warn about undefined middleware or missing class files
             let root_guard = self.root_path.read().await;
