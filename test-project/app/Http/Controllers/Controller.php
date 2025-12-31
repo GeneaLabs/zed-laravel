@@ -7,9 +7,14 @@ abstract class Controller
     function __construct()
     {
         Config::get('app.cipher');
-        route('t');
+        __('messages.goodbye');
+        $rules = [
+            'field' => 'required|array',
+            'field1' => 'after:field|exists:users,name',
+        ];
 
         throw new \Exception('Not implemented');
+        view('asset-test');
     }
     //
 }

@@ -9,6 +9,8 @@ pub mod queries;
 pub mod config;
 pub mod middleware_parser;
 pub mod cache_manager;
+pub mod validation_rules;
+pub mod database;
 
 // Salsa 0.25 implementation (incremental computation)
 pub mod salsa_impl;

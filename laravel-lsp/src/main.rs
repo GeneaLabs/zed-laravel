@@ -134,6 +134,169 @@ struct RouteNameCompletion {
     source: String,
 }
 
+/// A translation key for autocomplete
+struct TranslationKeyCompletion {
+    /// The full dot-notation key (e.g., "messages.welcome")
+    key: String,
+    /// The translated value (for display)
+    value: String,
+    /// Source file (e.g., "lang/en/messages.php")
+    source: String,
+}
+
+/// A validation rule for autocomplete
+struct ValidationRuleInfo {
+    /// The rule name (e.g., "required", "email", "max")
+    name: String,
+    /// Brief description
+    description: String,
+    /// Whether this rule accepts parameters (e.g., "max:255")
+    has_params: bool,
+    /// Source: "laravel" for built-in, or file path for custom
+    source: String,
+}
+
+/// Context for validation rule parameter completion (e.g., "exists:█" or "after:█")
+struct ValidationParamContext {
+    /// The rule name (e.g., "exists", "after", "dimensions")
+    rule_name: String,
+    /// Text typed after colon (or after last comma for multi-param rules)
+    current_param: String,
+    /// Full text after the colon (for rules that need to reference previous params)
+    full_params: String,
+    /// Parameter index (0 = first param, 1 = second, etc.)
+    param_index: usize,
+}
+
+/// Laravel's built-in validation rules
+/// Reference: https://laravel.com/docs/12.x/validation#available-validation-rules
+fn get_laravel_validation_rules() -> Vec<ValidationRuleInfo> {
+    vec![
+        // Boolean/Acceptance Rules
+        ValidationRuleInfo { name: "accepted".into(), description: "Must be yes, on, 1, or true".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "accepted_if".into(), description: "Accepted if another field equals value".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "boolean".into(), description: "Must be boolean (true, false, 1, 0)".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "declined".into(), description: "Must be no, off, 0, or false".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "declined_if".into(), description: "Declined if another field equals value".into(), has_params: true, source: "laravel".into() },
+
+        // String Rules
+        ValidationRuleInfo { name: "active_url".into(), description: "Valid URL with DNS record".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "alpha".into(), description: "Only alphabetic characters".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "alpha_dash".into(), description: "Alphanumeric, dashes, underscores".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "alpha_num".into(), description: "Only alphanumeric characters".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "ascii".into(), description: "Only 7-bit ASCII characters".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "confirmed".into(), description: "Must have matching _confirmation field".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "current_password".into(), description: "Must match user's password".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "different".into(), description: "Must differ from another field".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "doesnt_start_with".into(), description: "Must not start with given values".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "doesnt_end_with".into(), description: "Must not end with given values".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "email".into(), description: "Valid email address".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "ends_with".into(), description: "Must end with given values".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "enum".into(), description: "Valid backed enum value".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "hex_color".into(), description: "Valid hexadecimal color".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "in".into(), description: "Must be in given list".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "ip".into(), description: "Valid IP address".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "ipv4".into(), description: "Valid IPv4 address".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "ipv6".into(), description: "Valid IPv6 address".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "json".into(), description: "Valid JSON string".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "lowercase".into(), description: "Must be lowercase".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "mac_address".into(), description: "Valid MAC address".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "not_in".into(), description: "Must not be in given list".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "not_regex".into(), description: "Must not match regex".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "regex".into(), description: "Must match regex pattern".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "same".into(), description: "Must match another field".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "starts_with".into(), description: "Must start with given values".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "string".into(), description: "Must be a string".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "uppercase".into(), description: "Must be uppercase".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "url".into(), description: "Valid URL".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "ulid".into(), description: "Valid ULID".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "uuid".into(), description: "Valid UUID".into(), has_params: false, source: "laravel".into() },
+
+        // Numeric Rules
+        ValidationRuleInfo { name: "between".into(), description: "Value between min and max".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "decimal".into(), description: "Numeric with decimal places".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "digits".into(), description: "Exact number of digits".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "digits_between".into(), description: "Digits between min and max".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "gt".into(), description: "Greater than field/value".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "gte".into(), description: "Greater than or equal".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "integer".into(), description: "Must be an integer".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "lt".into(), description: "Less than field/value".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "lte".into(), description: "Less than or equal".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "max".into(), description: "Maximum value/length/size".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "max_digits".into(), description: "Maximum number of digits".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "min".into(), description: "Minimum value/length/size".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "min_digits".into(), description: "Minimum number of digits".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "multiple_of".into(), description: "Must be multiple of value".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "numeric".into(), description: "Must be numeric".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "size".into(), description: "Exact size/length".into(), has_params: true, source: "laravel".into() },
+
+        // Array Rules
+        ValidationRuleInfo { name: "array".into(), description: "Must be an array".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "contains".into(), description: "Array must contain values".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "doesnt_contain".into(), description: "Array must not contain values".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "distinct".into(), description: "Array values must be unique".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "in_array".into(), description: "Must exist in another array field".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "list".into(), description: "Array with consecutive keys".into(), has_params: false, source: "laravel".into() },
+
+        // Date Rules
+        ValidationRuleInfo { name: "after".into(), description: "Date after given date".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "after_or_equal".into(), description: "Date after or equal".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "before".into(), description: "Date before given date".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "before_or_equal".into(), description: "Date before or equal".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "date".into(), description: "Valid date".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "date_equals".into(), description: "Date equals given date".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "date_format".into(), description: "Matches date format".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "timezone".into(), description: "Valid timezone".into(), has_params: false, source: "laravel".into() },
+
+        // File Rules
+        ValidationRuleInfo { name: "dimensions".into(), description: "Image dimension constraints".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "extensions".into(), description: "File extension".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "file".into(), description: "Successfully uploaded file".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "image".into(), description: "Image file".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "mimetypes".into(), description: "MIME type".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "mimes".into(), description: "File extension/MIME".into(), has_params: true, source: "laravel".into() },
+
+        // Database Rules
+        ValidationRuleInfo { name: "exists".into(), description: "Record exists in database".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "unique".into(), description: "Unique in database table".into(), has_params: true, source: "laravel".into() },
+
+        // Presence/Required Rules
+        ValidationRuleInfo { name: "bail".into(), description: "Stop on first failure".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "exclude".into(), description: "Exclude from validated data".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "exclude_if".into(), description: "Exclude if field equals value".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "exclude_unless".into(), description: "Exclude unless field equals".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "exclude_with".into(), description: "Exclude if field present".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "exclude_without".into(), description: "Exclude if field absent".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "filled".into(), description: "Not empty when present".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "missing".into(), description: "Must not be present".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "missing_if".into(), description: "Missing if field equals".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "missing_unless".into(), description: "Missing unless field equals".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "missing_with".into(), description: "Missing if field present".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "missing_with_all".into(), description: "Missing if all fields present".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "nullable".into(), description: "May be null".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "present".into(), description: "Must be present".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "present_if".into(), description: "Present if field equals".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "present_unless".into(), description: "Present unless field equals".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "present_with".into(), description: "Present if field present".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "present_with_all".into(), description: "Present if all fields present".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "prohibited".into(), description: "Must not be present".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "prohibited_if".into(), description: "Prohibited if field equals".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "prohibited_unless".into(), description: "Prohibited unless field equals".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "prohibits".into(), description: "Prohibits other fields".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "required".into(), description: "Field is required".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo { name: "required_if".into(), description: "Required if field equals".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "required_if_accepted".into(), description: "Required if field accepted".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "required_if_declined".into(), description: "Required if field declined".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "required_unless".into(), description: "Required unless field equals".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "required_with".into(), description: "Required if field present".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "required_with_all".into(), description: "Required if all fields present".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "required_without".into(), description: "Required if field absent".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "required_without_all".into(), description: "Required if all fields absent".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "required_array_keys".into(), description: "Array must have keys".into(), has_params: true, source: "laravel".into() },
+        ValidationRuleInfo { name: "sometimes".into(), description: "Validate only when present".into(), has_params: false, source: "laravel".into() },
+    ]
+}
+
 /// The main Laravel Language Server struct
 /// This holds all the state for our LSP
 #[derive(Clone)]
@@ -174,6 +337,14 @@ struct LaravelLanguageServer {
     /// Configurable debounce delay for Salsa updates in milliseconds (default: 200ms)
     /// Can be configured via LSP settings: { "laravel": { "debounceMs": 200 } }
     salsa_debounce_ms: Arc<RwLock<u64>>,
+    /// Whether we've shown the vendor missing diagnostic this session
+    vendor_diagnostic_shown: Arc<RwLock<bool>>,
+    /// Cached validation rule names (parsed from Laravel framework at startup)
+    cached_validation_rule_names: Arc<RwLock<Vec<String>>>,
+    /// Database schema provider for exists:/unique: validation rules
+    database_schema: Arc<RwLock<Option<laravel_lsp::database::DatabaseSchemaProvider>>>,
+    /// Whether we've shown the database connection error diagnostic this session
+    database_diagnostic_shown: Arc<RwLock<bool>>,
 }
 
 /// Default Salsa debounce delay in milliseconds
@@ -900,6 +1071,10 @@ impl LaravelLanguageServer {
             initialized_root: Arc::new(RwLock::new(None)),
             pending_salsa_updates: Arc::new(RwLock::new(HashMap::new())),
             salsa_debounce_ms: Arc::new(RwLock::new(DEFAULT_SALSA_DEBOUNCE_MS)),
+            vendor_diagnostic_shown: Arc::new(RwLock::new(false)),
+            cached_validation_rule_names: Arc::new(RwLock::new(Vec::new())),
+            database_schema: Arc::new(RwLock::new(None)),
+            database_diagnostic_shown: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -1791,8 +1966,353 @@ impl LaravelLanguageServer {
         info!("========================================");
         self.register_env_files_with_salsa(&discovered_root).await;
 
+        // Cache validation rule names from Laravel framework
+        info!("========================================");
+        info!("📋 Caching validation rules from root: {:?}", discovered_root);
+        info!("========================================");
+        self.cache_validation_rule_names(&discovered_root).await;
+
+        // Initialize database schema provider
+        info!("🗄️  Initializing database schema provider");
+        self.init_database_schema_provider(&discovered_root).await;
+
         // Mark this root as fully initialized
         *self.initialized_root.write().await = Some(discovered_root);
+    }
+
+    /// Cache validation rule names from Laravel framework for context detection
+    async fn cache_validation_rule_names(&self, root: &PathBuf) {
+        use laravel_lsp::validation_rules::LaravelRulesParser;
+
+        let parser = LaravelRulesParser::new(root.clone());
+        let rules = parser.parse_validation_rules();
+
+        // Extract rule names with colon suffix for context detection
+        let rule_names: Vec<String> = rules
+            .iter()
+            .filter(|r| r.has_params)
+            .map(|r| format!("{}:", r.name))
+            .collect();
+
+        info!("   📋 Cached {} validation rule names for context detection", rule_names.len());
+
+        *self.cached_validation_rule_names.write().await = rule_names;
+    }
+
+    /// Validate validation rules in source code and return diagnostics
+    ///
+    /// Finds validation rule strings like `'email' => 'required|email|exists:users,email'`
+    /// and validates:
+    /// - Rule names exist (built-in Laravel rules or custom rules)
+    /// - Database tables exist (for exists:/unique:)
+    /// - Database columns exist (for exists:/unique:)
+    /// - Required parameters are provided
+    async fn validate_validation_rules(&self, source: &str) -> Vec<Diagnostic> {
+        use regex::Regex;
+
+        let mut diagnostics = Vec::new();
+
+        // Get known validation rules
+        let known_rules = self.get_all_validation_rules().await;
+        let known_rule_names: std::collections::HashSet<String> = known_rules
+            .iter()
+            .map(|r| r.name.to_lowercase())
+            .collect();
+
+        // Regex to find validation rule strings in arrays
+        // Matches: 'field' => 'rule|rule:param' or "field" => "rule|rule:param"
+        // Also matches array syntax in Form Requests, Validator::make, etc.
+        let rule_string_regex = Regex::new(
+            r#"['"]([a-zA-Z_][a-zA-Z0-9_.*]*)['"]\s*=>\s*['"]([^'"]+)['"]"#
+        ).unwrap();
+
+        // Track line positions
+        let lines: Vec<&str> = source.lines().collect();
+        let mut line_starts: Vec<usize> = Vec::with_capacity(lines.len() + 1);
+        let mut pos = 0;
+        for line in &lines {
+            line_starts.push(pos);
+            pos += line.len() + 1; // +1 for newline
+        }
+        line_starts.push(pos);
+
+        // Helper to convert byte offset to line/column
+        let byte_to_position = |byte_offset: usize| -> (u32, u32) {
+            for (line_num, &start) in line_starts.iter().enumerate() {
+                if line_num + 1 < line_starts.len() && byte_offset < line_starts[line_num + 1] {
+                    return (line_num as u32, (byte_offset - start) as u32);
+                }
+            }
+            (0, 0)
+        };
+
+        // Find all validation rule strings
+        for cap in rule_string_regex.captures_iter(source) {
+            let _field_name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let rules_string = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            let rules_match = cap.get(2).unwrap();
+            let rules_start = rules_match.start();
+
+            // Skip if this doesn't look like validation rules (heuristic)
+            // Must contain at least one known rule or a pipe
+            let looks_like_rules = rules_string.contains('|') ||
+                rules_string.split('|').any(|r| {
+                    let rule_name = r.split(':').next().unwrap_or("").to_lowercase();
+                    known_rule_names.contains(&rule_name)
+                });
+
+            if !looks_like_rules {
+                continue;
+            }
+
+            // Check for leading pipe
+            if rules_string.starts_with('|') {
+                let (line, col) = byte_to_position(rules_start);
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position { line, character: col },
+                        end: Position { line, character: col + 1 },
+                    },
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: None,
+                    source: Some("laravel-lsp".to_string()),
+                    message: "Unexpected leading '|' in validation rules".to_string(),
+                    related_information: None,
+                    tags: None,
+                    code_description: None,
+                    data: None,
+                });
+            }
+
+            // Check for trailing pipe
+            if rules_string.ends_with('|') {
+                let pipe_offset = rules_start + rules_string.len() - 1;
+                let (line, col) = byte_to_position(pipe_offset);
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position { line, character: col },
+                        end: Position { line, character: col + 1 },
+                    },
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: None,
+                    source: Some("laravel-lsp".to_string()),
+                    message: "Unexpected trailing '|' in validation rules".to_string(),
+                    related_information: None,
+                    tags: None,
+                    code_description: None,
+                    data: None,
+                });
+            }
+
+            // Check for consecutive pipes (empty rule)
+            if rules_string.contains("||") {
+                let mut search_start = 0;
+                while let Some(pos) = rules_string[search_start..].find("||") {
+                    let pipe_offset = rules_start + search_start + pos;
+                    let (line, col) = byte_to_position(pipe_offset);
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position { line, character: col },
+                            end: Position { line, character: col + 2 },
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        code: None,
+                        source: Some("laravel-lsp".to_string()),
+                        message: "Empty validation rule between '||'".to_string(),
+                        related_information: None,
+                        tags: None,
+                        code_description: None,
+                        data: None,
+                    });
+                    search_start += pos + 2;
+                }
+            }
+
+            // Parse individual rules (split by |)
+            let mut current_offset = 0;
+            for rule_part in rules_string.split('|') {
+                let rule_offset = rules_start + current_offset; // rules_start already points to content
+                current_offset += rule_part.len() + 1; // +1 for pipe
+
+                if rule_part.is_empty() {
+                    continue; // Already handled above with leading/trailing/consecutive checks
+                }
+
+                // Parse rule name and params
+                let (rule_name, params) = if let Some(colon_pos) = rule_part.find(':') {
+                    (&rule_part[..colon_pos], Some(&rule_part[colon_pos + 1..]))
+                } else {
+                    (rule_part, None)
+                };
+
+                let rule_name_lower = rule_name.to_lowercase();
+
+                // Check if rule exists
+                if !known_rule_names.contains(&rule_name_lower) {
+                    let (line, col) = byte_to_position(rule_offset);
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position { line, character: col },
+                            end: Position { line, character: col + rule_name.len() as u32 },
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        code: None,
+                        source: Some("laravel-lsp".to_string()),
+                        message: format!("Unknown validation rule: '{}'", rule_name),
+                        related_information: None,
+                        tags: None,
+                        code_description: None,
+                        data: None,
+                    });
+                    continue;
+                }
+
+                // Validate database rules (exists/unique)
+                if rule_name_lower == "exists" || rule_name_lower == "unique" {
+                    if let Some(params_str) = params {
+                        // Parse table and column
+                        let param_parts: Vec<&str> = params_str.split(',').collect();
+                        let table_param = param_parts.first().map(|s| s.trim()).unwrap_or("");
+
+                        if table_param.is_empty() {
+                            let (line, col) = byte_to_position(rule_offset);
+                            diagnostics.push(Diagnostic {
+                                range: Range {
+                                    start: Position { line, character: col },
+                                    end: Position { line, character: col + rule_part.len() as u32 },
+                                },
+                                severity: Some(DiagnosticSeverity::ERROR),
+                                code: None,
+                                source: Some("laravel-lsp".to_string()),
+                                message: format!("Rule '{}' requires a table name", rule_name),
+                                related_information: None,
+                                tags: None,
+                                code_description: None,
+                                data: None,
+                            });
+                            continue;
+                        }
+
+                        // Extract actual table name (handle connection.table and Model class)
+                        let table_name: String = if table_param.contains('.') && !table_param.contains('\\') {
+                            // connection.table syntax
+                            table_param.split('.').nth(1).unwrap_or(table_param).to_string()
+                        } else if table_param.contains('\\') {
+                            // Model class - infer table name
+                            table_param.rsplit('\\').next()
+                                .map(|class| format!("{}s", class.to_lowercase()))
+                                .unwrap_or_else(|| table_param.to_string())
+                        } else {
+                            table_param.to_string()
+                        };
+
+                        // Check if table exists in database
+                        let schema_guard = self.database_schema.read().await;
+                        if let Some(ref provider) = *schema_guard {
+                            let tables = provider.get_tables().await;
+
+                            // Only validate if we have database connection
+                            if !tables.is_empty() {
+                                let table_name_ref: &str = if table_param.contains('\\') {
+                                    // For model class, use inferred name
+                                    &table_name
+                                } else if table_param.contains('.') && !table_param.contains('\\') {
+                                    table_param.split('.').nth(1).unwrap_or(table_param)
+                                } else {
+                                    table_param
+                                };
+
+                                if !tables.iter().any(|t| t.eq_ignore_ascii_case(table_name_ref)) {
+                                    let colon_offset = rule_offset + rule_name.len();
+                                    let table_offset = colon_offset + 1; // +1 for colon
+                                    let (line, col) = byte_to_position(table_offset);
+
+                                    diagnostics.push(Diagnostic {
+                                        range: Range {
+                                            start: Position { line, character: col },
+                                            end: Position { line, character: col + table_param.len() as u32 },
+                                        },
+                                        severity: Some(DiagnosticSeverity::ERROR),
+                                        code: None,
+                                        source: Some("laravel-lsp".to_string()),
+                                        message: format!("Table '{}' not found in database", table_name_ref),
+                                        related_information: None,
+                                        tags: None,
+                                        code_description: None,
+                                        data: None,
+                                    });
+                                } else if param_parts.len() > 1 {
+                                    // Check column exists
+                                    let column_param = param_parts.get(1).map(|s| s.trim()).unwrap_or("");
+                                    if !column_param.is_empty() {
+                                        let columns = provider.get_columns(table_name_ref).await;
+
+                                        if !columns.is_empty() && !columns.iter().any(|c| c.eq_ignore_ascii_case(column_param)) {
+                                            let colon_offset = rule_offset + rule_name.len();
+                                            let column_offset = colon_offset + 1 + table_param.len() + 1; // colon + table + comma
+                                            let (line, col) = byte_to_position(column_offset);
+
+                                            diagnostics.push(Diagnostic {
+                                                range: Range {
+                                                    start: Position { line, character: col },
+                                                    end: Position { line, character: col + column_param.len() as u32 },
+                                                },
+                                                severity: Some(DiagnosticSeverity::ERROR),
+                                                code: None,
+                                                source: Some("laravel-lsp".to_string()),
+                                                message: format!("Column '{}' not found in table '{}'", column_param, table_name_ref),
+                                                related_information: None,
+                                                tags: None,
+                                                code_description: None,
+                                                data: None,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // No params for exists/unique
+                        let (line, col) = byte_to_position(rule_offset);
+                        diagnostics.push(Diagnostic {
+                            range: Range {
+                                start: Position { line, character: col },
+                                end: Position { line, character: col + rule_name.len() as u32 },
+                            },
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            code: None,
+                            source: Some("laravel-lsp".to_string()),
+                            message: format!("Rule '{}' requires a table name parameter", rule_name),
+                            related_information: None,
+                            tags: None,
+                            code_description: None,
+                            data: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        diagnostics
+    }
+
+    /// Initialize the database schema provider for exists:/unique: validation rules
+    async fn init_database_schema_provider(&self, root: &PathBuf) {
+        use laravel_lsp::database::DatabaseSchemaProvider;
+
+        let provider = DatabaseSchemaProvider::new(root.clone());
+
+        // Log config status but always store provider
+        // Errors will be handled when completions are requested
+        if let Some(config) = provider.get_database_config().await {
+            info!("   🗄️  Database config found: {} @ {}:{}",
+                config.driver, config.host, config.port);
+        } else {
+            info!("   ⚠️  Database config not found - will show diagnostic on first use");
+        }
+
+        // Always store provider - errors handled when completions requested
+        *self.database_schema.write().await = Some(provider);
     }
 
     /// Check if a file exists with async I/O and TTL caching
@@ -2362,6 +2882,963 @@ impl LaravelLanguageServer {
         Some(after_pattern.to_string())
     }
 
+    /// Check if cursor is inside __('...'), trans('...'), or other translation-related calls
+    /// Returns the partial text typed so far (for filtering completions)
+    ///
+    /// Examples:
+    /// - `__('messages.` returns Some("messages.")
+    /// - `trans('auth.` returns Some("auth.")
+    /// - `Lang::get('` returns Some("")
+    fn get_translation_call_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Look for various translation patterns before cursor
+        // Pattern: (pattern_string, quote_char, pattern_length)
+        let patterns: Vec<(&str, char, usize)> = vec![
+            // __(' or __("
+            ("__('", '\'', 4),
+            ("__(\"", '"', 4),
+            // trans(' or trans("
+            ("trans('", '\'', 7),
+            ("trans(\"", '"', 7),
+            // trans_choice(' or trans_choice("
+            ("trans_choice('", '\'', 14),
+            ("trans_choice(\"", '"', 14),
+            // Lang::get('
+            ("Lang::get('", '\'', 11),
+            ("Lang::get(\"", '"', 11),
+            // Lang::has('
+            ("Lang::has('", '\'', 11),
+            ("Lang::has(\"", '"', 11),
+            // Lang::choice('
+            ("Lang::choice('", '\'', 14),
+            ("Lang::choice(\"", '"', 14),
+            // Lang::hasForLocale('
+            ("Lang::hasForLocale('", '\'', 20),
+            ("Lang::hasForLocale(\"", '"', 20),
+            // @lang(' - Blade directive
+            ("@lang('", '\'', 7),
+            ("@lang(\"", '"', 7),
+        ];
+
+        // Find all matches and their positions
+        let mut matches: Vec<(usize, char, usize)> = Vec::new();
+
+        for (pattern, quote, len) in &patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                matches.push((pos, *quote, *len));
+            }
+        }
+
+        if matches.is_empty() {
+            return None;
+        }
+
+        // Find the latest match (closest to cursor)
+        let (pos, quote_char, pattern_len) = matches
+            .into_iter()
+            .max_by_key(|(p, _, _)| *p)?;
+
+        let start_pos = pos + pattern_len;
+
+        // Check that there's no closing quote between start and cursor
+        let after_pattern = &before_cursor[start_pos..];
+        if after_pattern.contains(quote_char) {
+            return None;
+        }
+
+        Some(after_pattern.to_string())
+    }
+
+    // ========================================================================
+    // Validation Rule Parameter Context Detection
+    // ========================================================================
+
+    /// Check if cursor is inside a validation rule parameter context (after the colon)
+    /// e.g., "exists:█" or "after:start_█" or "unique:users,█"
+    fn get_validation_param_context(
+        line_text: &str,
+        character: u32,
+        surrounding_lines: &[&str],
+        cached_rules: &[String],
+    ) -> Option<ValidationParamContext> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            info!("      ⚠️  Cursor {} > line length {}", cursor, line_text.len());
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+        info!("      📍 before_cursor: '{}'", before_cursor);
+
+        // First verify we're in a validation context
+        let line_has_context = Self::is_validation_context(line_text, cached_rules);
+        let surrounding_has_context = surrounding_lines.iter().any(|l| Self::is_validation_context(l, cached_rules));
+        let in_validation_context = line_has_context || surrounding_has_context;
+
+        info!("      🔍 Validation context: line={}, surrounding={}", line_has_context, surrounding_has_context);
+
+        if !in_validation_context {
+            info!("      ❌ Not in validation context");
+            return None;
+        }
+
+        // Find if we're inside a quoted string with a colon (rule parameter)
+        // Look for pattern like: 'rule_name:param' or "rule_name:param"
+        let result = Self::extract_param_context(before_cursor);
+        info!("      📋 extract_param_context result: {:?}", result.as_ref().map(|c| (&c.rule_name, &c.current_param)));
+        result
+    }
+
+    /// Extract the rule name and current parameter from before the cursor
+    /// Returns None if not in a rule parameter context
+    ///
+    /// For input like `'after:field|exists:'` with cursor at end:
+    /// - rule_name = "exists" (the rule immediately before cursor's colon)
+    /// - current_param = "" (nothing after the colon yet)
+    fn extract_param_context(before_cursor: &str) -> Option<ValidationParamContext> {
+        // Check if we're inside a quoted string
+        let single_quotes = before_cursor.matches('\'').count();
+        let double_quotes = before_cursor.matches('"').count();
+        let in_single_quoted = single_quotes % 2 == 1;
+        let in_double_quoted = double_quotes % 2 == 1;
+
+        if !in_single_quoted && !in_double_quoted {
+            return None;
+        }
+
+        // Find the opening quote
+        let quote_char = if in_single_quoted { '\'' } else { '"' };
+        let last_quote_pos = before_cursor.rfind(quote_char)?;
+
+        // Get content inside the quote (after the opening quote)
+        let inside_quote = &before_cursor[last_quote_pos + 1..];
+
+        // Find the LAST colon - this is the one immediately before cursor
+        let last_colon_pos = inside_quote.rfind(':')?;
+
+        // Extract rule name: find the start of the current rule segment
+        // It's either after the last pipe before this colon, or the start of the string
+        let before_last_colon = &inside_quote[..last_colon_pos];
+        let rule_start = before_last_colon.rfind('|').map(|p| p + 1).unwrap_or(0);
+        let rule_name = &before_last_colon[rule_start..];
+
+        // Extract current parameter (after the last colon)
+        let after_colon = &inside_quote[last_colon_pos + 1..];
+
+        // Count commas to determine param_index, find text after last comma
+        let (current_param, param_index) = if let Some(comma_pos) = after_colon.rfind(',') {
+            // After a comma - we're on a subsequent parameter
+            let param_count = after_colon.matches(',').count();
+            (after_colon[comma_pos + 1..].to_string(), param_count)
+        } else {
+            // No comma - we're on the first parameter
+            (after_colon.to_string(), 0)
+        };
+
+        Some(ValidationParamContext {
+            rule_name: rule_name.to_string(),
+            current_param,
+            full_params: after_colon.to_string(),
+            param_index,
+        })
+    }
+
+    /// Extract field names from a validation array for field reference completions
+    /// This finds all `'field_name' =>` or `"field_name" =>` patterns in the validation array
+    /// Excludes the current field (the one being validated on cursor_line)
+    fn extract_validation_fields(content: &str, cursor_line: usize) -> Vec<String> {
+        let lines: Vec<&str> = content.lines().collect();
+        info!("      📄 extract_validation_fields: {} total lines, cursor at {}", lines.len(), cursor_line);
+        if cursor_line >= lines.len() {
+            info!("      ❌ cursor_line {} >= lines.len() {}", cursor_line, lines.len());
+            return Vec::new();
+        }
+
+        // Extract the current field name from the cursor line to exclude it
+        let current_line = lines[cursor_line];
+        let current_field = Self::extract_field_name_from_line(current_line);
+        info!("      📍 Current line: '{}', current_field: {:?}", current_line.trim(), current_field);
+
+        // Search backwards to find array start
+        let mut bracket_count = 0;
+        let mut array_start = cursor_line;
+        let mut found_array_start = false;
+
+        for i in (0..=cursor_line).rev() {
+            let line = lines[i];
+            // Count brackets (simplified - doesn't handle strings perfectly but good enough)
+            for ch in line.chars().rev() {
+                match ch {
+                    ']' => bracket_count += 1,
+                    '[' => {
+                        if bracket_count > 0 {
+                            bracket_count -= 1;
+                        } else {
+                            // Found the opening bracket of our array
+                            array_start = i;
+                            found_array_start = true;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if found_array_start {
+                break;
+            }
+        }
+        info!("      🔍 Array boundaries: start={}, found={}", array_start, found_array_start);
+
+        // Search forward to find array end
+        bracket_count = 0;
+        let mut array_end = cursor_line;
+        let mut started = false;
+
+        for i in array_start..lines.len() {
+            let line = lines[i];
+            for ch in line.chars() {
+                match ch {
+                    '[' => {
+                        started = true;
+                        bracket_count += 1;
+                    }
+                    ']' => {
+                        bracket_count -= 1;
+                        if started && bracket_count == 0 {
+                            array_end = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if started && bracket_count == 0 {
+                break;
+            }
+        }
+        info!("      🔍 Array range: lines {} to {}", array_start, array_end);
+
+        // Extract field names from the array range
+        let mut fields = Vec::new();
+        let field_pattern = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_.*]*)['"][ \t]*=>"#).unwrap();
+
+        for i in array_start..=array_end.min(lines.len() - 1) {
+            let line = lines[i];
+            for caps in field_pattern.captures_iter(line) {
+                if let Some(field_match) = caps.get(1) {
+                    let field_name = field_match.as_str().to_string();
+
+                    // Skip the current field (we don't want to suggest the field we're validating)
+                    if let Some(ref current) = current_field {
+                        if &field_name == current {
+                            continue;
+                        }
+                    }
+
+                    // Add both the exact field and any wildcard parent
+                    if !fields.contains(&field_name) {
+                        fields.push(field_name.clone());
+                    }
+                    // For nested fields like "items.*.price", also suggest "items"
+                    if let Some(dot_pos) = field_name.find('.') {
+                        let parent = field_name[..dot_pos].to_string();
+                        if !fields.contains(&parent) && Some(&parent) != current_field.as_ref() {
+                            fields.push(parent);
+                        }
+                    }
+                }
+            }
+        }
+
+        fields
+    }
+
+    /// Extract field name from a validation array line
+    /// e.g., "'end_date' => 'after:'" returns Some("end_date")
+    fn extract_field_name_from_line(line: &str) -> Option<String> {
+        let field_pattern = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_.*]*)['"][ \t]*=>"#).unwrap();
+        if let Some(caps) = field_pattern.captures(line) {
+            if let Some(field_match) = caps.get(1) {
+                return Some(field_match.as_str().to_string());
+            }
+        }
+        None
+    }
+
+    /// Get completion items for validation rule parameters
+    /// Based on the rule type, returns appropriate options (field refs, database tables, etc.)
+    async fn get_validation_param_completions(
+        &self,
+        context: &ValidationParamContext,
+        content: &str,
+        cursor_line: usize,
+        uri: &Url,
+        position: Position,
+    ) -> Vec<CompletionItem> {
+        use laravel_lsp::validation_rules::{LaravelRulesParser, ParamType};
+
+        // Get project root for vendor parsing
+        let root = {
+            let root_guard = self.root_path.read().await;
+            match root_guard.as_ref() {
+                Some(r) => r.clone(),
+                None => return Vec::new(),
+            }
+        };
+
+        let parser = LaravelRulesParser::new(root.clone());
+
+        // Parse validation rules to determine rule type
+        let rules = parser.parse_validation_rules();
+        info!("   📖 Parsed {} validation rules from Laravel", rules.len());
+
+        let rule_info = rules.iter().find(|r| r.name == context.rule_name);
+
+        let param_type = match rule_info {
+            Some(info) => {
+                info!("   ✅ Found rule '{}' with param type {:?}", context.rule_name, info.param_type);
+                info.param_type.clone()
+            },
+            None => {
+                // Unknown rule - check if it looks like a field reference rule
+                // (common pattern for custom rules)
+                info!("   ⚠️  Rule '{}' not found, defaulting to Custom", context.rule_name);
+                ParamType::Custom
+            }
+        };
+
+        let prefix = &context.current_param;
+        let prefix_lower = prefix.to_lowercase();
+
+        match param_type {
+            ParamType::None => {
+                info!("   ℹ️  Rule has no parameters");
+                Vec::new()
+            }
+
+            ParamType::FieldRef => {
+                // Get fields from the validation array
+                info!("   🔍 Extracting fields from content ({} chars) at line {}", content.len(), cursor_line);
+                let fields = Self::extract_validation_fields(content, cursor_line);
+                info!("   📋 Extracted {} fields from validation array", fields.len());
+                if fields.is_empty() {
+                    info!("   ⚠️  No fields found - check if cursor is inside a validation array");
+                    // Show first few lines around cursor for debugging
+                    let lines: Vec<&str> = content.lines().collect();
+                    if cursor_line > 0 && cursor_line < lines.len() {
+                        info!("   📄 Line {}: '{}'", cursor_line - 1, lines.get(cursor_line - 1).unwrap_or(&""));
+                        info!("   📄 Line {}: '{}'", cursor_line, lines.get(cursor_line).unwrap_or(&""));
+                        info!("   📄 Line {}: '{}'", cursor_line + 1, lines.get(cursor_line + 1).unwrap_or(&""));
+                    }
+                } else {
+                    info!("   📋 Fields: {:?}", fields);
+                }
+
+                fields
+                    .into_iter()
+                    .filter(|f| f.to_lowercase().starts_with(&prefix_lower))
+                    .map(|field| CompletionItem {
+                        label: field.clone(),
+                        kind: Some(CompletionItemKind::FIELD),
+                        detail: Some("validation field".to_string()),
+                        documentation: Some(Documentation::String(
+                            "Reference to another field in the validation array".to_string(),
+                        )),
+                        ..Default::default()
+                    })
+                    .collect()
+            }
+
+            ParamType::Database => {
+                // For database rules (exists:, unique:):
+                //
+                // exists: syntax (https://laravel.com/docs/12.x/validation#rule-exists):
+                //   exists:table
+                //   exists:table,column
+                //   exists:connection.table,column
+                //   exists:App\Models\User,column
+                //
+                // unique: syntax (https://laravel.com/docs/12.x/validation#rule-unique):
+                //   unique:table
+                //   unique:table,column
+                //   unique:table,column,ignore_id
+                //   unique:table,column,ignore_id,id_column
+                //   unique:connection.table,column
+                //
+                // Param index meanings:
+                //   0 = table (or connection.table, or Model class)
+                //   1 = column name
+                //   2 = ignore ID (unique only, no autocomplete)
+                //   3 = ID column name (unique only)
+                let schema_guard = self.database_schema.read().await;
+                if let Some(ref provider) = *schema_guard {
+                    // Try to get tables (this triggers connection if not cached)
+                    let tables = provider.get_tables().await;
+
+                    // If tables is empty and there was a connection error, publish diagnostic
+                    if tables.is_empty() {
+                        if let Some(error) = provider.get_last_error().await {
+                            info!("   ❌ Database connection error: {}", error.message);
+
+                            // Check if we've already shown this diagnostic
+                            let mut shown = self.database_diagnostic_shown.write().await;
+                            if !*shown {
+                                *shown = true;
+
+                                // Publish diagnostic at the validation rule position
+                                let diagnostic = Diagnostic {
+                                    range: Range {
+                                        start: position,
+                                        end: Position {
+                                            line: position.line,
+                                            character: position.character + context.rule_name.len() as u32 + 1, // +1 for colon
+                                        },
+                                    },
+                                    severity: Some(DiagnosticSeverity::INFORMATION),
+                                    code: None,
+                                    source: Some("laravel-lsp".to_string()),
+                                    message: format!(
+                                        "Database connection failed: {}\n\nConfigure these in .env for exists:/unique: autocomplete:\n• DB_CONNECTION\n• DB_HOST\n• DB_DATABASE\n• DB_USERNAME\n• DB_PASSWORD",
+                                        error.message
+                                    ),
+                                    related_information: None,
+                                    tags: None,
+                                    code_description: None,
+                                    data: None,
+                                };
+
+                                self.client.publish_diagnostics(uri.clone(), vec![diagnostic], None).await;
+                            }
+
+                            // Return empty - no completions available
+                            return Vec::new();
+                        }
+                    }
+
+                    // Helper to extract table name from first param
+                    // Handles: "users", "connection.users", "App\Models\User"
+                    let extract_table_name = |first_param: &str| -> String {
+                        let trimmed = first_param.trim();
+
+                        // Check for connection.table syntax (period but no backslash before it)
+                        if let Some(dot_pos) = trimmed.find('.') {
+                            let before_dot = &trimmed[..dot_pos];
+                            // If no backslash, it's connection.table
+                            if !before_dot.contains('\\') {
+                                return trimmed[dot_pos + 1..].to_string();
+                            }
+                        }
+
+                        // Check for Model class syntax (contains backslash)
+                        if trimmed.contains('\\') {
+                            // Try to infer table name from model class name
+                            // App\Models\User -> users (pluralize + lowercase)
+                            if let Some(class_name) = trimmed.rsplit('\\').next() {
+                                // Simple pluralization: add 's' and lowercase
+                                // This is a simplification - Laravel uses Str::plural()
+                                return format!("{}s", class_name.to_lowercase());
+                            }
+                        }
+
+                        // Plain table name
+                        trimmed.to_string()
+                    };
+
+                    match context.param_index {
+                        0 => {
+                            // First param: table name (or connection.table, or Model)
+                            // Check if user is typing after a period (connection.█)
+                            if context.current_param.contains('.') && !context.current_param.contains('\\') {
+                                // User typed "connection." - show tables for that connection
+                                // For now, we only support default connection, so show tables
+                                let parts: Vec<&str> = context.current_param.splitn(2, '.').collect();
+                                let table_prefix = parts.get(1).unwrap_or(&"").trim().to_lowercase();
+
+                                info!("   🗄️  Connection.table syntax: prefix='{}'", table_prefix);
+
+                                tables
+                                    .into_iter()
+                                    .filter(|t| t.to_lowercase().starts_with(&table_prefix))
+                                    .map(|table| CompletionItem {
+                                        label: table.clone(),
+                                        kind: Some(CompletionItemKind::CLASS),
+                                        detail: Some("database table".to_string()),
+                                        documentation: Some(Documentation::String(format!(
+                                            "Table: {}",
+                                            table
+                                        ))),
+                                        ..Default::default()
+                                    })
+                                    .collect()
+                            } else {
+                                // Show both connection names and table names
+                                let connections = provider.get_connections();
+                                info!("   🗄️  Database connections: {} found, tables: {} found",
+                                    connections.len(), tables.len());
+
+                                let mut items: Vec<CompletionItem> = Vec::new();
+
+                                // Add connection names (user types '.' after to trigger table completion)
+                                for conn in connections {
+                                    if conn.to_lowercase().starts_with(&prefix_lower) {
+                                        items.push(CompletionItem {
+                                            label: conn.clone(),
+                                            kind: Some(CompletionItemKind::FOLDER),
+                                            detail: Some("database connection".to_string()),
+                                            documentation: Some(Documentation::String(format!(
+                                                "Connection: {} (type '.' for tables)",
+                                                conn
+                                            ))),
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+
+                                // Add table names
+                                for table in tables {
+                                    if table.to_lowercase().starts_with(&prefix_lower) {
+                                        items.push(CompletionItem {
+                                            label: table.clone(),
+                                            kind: Some(CompletionItemKind::CLASS),
+                                            detail: Some("database table".to_string()),
+                                            documentation: Some(Documentation::String(format!(
+                                                "Table: {}",
+                                                table
+                                            ))),
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+
+                                items
+                            }
+                        }
+                        1 | 3 => {
+                            // Param 1: column name for the table
+                            // Param 3 (unique only): ID column name
+                            let first_param = context.full_params
+                                .split(',')
+                                .next()
+                                .unwrap_or("")
+                                .trim();
+
+                            let table_name = extract_table_name(first_param);
+                            info!("   🗄️  Column completion for table='{}', prefix='{}'", table_name, prefix);
+
+                            if table_name.is_empty() {
+                                Vec::new()
+                            } else {
+                                let columns = provider.get_columns(&table_name).await;
+                                info!("   🗄️  Columns for '{}': {} found", table_name, columns.len());
+
+                                columns
+                                    .into_iter()
+                                    .filter(|c| c.to_lowercase().starts_with(&prefix_lower))
+                                    .map(|col| CompletionItem {
+                                        label: col.clone(),
+                                        kind: Some(CompletionItemKind::FIELD),
+                                        detail: Some(format!("{}.{}", table_name, col)),
+                                        documentation: Some(Documentation::String(format!(
+                                            "Column: {}.{}",
+                                            table_name, col
+                                        ))),
+                                        ..Default::default()
+                                    })
+                                    .collect()
+                            }
+                        }
+                        2 => {
+                            // Param 2 (unique only): ignore ID - no autocomplete
+                            // This is typically a value like $user->id or a number
+                            info!("   🗄️  Param 2 (ignore ID) - no autocomplete");
+                            Vec::new()
+                        }
+                        _ => {
+                            // Beyond param 3 - no autocomplete
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    info!("   ⚠️  Database schema provider not initialized");
+
+                    // Publish diagnostic at the validation rule position
+                    let mut shown = self.database_diagnostic_shown.write().await;
+                    if !*shown {
+                        *shown = true;
+
+                        let diagnostic = Diagnostic {
+                            range: Range {
+                                start: position,
+                                end: Position {
+                                    line: position.line,
+                                    character: position.character + context.rule_name.len() as u32 + 1, // +1 for colon
+                                },
+                            },
+                            severity: Some(DiagnosticSeverity::INFORMATION),
+                            code: None,
+                            source: Some("laravel-lsp".to_string()),
+                            message: "Database not configured. Set DB_CONNECTION, DB_HOST, DB_DATABASE, DB_USERNAME, DB_PASSWORD in .env for exists:/unique: autocomplete.".to_string(),
+                            related_information: None,
+                            tags: None,
+                            code_description: None,
+                            data: None,
+                        };
+
+                        self.client.publish_diagnostics(uri.clone(), vec![diagnostic], None).await;
+                    }
+
+                    // Return empty - no completions available
+                    Vec::new()
+                }
+            }
+
+            ParamType::Dimensions => {
+                // Get dimension options from Dimensions.php or fallback
+                let options: Vec<String> = parser.parse_dimension_options();
+
+                options
+                    .into_iter()
+                    .filter(|opt: &String| opt.to_lowercase().starts_with(&prefix_lower))
+                    .map(|opt: String| {
+                        // Dimension options need = suffix (e.g., "min_width=100")
+                        let label = format!("{}=", opt);
+                        CompletionItem {
+                            label: label.clone(),
+                            insert_text: Some(label),
+                            kind: Some(CompletionItemKind::PROPERTY),
+                            detail: Some("dimension constraint".to_string()),
+                            documentation: Some(Documentation::String(format!(
+                                "Set {} constraint for image dimensions",
+                                opt
+                            ))),
+                            ..Default::default()
+                        }
+                    })
+                    .collect()
+            }
+
+            ParamType::MimeExtensions => {
+                // Get MIME extensions from Symfony MimeTypes.php or fallback
+                let (extensions, _mime_types): (Vec<String>, Vec<String>) = parser.parse_mime_types();
+
+                extensions
+                    .into_iter()
+                    .filter(|ext: &String| ext.to_lowercase().starts_with(&prefix_lower))
+                    .map(|ext: String| CompletionItem {
+                        label: ext.clone(),
+                        kind: Some(CompletionItemKind::VALUE),
+                        detail: Some("file extension".to_string()),
+                        documentation: Some(Documentation::String(format!(
+                            "Allow files with .{} extension",
+                            ext
+                        ))),
+                        ..Default::default()
+                    })
+                    .collect()
+            }
+
+            ParamType::MimeTypes => {
+                // Get MIME types from Symfony MimeTypes.php or fallback
+                let (_extensions, mime_types): (Vec<String>, Vec<String>) = parser.parse_mime_types();
+
+                mime_types
+                    .into_iter()
+                    .filter(|mt: &String| mt.to_lowercase().starts_with(&prefix_lower))
+                    .map(|mt: String| CompletionItem {
+                        label: mt.clone(),
+                        kind: Some(CompletionItemKind::VALUE),
+                        detail: Some("MIME type".to_string()),
+                        documentation: Some(Documentation::String(format!(
+                            "Allow files with {} MIME type",
+                            mt
+                        ))),
+                        ..Default::default()
+                    })
+                    .collect()
+            }
+
+            ParamType::Timezone => {
+                // Get timezone identifiers
+                let timezones: Vec<String> = LaravelRulesParser::get_timezone_identifiers();
+
+                timezones
+                    .into_iter()
+                    .filter(|tz: &String| tz.to_lowercase().starts_with(&prefix_lower))
+                    .map(|tz: String| CompletionItem {
+                        label: tz.clone(),
+                        kind: Some(CompletionItemKind::VALUE),
+                        detail: Some("timezone".to_string()),
+                        documentation: Some(Documentation::String(format!(
+                            "Timezone identifier: {}",
+                            tz
+                        ))),
+                        ..Default::default()
+                    })
+                    .collect()
+            }
+
+            ParamType::Custom => {
+                // Custom rules don't have predefined options
+                Vec::new()
+            }
+        }
+    }
+
+    // ========================================================================
+    // Validation Rule Context Detection (for rule name completion)
+    // ========================================================================
+
+    /// Check if cursor is inside a validation rule context
+    /// Returns the partial rule text typed so far (for filtering completions)
+    ///
+    /// Detects validation contexts in Laravel and Livewire:
+    /// - $request->validate([...])
+    /// - Validator::make($data, [...])
+    /// - validator($data, [...])
+    /// - $rules = [...] or protected $rules = [...]
+    /// - function rules() { return [...]; }
+    /// - #[Rule('...')] or #[Validate('...')]
+    /// - $this->validate([...])
+    ///
+    /// `surrounding_lines` provides context from previous lines (for multi-line arrays)
+    fn get_validation_rule_context(
+        line_text: &str,
+        character: u32,
+        surrounding_lines: &[&str],
+        cached_rules: &[String],
+    ) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // First, extract the partial rule text if we're in a string
+        let partial_rule = Self::extract_partial_validation_rule(before_cursor)?;
+
+        // Then verify we're in a validation context (check current line first)
+        if Self::is_validation_context(line_text, cached_rules) {
+            return Some(partial_rule);
+        }
+
+        // Check surrounding lines for validation context
+        for surrounding in surrounding_lines {
+            if Self::is_validation_context(surrounding, cached_rules) {
+                return Some(partial_rule);
+            }
+        }
+
+        None
+    }
+
+    /// Extract the partial validation rule text from before the cursor
+    /// Returns None if cursor is not inside a quoted string that's a VALUE (not a key)
+    fn extract_partial_validation_rule(before_cursor: &str) -> Option<String> {
+        // IMPORTANT: We need to distinguish between:
+        // - 'field_name' => ... (cursor in KEY position - NO completion)
+        // - 'field_name' => 'rule█' (cursor in VALUE position - YES completion)
+        //
+        // The key insight: if we're in a VALUE, there must be a `=>` before our current string
+
+        // Check for pipe-delimited format: '...|█' or "...|█"
+        // This is always a VALUE position (inside a rule string)
+        if let Some(last_pipe) = before_cursor.rfind('|') {
+            let before_pipe = &before_cursor[..last_pipe];
+            let single_quotes = before_pipe.matches('\'').count();
+            let double_quotes = before_pipe.matches('"').count();
+
+            // If odd number of quotes, we're inside a string
+            if single_quotes % 2 == 1 || double_quotes % 2 == 1 {
+                let after_pipe = &before_cursor[last_pipe + 1..];
+                if !after_pipe.contains('\'') && !after_pipe.contains('"') {
+                    return Some(after_pipe.to_string());
+                }
+            }
+        }
+
+        // For non-pipe patterns, we need to ensure we're in VALUE position
+        // VALUE patterns (after =>)
+        let value_patterns: &[(&str, char)] = &[
+            // Arrow patterns (for 'field' => '█') - these are definitely VALUES
+            ("=> '", '\''),
+            ("=> \"", '"'),
+            ("=>'", '\''),
+            ("=>\"", '"'),
+            // Attribute patterns for #[Rule('█')] and #[Validate('█')]
+            ("Rule('", '\''),
+            ("Rule(\"", '"'),
+            ("Validate('", '\''),
+            ("Validate(\"", '"'),
+        ];
+
+        for (pattern, quote_char) in value_patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                let start_pos = pos + pattern.len();
+                let after_pattern = &before_cursor[start_pos..];
+
+                // Make sure there's no closing quote
+                if !after_pattern.contains(*quote_char) {
+                    return Some(after_pattern.to_string());
+                }
+            }
+        }
+
+        // For array element patterns like ['rule'] or [, 'rule'], we need to check
+        // if there's NO `=>` after the pattern - that means it's NOT a key
+        let array_patterns: &[(&str, char)] = &[
+            (", '", '\''),
+            (", \"", '"'),
+            (",'", '\''),
+            (",\"", '"'),
+            ("['", '\''),
+            ("[\"", '"'),
+        ];
+
+        for (pattern, quote_char) in array_patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                let start_pos = pos + pattern.len();
+                let after_pattern = &before_cursor[start_pos..];
+
+                // Make sure there's no closing quote
+                if after_pattern.contains(*quote_char) {
+                    continue;
+                }
+
+                // Check if there's a `=>` AFTER this pattern start but BEFORE cursor
+                // If there IS a `=>`, this quoted string is a KEY, not a value
+                // e.g., ['field_name' => ...] - 'field_name' has => after it
+                let text_after_pattern_start = &before_cursor[pos..];
+                if text_after_pattern_start.contains("=>") {
+                    // This is a KEY position, not a value - skip
+                    continue;
+                }
+
+                // No => found, so this could be a rule in array format like ['required', 'email']
+                return Some(after_pattern.to_string());
+            }
+        }
+
+        None
+    }
+
+    /// Check if the line appears to be in a validation context
+    /// This verifies we're not just in any random string
+    /// `cached_rules` - optional slice of rule names (with colon suffix) from Laravel framework
+    fn is_validation_context(line_text: &str, cached_rules: &[String]) -> bool {
+        let line_lower = line_text.to_lowercase();
+        let line_trimmed = line_text.trim();
+
+        // 1. Request validation: $request->validate(, $this->validate(, ->validateWithBag(
+        if line_lower.contains("->validate(")
+            || line_lower.contains("->validatewithbag(")
+        {
+            return true;
+        }
+
+        // 2. Validator facade/helper: Validator::make(, validator(
+        if line_lower.contains("validator::make(")
+            || line_lower.contains("validator(")
+        {
+            return true;
+        }
+
+        // 3. Rules variable: $rules = [...] or $rules[
+        if line_lower.contains("$rules")
+            && (line_lower.contains("=") || line_lower.contains("["))
+        {
+            return true;
+        }
+
+        // 4. Rules property: protected $rules, public $rules, private $rules
+        //    Also: protected array $rules
+        if (line_lower.contains("protected")
+            || line_lower.contains("public")
+            || line_lower.contains("private"))
+            && line_lower.contains("$rules")
+        {
+            return true;
+        }
+
+        // 5. Function rules() definition (Form Request pattern)
+        //    Matches: function rules(), public function rules(): array
+        if line_lower.contains("function rules(")
+            || line_lower.contains("function rules (")
+        {
+            return true;
+        }
+
+        // 6. Return statement with array (likely inside rules() method)
+        //    Pattern: return [
+        if line_trimmed.starts_with("return") && line_lower.contains("[") {
+            return true;
+        }
+
+        // 7. Inside array with => (likely validation array value)
+        //    Pattern: 'field' => 'rules' or 'field' => ['rules']
+        if line_lower.contains("=>") {
+            // Check if this looks like a validation rule using cached rules from Laravel framework
+            // First check cached rules (dynamically discovered from vendor)
+            for rule in cached_rules {
+                if line_lower.contains(rule) {
+                    return true;
+                }
+            }
+
+            // Fallback: common rules without parameters (stable, rarely change)
+            let base_indicators = [
+                "required", "nullable", "string", "integer", "email",
+                "confirmed", "accepted", "boolean", "numeric", "array",
+                "date", "file", "image", "url",
+            ];
+            for indicator in base_indicators {
+                if line_lower.contains(indicator) {
+                    return true;
+                }
+            }
+            // Also trigger if value side of => is a string or array starting point
+            // This allows completing even when starting fresh: 'field' => '█'
+            if line_text.contains("=> '") || line_text.contains("=> \"")
+                || line_text.contains("=> [")
+            {
+                return true;
+            }
+        }
+
+        // 8. Livewire #[Rule(...)] or #[Validate(...)] attributes
+        if line_trimmed.starts_with("#[Rule(") || line_trimmed.starts_with("#[Validate(") {
+            return true;
+        }
+
+        // 9. Inside what looks like a rules array (has pipe-delimited rules)
+        if line_text.contains("|") {
+            let validation_rules = [
+                "required", "nullable", "string", "integer", "email", "max", "min",
+                "unique", "exists", "in", "between", "confirmed", "accepted",
+            ];
+            for rule in validation_rules {
+                if line_lower.contains(rule) {
+                    return true;
+                }
+            }
+        }
+
+        // 10. Inside a validation messages or attributes method (related context)
+        if line_lower.contains("function messages(")
+            || line_lower.contains("function attributes(")
+        {
+            return true;
+        }
+
+        false
+    }
+
     /// Get all config keys from config/*.php files for autocomplete
     async fn get_all_config_keys(&self) -> Vec<ConfigKeyCompletion> {
         let root = match self.root_path.read().await.clone() {
@@ -2572,6 +4049,224 @@ impl LaravelLanguageServer {
 
         // No modifiers - return all actions
         all_actions.to_vec()
+    }
+
+    /// Get all translation keys from lang/*.php files for autocomplete
+    async fn get_all_translation_keys(&self) -> Vec<TranslationKeyCompletion> {
+        let root = match self.root_path.read().await.clone() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        // Laravel 9+ uses lang/, older versions use resources/lang/
+        let lang_dirs = [
+            root.join("lang"),
+            root.join("resources").join("lang"),
+        ];
+
+        let lang_dir = lang_dirs.iter().find(|d| d.exists());
+        let lang_dir = match lang_dir {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+
+        let mut completions = Vec::new();
+
+        // Find the default locale directory (usually 'en')
+        // We'll use the first locale we find
+        if let Ok(entries) = std::fs::read_dir(lang_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let locale = path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("en");
+
+                    // Read all PHP files in this locale directory
+                    if let Ok(files) = std::fs::read_dir(&path) {
+                        for file_entry in files.flatten() {
+                            let file_path = file_entry.path();
+                            if file_path.extension().map_or(false, |e| e == "php") {
+                                if let Some(file_name) = file_path.file_stem().and_then(|s| s.to_str()) {
+                                    let base_key = file_name.to_string();
+                                    let source = format!("lang/{}/{}.php", locale, file_name);
+
+                                    if let Ok(content) = std::fs::read_to_string(&file_path) {
+                                        let keys = Self::parse_translation_keys(&content, &base_key);
+                                        for (key, value) in keys {
+                                            completions.push(TranslationKeyCompletion {
+                                                key,
+                                                value,
+                                                source: source.clone(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Only use the first locale directory found
+                    break;
+                }
+            }
+        }
+
+        // Sort by key for consistent ordering
+        completions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        // Remove duplicates
+        completions.dedup_by(|a, b| a.key == b.key);
+
+        completions
+    }
+
+    /// Parse a PHP translation file to extract all keys and values
+    /// Returns a list of (key, value) tuples with dot-notation keys
+    fn parse_translation_keys(content: &str, base_key: &str) -> Vec<(String, String)> {
+        let mut results = Vec::new();
+
+        // Simple regex-based parsing for Laravel translation files
+        // This handles: 'key' => 'value', or "key" => "value"
+        let key_pattern = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"][\s]*=>"#).unwrap();
+
+        // Track nesting depth and current key path
+        let mut key_stack: Vec<String> = vec![base_key.to_string()];
+        let mut in_array_depth = 0;
+        let mut pending_key: Option<String> = None;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+
+            // Skip comments and empty lines
+            if trimmed.is_empty()
+                || trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with("*")
+            {
+                continue;
+            }
+
+            // Handle array opening
+            if trimmed.contains("[") && !trimmed.contains("=>") {
+                in_array_depth += 1;
+                if let Some(key) = pending_key.take() {
+                    key_stack.push(key);
+                }
+                continue;
+            }
+
+            // Handle key => [ (nested array on same line)
+            if let Some(caps) = key_pattern.captures(trimmed) {
+                let key_name = caps.get(1).unwrap().as_str();
+
+                if trimmed.contains("=> [") || trimmed.ends_with("=> [") {
+                    // This is a nested array
+                    pending_key = Some(key_name.to_string());
+                    in_array_depth += 1;
+                    key_stack.push(key_name.to_string());
+                } else {
+                    // This is a simple key => value
+                    let full_key = format!("{}.{}", key_stack.join("."), key_name);
+
+                    // Extract value
+                    let value = Self::extract_translation_value(trimmed);
+                    results.push((full_key, value));
+                }
+            }
+
+            // Handle array closing
+            let close_count = trimmed.matches(']').count();
+            for _ in 0..close_count {
+                if in_array_depth > 0 {
+                    in_array_depth -= 1;
+                    if key_stack.len() > 1 {
+                        key_stack.pop();
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Extract the value from a translation line like "'key' => 'value',"
+    fn extract_translation_value(line: &str) -> String {
+        if let Some(arrow_pos) = line.find("=>") {
+            let after_arrow = &line[arrow_pos + 2..];
+            let value = after_arrow.trim().trim_end_matches(',').trim();
+
+            // Remove quotes and truncate
+            let unquoted = value
+                .trim_start_matches('\'')
+                .trim_start_matches('"')
+                .trim_end_matches('\'')
+                .trim_end_matches('"');
+
+            // Truncate long values for display
+            if unquoted.len() > 50 {
+                format!("{}...", &unquoted[..47])
+            } else {
+                unquoted.to_string()
+            }
+        } else {
+            String::new()
+        }
+    }
+
+    /// Get all validation rules (built-in + custom from app/Rules/)
+    async fn get_all_validation_rules(&self) -> Vec<ValidationRuleInfo> {
+        let mut rules = get_laravel_validation_rules();
+
+        // Add custom rules from app/Rules/ directory
+        let root = match self.root_path.read().await.clone() {
+            Some(r) => r,
+            None => return rules,
+        };
+
+        let rules_dir = root.join("app").join("Rules");
+        if rules_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&rules_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "php") {
+                        if let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) {
+                            // Convert PascalCase to snake_case for the rule name
+                            let rule_name = Self::pascal_to_snake_case(file_name);
+                            let source = format!("app/Rules/{}.php", file_name);
+
+                            rules.push(ValidationRuleInfo {
+                                name: rule_name,
+                                description: format!("Custom rule: {}", file_name),
+                                has_params: false, // Custom rules typically don't have inline params
+                                source,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort alphabetically
+        rules.sort_by(|a, b| a.name.cmp(&b.name));
+        rules
+    }
+
+    /// Convert PascalCase to snake_case
+    /// e.g., "Uppercase" -> "uppercase", "ValidEmail" -> "valid_email"
+    fn pascal_to_snake_case(s: &str) -> String {
+        let mut result = String::new();
+        for (i, c) in s.chars().enumerate() {
+            if c.is_uppercase() {
+                if i > 0 {
+                    result.push('_');
+                }
+                result.push(c.to_lowercase().next().unwrap());
+            } else {
+                result.push(c);
+            }
+        }
+        result
     }
 
     /// Parse a PHP config file to extract all keys and values
@@ -3834,6 +5529,84 @@ return [
         None
     }
 
+    /// Check if Laravel vendor is available and return diagnostic if not
+    /// Only returns a diagnostic once per session to avoid spamming
+    async fn get_vendor_missing_diagnostic(&self) -> Option<Diagnostic> {
+        // Check if we've already shown this diagnostic
+        let mut shown = self.vendor_diagnostic_shown.write().await;
+        if *shown {
+            return None;
+        }
+
+        // Get the project root
+        let root_guard = self.root_path.read().await;
+        let root = root_guard.as_ref()?;
+
+        // Check if vendor/laravel/framework exists
+        let vendor_path = root.join("vendor/laravel/framework");
+        if vendor_path.exists() {
+            return None;
+        }
+
+        // Mark as shown so we don't show it again
+        *shown = true;
+
+        Some(Diagnostic {
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 0 },
+            },
+            severity: Some(DiagnosticSeverity::INFORMATION),
+            code: None,
+            source: Some("laravel-lsp".to_string()),
+            message: "Laravel dependencies not installed. Run 'composer install' for full validation autocomplete support.".to_string(),
+            related_information: None,
+            tags: None,
+            code_description: None,
+            data: None,
+        })
+    }
+
+    /// Check if database connection has failed and return an Info diagnostic if so
+    /// This diagnostic is shown once per session when exists:/unique: validation rules are used
+    /// but the database cannot be connected
+    async fn get_database_error_diagnostic(&self) -> Option<Diagnostic> {
+        // Check if we've already shown this diagnostic
+        let mut shown = self.database_diagnostic_shown.write().await;
+        if *shown {
+            return None;
+        }
+
+        // Check if database schema provider exists and has an error
+        let schema_guard = self.database_schema.read().await;
+        if let Some(ref provider) = *schema_guard {
+            if let Some(error) = provider.get_last_error().await {
+                // Mark as shown so we don't show it again
+                *shown = true;
+
+                return Some(Diagnostic {
+                    range: Range {
+                        start: Position { line: 0, character: 0 },
+                        end: Position { line: 0, character: 0 },
+                    },
+                    severity: Some(DiagnosticSeverity::INFORMATION),
+                    code: None,
+                    source: Some("laravel-lsp".to_string()),
+                    message: format!(
+                        "Database connection failed: {}\nConfigure database settings in .env for exists:/unique: validation autocomplete.",
+                        error.message
+                    ),
+                    related_information: None,
+                    tags: None,
+                    code_description: None,
+                    data: None,
+                });
+            }
+        }
+
+        None
+    }
+
     /// Clone server for spawning async tasks
     fn clone_for_spawn(&self) -> Self {
         LaravelLanguageServer {
@@ -3853,6 +5626,10 @@ return [
             initialized_root: self.initialized_root.clone(),
             pending_salsa_updates: self.pending_salsa_updates.clone(),
             salsa_debounce_ms: self.salsa_debounce_ms.clone(),
+            vendor_diagnostic_shown: self.vendor_diagnostic_shown.clone(),
+            cached_validation_rule_names: self.cached_validation_rule_names.clone(),
+            database_schema: self.database_schema.clone(),
+            database_diagnostic_shown: self.database_diagnostic_shown.clone(),
         }
     }
 
@@ -3866,6 +5643,16 @@ return [
     async fn validate_and_publish_diagnostics(&self, uri: &Url, source: &str) {
         info!("🔍 validate_and_publish_diagnostics called for {}", uri);
         let mut diagnostics = Vec::new();
+
+        // Check for vendor missing diagnostic (shows once per session)
+        if let Some(vendor_diag) = self.get_vendor_missing_diagnostic().await {
+            diagnostics.push(vendor_diag);
+        }
+
+        // Check for database connection error diagnostic (shows once per session)
+        if let Some(db_diag) = self.get_database_error_diagnostic().await {
+            diagnostics.push(db_diag);
+        }
 
         // Get the Laravel config (checks memory cache first, then Salsa)
         let t_config = std::time::Instant::now();
@@ -4422,6 +6209,10 @@ return [
             }
             drop(root_guard);
 
+            // Validate validation rules in PHP files
+            let validation_diagnostics = self.validate_validation_rules(source).await;
+            diagnostics.extend(validation_diagnostics);
+
             // Store and publish diagnostics for PHP files
             self.diagnostics.write().await.insert(uri.clone(), diagnostics.clone());
             self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
@@ -4733,14 +6524,21 @@ impl LanguageServer for LaravelLanguageServer {
                 // We only support goto_definition (Option+click navigation).
                 // Hover popups are redundant - the underline already indicates navigability.
 
-                // ✅ Completion provider for env var autocomplete
-                // Only triggers inside env('...') calls in PHP/Blade and ${...} in .env files
-                // This is lightweight - just string matching + Salsa cache lookup, no tree-sitter
+                // ✅ Completion provider for autocomplete features
+                // Triggers on various characters depending on context:
+                // - ' and " for env(), config(), route(), etc.
+                // - { for ${...} in .env files
+                // - | for pipe-delimited validation rules
+                // - : for validation rule parameters (exists:, after:, etc.)
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
-                        "'".to_string(),  // env('
-                        "\"".to_string(), // env("
+                        "'".to_string(),  // env(', config(', route(', etc.
+                        "\"".to_string(), // env(", config(", route(", etc.
                         "{".to_string(),  // ${
+                        "|".to_string(),  // validation rules: 'required|'
+                        ":".to_string(),  // validation rule params: 'exists:'
+                        ".".to_string(),  // connection.table in exists:/unique:
+                        ",".to_string(),  // table,column in exists:/unique:
                     ]),
                     ..Default::default()
                 }),
@@ -4789,6 +6587,9 @@ impl LanguageServer for LaravelLanguageServer {
 
             // Register env files with Salsa (if not loaded from cache)
             server.register_env_files_with_salsa(&root).await;
+
+            // Initialize database schema provider for exists:/unique: validation autocomplete
+            server.init_database_schema_provider(&root).await;
 
             // Execute pending rescans (vendor, app, node_modules)
             server.execute_pending_rescans().await;
@@ -5284,6 +7085,151 @@ impl LanguageServer for LaravelLanguageServer {
                     .collect();
 
                 debug!("   Returning {} route completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for translation context
+            if let Some(trans_prefix) = Self::get_translation_call_context(line_text, position.character) {
+                debug!("   Translation context, filter prefix: '{}'", trans_prefix);
+
+                // Get all translation keys
+                let translation_keys = self.get_all_translation_keys().await;
+
+                // Build completion items, filtering by prefix (case-sensitive)
+                let items: Vec<CompletionItem> = translation_keys
+                    .into_iter()
+                    .filter(|t| t.key.starts_with(&trans_prefix))
+                    .map(|t| {
+                        let detail = if t.value.is_empty() {
+                            format!("({})", t.source)
+                        } else {
+                            format!("{} ({})", t.value, t.source)
+                        };
+
+                        CompletionItem {
+                            label: t.key.clone(),
+                            kind: Some(CompletionItemKind::TEXT),
+                            detail: Some(detail),
+                            documentation: None,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} translation completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Build surrounding lines context once for both param and rule context checks
+            let surrounding_lines: Vec<&str> = {
+                let line_idx = position.line as usize;
+                let mut context = Vec::new();
+                // Look back up to 10 lines for validation context
+                for i in 1..=10 {
+                    if line_idx >= i {
+                        if let Some(prev_line) = lines.get(line_idx - i) {
+                            context.push(*prev_line);
+                        }
+                    }
+                }
+                context
+            };
+
+            // Get cached validation rule names for context detection
+            let cached_rules = self.cached_validation_rule_names.read().await.clone();
+            info!("   📋 Cached validation rules count: {}", cached_rules.len());
+            if cached_rules.is_empty() {
+                info!("   ⚠️  No cached rules - context detection will use fallback only");
+            }
+
+            // Check for validation rule PARAMETER context first (e.g., "exists:█" or "after:█")
+            info!("   🔍 Checking validation param context for line: '{}'", line_text);
+            if let Some(param_context) = Self::get_validation_param_context(
+                line_text,
+                position.character,
+                &surrounding_lines,
+                &cached_rules,
+            ) {
+                info!(
+                    "   ✅ Validation param context detected: rule='{}', param='{}', index={}",
+                    param_context.rule_name, param_context.current_param, param_context.param_index
+                );
+
+                let items = self.get_validation_param_completions(
+                    &param_context,
+                    &content,
+                    position.line as usize,
+                    uri,
+                    position,
+                ).await;
+
+                info!("   📋 Got {} param completion items", items.len());
+
+                if !items.is_empty() {
+                    info!("   ✅ Returning {} validation param completion items", items.len());
+                    return Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })));
+                } else {
+                    info!("   ⚠️  No param completions available for rule '{}'", param_context.rule_name);
+                }
+            } else {
+                info!("   ℹ️  Not in validation param context");
+            }
+
+            // Check for validation rule context (rule name completion)
+            if let Some(rule_prefix) = Self::get_validation_rule_context(
+                line_text,
+                position.character,
+                &surrounding_lines,
+                &cached_rules,
+            ) {
+                debug!("   Validation rule context, filter prefix: '{}'", rule_prefix);
+
+                // Get all validation rules (built-in + custom)
+                let validation_rules = self.get_all_validation_rules().await;
+
+                // Build completion items, filtering by prefix (case-insensitive for rules)
+                let prefix_lower = rule_prefix.to_lowercase();
+                let items: Vec<CompletionItem> = validation_rules
+                    .into_iter()
+                    .filter(|r| r.name.to_lowercase().starts_with(&prefix_lower))
+                    .map(|r| {
+                        let label = if r.has_params {
+                            format!("{}:", r.name)
+                        } else {
+                            r.name.clone()
+                        };
+
+                        CompletionItem {
+                            label,
+                            kind: Some(CompletionItemKind::KEYWORD),
+                            detail: Some(format!("({})", r.source)),
+                            documentation: Some(Documentation::String(r.description)),
+                            insert_text: Some(r.name.clone()),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} validation rule completion items", items.len());
 
                 return if items.is_empty() {
                     Ok(None)
