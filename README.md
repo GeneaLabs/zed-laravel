@@ -172,6 +172,8 @@ URL::route('contact');
 
 **Autocomplete** — Type `route('` and get suggestions with source file:
 - Shows all route names from `routes/*.php`
+- Parses `Route::resource()` and `Route::apiResource()` for implicit names
+- Respects `->only()` and `->except()` modifiers
 - Works with all route reference patterns
 
 </details>

@@ -2433,6 +2433,32 @@ impl LaravelLanguageServer {
         // Regex to match ->name('route.name') or ->name("route.name")
         let name_pattern = regex::Regex::new(r#"->name\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap();
 
+        // Regex to match Route::resource('name', Controller::class) with optional modifiers
+        // Captures: 1=resource name, 2=rest of the chain (for only/except parsing)
+        let resource_pattern = regex::Regex::new(
+            r#"Route::resource\s*\(\s*['"]([^'"]+)['"]\s*,[^)]+\)([^;]*)"#
+        ).unwrap();
+
+        // Regex to match Route::apiResource('name', Controller::class) with optional modifiers
+        let api_resource_pattern = regex::Regex::new(
+            r#"Route::apiResource\s*\(\s*['"]([^'"]+)['"]\s*,[^)]+\)([^;]*)"#
+        ).unwrap();
+
+        // Regex to extract ->only([...]) actions
+        let only_pattern = regex::Regex::new(
+            r#"->only\s*\(\s*\[([^\]]*)\]"#
+        ).unwrap();
+
+        // Regex to extract ->except([...]) actions
+        let except_pattern = regex::Regex::new(
+            r#"->except\s*\(\s*\[([^\]]*)\]"#
+        ).unwrap();
+
+        // Standard resource actions
+        let resource_actions = ["index", "create", "store", "show", "edit", "update", "destroy"];
+        // API resource actions (no create/edit - those are for forms)
+        let api_resource_actions = ["index", "store", "show", "update", "destroy"];
+
         for file_name in route_files {
             let route_file = routes_dir.join(file_name);
             if route_file.exists() {
@@ -2448,6 +2474,46 @@ impl LaravelLanguageServer {
                             });
                         }
                     }
+
+                    // Find all Route::resource() patterns
+                    for caps in resource_pattern.captures_iter(&content) {
+                        if let Some(resource_name) = caps.get(1) {
+                            let chain = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                            let actions = Self::get_resource_actions(
+                                chain,
+                                &resource_actions,
+                                &only_pattern,
+                                &except_pattern,
+                            );
+
+                            for action in actions {
+                                completions.push(RouteNameCompletion {
+                                    name: format!("{}.{}", resource_name.as_str(), action),
+                                    source: source.clone(),
+                                });
+                            }
+                        }
+                    }
+
+                    // Find all Route::apiResource() patterns
+                    for caps in api_resource_pattern.captures_iter(&content) {
+                        if let Some(resource_name) = caps.get(1) {
+                            let chain = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                            let actions = Self::get_resource_actions(
+                                chain,
+                                &api_resource_actions,
+                                &only_pattern,
+                                &except_pattern,
+                            );
+
+                            for action in actions {
+                                completions.push(RouteNameCompletion {
+                                    name: format!("{}.{}", resource_name.as_str(), action),
+                                    source: source.clone(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2459,6 +2525,53 @@ impl LaravelLanguageServer {
         completions.dedup_by(|a, b| a.name == b.name);
 
         completions
+    }
+
+    /// Parse ->only() and ->except() modifiers to determine which resource actions to include
+    fn get_resource_actions<'a>(
+        chain: &str,
+        all_actions: &'a [&'a str],
+        only_pattern: &regex::Regex,
+        except_pattern: &regex::Regex,
+    ) -> Vec<&'a str> {
+        // Check for ->only([...])
+        if let Some(only_caps) = only_pattern.captures(chain) {
+            if let Some(only_list) = only_caps.get(1) {
+                let only_actions: Vec<&str> = only_list
+                    .as_str()
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('\'').trim_matches('"'))
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                return all_actions
+                    .iter()
+                    .filter(|a| only_actions.contains(a))
+                    .copied()
+                    .collect();
+            }
+        }
+
+        // Check for ->except([...])
+        if let Some(except_caps) = except_pattern.captures(chain) {
+            if let Some(except_list) = except_caps.get(1) {
+                let except_actions: Vec<&str> = except_list
+                    .as_str()
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('\'').trim_matches('"'))
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                return all_actions
+                    .iter()
+                    .filter(|a| !except_actions.contains(a))
+                    .copied()
+                    .collect();
+            }
+        }
+
+        // No modifiers - return all actions
+        all_actions.to_vec()
     }
 
     /// Parse a PHP config file to extract all keys and values
