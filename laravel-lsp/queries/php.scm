@@ -1233,3 +1233,29 @@
   (#eq? @method_name "routeIs"))
 
 ; ============================================================================
+; Pattern 26: $request->route()->named('name') - Check if route matches name
+; ============================================================================
+; Matches: $request->route()->named('profile')
+;          $request->route()->named('admin.dashboard')
+;
+; Check if the current route has a specific name
+
+; Single-quoted strings
+(member_call_expression
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @route_name)))
+  (#eq? @method_name "named"))
+
+; Double-quoted strings
+(member_call_expression
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @route_name)))
+  (#eq? @method_name "named"))

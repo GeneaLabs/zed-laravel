@@ -160,7 +160,19 @@ $url = route('users.show', $user);
 
 return redirect()->route('dashboard');
 return to_route('login');
+
+// All these patterns are supported:
+Route::has('admin.dashboard');
+Route::is('user.*');
+Route::currentRouteNamed('home');
+$request->routeIs('profile');
+$request->route()->named('settings');
+URL::route('contact');
 ```
+
+**Autocomplete** — Type `route('` and get suggestions with source file:
+- Shows all route names from `routes/*.php`
+- Works with all route reference patterns
 
 </details>
 
@@ -506,9 +518,9 @@ Add to your Zed `settings.json` if you want to adjust the diagnostic update timi
 **Done:**
 - [x] Environment variables: `env('█')`, `${█}` in .env, `<env name="█">` in phpunit.xml
 - [x] Config keys: `config('█')`, `Config::get('█')`, etc. (with resolved env values)
+- [x] Route names: `route('█')`, `to_route('█')`, `URL::route('█')`, etc.
 
 **Planned:**
-- [ ] Route names: `route('█')`
 - [ ] Translation keys: `__('█')`
 - [ ] Component names: `<x-█`
 - [ ] Validation rules

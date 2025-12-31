@@ -126,6 +126,14 @@ struct ConfigKeyCompletion {
     source: String,
 }
 
+/// A route name for autocomplete
+struct RouteNameCompletion {
+    /// The route name (e.g., "users.index")
+    name: String,
+    /// Source file (e.g., "routes/web.php")
+    source: String,
+}
+
 /// The main Laravel Language Server struct
 /// This holds all the state for our LSP
 #[derive(Clone)]
@@ -2278,6 +2286,82 @@ impl LaravelLanguageServer {
         Some(after_pattern.to_string())
     }
 
+    /// Check if cursor is inside route('...'), to_route('...'), or other route-related calls
+    /// Returns the partial text typed so far (for filtering completions)
+    ///
+    /// Examples:
+    /// - `route('users.` returns Some("users.")
+    /// - `to_route('admin.` returns Some("admin.")
+    /// - `redirect()->route('` returns Some("")
+    fn get_route_call_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Look for various route patterns before cursor
+        // Pattern: (pattern_string, quote_char, pattern_length)
+        let patterns: Vec<(&str, char, usize)> = vec![
+            // route(' or route("
+            ("route('", '\'', 7),
+            ("route(\"", '"', 7),
+            // to_route(' or to_route("
+            ("to_route('", '\'', 10),
+            ("to_route(\"", '"', 10),
+            // ->route(' (for redirect()->route)
+            ("->route('", '\'', 9),
+            ("->route(\"", '"', 9),
+            // URL::route('
+            ("URL::route('", '\'', 12),
+            ("URL::route(\"", '"', 12),
+            // Route::has('
+            ("Route::has('", '\'', 12),
+            ("Route::has(\"", '"', 12),
+            // Route::is('
+            ("Route::is('", '\'', 11),
+            ("Route::is(\"", '"', 11),
+            // Route::currentRouteNamed('
+            ("Route::currentRouteNamed('", '\'', 26),
+            ("Route::currentRouteNamed(\"", '"', 26),
+            // ->routeIs('
+            ("->routeIs('", '\'', 11),
+            ("->routeIs(\"", '"', 11),
+            // ->named('
+            ("->named('", '\'', 9),
+            ("->named(\"", '"', 9),
+        ];
+
+        // Find all matches and their positions
+        let mut matches: Vec<(usize, char, usize)> = Vec::new();
+
+        for (pattern, quote, len) in &patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                matches.push((pos, *quote, *len));
+            }
+        }
+
+        if matches.is_empty() {
+            return None;
+        }
+
+        // Find the latest match (closest to cursor)
+        let (pos, quote_char, pattern_len) = matches
+            .into_iter()
+            .max_by_key(|(p, _, _)| *p)?;
+
+        let start_pos = pos + pattern_len;
+
+        // Check that there's no closing quote between start and cursor
+        let after_pattern = &before_cursor[start_pos..];
+        if after_pattern.contains(quote_char) {
+            return None;
+        }
+
+        Some(after_pattern.to_string())
+    }
+
     /// Get all config keys from config/*.php files for autocomplete
     async fn get_all_config_keys(&self) -> Vec<ConfigKeyCompletion> {
         let root = match self.root_path.read().await.clone() {
@@ -2328,6 +2412,52 @@ impl LaravelLanguageServer {
 
         // Sort by key for consistent ordering
         completions.sort_by(|a, b| a.key.cmp(&b.key));
+        completions
+    }
+
+    /// Get all route names from routes/*.php files for autocomplete
+    async fn get_all_route_names(&self) -> Vec<RouteNameCompletion> {
+        let root = match self.root_path.read().await.clone() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        let routes_dir = root.join("routes");
+        if !routes_dir.exists() {
+            return Vec::new();
+        }
+
+        let mut completions = Vec::new();
+        let route_files = ["web.php", "api.php", "channels.php", "console.php"];
+
+        // Regex to match ->name('route.name') or ->name("route.name")
+        let name_pattern = regex::Regex::new(r#"->name\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap();
+
+        for file_name in route_files {
+            let route_file = routes_dir.join(file_name);
+            if route_file.exists() {
+                if let Ok(content) = std::fs::read_to_string(&route_file) {
+                    let source = format!("routes/{}", file_name);
+
+                    // Find all ->name('...') patterns
+                    for caps in name_pattern.captures_iter(&content) {
+                        if let Some(name_match) = caps.get(1) {
+                            completions.push(RouteNameCompletion {
+                                name: name_match.as_str().to_string(),
+                                source: source.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by name for consistent ordering
+        completions.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Remove duplicates (same route name from different files - keep first occurrence)
+        completions.dedup_by(|a, b| a.name == b.name);
+
         completions
     }
 
@@ -5007,6 +5137,40 @@ impl LanguageServer for LaravelLanguageServer {
                     .collect();
 
                 debug!("   Returning {} config completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for route context
+            if let Some(route_prefix) = Self::get_route_call_context(line_text, position.character) {
+                debug!("   Route context, filter prefix: '{}'", route_prefix);
+
+                // Get all route names
+                let route_names = self.get_all_route_names().await;
+
+                // Build completion items, filtering by prefix (case-sensitive)
+                let items: Vec<CompletionItem> = route_names
+                    .into_iter()
+                    .filter(|r| r.name.starts_with(&route_prefix))
+                    .map(|r| {
+                        CompletionItem {
+                            label: r.name.clone(),
+                            kind: Some(CompletionItemKind::CONSTANT),
+                            detail: Some(format!("({})", r.source)),
+                            documentation: None,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} route completion items", items.len());
 
                 return if items.is_empty() {
                     Ok(None)
