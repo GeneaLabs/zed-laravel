@@ -110,7 +110,7 @@ Route::view('/welcome', 'welcome');
 </details>
 
 <details>
-<summary><strong>Config</strong> — <code>config()</code></summary>
+<summary><strong>Config</strong> — <code>config()</code>, <code>Config::</code></summary>
 
 ```php
 $appName = config('app.name');
@@ -118,7 +118,18 @@ $appName = config('app.name');
 
 $driver = config('database.default');
 $mailHost = config('mail.mailers.smtp.host');
+
+// Config facade methods also supported
+Config::get('app.name');
+Config::string('app.timezone');
+Config::boolean('app.debug');
+Config::integer('queue.retry_after');
+Config::array('app.providers');
 ```
+
+**Autocomplete** — Type `config('` and get suggestions with resolved values:
+- Shows all config keys from `config/*.php`
+- Resolves `env()` references to actual values from `.env`
 
 </details>
 
@@ -494,10 +505,10 @@ Add to your Zed `settings.json` if you want to adjust the diagnostic update timi
 
 **Done:**
 - [x] Environment variables: `env('█')`, `${█}` in .env, `<env name="█">` in phpunit.xml
+- [x] Config keys: `config('█')`, `Config::get('█')`, etc. (with resolved env values)
 
 **Planned:**
 - [ ] Route names: `route('█')`
-- [ ] Config keys: `config('█')`
 - [ ] Translation keys: `__('█')`
 - [ ] Component names: `<x-█`
 - [ ] Validation rules

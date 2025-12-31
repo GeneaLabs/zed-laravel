@@ -223,6 +223,65 @@
   (#eq? @function_name "config"))
 
 ; ============================================================================
+; Pattern 6b: Config::get('key'), Config::string('key'), etc. - Facade methods
+; ============================================================================
+; Matches: Config::get('app.name')
+;          Config::string('app.name')
+;          Config::integer('app.timeout')
+;          Config::boolean('app.debug')
+;          Config::array('app.providers')
+;
+; This captures config key access via the Config facade
+
+; Single-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @config_key)))
+  (#eq? @class_name "Config")
+  (#match? @method_name "^(get|string|integer|boolean|array|set|has)$"))
+
+; Double-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @config_key)))
+  (#eq? @class_name "Config")
+  (#match? @method_name "^(get|string|integer|boolean|array|set|has)$"))
+
+; Also match fully qualified Config class - single quotes
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @config_key)))
+  (#match? @class_name ".*Config$")
+  (#match? @method_name "^(get|string|integer|boolean|array|set|has)$"))
+
+; Also match fully qualified Config class - double quotes
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @config_key)))
+  (#match? @class_name ".*Config$")
+  (#match? @method_name "^(get|string|integer|boolean|array|set|has)$"))
+
+; ============================================================================
 ; Pattern 7: route('route.name') function calls
 ; ============================================================================
 ; Matches: route('home')

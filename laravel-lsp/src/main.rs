@@ -116,6 +116,16 @@ struct ConfigCheck {
     nested_key: Option<String>,
 }
 
+/// A config key for autocomplete
+struct ConfigKeyCompletion {
+    /// The full dot-notation key (e.g., "app.name")
+    key: String,
+    /// The value (truncated for display)
+    value: String,
+    /// Source file (e.g., "config/app.php")
+    source: String,
+}
+
 /// The main Laravel Language Server struct
 /// This holds all the state for our LSP
 #[derive(Clone)]
@@ -2167,6 +2177,317 @@ impl LaravelLanguageServer {
         }
 
         Some(after_pattern.to_string())
+    }
+
+    /// Check if cursor is inside config('...') or Config::get('...') calls
+    /// Returns the partial text typed so far (for filtering completions)
+    ///
+    /// Examples:
+    /// - `config('app.` returns Some("app.")
+    /// - `Config::get('db.` returns Some("db.")
+    /// - `Config::string('app.` returns Some("app.")
+    fn get_config_call_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Look for various config patterns before cursor
+        // config(' or config("
+        let config_single = before_cursor.rfind("config('");
+        let config_double = before_cursor.rfind("config(\"");
+
+        // Config::get(' or Config::get("
+        let facade_get_single = before_cursor.rfind("Config::get('");
+        let facade_get_double = before_cursor.rfind("Config::get(\"");
+
+        // Config::string(', Config::integer(', Config::boolean(', Config::array('
+        let facade_string_single = before_cursor.rfind("Config::string('");
+        let facade_string_double = before_cursor.rfind("Config::string(\"");
+        let facade_integer_single = before_cursor.rfind("Config::integer('");
+        let facade_integer_double = before_cursor.rfind("Config::integer(\"");
+        let facade_boolean_single = before_cursor.rfind("Config::boolean('");
+        let facade_boolean_double = before_cursor.rfind("Config::boolean(\"");
+        let facade_array_single = before_cursor.rfind("Config::array('");
+        let facade_array_double = before_cursor.rfind("Config::array(\"");
+
+        // Find the latest match and its corresponding quote character
+        let matches: Vec<(usize, char, usize)> = vec![
+            (config_single.unwrap_or(0), '\'', 8),      // config('
+            (config_double.unwrap_or(0), '"', 8),       // config("
+            (facade_get_single.unwrap_or(0), '\'', 13), // Config::get('
+            (facade_get_double.unwrap_or(0), '"', 13),  // Config::get("
+            (facade_string_single.unwrap_or(0), '\'', 16), // Config::string('
+            (facade_string_double.unwrap_or(0), '"', 16),  // Config::string("
+            (facade_integer_single.unwrap_or(0), '\'', 17), // Config::integer('
+            (facade_integer_double.unwrap_or(0), '"', 17),  // Config::integer("
+            (facade_boolean_single.unwrap_or(0), '\'', 17), // Config::boolean('
+            (facade_boolean_double.unwrap_or(0), '"', 17),  // Config::boolean("
+            (facade_array_single.unwrap_or(0), '\'', 15), // Config::array('
+            (facade_array_double.unwrap_or(0), '"', 15),  // Config::array("
+        ];
+
+        // Filter to only actual matches (position > 0 or the pattern was actually found at 0)
+        let actual_matches: Vec<(usize, char, usize)> = matches
+            .into_iter()
+            .filter(|(pos, quote, len)| {
+                if *pos == 0 {
+                    // Check if pattern actually exists at position 0
+                    let patterns = [
+                        ("config('", '\'', 8),
+                        ("config(\"", '"', 8),
+                        ("Config::get('", '\'', 13),
+                        ("Config::get(\"", '"', 13),
+                        ("Config::string('", '\'', 16),
+                        ("Config::string(\"", '"', 16),
+                        ("Config::integer('", '\'', 17),
+                        ("Config::integer(\"", '"', 17),
+                        ("Config::boolean('", '\'', 17),
+                        ("Config::boolean(\"", '"', 17),
+                        ("Config::array('", '\'', 15),
+                        ("Config::array(\"", '"', 15),
+                    ];
+                    patterns.iter().any(|(pat, q, l)| {
+                        before_cursor.starts_with(pat) && *q == *quote && *l == *len
+                    })
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        if actual_matches.is_empty() {
+            return None;
+        }
+
+        // Find the latest match
+        let (pos, quote_char, pattern_len) = actual_matches
+            .into_iter()
+            .max_by_key(|(p, _, _)| *p)?;
+
+        let start_pos = pos + pattern_len;
+
+        // Check that there's no closing quote between start and cursor
+        let after_pattern = &before_cursor[start_pos..];
+        if after_pattern.contains(quote_char) {
+            return None;
+        }
+
+        Some(after_pattern.to_string())
+    }
+
+    /// Get all config keys from config/*.php files for autocomplete
+    async fn get_all_config_keys(&self) -> Vec<ConfigKeyCompletion> {
+        let root = match self.root_path.read().await.clone() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        let config_dir = root.join("config");
+        if !config_dir.exists() {
+            return Vec::new();
+        }
+
+        // Get env vars for resolving env() references
+        let env_vars: std::collections::HashMap<String, String> = match self.salsa.get_all_parsed_env_vars().await {
+            Ok(vars) => vars.into_iter()
+                .filter(|v| !v.is_commented)
+                .map(|v| (v.name, v.value))
+                .collect(),
+            Err(_) => std::collections::HashMap::new(),
+        };
+
+        let mut completions = Vec::new();
+
+        // Read all PHP files in config directory
+        if let Ok(entries) = std::fs::read_dir(&config_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |e| e == "php") {
+                    if let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) {
+                        let base_key = file_name.to_string();
+                        let source = format!("config/{}.php", file_name);
+
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            // Parse the config file and extract keys
+                            let keys = Self::parse_config_keys(&content, &base_key, &env_vars);
+                            for (key, value) in keys {
+                                completions.push(ConfigKeyCompletion {
+                                    key,
+                                    value,
+                                    source: source.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by key for consistent ordering
+        completions.sort_by(|a, b| a.key.cmp(&b.key));
+        completions
+    }
+
+    /// Parse a PHP config file to extract all keys and values
+    /// Returns a list of (key, value) tuples with dot-notation keys
+    fn parse_config_keys(
+        content: &str,
+        base_key: &str,
+        env_vars: &std::collections::HashMap<String, String>,
+    ) -> Vec<(String, String)> {
+        let mut results = Vec::new();
+
+        // Simple regex-based parsing for Laravel config files
+        // This handles the common patterns: 'key' => value, or "key" => value
+        let key_pattern = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"][\s]*=>"#).unwrap();
+
+        // Track nesting depth and current key path
+        let mut key_stack: Vec<String> = vec![base_key.to_string()];
+        let mut in_array_depth = 0;
+        let mut pending_key: Option<String> = None;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+
+            // Skip comments and empty lines
+            if trimmed.is_empty()
+                || trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with("*")
+            {
+                continue;
+            }
+
+            // Handle array opening
+            if trimmed.contains("[") && !trimmed.contains("=>") {
+                in_array_depth += 1;
+                if let Some(key) = pending_key.take() {
+                    key_stack.push(key);
+                }
+                continue;
+            }
+
+            // Handle key => [ (nested array on same line)
+            if let Some(caps) = key_pattern.captures(trimmed) {
+                let key_name = caps.get(1).unwrap().as_str();
+
+                if trimmed.contains("=> [") || trimmed.ends_with("=> [") {
+                    // This is a nested array
+                    pending_key = Some(key_name.to_string());
+                    in_array_depth += 1;
+                    key_stack.push(key_name.to_string());
+                } else {
+                    // This is a simple key => value
+                    let full_key = format!("{}.{}", key_stack.join("."), key_name);
+
+                    // Extract value and resolve env() references
+                    let value = Self::extract_config_value(trimmed, env_vars);
+                    results.push((full_key, value));
+                }
+            }
+
+            // Handle array closing
+            let close_count = trimmed.matches(']').count();
+            for _ in 0..close_count {
+                if in_array_depth > 0 {
+                    in_array_depth -= 1;
+                    if key_stack.len() > 1 {
+                        key_stack.pop();
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Extract the value from a config line like "'key' => value,"
+    /// Resolves env() references using the provided env_vars map
+    fn extract_config_value(
+        line: &str,
+        env_vars: &std::collections::HashMap<String, String>,
+    ) -> String {
+        if let Some(arrow_pos) = line.find("=>") {
+            let after_arrow = &line[arrow_pos + 2..];
+            let value = after_arrow.trim().trim_end_matches(',').trim();
+
+            // Check for env() call pattern: env('VAR_NAME') or env('VAR_NAME', 'default')
+            let resolved = Self::resolve_env_value(value, env_vars);
+
+            // Truncate long values for display
+            let display_value = if resolved.len() > 50 {
+                format!("{}...", &resolved[..47])
+            } else {
+                resolved
+            };
+
+            display_value
+        } else {
+            String::new()
+        }
+    }
+
+    /// Resolve an env() call to its actual value
+    /// Handles: env('VAR'), env('VAR', 'default'), env('VAR', default_value)
+    fn resolve_env_value(
+        value: &str,
+        env_vars: &std::collections::HashMap<String, String>,
+    ) -> String {
+        // Match env('VAR_NAME') or env('VAR_NAME', default) or env("VAR_NAME", default)
+        let env_pattern = regex::Regex::new(
+            r#"env\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"](?:\s*,\s*(.+))?\s*\)"#
+        ).unwrap();
+
+        if let Some(caps) = env_pattern.captures(value) {
+            let var_name = caps.get(1).unwrap().as_str();
+
+            // Try to get value from env vars
+            if let Some(env_value) = env_vars.get(var_name) {
+                return env_value.clone();
+            }
+
+            // Fall back to default if provided
+            if let Some(default_match) = caps.get(2) {
+                let default = default_match.as_str().trim();
+                // Clean up quotes from default value
+                return default
+                    .trim_matches('\'')
+                    .trim_matches('"')
+                    .to_string();
+            }
+
+            // No value found, return the var name as placeholder
+            return format!("${{{}}}", var_name);
+        }
+
+        // Check for (bool) env(...) pattern
+        let bool_env_pattern = regex::Regex::new(
+            r#"\(bool\)\s*env\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"](?:\s*,\s*(.+))?\s*\)"#
+        ).unwrap();
+
+        if let Some(caps) = bool_env_pattern.captures(value) {
+            let var_name = caps.get(1).unwrap().as_str();
+
+            if let Some(env_value) = env_vars.get(var_name) {
+                return env_value.clone();
+            }
+
+            if let Some(default_match) = caps.get(2) {
+                let default = default_match.as_str().trim();
+                return default.to_string();
+            }
+
+            return format!("${{{}}}", var_name);
+        }
+
+        // Not an env() call, clean up and return as-is
+        value
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string()
     }
 
     // ========================================================================
@@ -4654,8 +4975,52 @@ impl LanguageServer for LaravelLanguageServer {
         let is_phpunit_file = path.ends_with("phpunit.xml")
             || path.ends_with("phpunit.xml.dist")
             || path.ends_with("phpunit.dist.xml");
+        let is_php_or_blade = path.ends_with(".php") || path.ends_with(".blade.php");
 
-        let filter_prefix = if is_env_file {
+        // In PHP/Blade files, check for config context first
+        if is_php_or_blade {
+            if let Some(config_prefix) = Self::get_config_call_context(line_text, position.character) {
+                debug!("   Config context, filter prefix: '{}'", config_prefix);
+
+                // Get all config keys
+                let config_keys = self.get_all_config_keys().await;
+
+                // Build completion items, filtering by prefix (case-sensitive)
+                let items: Vec<CompletionItem> = config_keys
+                    .into_iter()
+                    .filter(|c| c.key.starts_with(&config_prefix))
+                    .map(|c| {
+                        let detail = if c.value.is_empty() {
+                            format!("({})", c.source)
+                        } else {
+                            format!("{} ({})", c.value, c.source)
+                        };
+
+                        CompletionItem {
+                            label: c.key.clone(),
+                            kind: Some(CompletionItemKind::CONSTANT),
+                            detail: Some(detail),
+                            documentation: None,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} config completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+        }
+
+        // Check for env context
+        let env_filter_prefix = if is_env_file {
             // In .env files, check for ${...} interpolation
             Self::get_env_interpolation_context(line_text, position.character)
         } else if is_phpunit_file {
@@ -4667,15 +5032,15 @@ impl LanguageServer for LaravelLanguageServer {
         };
 
         // If not in a valid context, return no completions
-        let filter_prefix = match filter_prefix {
+        let filter_prefix = match env_filter_prefix {
             Some(prefix) => prefix,
             None => {
-                debug!("   Not in env completion context");
+                debug!("   Not in completion context");
                 return Ok(None);
             }
         };
 
-        debug!("   Filter prefix: '{}'", filter_prefix);
+        debug!("   Env filter prefix: '{}'", filter_prefix);
 
         // Get all env vars from Salsa (.env files)
         let env_vars = match self.salsa.get_all_parsed_env_vars().await {
@@ -4727,7 +5092,7 @@ impl LanguageServer for LaravelLanguageServer {
             }
         }
 
-        debug!("   Returning {} completion items", items.len());
+        debug!("   Returning {} env completion items", items.len());
 
         if items.is_empty() {
             Ok(None)
