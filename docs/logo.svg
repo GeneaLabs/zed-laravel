@@ -5,10 +5,13 @@
       <stop offset="100%" style="stop-color:#E3342F"/>
     </linearGradient>
   </defs>
-  <!-- Zed-style angular background -->
-  <path d="M24 8 L104 8 L120 24 L120 104 L104 120 L24 120 L8 104 L8 24 Z" fill="url(#laravelGrad)"/>
-  <!-- Stylized L with angular cut like Zed's Z -->
-  <path d="M40 32 L56 32 L56 80 L88 80 L88 96 L40 96 Z" fill="white"/>
-  <!-- Angular accent cut -->
-  <path d="M56 80 L72 64 L72 80 Z" fill="url(#laravelGrad)"/>
+
+  <!-- Squircle background (Zed's logo shape) -->
+  <rect width="128" height="128" rx="32" ry="32" fill="url(#laravelGrad)"/>
+
+  <!-- Bold L with angular step (Zed-inspired) -->
+  <path d="M 38 24 L 54 24 L 54 82 L 90 82 L 90 104 L 38 104 Z" fill="white"/>
+
+  <!-- Angular accent notch -->
+  <path d="M 54 82 L 70 66 L 70 82 Z" fill="url(#laravelGrad)"/>
 </svg>
