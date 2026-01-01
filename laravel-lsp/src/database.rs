@@ -18,6 +18,8 @@ pub struct DatabaseSchema {
     pub tables: Vec<String>,
     /// Map of table name to column names
     pub columns: HashMap<String, Vec<String>>,
+    /// Map of table name to columns with types (column_name, php_type)
+    pub columns_with_types: HashMap<String, Vec<(String, String)>>,
     /// When the cache was last updated
     pub cached_at: Instant,
 }
@@ -136,6 +138,56 @@ impl DatabaseSchemaProvider {
             .await
             .and_then(|s| s.columns.get(table).cloned())
             .unwrap_or_default()
+    }
+
+    /// Get columns with their PHP types for a specific table
+    /// Returns Vec<(column_name, php_type)>
+    pub async fn get_columns_with_types(&self, table: &str) -> Vec<(String, String)> {
+        self.get_schema()
+            .await
+            .and_then(|s| s.columns_with_types.get(table).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Map SQL data type to PHP type
+    /// Note: Without casts, Eloquent returns database values as-is
+    /// Dates are strings unless cast, JSON is a string unless cast
+    fn map_sql_type_to_php(sql_type: &str) -> String {
+        let sql_lower = sql_type.to_lowercase();
+
+        // Integer types
+        if sql_lower.contains("int")
+            || sql_lower.contains("serial")
+            || sql_lower == "integer"
+            || sql_lower == "smallint"
+            || sql_lower == "bigint"
+        {
+            return "int".to_string();
+        }
+
+        // Float/decimal types
+        if sql_lower.contains("float")
+            || sql_lower.contains("double")
+            || sql_lower.contains("decimal")
+            || sql_lower.contains("numeric")
+            || sql_lower.contains("real")
+            || sql_lower.contains("money")
+        {
+            return "float".to_string();
+        }
+
+        // Boolean (PostgreSQL only - MySQL tinyint(1) is still int without cast)
+        if sql_lower == "boolean" || sql_lower == "bool" {
+            return "bool".to_string();
+        }
+
+        // Everything else is a string in PHP without casts:
+        // - varchar, text, char
+        // - datetime, timestamp, date, time (strings unless cast to Carbon)
+        // - json, jsonb (strings unless cast to array)
+        // - blob, binary
+        // - enum, set
+        "string".to_string()
     }
 
     /// Get all available database connection names from config/database.php
@@ -592,17 +644,29 @@ impl DatabaseSchemaProvider {
             .filter_map(|row| row.try_get::<String, _>(0).ok())
             .collect();
 
-        // Get columns for each table
+        // Get columns for each table (with types)
         let mut columns = HashMap::new();
+        let mut columns_with_types = HashMap::new();
         for table in &tables {
-            let cols: Vec<String> = sqlx::query(&format!("DESCRIBE `{}`", table))
+            let rows = sqlx::query(&format!("SHOW COLUMNS FROM `{}`", table))
                 .fetch_all(&pool)
                 .await
-                .ok()?
-                .into_iter()
-                .filter_map(|row| row.try_get::<String, _>("Field").ok())
-                .collect();
-            columns.insert(table.clone(), cols);
+                .ok()?;
+
+            let mut col_names = Vec::new();
+            let mut col_types = Vec::new();
+
+            for row in rows {
+                if let Ok(field) = row.try_get::<String, _>("Field") {
+                    let sql_type = row.try_get::<String, _>("Type").unwrap_or_default();
+                    let php_type = Self::map_sql_type_to_php(&sql_type);
+                    col_names.push(field.clone());
+                    col_types.push((field, php_type));
+                }
+            }
+
+            columns.insert(table.clone(), col_names);
+            columns_with_types.insert(table.clone(), col_types);
         }
 
         info!("MySQL schema loaded: {} tables", tables.len());
@@ -610,6 +674,7 @@ impl DatabaseSchemaProvider {
         Some(DatabaseSchema {
             tables,
             columns,
+            columns_with_types,
             cached_at: Instant::now(),
         })
     }
@@ -650,20 +715,32 @@ impl DatabaseSchemaProvider {
             .filter_map(|row| row.try_get::<String, _>("table_name").ok())
             .collect();
 
-        // Get columns for each table
+        // Get columns for each table (with types)
         let mut columns = HashMap::new();
+        let mut columns_with_types = HashMap::new();
         for table in &tables {
-            let cols: Vec<String> = sqlx::query(
-                "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1"
+            let rows = sqlx::query(
+                "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1"
             )
                 .bind(table)
                 .fetch_all(&pool)
                 .await
-                .ok()?
-                .into_iter()
-                .filter_map(|row| row.try_get::<String, _>("column_name").ok())
-                .collect();
-            columns.insert(table.clone(), cols);
+                .ok()?;
+
+            let mut col_names = Vec::new();
+            let mut col_types = Vec::new();
+
+            for row in rows {
+                if let Ok(col_name) = row.try_get::<String, _>("column_name") {
+                    let sql_type = row.try_get::<String, _>("data_type").unwrap_or_default();
+                    let php_type = Self::map_sql_type_to_php(&sql_type);
+                    col_names.push(col_name.clone());
+                    col_types.push((col_name, php_type));
+                }
+            }
+
+            columns.insert(table.clone(), col_names);
+            columns_with_types.insert(table.clone(), col_types);
         }
 
         info!("PostgreSQL schema loaded: {} tables", tables.len());
@@ -671,6 +748,7 @@ impl DatabaseSchemaProvider {
         Some(DatabaseSchema {
             tables,
             columns,
+            columns_with_types,
             cached_at: Instant::now(),
         })
     }
@@ -722,17 +800,29 @@ impl DatabaseSchemaProvider {
             .filter_map(|row| row.try_get::<String, _>("name").ok())
             .collect();
 
-        // Get columns for each table
+        // Get columns for each table (with types)
         let mut columns = HashMap::new();
+        let mut columns_with_types = HashMap::new();
         for table in &tables {
-            let cols: Vec<String> = sqlx::query(&format!("PRAGMA table_info('{}')", table))
+            let rows = sqlx::query(&format!("PRAGMA table_info('{}')", table))
                 .fetch_all(&pool)
                 .await
-                .ok()?
-                .into_iter()
-                .filter_map(|row| row.try_get::<String, _>("name").ok())
-                .collect();
-            columns.insert(table.clone(), cols);
+                .ok()?;
+
+            let mut col_names = Vec::new();
+            let mut col_types = Vec::new();
+
+            for row in rows {
+                if let Ok(col_name) = row.try_get::<String, _>("name") {
+                    let sql_type = row.try_get::<String, _>("type").unwrap_or_default();
+                    let php_type = Self::map_sql_type_to_php(&sql_type);
+                    col_names.push(col_name.clone());
+                    col_types.push((col_name, php_type));
+                }
+            }
+
+            columns.insert(table.clone(), col_names);
+            columns_with_types.insert(table.clone(), col_types);
         }
 
         info!("SQLite schema loaded: {} tables", tables.len());
@@ -740,6 +830,7 @@ impl DatabaseSchemaProvider {
         Some(DatabaseSchema {
             tables,
             columns,
+            columns_with_types,
             cached_at: Instant::now(),
         })
     }
@@ -793,22 +884,34 @@ impl DatabaseSchemaProvider {
             .filter_map(|row| row.get::<&str, _>("TABLE_NAME").map(|s| s.to_string()))
             .collect();
 
-        // Get columns for each table
+        // Get columns for each table (with types)
         let mut columns = HashMap::new();
+        let mut columns_with_types = HashMap::new();
         for table in &tables {
             let stream = client.query(
-                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @P1",
+                "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @P1",
                 &[&table.as_str()]
             ).await.ok()?;
 
-            let cols: Vec<String> = stream
+            let rows = stream
                 .into_first_result()
                 .await
-                .ok()?
-                .into_iter()
-                .filter_map(|row| row.get::<&str, _>("COLUMN_NAME").map(|s| s.to_string()))
-                .collect();
-            columns.insert(table.clone(), cols);
+                .ok()?;
+
+            let mut col_names = Vec::new();
+            let mut col_types = Vec::new();
+
+            for row in rows {
+                if let Some(col_name) = row.get::<&str, _>("COLUMN_NAME") {
+                    let sql_type = row.get::<&str, _>("DATA_TYPE").unwrap_or("");
+                    let php_type = Self::map_sql_type_to_php(sql_type);
+                    col_names.push(col_name.to_string());
+                    col_types.push((col_name.to_string(), php_type));
+                }
+            }
+
+            columns.insert(table.clone(), col_names);
+            columns_with_types.insert(table.clone(), col_types);
         }
 
         info!("SQL Server schema loaded: {} tables", tables.len());
@@ -816,6 +919,7 @@ impl DatabaseSchemaProvider {
         Some(DatabaseSchema {
             tables,
             columns,
+            columns_with_types,
             cached_at: Instant::now(),
         })
     }
@@ -840,8 +944,44 @@ mod tests {
         let schema = DatabaseSchema {
             tables: vec!["users".to_string()],
             columns: HashMap::new(),
+            columns_with_types: HashMap::new(),
             cached_at: Instant::now(),
         };
         assert!(schema.is_valid());
+    }
+
+    #[test]
+    fn test_map_sql_type_to_php() {
+        // Integer types
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("int"), "int");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("INTEGER"), "int");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("bigint"), "int");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("smallint"), "int");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("tinyint"), "int");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("serial"), "int");
+
+        // Float types
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("float"), "float");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("double"), "float");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("decimal(10,2)"), "float");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("numeric"), "float");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("real"), "float");
+
+        // Boolean (PostgreSQL only)
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("boolean"), "bool");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("bool"), "bool");
+
+        // String types (dates and json are strings without casts!)
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("varchar(255)"), "string");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("text"), "string");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("char(10)"), "string");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("datetime"), "string");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("timestamp"), "string");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("date"), "string");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("time"), "string");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("json"), "string");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("jsonb"), "string");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("blob"), "string");
+        assert_eq!(DatabaseSchemaProvider::map_sql_type_to_php("enum('a','b')"), "string");
     }
 }

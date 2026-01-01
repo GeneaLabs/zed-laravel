@@ -28,13 +28,13 @@
 
 ---
 
-## Install
+## 📦 Install
 
 Search **"Laravel"** in Zed Extensions and click Install.
 
 **From source:** Clone the repo, run `cargo build --release` in `laravel-lsp/`, then use "zed: install dev extension".
 
-## Configuration
+## ⚙️ Configuration
 
 The extension works out of the box with zero configuration. It automatically discovers your Laravel project structure, including view paths, component namespaces, route files, and service providers.
 
@@ -58,7 +58,7 @@ The extension works out of the box with zero configuration. It automatically dis
 |---------|---------|-------------|
 | `debounceMs` | `200` | Delay before diagnostics update after typing. Lower values (50-100ms) give faster feedback on fast machines. Higher values (300-500ms) reduce CPU usage on slower machines or large projects. |
 
-**Database autocomplete** (`exists:`, `unique:` rules) requires a working database connection. Configure in your `.env`:
+**🗄️ Database autocomplete** (`exists:`, `unique:` rules, Eloquent properties) requires a working database connection. Configure in your `.env`:
 
 ```env
 DB_CONNECTION=mysql
@@ -70,9 +70,9 @@ DB_PASSWORD=secret
 
 Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
-## Features
+## ✨ Features
 
-### Go-to-Definition
+### 🔗 Go-to-Definition
 
 Navigate your Laravel codebase by Cmd+Clicking (or `Cmd+D`) on any recognized pattern. The extension understands Laravel's conventions and jumps directly to the source file, whether it's a view, component, route, config key, or translation.
 
@@ -112,44 +112,79 @@ $message = __('auth.failed');
 **Supported patterns:**
 `view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `<livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()`
 
-### Autocomplete
+### 💡 Autocomplete
 
-Get intelligent suggestions as you type. The extension provides context-aware completions for views, Blade components, validation rules, database schemas, config keys, routes, middleware, translations, and environment variables. Completions include helpful metadata like resolved values and source file locations.
+Get intelligent suggestions as you type. The extension provides context-aware completions for views, Blade components, validation rules, database schemas, config keys, routes, middleware, translations, environment variables, Eloquent models, and Blade variables.
 
 ```php
 $request->validate([
     'email' => 'required|email|exists:',
-    //                               ^ database tables appear here
+    //                               ^ 🗄️ database tables appear here
 
     'email' => 'required|email|exists:users,',
-    //                                     ^ column names appear here
+    //                                     ^ 🗄️ column names appear here
 
     'name' => 'required|',
-    //                  ^ 90+ validation rules appear here
+    //                  ^ 📋 90+ validation rules appear here
 ]);
 
 $name = config('app.');
-//                  ^ config keys with resolved values
+//                  ^ ⚙️ config keys with resolved values
 
 return view('users.');
-//                 ^ view names from resources/views
+//                 ^ 📄 view names from resources/views
 
 $url = route('users.');
-//                  ^ named routes from routes/*.php
+//                  ^ 🔗 named routes from routes/*.php
 
 Route::middleware('');
-//                ^ middleware aliases from bootstrap/app.php
+//                ^ 🛡️ middleware aliases from bootstrap/app.php
 
 $message = __('auth.');
-//                  ^ translation keys with values
+//                  ^ 🌐 translation keys with values
 ```
 
 ```blade
 <x-
-{{-- ^ component names from resources/views/components --}}
+{{-- ^ 🧩 component names from resources/views/components --}}
 ```
 
-### Diagnostics
+#### 🏗️ Eloquent Model Properties
+
+Type `$user->` to get completions for model properties, including database columns, casts, accessors, and relationships:
+
+```php
+$user->
+//    ^ name (string)        ← database column
+//    ^ email (string)       ← database column
+//    ^ email_verified_at (Carbon)  ← cast to datetime
+//    ^ is_admin (bool)      ← cast to boolean
+//    ^ full_name (string)   ← accessor
+//    ^ posts (Collection)   ← hasMany relationship
+```
+
+Works with type-hinted variables, PHPDoc annotations, and static chains like `User::find(1)->`.
+
+#### 📝 Blade Variables
+
+Type `$` in Blade files to see all available variables passed to the view:
+
+```blade
+{{ $
+{{-- ^ user (User)     ← from controller
+     ^ posts (Collection) ← from controller
+     ^ title (string)  ← from @props --}}
+```
+
+Variables are resolved from:
+- `view('name', compact('user', 'posts'))`
+- `view('name', ['user' => $user])`
+- `view('name')->with('user', $user)`
+- `view('name')->with(['user' => $user])`
+- `@props(['title' => string])` in Blade components
+- Livewire component public properties
+
+### ⚠️ Diagnostics
 
 See problems in real-time as you type. The extension validates your Laravel code against your actual project structure, highlighting missing views, undefined components, invalid validation rules, and other issues before you run your application.
 
@@ -174,7 +209,7 @@ $request->validate([
 {{--       ^^^^^^^^^^^ ⚠️ Livewire component not found --}}
 ```
 
-### Quick Actions
+### ⚡ Quick Actions
 
 Fix problems with a single click. When you see a warning, press `Cmd+.` to open quick actions. The extension offers to create missing files with the correct Laravel structure—views, components, middleware, translations, and more.
 
@@ -200,22 +235,21 @@ Route::middleware('admin-only')->group(...);
 ```
 
 **Available quick actions:**
-- Create missing views
-- Create Blade components (anonymous or with class)
-- Create Livewire components
-- Create middleware
-- Add translations to existing files
-- Add environment variables to `.env`
+- 📄 Create missing views
+- 🧩 Create Blade components (anonymous or with class)
+- ⚡ Create Livewire components
+- 🛡️ Create middleware
+- 🌐 Add translations to existing files
+- 🔐 Add environment variables to `.env`
 
-## Planned Features
+## 🚧 Planned Features
 
-- Eloquent model field and relationship autocomplete
-- Hover documentation with resolved values
-- Inertia.js support (`Inertia::render('Page')`)
-- Folio page routing
-- Volt component support
+- 📖 Hover documentation with resolved values
+- 🎨 Inertia.js support (`Inertia::render('Page')`)
+- 📁 Folio page routing
+- ⚡ Volt component support
 
-## Contributing
+## 🤝 Contributing
 
 ```bash
 cd laravel-lsp && cargo build --release && cargo test

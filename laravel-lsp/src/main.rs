@@ -164,6 +164,16 @@ struct FilePathCompletion {
     path: String,
 }
 
+/// A model property for autocomplete (used by $model->)
+struct ModelPropertyCompletion {
+    /// The property name (e.g., "id", "email", "first_name")
+    name: String,
+    /// The PHP type (e.g., "int", "string", "Carbon", "Collection<Post>")
+    php_type: String,
+    /// Source of the property (database, cast, accessor, relationship)
+    source: String,
+}
+
 /// A translation key for autocomplete
 struct TranslationKeyCompletion {
     /// The full dot-notation key (e.g., "messages.welcome")
@@ -1080,6 +1090,23 @@ class {} extends Component
             change_annotations: None,
         })
     }
+}
+
+/// Represents a variable property access in Blade content
+/// e.g., $user->name, $post->title
+struct VariableAccess {
+    variable_name: String,
+    line: u32,
+    column: u32,
+    end_column: u32,
+}
+
+/// Represents an available variable in a Blade file
+/// Used for $variable name autocompletion
+struct BladeVariableInfo {
+    name: String,
+    php_type: String,
+    source: String, // "props", "controller", "component", "livewire", "framework"
 }
 
 impl LaravelLanguageServer {
@@ -3368,6 +3395,1497 @@ impl LaravelLanguageServer {
         None
     }
 
+    /// Check if cursor is after `->` on a model variable or static chain
+    /// Returns (model_class_hint, typed_prefix) for property completions
+    ///
+    /// This detects two patterns:
+    /// 1. Variable access: `$user->` where we need to resolve $user's type
+    /// 2. Static chain: `User::find(1)->` or `User::where(...)->first()->` where we extract the class
+    ///
+    /// Examples:
+    /// - `$user->` returns Some(("$user", ""))
+    /// - `$user->na` returns Some(("$user", "na"))
+    /// - `User::find(1)->` returns Some(("User", ""))
+    /// - `User::find(1)->ema` returns Some(("User", "ema"))
+    fn get_model_property_context(line_text: &str, character: u32) -> Option<(String, String)> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Find the last `->` before cursor
+        let arrow_pos = before_cursor.rfind("->")?;
+
+        // Extract what's typed after `->`
+        let typed_prefix = before_cursor[arrow_pos + 2..].to_string();
+
+        // Don't match if prefix contains invalid characters for a property name
+        if typed_prefix.contains(|c: char| !c.is_alphanumeric() && c != '_') {
+            return None;
+        }
+
+        // Get the part before `->`
+        let before_arrow = &before_cursor[..arrow_pos];
+
+        // Try to extract the class/variable that the arrow is on
+        let class_hint = Self::extract_model_class_hint(before_arrow)?;
+
+        Some((class_hint, typed_prefix))
+    }
+
+    /// Extract the model class hint from the expression before `->`
+    ///
+    /// Handles:
+    /// - `$variable` -> returns "$variable" (caller will resolve type)
+    /// - `User::find(1)` -> returns "User"
+    /// - `User::where(...)->first()` -> returns "User"
+    /// - `$this` -> returns "$this" (for use inside a model)
+    fn extract_model_class_hint(before_arrow: &str) -> Option<String> {
+        let trimmed = before_arrow.trim_end();
+
+        // Case 1: Ends with a variable like $user or $this
+        if let Some(var_match) = regex::Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)$")
+            .ok()
+            .and_then(|re| re.find(trimmed))
+        {
+            return Some(var_match.as_str().to_string());
+        }
+
+        // Case 2: Ends with a method call on a static class like User::find(1) or User::where(...)->first()
+        // Look for the class name at the start of a static chain
+        // Pattern: ClassName::method(...) or ClassName::method(...)->other(...)
+        if let Some(caps) = regex::Regex::new(r"([A-Z][a-zA-Z0-9_]*)::(?:find|findOrFail|first|firstOrFail|where|query|all|get|create|make|findOr|sole|firstOr|firstWhere|findMany)\s*\(")
+            .ok()
+            .and_then(|re| re.captures(trimmed))
+        {
+            if let Some(class) = caps.get(1) {
+                return Some(class.as_str().to_string());
+            }
+        }
+
+        // Case 3: Ends with a method call like ->first(), ->find(), etc. - try to find class earlier in chain
+        if trimmed.ends_with(')') {
+            // Look backwards for a class name in a static call pattern
+            if let Some(caps) = regex::Regex::new(r"([A-Z][a-zA-Z0-9_]*)::(?:find|findOrFail|first|firstOrFail|where|query|all|get|create|make)\s*\(")
+                .ok()
+                .and_then(|re| re.captures(trimmed))
+            {
+                if let Some(class) = caps.get(1) {
+                    return Some(class.as_str().to_string());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Resolve a variable name to its model class type by analyzing the file content
+    ///
+    /// Searches for:
+    /// 1. Type hints in function parameters: `function show(User $user)`
+    /// 2. Type hints in variable declarations: `User $user = ...`
+    /// 3. PHPDoc annotations: `@var User $user` or `@param User $user`
+    ///
+    /// Returns the class name if found (e.g., "User")
+    fn resolve_variable_type(content: &str, variable_name: &str) -> Option<String> {
+        // Remove the $ from variable name for matching
+        let var_without_dollar = variable_name.trim_start_matches('$');
+
+        // Pattern 1: Type hint in function parameter
+        // e.g., "function show(User $user)" or "(Request $request, User $user)"
+        let param_pattern = format!(
+            r"([A-Z][a-zA-Z0-9_\\]*)\s+\${}(?:\s*[,=)]|\s*$)",
+            regex::escape(var_without_dollar)
+        );
+        if let Some(caps) = regex::Regex::new(&param_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(class) = caps.get(1) {
+                let class_name = class.as_str();
+                // Get just the class name (last part after \)
+                let simple_name = class_name.rsplit('\\').next().unwrap_or(class_name);
+                return Some(simple_name.to_string());
+            }
+        }
+
+        // Pattern 2: PHPDoc @var annotation
+        // e.g., "/** @var User $user */" or "@var User $user"
+        let var_pattern = format!(
+            r"@var\s+([A-Z][a-zA-Z0-9_\\]*)\s+\${}(?:\s|$)",
+            regex::escape(var_without_dollar)
+        );
+        if let Some(caps) = regex::Regex::new(&var_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(class) = caps.get(1) {
+                let class_name = class.as_str();
+                let simple_name = class_name.rsplit('\\').next().unwrap_or(class_name);
+                return Some(simple_name.to_string());
+            }
+        }
+
+        // Pattern 3: PHPDoc @param annotation
+        // e.g., "@param User $user"
+        let param_doc_pattern = format!(
+            r"@param\s+([A-Z][a-zA-Z0-9_\\]*)\s+\${}(?:\s|$)",
+            regex::escape(var_without_dollar)
+        );
+        if let Some(caps) = regex::Regex::new(&param_doc_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(class) = caps.get(1) {
+                let class_name = class.as_str();
+                let simple_name = class_name.rsplit('\\').next().unwrap_or(class_name);
+                return Some(simple_name.to_string());
+            }
+        }
+
+        // Pattern 4: Variable assignment with new
+        // e.g., "$user = new User("
+        let new_pattern = format!(
+            r"\${}\s*=\s*new\s+([A-Z][a-zA-Z0-9_\\]*)\s*\(",
+            regex::escape(var_without_dollar)
+        );
+        if let Some(caps) = regex::Regex::new(&new_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(class) = caps.get(1) {
+                let class_name = class.as_str();
+                let simple_name = class_name.rsplit('\\').next().unwrap_or(class_name);
+                return Some(simple_name.to_string());
+            }
+        }
+
+        // Pattern 5: Variable assignment with static method that returns model
+        // e.g., "$user = User::find(1)" or "$user = User::create([...])"
+        let static_pattern = format!(
+            r"\${}\s*=\s*([A-Z][a-zA-Z0-9_\\]*)::(?:find|findOrFail|create|first|firstOrFail|sole|make)\s*\(",
+            regex::escape(var_without_dollar)
+        );
+        if let Some(caps) = regex::Regex::new(&static_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(class) = caps.get(1) {
+                let class_name = class.as_str();
+                let simple_name = class_name.rsplit('\\').next().unwrap_or(class_name);
+                return Some(simple_name.to_string());
+            }
+        }
+
+        None
+    }
+
+    /// Resolve a Blade view variable's type by checking the source that provides it
+    ///
+    /// For a view like `resources/views/users/show.blade.php` with variable `$user`,
+    /// checks these sources in order (higher priority sources override lower):
+    /// 1. @props directive in the Blade file (lowest priority - fallback)
+    /// 2. Controller methods that render this view
+    /// 3. View component class (if this is a component view)
+    /// 4. Livewire component (if this is a Livewire view) (highest priority)
+    fn resolve_blade_variable_type_sync(&self, uri: &Url, variable_name: &str) -> Option<String> {
+        // Get the view path from the URI
+        let path = uri.path();
+
+        // Only process Blade files
+        if !path.ends_with(".blade.php") {
+            return None;
+        }
+
+        // Get project root synchronously (we're already in async context but need sync access)
+        let root = {
+            let root_guard = self.root_path.try_read().ok()?;
+            root_guard.clone()?
+        };
+
+        // Extract view name from path
+        // e.g., /path/to/project/resources/views/users/show.blade.php -> users.show
+        let view_name = self.extract_view_name_from_path(path, &root);
+        let var_without_dollar = variable_name.trim_start_matches('$');
+
+        // Read the Blade file content for @props check
+        let blade_content = std::fs::read_to_string(path).ok();
+
+        // Start with @props as the base (lowest priority)
+        let mut resolved_type = blade_content.as_ref()
+            .and_then(|content| Self::extract_props_type(content, var_without_dollar));
+
+        // Check controllers (overrides @props)
+        if let Some(ref vn) = view_name {
+            if let Some(class) = self.check_controller_view_variable(&root, vn, var_without_dollar) {
+                resolved_type = Some(class);
+            }
+        }
+
+        // Check View component class (overrides controller)
+        if let Some(class) = self.check_view_component_variable(&root, path, var_without_dollar) {
+            resolved_type = Some(class);
+        }
+
+        // Check Livewire component (highest priority - overrides all)
+        if let Some(ref vn) = view_name {
+            if let Some(class) = self.check_livewire_component_variable(&root, vn, var_without_dollar) {
+                resolved_type = Some(class);
+            }
+        }
+
+        resolved_type
+    }
+
+    /// Extract type from @props directive in a Blade file
+    /// Supports formats:
+    /// - @props(['user' => User::class])
+    /// - @props(['user' => \App\Models\User::class])
+    /// - @props(['user' => 'App\Models\User'])
+    fn extract_props_type(content: &str, prop_name: &str) -> Option<String> {
+        // Find the @props directive
+        let props_re = regex::Regex::new(r"@props\s*\(\s*\[([^\]]*)\]\s*\)").ok()?;
+        let caps = props_re.captures(content)?;
+        let props_content = caps.get(1)?.as_str();
+
+        // Look for 'propName' => Type::class or 'propName' => 'TypeName'
+        // Pattern 1: 'propName' => ClassName::class
+        let class_pattern = format!(
+            r#"['"]{}['"]\s*=>\s*\\?([A-Za-z][A-Za-z0-9_\\]*)::class"#,
+            regex::escape(prop_name)
+        );
+        if let Some(caps) = regex::Regex::new(&class_pattern).ok()?.captures(props_content) {
+            if let Some(m) = caps.get(1) {
+                let full_type = m.as_str();
+                // Get just the class name (last part after \)
+                return Some(full_type.rsplit('\\').next().unwrap_or(full_type).to_string());
+            }
+        }
+
+        // Pattern 2: 'propName' => 'ClassName' (string type hint)
+        let string_pattern = format!(
+            r#"['"]{}['"]\s*=>\s*['"]\\?([A-Za-z][A-Za-z0-9_\\]*)['"]"#,
+            regex::escape(prop_name)
+        );
+        if let Some(caps) = regex::Regex::new(&string_pattern).ok()?.captures(props_content) {
+            if let Some(m) = caps.get(1) {
+                let full_type = m.as_str();
+                return Some(full_type.rsplit('\\').next().unwrap_or(full_type).to_string());
+            }
+        }
+
+        None
+    }
+
+    /// Detect if user is typing a variable name (e.g., `$u`, `$user`)
+    /// Returns the prefix they've typed (without $) if in variable name context
+    /// Returns None if they're in `$var->` context (property access)
+    fn get_variable_name_context(line_text: &str, cursor_col: u32) -> Option<String> {
+        let cursor = cursor_col as usize;
+        if cursor == 0 || cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Check if we're after a $ and NOT in property access context
+        // Look backwards to find $
+        let mut dollar_pos = None;
+        for (i, c) in before_cursor.char_indices().rev() {
+            if c == '$' {
+                dollar_pos = Some(i);
+                break;
+            }
+            // If we hit non-identifier chars before finding $, we're not in variable context
+            if !c.is_alphanumeric() && c != '_' {
+                break;
+            }
+        }
+
+        let dollar_pos = dollar_pos?;
+
+        // Get the text after $
+        let after_dollar = &before_cursor[dollar_pos + 1..];
+
+        // Check it's a valid variable name prefix (only alphanumeric and _)
+        if !after_dollar.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+
+        // Make sure we're not in property access context ($var->)
+        // Check if there's a -> after the variable name before cursor
+        let _rest_of_line = &line_text[cursor..];
+
+        // If the variable name is immediately followed by ->, skip
+        // But we need to look at what's AFTER cursor to see if we're in $var| context vs $var->|
+        // Actually, we just need to check if BEFORE cursor there's ->
+        if before_cursor.contains("->") {
+            // Find if the -> is after our $
+            let after_dollar_to_cursor = &before_cursor[dollar_pos..];
+            if after_dollar_to_cursor.contains("->") {
+                return None; // We're in property access context
+            }
+        }
+
+        Some(after_dollar.to_string())
+    }
+
+    /// Get all available variables for a Blade file
+    /// Collects variables from @props, controller, Livewire, and view component
+    fn get_blade_available_variables(&self, uri: &Url) -> Vec<BladeVariableInfo> {
+        let path = uri.path();
+
+        if !path.ends_with(".blade.php") {
+            return Vec::new();
+        }
+
+        let root = match self.root_path.try_read().ok().and_then(|g| g.clone()) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        let mut variables = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let view_name = self.extract_view_name_from_path(path, &root);
+        let blade_content = std::fs::read_to_string(path).ok();
+
+        // 1. Extract from @props directive
+        if let Some(ref content) = blade_content {
+            let props_vars = Self::extract_all_props_variables(content);
+            for (name, php_type) in props_vars {
+                if seen.insert(name.clone()) {
+                    variables.push(BladeVariableInfo {
+                        name,
+                        php_type,
+                        source: "props".to_string(),
+                    });
+                }
+            }
+        }
+
+        // 2. Extract from controller (if this is a regular view)
+        if let Some(ref vn) = view_name {
+            let controller_vars = self.extract_controller_variables(&root, vn);
+            for (name, php_type) in controller_vars {
+                if seen.insert(name.clone()) {
+                    variables.push(BladeVariableInfo {
+                        name,
+                        php_type,
+                        source: "controller".to_string(),
+                    });
+                }
+            }
+        }
+
+        // 3. Extract from View component class
+        let component_vars = self.extract_component_variables(&root, path);
+        for (name, php_type) in component_vars {
+            if seen.insert(name.clone()) {
+                variables.push(BladeVariableInfo {
+                    name,
+                    php_type,
+                    source: "component".to_string(),
+                });
+            }
+        }
+
+        // 4. Extract from Livewire component
+        if let Some(ref vn) = view_name {
+            let livewire_vars = self.extract_livewire_variables(&root, vn);
+            for (name, php_type) in livewire_vars {
+                if seen.insert(name.clone()) {
+                    variables.push(BladeVariableInfo {
+                        name,
+                        php_type,
+                        source: "livewire".to_string(),
+                    });
+                }
+            }
+        }
+
+        // Add common Blade framework variables
+        let framework_vars = [
+            ("errors", "MessageBag", "framework"),
+            ("slot", "string", "framework"),
+            ("attributes", "ComponentAttributeBag", "framework"),
+            ("component", "Component", "framework"),
+        ];
+        for (name, php_type, source) in framework_vars {
+            if seen.insert(name.to_string()) {
+                variables.push(BladeVariableInfo {
+                    name: name.to_string(),
+                    php_type: php_type.to_string(),
+                    source: source.to_string(),
+                });
+            }
+        }
+
+        variables
+    }
+
+    /// Extract all props variable names and types from @props directive
+    fn extract_all_props_variables(content: &str) -> Vec<(String, String)> {
+        let mut vars = Vec::new();
+
+        // Find the @props directive
+        let props_re = match regex::Regex::new(r"@props\s*\(\s*\[([^\]]*)\]\s*\)") {
+            Ok(re) => re,
+            Err(_) => return vars,
+        };
+
+        let Some(caps) = props_re.captures(content) else {
+            return vars;
+        };
+        let Some(props_content) = caps.get(1) else {
+            return vars;
+        };
+        let props_str = props_content.as_str();
+
+        // Match 'propName' => Type::class or 'propName' => 'Type' or just 'propName'
+        // Pattern for typed props: 'name' => Type::class or 'name' => 'Type'
+        let typed_re = regex::Regex::new(
+            r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]\s*=>\s*(?:(?:\\?([A-Za-z][A-Za-z0-9_\\]*)::class)|['"]\\?([A-Za-z][A-Za-z0-9_\\]*)['"])"#
+        ).ok();
+
+        if let Some(re) = typed_re {
+            for cap in re.captures_iter(props_str) {
+                if let Some(name) = cap.get(1) {
+                    let php_type = cap.get(2)
+                        .or(cap.get(3))
+                        .map(|m| {
+                            let t = m.as_str();
+                            t.rsplit('\\').next().unwrap_or(t).to_string()
+                        })
+                        .unwrap_or_else(|| "mixed".to_string());
+                    vars.push((name.as_str().to_string(), php_type));
+                }
+            }
+        }
+
+        // Pattern for untyped props: 'name' (not followed by =>)
+        let untyped_re = regex::Regex::new(
+            r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"](?:\s*(?:,|\]|$))"#
+        ).ok();
+
+        if let Some(re) = untyped_re {
+            for cap in re.captures_iter(props_str) {
+                if let Some(name) = cap.get(1) {
+                    let name_str = name.as_str().to_string();
+                    // Only add if not already in typed list
+                    if !vars.iter().any(|(n, _)| n == &name_str) {
+                        vars.push((name_str, "mixed".to_string()));
+                    }
+                }
+            }
+        }
+
+        vars
+    }
+
+    /// Extract variables passed to a view from any PHP file that renders it
+    /// Supports:
+    /// - view('name', compact('a', 'b'))
+    /// - view('name', ['key' => $value])
+    /// - view('name')->with('key', $value)
+    /// - view('name')->with(['key' => $value])
+    /// - View::make('name')->with(...)
+    fn extract_controller_variables(&self, root: &std::path::Path, view_name: &str) -> Vec<(String, String)> {
+        let mut vars = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Search in common directories where views are called from
+        let search_dirs = [
+            root.join("app").join("Http").join("Controllers"),
+            root.join("app").join("Livewire"),
+            root.join("app").join("View").join("Components"),
+            root.join("routes"),
+        ];
+
+        for dir in &search_dirs {
+            if !dir.exists() {
+                continue;
+            }
+
+            self.search_php_files_for_view_vars(dir, view_name, &mut vars, &mut seen);
+        }
+
+        vars
+    }
+
+    /// Recursively search PHP files in a directory for view variable assignments
+    fn search_php_files_for_view_vars(
+        &self,
+        dir: &std::path::Path,
+        view_name: &str,
+        vars: &mut Vec<(String, String)>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if path.is_dir() {
+                // Recurse into subdirectories
+                self.search_php_files_for_view_vars(&path, view_name, vars, seen);
+                continue;
+            }
+
+            if !path.extension().map(|e| e == "php").unwrap_or(false) {
+                continue;
+            }
+
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+
+            // Check if this file references the view at all (quick check)
+            if !content.contains(view_name) {
+                continue;
+            }
+
+            self.extract_view_vars_from_content(&content, view_name, vars, seen);
+        }
+    }
+
+    /// Extract variables from file content for a specific view
+    fn extract_view_vars_from_content(
+        &self,
+        content: &str,
+        view_name: &str,
+        vars: &mut Vec<(String, String)>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        let escaped_name = regex::escape(view_name);
+
+        // Pattern 1: view('name', compact('a', 'b', ...))
+        let compact_in_view = format!(
+            r#"view\s*\(\s*['"]{}['"]\s*,\s*compact\s*\(([^)]+)\)"#,
+            escaped_name
+        );
+        if let Ok(re) = regex::Regex::new(&compact_in_view) {
+            for cap in re.captures_iter(content) {
+                if let Some(compact_args) = cap.get(1) {
+                    self.extract_vars_from_compact(content, compact_args.as_str(), vars, seen);
+                }
+            }
+        }
+
+        // Pattern 2: view('name', ['key' => ...])
+        let array_in_view = format!(
+            r#"view\s*\(\s*['"]{}['"]\s*,\s*\[([^\]]+)\]"#,
+            escaped_name
+        );
+        if let Ok(re) = regex::Regex::new(&array_in_view) {
+            for cap in re.captures_iter(content) {
+                if let Some(array_content) = cap.get(1) {
+                    self.extract_vars_from_array(content, array_content.as_str(), vars, seen);
+                }
+            }
+        }
+
+        // Pattern 3a: view('name')->with(['key' => $value, ...]) - array notation
+        // Handle this separately to better capture array contents
+        let with_array_pattern = format!(
+            r#"view\s*\(\s*['"]{}['"]\s*\)\s*->\s*with\s*\(\s*\[([^\]]+)\]"#,
+            escaped_name
+        );
+        if let Ok(re) = regex::Regex::new(&with_array_pattern) {
+            for cap in re.captures_iter(content) {
+                if let Some(array_content) = cap.get(1) {
+                    self.extract_vars_from_array(content, array_content.as_str(), vars, seen);
+                }
+            }
+        }
+
+        // Pattern 3b: view('name')->with('key', $value) - single key-value or chained
+        let with_single_pattern = format!(
+            r#"view\s*\(\s*['"]{}['"]\s*\)(\s*->\s*with\s*\(\s*['"][^'"]+['"]\s*,[^)]+\))+"#,
+            escaped_name
+        );
+        if let Ok(re) = regex::Regex::new(&with_single_pattern) {
+            for cap in re.captures_iter(content) {
+                let full_match = cap.get(0).map(|m| m.as_str()).unwrap_or("");
+                self.extract_vars_from_with_chain(content, full_match, vars, seen);
+            }
+        }
+
+        // Pattern 3c: view('name')->with(compact(...))
+        let with_compact_pattern = format!(
+            r#"view\s*\(\s*['"]{}['"]\s*\)\s*->\s*with\s*\(\s*compact\s*\(([^)]+)\)"#,
+            escaped_name
+        );
+        if let Ok(re) = regex::Regex::new(&with_compact_pattern) {
+            for cap in re.captures_iter(content) {
+                if let Some(compact_args) = cap.get(1) {
+                    self.extract_vars_from_compact(content, compact_args.as_str(), vars, seen);
+                }
+            }
+        }
+
+        // Pattern 4: View::make('name')->with(...) or View::make('name', [...])
+        let view_make_pattern = format!(
+            r#"View::make\s*\(\s*['"]{}['"]\s*(?:,\s*([^\)]+))?\)(\s*->\s*with\s*\([^)]+\))*"#,
+            escaped_name
+        );
+        if let Ok(re) = regex::Regex::new(&view_make_pattern) {
+            for cap in re.captures_iter(content) {
+                // Check for second argument (array or compact)
+                if let Some(second_arg) = cap.get(1) {
+                    let arg_str = second_arg.as_str();
+                    if arg_str.contains("compact") {
+                        if let Some(compact_match) = regex::Regex::new(r#"compact\s*\(([^)]+)\)"#)
+                            .ok()
+                            .and_then(|re| re.captures(arg_str))
+                        {
+                            if let Some(compact_args) = compact_match.get(1) {
+                                self.extract_vars_from_compact(content, compact_args.as_str(), vars, seen);
+                            }
+                        }
+                    } else if arg_str.starts_with('[') || arg_str.contains("=>") {
+                        self.extract_vars_from_array(content, arg_str, vars, seen);
+                    }
+                }
+
+                // Check for ->with chain
+                let full_match = cap.get(0).map(|m| m.as_str()).unwrap_or("");
+                if full_match.contains("->with") {
+                    self.extract_vars_from_with_chain(content, full_match, vars, seen);
+                }
+            }
+        }
+    }
+
+    /// Extract variable names from compact('a', 'b', 'c')
+    fn extract_vars_from_compact(
+        &self,
+        content: &str,
+        compact_args: &str,
+        vars: &mut Vec<(String, String)>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        let var_re = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]"#).ok();
+        if let Some(re) = var_re {
+            for var_cap in re.captures_iter(compact_args) {
+                if let Some(var_name) = var_cap.get(1) {
+                    let name = var_name.as_str().to_string();
+                    if seen.insert(name.clone()) {
+                        let var_type = Self::find_variable_type_in_content(content, var_name.as_str())
+                            .unwrap_or_else(|| "mixed".to_string());
+                        vars.push((name, var_type));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extract variable names from ['key' => $value, ...] or ['key' => $this->property, ...]
+    fn extract_vars_from_array(
+        &self,
+        content: &str,
+        array_content: &str,
+        vars: &mut Vec<(String, String)>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        // Match 'key' => $this->property or 'key' => $variable
+        let array_re = regex::Regex::new(
+            r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]\s*=>\s*(?:\$this->([a-zA-Z_][a-zA-Z0-9_]*)|\$([a-zA-Z_][a-zA-Z0-9_]*))"#
+        ).ok();
+
+        if let Some(re) = array_re {
+            for arr_cap in re.captures_iter(array_content) {
+                if let Some(key) = arr_cap.get(1) {
+                    let name = key.as_str().to_string();
+                    if seen.insert(name.clone()) {
+                        // Check if it's $this->property (group 2) or $variable (group 3)
+                        let var_type = if let Some(prop_match) = arr_cap.get(2) {
+                            // It's $this->property
+                            Self::find_property_type_in_content(content, prop_match.as_str())
+                        } else if let Some(var_match) = arr_cap.get(3) {
+                            // It's $variable
+                            Self::find_variable_type_in_content(content, var_match.as_str())
+                        } else {
+                            None
+                        }.unwrap_or_else(|| "mixed".to_string());
+                        vars.push((name, var_type));
+                    }
+                }
+            }
+        }
+
+        // Also handle keys without explicit value assignment (just the key name)
+        let key_only_re = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"](?:\s*,|\s*\])"#).ok();
+        if let Some(re) = key_only_re {
+            for cap in re.captures_iter(array_content) {
+                if let Some(key) = cap.get(1) {
+                    let name = key.as_str().to_string();
+                    if seen.insert(name.clone()) {
+                        vars.push((name, "mixed".to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extract variable names from ->with('key', $value) or ->with(['key' => $value]) chains
+    fn extract_vars_from_with_chain(
+        &self,
+        content: &str,
+        chain_str: &str,
+        vars: &mut Vec<(String, String)>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        // Match ->with('key', $value) or ->with('key', $this->property) pattern
+        let single_with_re = regex::Regex::new(
+            r#"->\s*with\s*\(\s*['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]\s*,\s*(\$this->([a-zA-Z_][a-zA-Z0-9_]*)|\$([a-zA-Z_][a-zA-Z0-9_]*))"#
+        ).ok();
+
+        if let Some(re) = single_with_re {
+            for cap in re.captures_iter(chain_str) {
+                if let Some(key) = cap.get(1) {
+                    let name = key.as_str().to_string();
+                    if seen.insert(name.clone()) {
+                        // Check if it's $this->property (group 3) or $variable (group 4)
+                        let var_type = if let Some(prop_match) = cap.get(3) {
+                            // It's $this->property - look up the property type
+                            Self::find_property_type_in_content(content, prop_match.as_str())
+                        } else if let Some(var_match) = cap.get(4) {
+                            // It's $variable - look up the variable type
+                            Self::find_variable_type_in_content(content, var_match.as_str())
+                        } else {
+                            None
+                        }.unwrap_or_else(|| "mixed".to_string());
+                        vars.push((name, var_type));
+                    }
+                }
+            }
+        }
+
+        // Match ->with(['key' => $value, ...]) pattern
+        let array_with_re = regex::Regex::new(r#"->\s*with\s*\(\s*\[([^\]]+)\]\s*\)"#).ok();
+        if let Some(re) = array_with_re {
+            for cap in re.captures_iter(chain_str) {
+                if let Some(array_content) = cap.get(1) {
+                    self.extract_vars_from_array(content, array_content.as_str(), vars, seen);
+                }
+            }
+        }
+
+        // Match ->with(compact('a', 'b')) pattern
+        let compact_with_re = regex::Regex::new(r#"->\s*with\s*\(\s*compact\s*\(([^)]+)\)\s*\)"#).ok();
+        if let Some(re) = compact_with_re {
+            for cap in re.captures_iter(chain_str) {
+                if let Some(compact_args) = cap.get(1) {
+                    self.extract_vars_from_compact(content, compact_args.as_str(), vars, seen);
+                }
+            }
+        }
+    }
+
+    /// Find a variable's type by tracing its declaration in the content
+    /// Handles multiple patterns:
+    /// - Type hints: `User $user = ...`
+    /// - New expressions: `$user = new User(...)`
+    /// - Static methods: `$user = User::find(1)`, `$users = User::all()`
+    /// - Query chains: `$user = User::where(...)->first()`
+    /// - Function parameters: `function show(User $user)`
+    /// - PHPDoc: `@var User $user` or `@param User $user`
+    fn find_variable_type_in_content(content: &str, var_name: &str) -> Option<String> {
+        let escaped_var = regex::escape(var_name);
+
+        // 1. PHPDoc @var annotation: /** @var User $user */
+        let phpdoc_var_pattern = format!(
+            r#"@var\s+\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}"#,
+            escaped_var
+        );
+        if let Some(caps) = regex::Regex::new(&phpdoc_var_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(type_match) = caps.get(1) {
+                return Some(Self::simplify_type(type_match.as_str()));
+            }
+        }
+
+        // 2. Type-hinted variable declaration: User $user = ...
+        let type_hint_pattern = format!(
+            r#"(\?)?\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}\s*="#,
+            escaped_var
+        );
+        if let Some(caps) = regex::Regex::new(&type_hint_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(type_match) = caps.get(2) {
+                let nullable = caps.get(1).is_some();
+                let type_name = Self::simplify_type(type_match.as_str());
+                return Some(if nullable { format!("?{}", type_name) } else { type_name });
+            }
+        }
+
+        // 3. Function/method parameter type hint: function show(User $user)
+        let param_pattern = format!(
+            r#"function\s+\w+\s*\([^)]*(\?)?\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}"#,
+            escaped_var
+        );
+        if let Some(caps) = regex::Regex::new(&param_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(type_match) = caps.get(2) {
+                let nullable = caps.get(1).is_some();
+                let type_name = Self::simplify_type(type_match.as_str());
+                return Some(if nullable { format!("?{}", type_name) } else { type_name });
+            }
+        }
+
+        // 4. New expression: $user = new User(...)
+        let new_pattern = format!(
+            r#"\${}\s*=\s*new\s+\\?([A-Z][a-zA-Z0-9_\\]*)"#,
+            escaped_var
+        );
+        if let Some(caps) = regex::Regex::new(&new_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(class) = caps.get(1) {
+                return Some(Self::simplify_type(class.as_str()));
+            }
+        }
+
+        // 5. Static method returning single model: Model::find(), ::first(), ::findOrFail(), etc.
+        let single_model_pattern = format!(
+            r#"\${}\s*=\s*\\?([A-Z][a-zA-Z0-9_\\]*)::(?:find|findOrFail|first|firstOrFail|sole|firstWhere|create|updateOrCreate|firstOrCreate|firstOrNew)\s*\("#,
+            escaped_var
+        );
+        if let Some(caps) = regex::Regex::new(&single_model_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(model) = caps.get(1) {
+                return Some(Self::simplify_type(model.as_str()));
+            }
+        }
+
+        // 6. Static method returning collection: Model::all(), ::get(), etc.
+        let collection_pattern = format!(
+            r#"\${}\s*=\s*\\?([A-Z][a-zA-Z0-9_\\]*)::(?:all|get|paginate|simplePaginate|cursor)\s*\("#,
+            escaped_var
+        );
+        if let Some(caps) = regex::Regex::new(&collection_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(model) = caps.get(1) {
+                return Some(format!("Collection<{}>", Self::simplify_type(model.as_str())));
+            }
+        }
+
+        // 7. Query chain ending in first/find: Model::where(...)->first()
+        let chain_single_pattern = format!(
+            r#"\${}\s*=\s*\\?([A-Z][a-zA-Z0-9_\\]*)::.*->(?:first|find|sole|firstOrFail|findOrFail)\s*\("#,
+            escaped_var
+        );
+        if let Some(caps) = regex::Regex::new(&chain_single_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(model) = caps.get(1) {
+                return Some(Self::simplify_type(model.as_str()));
+            }
+        }
+
+        // 8. Query chain ending in get/all: Model::where(...)->get()
+        let chain_collection_pattern = format!(
+            r#"\${}\s*=\s*\\?([A-Z][a-zA-Z0-9_\\]*)::.*->(?:get|all|paginate)\s*\("#,
+            escaped_var
+        );
+        if let Some(caps) = regex::Regex::new(&chain_collection_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(model) = caps.get(1) {
+                return Some(format!("Collection<{}>", Self::simplify_type(model.as_str())));
+            }
+        }
+
+        // 9. Common Laravel helpers
+        // auth()->user() returns User (typically)
+        let auth_user_pattern = format!(
+            r#"\${}\s*=\s*(?:auth\(\)|Auth::user\(\))->user\s*\(\)"#,
+            escaped_var
+        );
+        if regex::Regex::new(&auth_user_pattern)
+            .ok()
+            .map(|re| re.is_match(content))
+            .unwrap_or(false)
+        {
+            return Some("User".to_string());
+        }
+
+        // request() or $request typically is Request
+        if var_name == "request" {
+            return Some("Request".to_string());
+        }
+
+        None
+    }
+
+    /// Simplify a fully qualified class name to just the class name
+    fn simplify_type(type_name: &str) -> String {
+        type_name.rsplit('\\').next().unwrap_or(type_name).to_string()
+    }
+
+    /// Find a class property's type from class definition
+    /// Handles: `protected User $user;`, `private ?Model $model;`, `public $items;` with PHPDoc
+    fn find_property_type_in_content(content: &str, property_name: &str) -> Option<String> {
+        let escaped_prop = regex::escape(property_name);
+
+        // PHP primitive types pattern - must match before class names
+        // Includes: int, string, bool, float, array, object, mixed, null, void, callable, iterable, never
+        let primitive_types = r"int|string|bool|boolean|float|double|array|object|mixed|null|void|callable|iterable|never|true|false";
+
+        // 1. PHPDoc @var annotation above property: /** @var User */ or /** @var int */
+        // Look for @var followed by property declaration
+        let phpdoc_pattern = format!(
+            r#"@var\s+\\?([A-Za-z][a-zA-Z0-9_\\|<>]*)\s*\*/\s*(?:public|protected|private)\s+(?:\?)?(?:[A-Za-z][a-zA-Z0-9_\\]*)?\s*\${}"#,
+            escaped_prop
+        );
+        if let Some(caps) = regex::Regex::new(&phpdoc_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(type_match) = caps.get(1) {
+                return Some(Self::simplify_type(type_match.as_str()));
+            }
+        }
+
+        // 2a. Typed property with primitive type: protected int $count;
+        let primitive_prop_pattern = format!(
+            r#"(?:public|protected|private)\s+(\?)?({})(?:\s+|\s*\|\s*[a-zA-Z]+\s+)\${}\s*[;=]"#,
+            primitive_types,
+            escaped_prop
+        );
+        if let Some(caps) = regex::Regex::new(&primitive_prop_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(type_match) = caps.get(2) {
+                let nullable = caps.get(1).is_some();
+                let type_name = type_match.as_str().to_string();
+                return Some(if nullable { format!("?{}", type_name) } else { type_name });
+            }
+        }
+
+        // 2b. Typed property with class type: protected User $user;
+        let typed_prop_pattern = format!(
+            r#"(?:public|protected|private)\s+(\?)?\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}\s*[;=]"#,
+            escaped_prop
+        );
+        if let Some(caps) = regex::Regex::new(&typed_prop_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(type_match) = caps.get(2) {
+                let nullable = caps.get(1).is_some();
+                let type_name = Self::simplify_type(type_match.as_str());
+                return Some(if nullable { format!("?{}", type_name) } else { type_name });
+            }
+        }
+
+        // 3a. Constructor property promotion with primitive: __construct(protected int $count)
+        let primitive_promoted_pattern = format!(
+            r#"__construct\s*\([^)]*(?:public|protected|private)\s+(\?)?({})(?:\s+|\s*\|\s*[a-zA-Z]+\s+)\${}"#,
+            primitive_types,
+            escaped_prop
+        );
+        if let Some(caps) = regex::Regex::new(&primitive_promoted_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(type_match) = caps.get(2) {
+                let nullable = caps.get(1).is_some();
+                let type_name = type_match.as_str().to_string();
+                return Some(if nullable { format!("?{}", type_name) } else { type_name });
+            }
+        }
+
+        // 3b. Constructor property promotion with class type: __construct(protected User $user)
+        let promoted_pattern = format!(
+            r#"__construct\s*\([^)]*(?:public|protected|private)\s+(\?)?\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}"#,
+            escaped_prop
+        );
+        if let Some(caps) = regex::Regex::new(&promoted_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(type_match) = caps.get(2) {
+                let nullable = caps.get(1).is_some();
+                let type_name = Self::simplify_type(type_match.as_str());
+                return Some(if nullable { format!("?{}", type_name) } else { type_name });
+            }
+        }
+
+        // 4. Property initialized in constructor with new: $this->user = new User()
+        let constructor_new_pattern = format!(
+            r#"\$this->{}\s*=\s*new\s+\\?([A-Z][a-zA-Z0-9_\\]*)"#,
+            escaped_prop
+        );
+        if let Some(caps) = regex::Regex::new(&constructor_new_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(class) = caps.get(1) {
+                return Some(Self::simplify_type(class.as_str()));
+            }
+        }
+
+        // 5. Property initialized with Model::find() etc
+        let model_assign_pattern = format!(
+            r#"\$this->{}\s*=\s*\\?([A-Z][a-zA-Z0-9_\\]*)::(?:find|first|create)"#,
+            escaped_prop
+        );
+        if let Some(caps) = regex::Regex::new(&model_assign_pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+        {
+            if let Some(model) = caps.get(1) {
+                return Some(Self::simplify_type(model.as_str()));
+            }
+        }
+
+        None
+    }
+
+    /// Extract variables from a View component class
+    fn extract_component_variables(&self, root: &std::path::Path, blade_path: &str) -> Vec<(String, String)> {
+        let vars = Vec::new();
+
+        // Check if this is a component view (in resources/views/components/)
+        let components_marker = format!("{}resources/views/components/", std::path::MAIN_SEPARATOR);
+        let components_marker_alt = "resources/views/components/";
+
+        if !blade_path.contains(&components_marker) && !blade_path.contains(components_marker_alt) {
+            return vars;
+        }
+
+        // Extract component name from path
+        // e.g., resources/views/components/button.blade.php -> Button
+        // e.g., resources/views/components/forms/input.blade.php -> Forms/Input
+        let relative = if let Some(idx) = blade_path.find("components/") {
+            &blade_path[idx + 11..] // Skip "components/"
+        } else {
+            return vars;
+        };
+
+        let without_ext = relative.strip_suffix(".blade.php").unwrap_or(relative);
+        let class_name = Self::path_to_class_name(without_ext);
+
+        // Find the component class
+        let class_path = root.join("app").join("View").join("Components").join(format!("{}.php", class_name));
+
+        if !class_path.exists() {
+            // Try nested structure
+            let parts: Vec<&str> = without_ext.split('/').collect();
+            if parts.len() > 1 {
+                let nested_path = root.join("app").join("View").join("Components")
+                    .join(parts[..parts.len()-1].join("/"))
+                    .join(format!("{}.php", Self::kebab_to_pascal(parts[parts.len()-1])));
+                if nested_path.exists() {
+                    return self.parse_component_class_vars(&nested_path);
+                }
+            }
+            return vars;
+        }
+
+        self.parse_component_class_vars(&class_path)
+    }
+
+    /// Parse a component class file for public properties
+    fn parse_component_class_vars(&self, class_path: &std::path::Path) -> Vec<(String, String)> {
+        let mut vars = Vec::new();
+
+        let Ok(content) = std::fs::read_to_string(class_path) else {
+            return vars;
+        };
+
+        // Extract public properties
+        let prop_re = regex::Regex::new(
+            r#"public\s+(?:(\?)?([A-Z][a-zA-Z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)"#
+        ).ok();
+
+        if let Some(re) = prop_re {
+            for cap in re.captures_iter(&content) {
+                if let Some(name) = cap.get(3) {
+                    let php_type = cap.get(2)
+                        .map(|t| {
+                            let type_str = t.as_str();
+                            type_str.rsplit('\\').next().unwrap_or(type_str).to_string()
+                        })
+                        .unwrap_or_else(|| "mixed".to_string());
+                    vars.push((name.as_str().to_string(), php_type));
+                }
+            }
+        }
+
+        // Extract constructor parameters (they become available in the view)
+        let constructor_re = regex::Regex::new(
+            r#"public\s+function\s+__construct\s*\(([^)]*)\)"#
+        ).ok();
+
+        if let Some(re) = constructor_re {
+            if let Some(cap) = re.captures(&content) {
+                if let Some(params) = cap.get(1) {
+                    let param_re = regex::Regex::new(
+                        r#"(?:public\s+)?(?:(\?)?([A-Z][a-zA-Z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)"#
+                    ).ok();
+
+                    if let Some(pre) = param_re {
+                        for pcap in pre.captures_iter(params.as_str()) {
+                            if let Some(name) = pcap.get(3) {
+                                let php_type = pcap.get(2)
+                                    .map(|t| {
+                                        let type_str = t.as_str();
+                                        type_str.rsplit('\\').next().unwrap_or(type_str).to_string()
+                                    })
+                                    .unwrap_or_else(|| "mixed".to_string());
+                                // Avoid duplicates
+                                let name_str = name.as_str().to_string();
+                                if !vars.iter().any(|(n, _)| n == &name_str) {
+                                    vars.push((name_str, php_type));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        vars
+    }
+
+    /// Convert path like "forms/input" to class name "Forms\Input"
+    fn path_to_class_name(path: &str) -> String {
+        path.split('/')
+            .map(|part| Self::kebab_to_pascal(part))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// Extract variables from a Livewire component
+    fn extract_livewire_variables(&self, root: &std::path::Path, view_name: &str) -> Vec<(String, String)> {
+        let mut vars = Vec::new();
+
+        // Only for livewire views
+        if !view_name.starts_with("livewire.") {
+            return vars;
+        }
+
+        let component_part = match view_name.strip_prefix("livewire.") {
+            Some(p) => p,
+            None => return vars,
+        };
+
+        let class_name = Self::kebab_to_pascal(component_part);
+
+        // Try both Livewire paths
+        let paths = [
+            root.join("app").join("Livewire").join(format!("{}.php", class_name)),
+            root.join("app").join("Http").join("Livewire").join(format!("{}.php", class_name)),
+        ];
+
+        for path in paths {
+            if path.exists() {
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+
+                // Extract public properties (they're automatically available in the view)
+                let prop_re = regex::Regex::new(
+                    r#"public\s+(?:(\?)?([A-Z][a-zA-Z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)"#
+                ).ok();
+
+                if let Some(re) = prop_re {
+                    for cap in re.captures_iter(&content) {
+                        if let Some(name) = cap.get(3) {
+                            let php_type = cap.get(2)
+                                .map(|t| {
+                                    let type_str = t.as_str();
+                                    type_str.rsplit('\\').next().unwrap_or(type_str).to_string()
+                                })
+                                .unwrap_or_else(|| "mixed".to_string());
+                            vars.push((name.as_str().to_string(), php_type));
+                        }
+                    }
+                }
+
+                break;
+            }
+        }
+
+        vars
+    }
+
+    /// Extract all variable property accesses from Blade content
+    /// Returns (variable_name, line, column, end_column) for each $var-> pattern
+    fn extract_blade_variable_accesses(content: &str) -> Vec<VariableAccess> {
+        let mut accesses = Vec::new();
+
+        // Match $variable-> pattern (with property access)
+        // We only want to flag variables that are being accessed for properties/methods
+        let re = regex::Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)->").unwrap();
+
+        for (line_num, line) in content.lines().enumerate() {
+            for cap in re.captures_iter(line) {
+                if let Some(var_match) = cap.get(1) {
+                    let var_name = var_match.as_str().to_string();
+
+                    // Skip common framework variables that don't need type resolution
+                    let framework_vars = [
+                        "this", "loop", "errors", "slot", "component", "attributes",
+                        "__env", "__data", "obLevel", "app", "request",
+                    ];
+                    if framework_vars.contains(&var_name.as_str()) {
+                        continue;
+                    }
+
+                    // Calculate the full match position (including $ prefix)
+                    let full_match = cap.get(0).unwrap();
+                    let column = full_match.start() as u32;
+                    // End column is just before the -> (at the end of the variable name)
+                    let end_column = (full_match.start() + 1 + var_name.len()) as u32;
+
+                    accesses.push(VariableAccess {
+                        variable_name: format!("${}", var_name),
+                        line: line_num as u32,
+                        column,
+                        end_column,
+                    });
+                }
+            }
+        }
+
+        accesses
+    }
+
+    /// Extract view name from file path
+    /// e.g., /project/resources/views/users/show.blade.php -> users.show
+    fn extract_view_name_from_path(&self, path: &str, root: &std::path::Path) -> Option<String> {
+        let views_dir = root.join("resources").join("views");
+        let views_str = views_dir.to_string_lossy();
+
+        if let Some(relative) = path.strip_prefix(views_str.as_ref()) {
+            let relative = relative.trim_start_matches('/').trim_start_matches('\\');
+            let without_ext = relative.strip_suffix(".blade.php")?;
+            Some(without_ext.replace(['/', '\\'], "."))
+        } else {
+            None
+        }
+    }
+
+    /// Check if variable is defined in a Livewire component
+    fn check_livewire_component_variable(&self, root: &std::path::Path, view_name: &str, var_name: &str) -> Option<String> {
+        // Livewire views are typically in resources/views/livewire/
+        // and map to app/Livewire/ or app/Http/Livewire/
+        if !view_name.starts_with("livewire.") {
+            return None;
+        }
+
+        // Convert view name to class name
+        // livewire.user-settings -> UserSettings
+        let component_part = view_name.strip_prefix("livewire.")?;
+        let class_name = Self::kebab_to_pascal(component_part);
+
+        // Try both Livewire v3 and v2 paths
+        let paths = [
+            root.join("app").join("Livewire").join(format!("{}.php", class_name)),
+            root.join("app").join("Http").join("Livewire").join(format!("{}.php", class_name)),
+        ];
+
+        for class_path in paths {
+            if class_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&class_path) {
+                    if let Some(type_name) = Self::extract_property_type(&content, var_name) {
+                        return Some(type_name);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if variable is defined in a View component class
+    fn check_view_component_variable(&self, root: &std::path::Path, blade_path: &str, var_name: &str) -> Option<String> {
+        // View components can be:
+        // 1. Anonymous: resources/views/components/button.blade.php (no class)
+        // 2. Class-based: app/View/Components/Button.php with resources/views/components/button.blade.php
+
+        // Check if this is in the components directory
+        if !blade_path.contains("/components/") {
+            return None;
+        }
+
+        // Extract component name from path
+        // resources/views/components/forms/input.blade.php -> Forms/Input
+        let views_components = root.join("resources").join("views").join("components");
+        let views_str = views_components.to_string_lossy();
+
+        let relative = blade_path.strip_prefix(views_str.as_ref())?.trim_start_matches('/');
+        let without_ext = relative.strip_suffix(".blade.php")?;
+
+        // Convert to class path: forms/input -> Forms/Input
+        let class_path_parts: Vec<String> = without_ext
+            .split('/')
+            .map(|part| Self::kebab_to_pascal(part))
+            .collect();
+        let class_relative = class_path_parts.join("/");
+
+        let class_path = root.join("app").join("View").join("Components").join(format!("{}.php", class_relative));
+
+        if class_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&class_path) {
+                // Check constructor parameters and public properties
+                if let Some(type_name) = Self::extract_property_type(&content, var_name) {
+                    return Some(type_name);
+                }
+                if let Some(type_name) = Self::extract_constructor_param_type(&content, var_name) {
+                    return Some(type_name);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if variable is passed from a controller to this view
+    fn check_controller_view_variable(&self, root: &std::path::Path, view_name: &str, var_name: &str) -> Option<String> {
+        // Scan controllers for view() calls that match this view
+        let controllers_dir = root.join("app").join("Http").join("Controllers");
+        if !controllers_dir.exists() {
+            return None;
+        }
+
+        // Walk through all controller files
+        for entry in walkdir::WalkDir::new(&controllers_dir)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|ext| ext == "php").unwrap_or(false))
+        {
+            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                if let Some(type_name) = Self::extract_view_variable_type(&content, view_name, var_name) {
+                    return Some(type_name);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Extract property type from a PHP class (public properties with type hints)
+    fn extract_property_type(content: &str, property_name: &str) -> Option<String> {
+        // Match: public TypeName $propertyName or public ?TypeName $propertyName
+        let pattern = format!(
+            r"public\s+\??([A-Z][a-zA-Z0-9_\\]*)\s+\${}(?:\s*[;=])",
+            regex::escape(property_name)
+        );
+
+        regex::Regex::new(&pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+            .and_then(|caps| caps.get(1))
+            .map(|m| {
+                let full_type = m.as_str();
+                // Get just the class name (last part after \)
+                full_type.rsplit('\\').next().unwrap_or(full_type).to_string()
+            })
+    }
+
+    /// Extract constructor parameter type
+    fn extract_constructor_param_type(content: &str, param_name: &str) -> Option<String> {
+        // Match: public function __construct(TypeName $paramName or __construct(..., TypeName $paramName
+        let pattern = format!(
+            r"__construct\s*\([^)]*\??([A-Z][a-zA-Z0-9_\\]*)\s+\${}",
+            regex::escape(param_name)
+        );
+
+        regex::Regex::new(&pattern)
+            .ok()
+            .and_then(|re| re.captures(content))
+            .and_then(|caps| caps.get(1))
+            .map(|m| {
+                let full_type = m.as_str();
+                full_type.rsplit('\\').next().unwrap_or(full_type).to_string()
+            })
+    }
+
+    /// Extract variable type from a controller method that renders a specific view
+    fn extract_view_variable_type(content: &str, view_name: &str, var_name: &str) -> Option<String> {
+        // Look for view('view.name', [...]) or view('view.name')->with([...])
+        // and extract the type of the variable being passed
+
+        // First, find if this controller renders the target view
+        let view_pattern = format!(r#"view\s*\(\s*['"]{}['"]"#, regex::escape(view_name));
+        let view_re = regex::Regex::new(&view_pattern).ok()?;
+
+        if !view_re.is_match(content) {
+            return None;
+        }
+
+        // Find the method that contains this view call and extract variable types
+        // This is complex because we need to:
+        // 1. Find the method containing the view() call
+        // 2. Look for type hints on variables passed to the view
+
+        // Simplified approach: look for compact('varName') or 'varName' => $varName patterns
+        // and then find the type of $varName in the same method
+
+        // Pattern for compact('varName') in view call
+        let compact_pattern = format!(
+            r#"view\s*\(\s*['"]{}['"]\s*,\s*compact\s*\([^)]*['"]{}['"]"#,
+            regex::escape(view_name),
+            regex::escape(var_name)
+        );
+
+        // Pattern for 'varName' => $varName in view call
+        let array_pattern = format!(
+            r#"view\s*\(\s*['"]{}['"]\s*,\s*\[[^\]]*['"]{}['"]\s*=>"#,
+            regex::escape(view_name),
+            regex::escape(var_name)
+        );
+
+        let has_var = regex::Regex::new(&compact_pattern).ok()?.is_match(content)
+            || regex::Regex::new(&array_pattern).ok()?.is_match(content);
+
+        if !has_var {
+            return None;
+        }
+
+        // Now find the type of $varName in this file
+        // Check for type hints on method parameters or variable declarations
+        Self::resolve_variable_type(content, &format!("${}", var_name))
+    }
+
+    /// Convert kebab-case to PascalCase
+    /// user-settings -> UserSettings
+    fn kebab_to_pascal(s: &str) -> String {
+        s.split('-')
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect()
+    }
+
     /// Check if cursor is inside __('...'), trans('...'), or other translation-related calls
     /// Returns the partial text typed so far (for filtering completions)
     ///
@@ -4795,6 +6313,121 @@ impl LaravelLanguageServer {
             }
         }
         result
+    }
+
+    /// Find the model file path for a given class name
+    /// Searches in app/Models/ directory
+    fn find_model_file(&self, root: &std::path::Path, class_name: &str) -> Option<std::path::PathBuf> {
+        // Try app/Models/ClassName.php first (Laravel 8+)
+        let model_path = root.join("app").join("Models").join(format!("{}.php", class_name));
+        if model_path.exists() {
+            return Some(model_path);
+        }
+
+        // Try app/ClassName.php (older Laravel)
+        let old_model_path = root.join("app").join(format!("{}.php", class_name));
+        if old_model_path.exists() {
+            return Some(old_model_path);
+        }
+
+        None
+    }
+
+    /// Get all properties for a model class
+    /// Combines database columns, casts, accessors, and relationships
+    async fn get_model_properties(&self, class_name: &str) -> Vec<ModelPropertyCompletion> {
+        use laravel_lsp::model_analyzer::{ModelMetadata, map_cast_to_php_type, relationship_to_php_type};
+
+        let root = match self.root_path.read().await.clone() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        // Find the model file
+        let model_path = match self.find_model_file(&root, class_name) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        // Read and parse the model file
+        let content = match std::fs::read_to_string(&model_path) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        let metadata = ModelMetadata::from_content(&content);
+
+        // Determine the table name (either from $table property or by convention)
+        let table_name = metadata.table_name.clone().unwrap_or_else(|| {
+            // Laravel convention: Model name -> plural snake_case
+            // User -> users, BlogPost -> blog_posts
+            let snake = ModelMetadata::pascal_to_snake(class_name);
+            // Simple pluralization (add 's')
+            format!("{}s", snake)
+        });
+
+        let mut properties: Vec<ModelPropertyCompletion> = Vec::new();
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // 1. Get database columns with types (lowest priority - can be overridden)
+        if let Some(ref db) = *self.database_schema.read().await {
+            let columns: Vec<(String, String)> = db.get_columns_with_types(&table_name).await;
+            for (col_name, php_type) in columns {
+                if seen_names.insert(col_name.clone()) {
+                    properties.push(ModelPropertyCompletion {
+                        name: col_name,
+                        php_type,
+                        source: "database".to_string(),
+                    });
+                }
+            }
+        }
+
+        // 2. Apply casts (override database types)
+        for (prop_name, cast_type) in &metadata.casts {
+            let php_type = map_cast_to_php_type(cast_type);
+            if let Some(existing) = properties.iter_mut().find(|p| &p.name == prop_name) {
+                existing.php_type = php_type;
+                existing.source = "cast".to_string();
+            } else if seen_names.insert(prop_name.clone()) {
+                properties.push(ModelPropertyCompletion {
+                    name: prop_name.clone(),
+                    php_type,
+                    source: "cast".to_string(),
+                });
+            }
+        }
+
+        // 3. Add accessors (computed properties)
+        for accessor in &metadata.accessors {
+            if seen_names.insert(accessor.property_name.clone()) {
+                let php_type = accessor.return_type.clone().unwrap_or_else(|| "mixed".to_string());
+                properties.push(ModelPropertyCompletion {
+                    name: accessor.property_name.clone(),
+                    php_type,
+                    source: "accessor".to_string(),
+                });
+            }
+        }
+
+        // 4. Add relationships
+        for rel in &metadata.relationships {
+            if seen_names.insert(rel.method_name.clone()) {
+                let php_type = relationship_to_php_type(
+                    &rel.relationship_type,
+                    rel.related_model.as_deref(),
+                );
+                properties.push(ModelPropertyCompletion {
+                    name: rel.method_name.clone(),
+                    php_type,
+                    source: "relationship".to_string(),
+                });
+            }
+        }
+
+        // Sort by name for consistent ordering
+        properties.sort_by(|a, b| a.name.cmp(&b.name));
+        properties
     }
 
     /// Get all route names from routes/*.php files for autocomplete
@@ -7356,6 +8989,51 @@ return [
         }
         drop(root_guard);
 
+        // Check for unresolved variable property accesses in Blade files
+        // This warns about variables like $user-> where the type cannot be determined
+        let variable_accesses = Self::extract_blade_variable_accesses(source);
+        let mut seen_variables: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for access in variable_accesses {
+            // Only report once per variable name to avoid spam
+            if seen_variables.contains(&access.variable_name) {
+                continue;
+            }
+
+            // Try to resolve the variable type
+            let resolved_type = self.resolve_blade_variable_type_sync(uri, &access.variable_name);
+
+            if resolved_type.is_none() {
+                seen_variables.insert(access.variable_name.clone());
+
+                let diagnostic = Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line: access.line,
+                            character: access.column,
+                        },
+                        end: Position {
+                            line: access.line,
+                            character: access.end_column,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::HINT),
+                    code: None,
+                    source: Some("laravel-lsp".to_string()),
+                    message: format!(
+                        "Cannot resolve type for '{}'\n\nTo enable autocomplete, ensure the variable is passed from:\n• Controller with return view('...', compact('{}'))\n• Livewire component with public property\n• View component with constructor parameter\n• @props directive with type hint",
+                        access.variable_name,
+                        access.variable_name.trim_start_matches('$')
+                    ),
+                    related_information: None,
+                    tags: None,
+                    code_description: None,
+                    data: None,
+                };
+                diagnostics.push(diagnostic);
+            }
+        }
+
         // Store diagnostics for hover filtering
         self.diagnostics.write().await.insert(uri.clone(), diagnostics.clone());
 
@@ -7926,8 +9604,103 @@ impl LanguageServer for LaravelLanguageServer {
             || path.ends_with("phpunit.dist.xml");
         let is_php_or_blade = path.ends_with(".php") || path.ends_with(".blade.php");
 
-        // In PHP/Blade files, check for config context first
+        // In PHP/Blade files, check for various contexts
         if is_php_or_blade {
+            // Check for variable name context in Blade files (typing $user, $u, etc.)
+            // This must come BEFORE model property context to avoid conflicts
+            if uri.path().ends_with(".blade.php") {
+                if let Some(var_prefix) = Self::get_variable_name_context(line_text, position.character) {
+                    debug!("   Variable name context in Blade, prefix: '{}'", var_prefix);
+
+                    // Get all available variables for this Blade file
+                    let variables = self.get_blade_available_variables(uri);
+
+                    // Filter by prefix and build completion items
+                    let prefix_lower = var_prefix.to_lowercase();
+                    let items: Vec<CompletionItem> = variables
+                        .into_iter()
+                        .filter(|v| v.name.to_lowercase().starts_with(&prefix_lower))
+                        .map(|v| {
+                            CompletionItem {
+                                label: format!("${}", v.name),
+                                kind: Some(CompletionItemKind::VARIABLE),
+                                detail: Some(format!("{} ({})", v.php_type, v.source)),
+                                insert_text: Some(v.name.clone()), // Insert without $ since user already typed it
+                                documentation: None,
+                                ..Default::default()
+                            }
+                        })
+                        .collect();
+
+                    debug!("   Returning {} variable completion items", items.len());
+
+                    if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::List(CompletionList {
+                            is_incomplete: false,
+                            items,
+                        })));
+                    }
+                }
+            }
+
+            // Check for model property context ($user-> or User::find()->)
+            if let Some((class_hint, typed_prefix)) = Self::get_model_property_context(line_text, position.character) {
+                debug!("   Model property context, class hint: '{}', typed prefix: '{}'", class_hint, typed_prefix);
+
+                // Resolve the model class from the hint
+                let model_class = if class_hint.starts_with('$') {
+                    // Variable - need to resolve type
+                    // Try explicit type hints/PHPDoc in current file first
+                    Self::resolve_variable_type(&content, &class_hint)
+                        .or_else(|| {
+                            // For Blade files, try to resolve from the source that provides this variable
+                            // (controller, Livewire component, view component, or view composer)
+                            self.resolve_blade_variable_type_sync(uri, &class_hint)
+                        })
+                } else {
+                    // Direct class name from static chain
+                    Some(class_hint)
+                };
+
+                if let Some(class_name) = model_class {
+                    debug!("   Resolved model class: {}", class_name);
+
+                    // Get model properties
+                    let properties = self.get_model_properties(&class_name).await;
+
+                    // Build completion items, filtering by prefix
+                    let prefix_lower = typed_prefix.to_lowercase();
+                    let items: Vec<CompletionItem> = properties
+                        .into_iter()
+                        .filter(|p| p.name.to_lowercase().starts_with(&prefix_lower))
+                        .map(|p| {
+                            let kind = match p.source.as_str() {
+                                "relationship" => CompletionItemKind::METHOD,
+                                "accessor" => CompletionItemKind::PROPERTY,
+                                _ => CompletionItemKind::FIELD,
+                            };
+
+                            CompletionItem {
+                                label: p.name.clone(),
+                                kind: Some(kind),
+                                detail: Some(format!("{} ({})", p.php_type, p.source)),
+                                documentation: None,
+                                ..Default::default()
+                            }
+                        })
+                        .collect();
+
+                    debug!("   Returning {} model property completion items", items.len());
+
+                    if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::List(CompletionList {
+                            is_incomplete: false,
+                            items,
+                        })));
+                    }
+                }
+            }
+
             if let Some(config_prefix) = Self::get_config_call_context(line_text, position.character) {
                 debug!("   Config context, filter prefix: '{}'", config_prefix);
 
