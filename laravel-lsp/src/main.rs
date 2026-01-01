@@ -134,6 +134,36 @@ struct RouteNameCompletion {
     source: String,
 }
 
+/// A view name for autocomplete
+struct ViewNameCompletion {
+    /// The view name in dot notation (e.g., "users.profile")
+    name: String,
+    /// Relative path to the view file (e.g., "resources/views/users/profile.blade.php")
+    path: String,
+}
+
+/// A Blade component for autocomplete
+struct BladeComponentCompletion {
+    /// The component name (e.g., "button", "forms.input")
+    name: String,
+    /// Relative path to the component file
+    path: String,
+}
+
+/// A Livewire component for autocomplete
+struct LivewireComponentCompletion {
+    /// The component name in kebab-case (e.g., "user-profile", "admin.dashboard")
+    name: String,
+    /// Relative path to the component PHP file
+    path: String,
+}
+
+/// A file path for autocomplete (used by asset(), @vite(), path helpers)
+struct FilePathCompletion {
+    /// The relative path from the base directory (e.g., "css/app.css", "js/app.js")
+    path: String,
+}
+
 /// A translation key for autocomplete
 struct TranslationKeyCompletion {
     /// The full dot-notation key (e.g., "messages.welcome")
@@ -1424,6 +1454,8 @@ impl LaravelLanguageServer {
                     component_paths: cached_config.component_paths.clone(),
                     livewire_path: cached_config.livewire_path.clone(),
                     has_livewire: cached_config.has_livewire,
+                    view_namespaces: std::collections::HashMap::new(),
+                    component_namespaces: std::collections::HashMap::new(),
                 };
                 // Store directly in memory - no Salsa channel call!
                 *self.cached_config.write().await = Some(config_data);
@@ -1461,6 +1493,8 @@ impl LaravelLanguageServer {
                 component_paths: c.component_paths.clone(),
                 livewire_path: c.livewire_path.clone(),
                 has_livewire: c.has_livewire,
+                view_namespaces: std::collections::HashMap::new(),
+                component_namespaces: std::collections::HashMap::new(),
             });
 
             tokio::spawn(async move {
@@ -2882,6 +2916,458 @@ impl LaravelLanguageServer {
         Some(after_pattern.to_string())
     }
 
+    /// Check if cursor is inside ->middleware('...') or similar middleware calls
+    /// Returns the partial text typed so far (for filtering completions)
+    ///
+    /// Examples:
+    /// - `->middleware('` returns Some("")
+    /// - `->middleware('auth` returns Some("auth")
+    /// - `->middleware(['auth', '` returns Some("")
+    fn get_middleware_call_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Look for various middleware patterns before cursor
+        // Pattern: (pattern_string, quote_char, pattern_length)
+        let patterns: Vec<(&str, char, usize)> = vec![
+            // ->middleware('
+            ("->middleware('", '\'', 14),
+            ("->middleware(\"", '"', 14),
+            // ->middleware([' (array syntax - first element)
+            ("->middleware(['", '\'', 15),
+            ("->middleware([\"", '"', 15),
+            // ', ' inside middleware array (subsequent elements)
+            ("', '", '\'', 4),
+            ("\", \"", '"', 4),
+            // Route::middleware('
+            ("Route::middleware('", '\'', 19),
+            ("Route::middleware(\"", '"', 19),
+            // withMiddleware('
+            ("withMiddleware('", '\'', 16),
+            ("withMiddleware(\"", '"', 16),
+            // ->withoutMiddleware('
+            ("->withoutMiddleware('", '\'', 21),
+            ("->withoutMiddleware(\"", '"', 21),
+        ];
+
+        // Find all matches and their positions
+        let mut matches: Vec<(usize, char, usize)> = Vec::new();
+
+        for (pattern, quote, len) in &patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                matches.push((pos, *quote, *len));
+            }
+        }
+
+        if matches.is_empty() {
+            return None;
+        }
+
+        // Find the latest match (closest to cursor)
+        let (pos, quote_char, pattern_len) = matches
+            .into_iter()
+            .max_by_key(|(p, _, _)| *p)?;
+
+        let start_pos = pos + pattern_len;
+
+        // Check that there's no closing quote between start and cursor
+        let after_pattern = &before_cursor[start_pos..];
+        if after_pattern.contains(quote_char) {
+            return None;
+        }
+
+        // For array patterns like "', '", verify we're actually in a middleware context
+        // by checking if ->middleware( or similar appears earlier in the line
+        if pattern_len <= 4 {
+            let middleware_indicators = [
+                "->middleware(",
+                "Route::middleware(",
+                "withMiddleware(",
+                "->withoutMiddleware(",
+            ];
+            let has_middleware_context = middleware_indicators
+                .iter()
+                .any(|ind| before_cursor[..pos].contains(ind));
+            if !has_middleware_context {
+                return None;
+            }
+        }
+
+        Some(after_pattern.to_string())
+    }
+
+    /// Check if cursor is inside view('...'), View::make('...'), or similar view calls
+    /// Returns the partial text typed so far (for filtering completions)
+    ///
+    /// Examples:
+    /// - `view('` returns Some("")
+    /// - `view('users.` returns Some("users.")
+    /// - `View::make('admin.` returns Some("admin.")
+    fn get_view_call_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Look for various view patterns before cursor
+        // Pattern: (pattern_string, quote_char, pattern_length)
+        let patterns: Vec<(&str, char, usize)> = vec![
+            // view('
+            ("view('", '\'', 6),
+            ("view(\"", '"', 6),
+            // View::make('
+            ("View::make('", '\'', 12),
+            ("View::make(\"", '"', 12),
+            // Route::view(' - second argument is the view name
+            // We need to be careful here - first arg is the URI
+            // For now, let's match after the comma
+            ("Route::view(", '\'', 12), // Will need special handling
+            // @extends('
+            ("@extends('", '\'', 10),
+            ("@extends(\"", '"', 10),
+            // @include('
+            ("@include('", '\'', 10),
+            ("@include(\"", '"', 10),
+            // @includeIf('
+            ("@includeIf('", '\'', 12),
+            ("@includeIf(\"", '"', 12),
+            // @includeWhen('
+            ("@includeWhen('", '\'', 13),
+            ("@includeWhen(\"", '"', 13),
+            // @includeUnless('
+            ("@includeUnless('", '\'', 16),
+            ("@includeUnless(\"", '"', 16),
+            // @includeFirst(['
+            ("@includeFirst(['", '\'', 16),
+            ("@includeFirst([\"", '"', 16),
+            // @each('
+            ("@each('", '\'', 7),
+            ("@each(\"", '"', 7),
+            // @component('
+            ("@component('", '\'', 12),
+            ("@component(\"", '"', 12),
+        ];
+
+        // Find all matches and their positions
+        let mut matches: Vec<(usize, char, usize)> = Vec::new();
+
+        for (pattern, quote, len) in &patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                matches.push((pos, *quote, *len));
+            }
+        }
+
+        // Special handling for Route::view - need to find the view argument (after first comma)
+        if let Some(route_view_pos) = before_cursor.rfind("Route::view(") {
+            let after_route_view = &before_cursor[route_view_pos + 12..];
+            // Find the first comma (after the URI argument)
+            if let Some(comma_pos) = after_route_view.find(',') {
+                let after_comma = &after_route_view[comma_pos + 1..];
+                // Look for opening quote after the comma
+                let trimmed = after_comma.trim_start();
+                if let Some(first_char) = trimmed.chars().next() {
+                    if first_char == '\'' || first_char == '"' {
+                        let quote_char = first_char;
+                        let quote_pos_in_after_comma = after_comma.find(quote_char).unwrap();
+                        let start = route_view_pos + 12 + comma_pos + 1 + quote_pos_in_after_comma + 1;
+                        if start <= cursor {
+                            let content = &before_cursor[start..];
+                            if !content.contains(quote_char) {
+                                matches.push((start - 1, quote_char, 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return None;
+        }
+
+        // Find the latest match (closest to cursor)
+        let (pos, quote_char, pattern_len) = matches
+            .into_iter()
+            .max_by_key(|(p, _, _)| *p)?;
+
+        let start_pos = pos + pattern_len;
+
+        // Check that there's no closing quote between start and cursor
+        let after_pattern = &before_cursor[start_pos..];
+        if after_pattern.contains(quote_char) {
+            return None;
+        }
+
+        Some(after_pattern.to_string())
+    }
+
+    /// Check if cursor is inside a Blade component tag like `<x-...`
+    /// Returns the partial component name typed so far (for filtering completions)
+    ///
+    /// Examples:
+    /// - `<x-` returns Some("")
+    /// - `<x-button` returns Some("button")
+    /// - `<x-forms.` returns Some("forms.")
+    fn get_blade_component_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Look for <x- pattern
+        // We need to find the last occurrence and ensure we're still in the tag name
+        if let Some(pos) = before_cursor.rfind("<x-") {
+            let start_pos = pos + 3; // After "<x-"
+
+            // Get the text after <x-
+            let after_prefix = &before_cursor[start_pos..];
+
+            // Check that we haven't closed the tag or hit a space (which would mean attributes)
+            // Component names can contain: letters, numbers, dots, and hyphens
+            // If we hit a space, >, or /, we're past the component name
+            if after_prefix.contains(' ') || after_prefix.contains('>') || after_prefix.contains('/') {
+                return None;
+            }
+
+            // Validate that after_prefix only contains valid component name characters
+            if after_prefix.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                return Some(after_prefix.to_string());
+            }
+        }
+
+        None
+    }
+
+    /// Check if cursor is inside a Livewire component tag like `<livewire:...` or `@livewire('...')`
+    /// Returns the partial component name typed so far (for filtering completions)
+    ///
+    /// Examples:
+    /// - `<livewire:` returns Some("")
+    /// - `<livewire:user-` returns Some("user-")
+    /// - `@livewire('user-` returns Some("user-")
+    fn get_livewire_component_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Check for <livewire: pattern (HTML-style)
+        if let Some(pos) = before_cursor.rfind("<livewire:") {
+            let start_pos = pos + 10; // After "<livewire:"
+
+            // Get the text after <livewire:
+            let after_prefix = &before_cursor[start_pos..];
+
+            // Check that we haven't closed the tag or hit a space (which would mean attributes)
+            // Component names can contain: letters, numbers, dots, and hyphens
+            if after_prefix.contains(' ') || after_prefix.contains('>') || after_prefix.contains('/') {
+                return None;
+            }
+
+            // Validate that after_prefix only contains valid component name characters
+            if after_prefix.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                return Some(after_prefix.to_string());
+            }
+        }
+
+        // Check for @livewire(' pattern (Blade directive style)
+        let patterns: Vec<(&str, char, usize)> = vec![
+            ("@livewire('", '\'', 11),
+            ("@livewire(\"", '"', 11),
+        ];
+
+        for (pattern, quote_char, pattern_len) in patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                let start_pos = pos + pattern_len;
+
+                // Get the text after the opening quote
+                let after_quote = &before_cursor[start_pos..];
+
+                // Check that we haven't hit the closing quote
+                if !after_quote.contains(quote_char) {
+                    // Validate component name characters
+                    if after_quote.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                        return Some(after_quote.to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if cursor is inside asset('...') call
+    /// Returns the partial path typed so far (for filtering completions)
+    ///
+    /// Examples:
+    /// - `asset('` returns Some("")
+    /// - `asset('css/` returns Some("css/")
+    /// - `asset('images/logo` returns Some("images/logo")
+    fn get_asset_call_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        let patterns: Vec<(&str, char, usize)> = vec![
+            ("asset('", '\'', 7),
+            ("asset(\"", '"', 7),
+        ];
+
+        for (pattern, quote_char, pattern_len) in patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                let start_pos = pos + pattern_len;
+                let after_quote = &before_cursor[start_pos..];
+
+                // Check that we haven't hit the closing quote
+                if !after_quote.contains(quote_char) {
+                    return Some(after_quote.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if cursor is inside @vite('...') or Vite::asset('...') call
+    /// Returns the partial path typed so far (for filtering completions)
+    ///
+    /// Examples:
+    /// - `@vite('` returns Some("")
+    /// - `@vite('resources/js/` returns Some("resources/js/")
+    fn get_vite_call_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        let patterns: Vec<(&str, char, usize)> = vec![
+            ("@vite('", '\'', 7),
+            ("@vite(\"", '"', 7),
+            ("@vite(['", '\'', 8),
+            ("@vite([\"", '"', 8),
+            ("Vite::asset('", '\'', 13),
+            ("Vite::asset(\"", '"', 13),
+        ];
+
+        for (pattern, quote_char, pattern_len) in patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                let start_pos = pos + pattern_len;
+                let after_quote = &before_cursor[start_pos..];
+
+                // Check that we haven't hit the closing quote
+                if !after_quote.contains(quote_char) {
+                    return Some(after_quote.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if cursor is inside a path helper call like app_path('...'), base_path('...'), etc.
+    /// Returns (helper_name, partial_path) for filtering completions
+    ///
+    /// Examples:
+    /// - `app_path('` returns Some(("app_path", ""))
+    /// - `storage_path('logs/` returns Some(("storage_path", "logs/"))
+    /// - `base_path('config/` returns Some(("base_path", "config/"))
+    fn get_path_helper_context(line_text: &str, character: u32) -> Option<(&'static str, String)> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // (pattern, quote_char, pattern_len, helper_name)
+        let patterns: Vec<(&str, char, usize, &'static str)> = vec![
+            ("app_path('", '\'', 10, "app_path"),
+            ("app_path(\"", '"', 10, "app_path"),
+            ("base_path('", '\'', 11, "base_path"),
+            ("base_path(\"", '"', 11, "base_path"),
+            ("config_path('", '\'', 13, "config_path"),
+            ("config_path(\"", '"', 13, "config_path"),
+            ("database_path('", '\'', 15, "database_path"),
+            ("database_path(\"", '"', 15, "database_path"),
+            ("lang_path('", '\'', 11, "lang_path"),
+            ("lang_path(\"", '"', 11, "lang_path"),
+            ("public_path('", '\'', 13, "public_path"),
+            ("public_path(\"", '"', 13, "public_path"),
+            ("resource_path('", '\'', 15, "resource_path"),
+            ("resource_path(\"", '"', 15, "resource_path"),
+            ("storage_path('", '\'', 14, "storage_path"),
+            ("storage_path(\"", '"', 14, "storage_path"),
+        ];
+
+        for (pattern, quote_char, pattern_len, helper_name) in patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                let start_pos = pos + pattern_len;
+                let after_quote = &before_cursor[start_pos..];
+
+                // Check that we haven't hit the closing quote
+                if !after_quote.contains(quote_char) {
+                    return Some((helper_name, after_quote.to_string()));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if cursor is inside app('...') or resolve('...') container binding calls
+    /// Returns the partial binding name typed so far (for filtering completions)
+    ///
+    /// Examples:
+    /// - `app('` returns Some("")
+    /// - `app('cache` returns Some("cache")
+    /// - `resolve('log` returns Some("log")
+    fn get_binding_call_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        let patterns: Vec<(&str, char, usize)> = vec![
+            ("app('", '\'', 5),
+            ("app(\"", '"', 5),
+            ("resolve('", '\'', 9),
+            ("resolve(\"", '"', 9),
+            ("App::make('", '\'', 11),
+            ("App::make(\"", '"', 11),
+        ];
+
+        for (pattern, quote_char, pattern_len) in patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                let start_pos = pos + pattern_len;
+                let after_quote = &before_cursor[start_pos..];
+
+                // Check that we haven't hit the closing quote
+                if !after_quote.contains(quote_char) {
+                    return Some(after_quote.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
     /// Check if cursor is inside __('...'), trans('...'), or other translation-related calls
     /// Returns the partial text typed so far (for filtering completions)
     ///
@@ -3890,6 +4376,425 @@ impl LaravelLanguageServer {
         // Sort by key for consistent ordering
         completions.sort_by(|a, b| a.key.cmp(&b.key));
         completions
+    }
+
+    /// Get all view names from resources/views for autocomplete
+    async fn get_all_view_names(&self) -> Vec<ViewNameCompletion> {
+        let root = match self.root_path.read().await.clone() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        // Get view paths from cached config
+        let view_paths = match self.cached_config.read().await.as_ref() {
+            Some(config) => config.view_paths.clone(),
+            None => {
+                // Default to resources/views if no config
+                vec![root.join("resources/views")]
+            }
+        };
+
+        let mut completions = Vec::new();
+
+        for view_path in view_paths {
+            if !view_path.exists() {
+                continue;
+            }
+
+            // Walk the directory recursively
+            for entry in walkdir::WalkDir::new(&view_path)
+                .follow_links(true)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_type().is_file()
+                        && e.path().extension().map_or(false, |ext| ext == "php")
+                })
+            {
+                let path = entry.into_path();
+
+                // Convert file path to view name
+                if let Ok(relative) = path.strip_prefix(&view_path) {
+                    let relative_str = relative.to_string_lossy();
+
+                    // Remove .blade.php or .php extension
+                    let view_name = if relative_str.ends_with(".blade.php") {
+                        relative_str.trim_end_matches(".blade.php")
+                    } else if relative_str.ends_with(".php") {
+                        relative_str.trim_end_matches(".php")
+                    } else {
+                        continue;
+                    };
+
+                    // Convert path separators to dots
+                    let view_name = view_name.replace(['/', '\\'], ".");
+
+                    // Get relative path from project root for display
+                    let display_path = path
+                        .strip_prefix(&root)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+                    completions.push(ViewNameCompletion {
+                        name: view_name.to_string(),
+                        path: display_path,
+                    });
+                }
+            }
+        }
+
+        // Add package views from view_namespaces
+        if let Some(config) = self.cached_config.read().await.as_ref() {
+            for (namespace, package_path) in &config.view_namespaces {
+                if !package_path.exists() {
+                    continue;
+                }
+
+                for entry in walkdir::WalkDir::new(package_path)
+                    .follow_links(true)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_type().is_file()
+                            && e.path().extension().map_or(false, |ext| ext == "php")
+                    })
+                {
+                    let path = entry.into_path();
+
+                    if let Ok(relative) = path.strip_prefix(package_path) {
+                        let relative_str = relative.to_string_lossy();
+
+                        let view_name = if relative_str.ends_with(".blade.php") {
+                            relative_str.trim_end_matches(".blade.php")
+                        } else if relative_str.ends_with(".php") {
+                            relative_str.trim_end_matches(".php")
+                        } else {
+                            continue;
+                        };
+
+                        // Convert path separators to dots and prefix with namespace::
+                        let view_name = format!("{}::{}", namespace, view_name.replace(['/', '\\'], "."));
+
+                        let display_path = path.to_string_lossy().to_string();
+
+                        completions.push(ViewNameCompletion {
+                            name: view_name,
+                            path: display_path,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Sort by name for consistent ordering
+        completions.sort_by(|a, b| a.name.cmp(&b.name));
+        completions
+    }
+
+    /// Get all Blade component names from component directories for autocomplete
+    async fn get_all_blade_components(&self) -> Vec<BladeComponentCompletion> {
+        let root = match self.root_path.read().await.clone() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        // Get component paths from cached config
+        let component_paths = match self.cached_config.read().await.as_ref() {
+            Some(config) => config.component_paths.clone(),
+            None => {
+                // Default to resources/views/components if no config
+                vec![(String::new(), root.join("resources/views/components"))]
+            }
+        };
+
+        let mut completions = Vec::new();
+
+        for (namespace, component_path) in component_paths {
+            if !component_path.exists() {
+                continue;
+            }
+
+            // Walk the directory recursively
+            for entry in walkdir::WalkDir::new(&component_path)
+                .follow_links(true)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_type().is_file()
+                        && e.path().extension().map_or(false, |ext| ext == "php")
+                })
+            {
+                let path = entry.into_path();
+
+                // Convert file path to component name
+                if let Ok(relative) = path.strip_prefix(&component_path) {
+                    let relative_str = relative.to_string_lossy();
+
+                    // Remove .blade.php or .php extension
+                    let component_name = if relative_str.ends_with(".blade.php") {
+                        relative_str.trim_end_matches(".blade.php")
+                    } else if relative_str.ends_with(".php") {
+                        relative_str.trim_end_matches(".php")
+                    } else {
+                        continue;
+                    };
+
+                    // Convert path separators to dots for nested components
+                    let component_name = component_name.replace(['/', '\\'], ".");
+
+                    // Convert to kebab-case (Laravel convention for Blade components)
+                    // PascalCase files become kebab-case: "Button" -> "button", "AlertDialog" -> "alert-dialog"
+                    let component_name = Self::to_kebab_case(&component_name);
+
+                    // Add namespace prefix if present
+                    let full_name = if namespace.is_empty() {
+                        component_name
+                    } else {
+                        format!("{}::{}", namespace, component_name)
+                    };
+
+                    // Get relative path from project root for display
+                    let display_path = path
+                        .strip_prefix(&root)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+                    completions.push(BladeComponentCompletion {
+                        name: full_name,
+                        path: display_path,
+                    });
+                }
+            }
+        }
+
+        // Add package components from view_namespaces
+        // Package anonymous components live in {package_view_path}/components/
+        if let Some(config) = self.cached_config.read().await.as_ref() {
+            for (namespace, package_path) in &config.view_namespaces {
+                let components_path = package_path.join("components");
+                if !components_path.exists() {
+                    continue;
+                }
+
+                for entry in walkdir::WalkDir::new(&components_path)
+                    .follow_links(true)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_type().is_file()
+                            && e.path().extension().map_or(false, |ext| ext == "php")
+                    })
+                {
+                    let path = entry.into_path();
+
+                    if let Ok(relative) = path.strip_prefix(&components_path) {
+                        let relative_str = relative.to_string_lossy();
+
+                        // Remove .blade.php or .php extension
+                        let component_name = if relative_str.ends_with(".blade.php") {
+                            relative_str.trim_end_matches(".blade.php")
+                        } else if relative_str.ends_with(".php") {
+                            relative_str.trim_end_matches(".php")
+                        } else {
+                            continue;
+                        };
+
+                        // Convert path separators to dots for nested components
+                        let component_name = component_name.replace(['/', '\\'], ".");
+
+                        // Convert to kebab-case
+                        let component_name = Self::to_kebab_case(&component_name);
+
+                        // Package components use namespace::component format
+                        let full_name = format!("{}::{}", namespace, component_name);
+
+                        // For display, show relative to package path or absolute
+                        let display_path = path.to_string_lossy().to_string();
+
+                        completions.push(BladeComponentCompletion {
+                            name: full_name,
+                            path: display_path,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Sort by name for consistent ordering
+        completions.sort_by(|a, b| a.name.cmp(&b.name));
+        completions
+    }
+
+    /// Get all Livewire component names from app/Livewire directory for autocomplete
+    ///
+    /// Returns a list of Livewire component names in kebab-case (as used in Blade templates)
+    /// along with their file paths.
+    async fn get_all_livewire_components(&self) -> Vec<LivewireComponentCompletion> {
+        let root = match self.root_path.read().await.clone() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        // Get Livewire path from cached config
+        let livewire_path = match self.cached_config.read().await.as_ref() {
+            Some(config) => match &config.livewire_path {
+                Some(path) => root.join(path),
+                None => return Vec::new(), // Livewire not configured
+            },
+            None => {
+                // Default to app/Livewire if no config
+                let v3_path = root.join("app/Livewire");
+                let v2_path = root.join("app/Http/Livewire");
+                if v3_path.exists() {
+                    v3_path
+                } else if v2_path.exists() {
+                    v2_path
+                } else {
+                    return Vec::new();
+                }
+            }
+        };
+
+        if !livewire_path.exists() {
+            return Vec::new();
+        }
+
+        let mut completions = Vec::new();
+
+        // Walk the Livewire directory recursively
+        for entry in walkdir::WalkDir::new(&livewire_path)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_type().is_file()
+                    && e.path().extension().map_or(false, |ext| ext == "php")
+            })
+        {
+            let path = entry.into_path();
+
+            // Convert file path to component name
+            if let Ok(relative) = path.strip_prefix(&livewire_path) {
+                let relative_str = relative.to_string_lossy();
+
+                // Remove .php extension
+                let component_name = if relative_str.ends_with(".php") {
+                    relative_str.trim_end_matches(".php")
+                } else {
+                    continue;
+                };
+
+                // Convert path separators to dots for nested components
+                // e.g., "Admin/Dashboard.php" -> "admin.dashboard"
+                let component_name = component_name.replace(['/', '\\'], ".");
+
+                // Convert PascalCase to kebab-case
+                // e.g., "UserProfile" -> "user-profile", "Admin.Dashboard" -> "admin.dashboard"
+                let component_name = Self::to_kebab_case(&component_name);
+
+                // Get relative path from project root for display
+                let display_path = path
+                    .strip_prefix(&root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+                completions.push(LivewireComponentCompletion {
+                    name: component_name,
+                    path: display_path,
+                });
+            }
+        }
+
+        // Sort by name for consistent ordering
+        completions.sort_by(|a, b| a.name.cmp(&b.name));
+        completions
+    }
+
+    /// Get all files in a directory for autocomplete (used by asset, vite, path helpers)
+    ///
+    /// Returns relative paths from the base directory.
+    /// Optionally filters by file extensions.
+    async fn get_directory_files(
+        &self,
+        base_dir: &std::path::Path,
+        extensions: Option<&[&str]>,
+    ) -> Vec<FilePathCompletion> {
+        if !base_dir.exists() {
+            return Vec::new();
+        }
+
+        let mut completions = Vec::new();
+
+        for entry in walkdir::WalkDir::new(base_dir)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let path = entry.path();
+
+            // Filter by extension if specified
+            if let Some(exts) = extensions {
+                let has_valid_ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| exts.iter().any(|ext| e.eq_ignore_ascii_case(ext)))
+                    .unwrap_or(false);
+
+                if !has_valid_ext {
+                    continue;
+                }
+            }
+
+            // Get relative path from base directory
+            if let Ok(relative) = path.strip_prefix(base_dir) {
+                let relative_str = relative.to_string_lossy().to_string();
+                // Normalize path separators to forward slashes
+                let normalized = relative_str.replace('\\', "/");
+                completions.push(FilePathCompletion { path: normalized });
+            }
+        }
+
+        // Sort by path for consistent ordering
+        completions.sort_by(|a, b| a.path.cmp(&b.path));
+        completions
+    }
+
+    /// Get the base directory for a path helper
+    fn get_path_helper_base_dir(&self, helper: &str, root: &std::path::Path) -> std::path::PathBuf {
+        match helper {
+            "app_path" => root.join("app"),
+            "base_path" => root.to_path_buf(),
+            "config_path" => root.join("config"),
+            "database_path" => root.join("database"),
+            "lang_path" => root.join("lang"),
+            "public_path" => root.join("public"),
+            "resource_path" => root.join("resources"),
+            "storage_path" => root.join("storage"),
+            _ => root.to_path_buf(),
+        }
+    }
+
+    /// Convert a string to kebab-case
+    /// "Button" -> "button"
+    /// "AlertDialog" -> "alert-dialog"
+    /// "forms.Input" -> "forms.input"
+    fn to_kebab_case(s: &str) -> String {
+        let mut result = String::new();
+        for (i, c) in s.chars().enumerate() {
+            if c == '.' {
+                // Preserve dots for nested components
+                result.push('.');
+            } else if c.is_uppercase() {
+                if i > 0 && !result.ends_with('.') && !result.ends_with('-') {
+                    result.push('-');
+                }
+                result.push(c.to_lowercase().next().unwrap());
+            } else {
+                result.push(c);
+            }
+        }
+        result
     }
 
     /// Get all route names from routes/*.php files for autocomplete
@@ -7062,6 +7967,280 @@ impl LanguageServer for LaravelLanguageServer {
                 };
             }
 
+            // Check for view context
+            if let Some(view_prefix) = Self::get_view_call_context(line_text, position.character) {
+                debug!("   View context, filter prefix: '{}'", view_prefix);
+
+                // Get all view names
+                let view_names = self.get_all_view_names().await;
+
+                // Build completion items, filtering by prefix (case-insensitive)
+                let prefix_lower = view_prefix.to_lowercase();
+                let items: Vec<CompletionItem> = view_names
+                    .into_iter()
+                    .filter(|v| v.name.to_lowercase().starts_with(&prefix_lower))
+                    .map(|v| {
+                        CompletionItem {
+                            label: v.name.clone(),
+                            kind: Some(CompletionItemKind::FILE),
+                            detail: Some(v.path),
+                            documentation: None,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} view completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for Blade component context (<x-...)
+            if let Some(component_prefix) = Self::get_blade_component_context(line_text, position.character) {
+                debug!("   Blade component context, filter prefix: '{}'", component_prefix);
+
+                // Get all Blade components
+                let components = self.get_all_blade_components().await;
+
+                // Build completion items, filtering by prefix (case-insensitive)
+                let prefix_lower = component_prefix.to_lowercase();
+                let items: Vec<CompletionItem> = components
+                    .into_iter()
+                    .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
+                    .map(|c| {
+                        CompletionItem {
+                            label: c.name.clone(),
+                            kind: Some(CompletionItemKind::CLASS),
+                            detail: Some(c.path),
+                            documentation: None,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} Blade component completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for Livewire component context (<livewire:... or @livewire('...'))
+            if let Some(livewire_prefix) = Self::get_livewire_component_context(line_text, position.character) {
+                debug!("   Livewire component context, filter prefix: '{}'", livewire_prefix);
+
+                // Get all Livewire components
+                let components = self.get_all_livewire_components().await;
+
+                // Build completion items, filtering by prefix (case-insensitive)
+                let prefix_lower = livewire_prefix.to_lowercase();
+                let items: Vec<CompletionItem> = components
+                    .into_iter()
+                    .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
+                    .map(|c| {
+                        CompletionItem {
+                            label: c.name.clone(),
+                            kind: Some(CompletionItemKind::CLASS),
+                            detail: Some(c.path),
+                            documentation: None,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} Livewire component completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for asset() context
+            if let Some(asset_prefix) = Self::get_asset_call_context(line_text, position.character) {
+                debug!("   Asset context, filter prefix: '{}'", asset_prefix);
+
+                let root = match self.root_path.read().await.clone() {
+                    Some(r) => r,
+                    None => return Ok(None),
+                };
+
+                let public_dir = root.join("public");
+                let files = self.get_directory_files(&public_dir, None).await;
+
+                // Build completion items, filtering by prefix
+                let prefix_lower = asset_prefix.to_lowercase();
+                let items: Vec<CompletionItem> = files
+                    .into_iter()
+                    .filter(|f| f.path.to_lowercase().starts_with(&prefix_lower))
+                    .map(|f| {
+                        CompletionItem {
+                            label: f.path.clone(),
+                            kind: Some(CompletionItemKind::FILE),
+                            detail: Some("public/".to_string() + &f.path),
+                            documentation: None,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} asset completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for @vite() context
+            if let Some(vite_prefix) = Self::get_vite_call_context(line_text, position.character) {
+                debug!("   Vite context, filter prefix: '{}'", vite_prefix);
+
+                let root = match self.root_path.read().await.clone() {
+                    Some(r) => r,
+                    None => return Ok(None),
+                };
+
+                // Vite assets are typically in resources/ directory
+                let resources_dir = root.join("resources");
+                let vite_extensions = &["js", "ts", "jsx", "tsx", "css", "scss", "sass", "less", "vue", "svelte"];
+                let files = self.get_directory_files(&resources_dir, Some(vite_extensions)).await;
+
+                // Prefix paths with "resources/" for proper Vite resolution
+                let prefix_lower = vite_prefix.to_lowercase();
+                let items: Vec<CompletionItem> = files
+                    .into_iter()
+                    .map(|f| format!("resources/{}", f.path))
+                    .filter(|p| p.to_lowercase().starts_with(&prefix_lower))
+                    .map(|path| {
+                        CompletionItem {
+                            label: path.clone(),
+                            kind: Some(CompletionItemKind::FILE),
+                            detail: None,
+                            documentation: None,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} Vite completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for path helper context (app_path, base_path, storage_path, etc.)
+            if let Some((helper, path_prefix)) = Self::get_path_helper_context(line_text, position.character) {
+                debug!("   Path helper context: {}, filter prefix: '{}'", helper, path_prefix);
+
+                let root = match self.root_path.read().await.clone() {
+                    Some(r) => r,
+                    None => return Ok(None),
+                };
+
+                let base_dir = self.get_path_helper_base_dir(helper, &root);
+                let files = self.get_directory_files(&base_dir, None).await;
+
+                // Build completion items, filtering by prefix
+                let prefix_lower = path_prefix.to_lowercase();
+                let items: Vec<CompletionItem> = files
+                    .into_iter()
+                    .filter(|f| f.path.to_lowercase().starts_with(&prefix_lower))
+                    .map(|f| {
+                        CompletionItem {
+                            label: f.path.clone(),
+                            kind: Some(CompletionItemKind::FILE),
+                            detail: None,
+                            documentation: None,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} path helper completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for container binding context (app('...'), resolve('...'))
+            if let Some(binding_prefix) = Self::get_binding_call_context(line_text, position.character) {
+                debug!("   Binding context, filter prefix: '{}'", binding_prefix);
+
+                // Get all bindings from Salsa
+                let bindings = match self.salsa.get_all_parsed_bindings().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        debug!("   Failed to get bindings: {}", e);
+                        Vec::new()
+                    }
+                };
+
+                // Build completion items, filtering by prefix (case-insensitive)
+                let prefix_lower = binding_prefix.to_lowercase();
+                let items: Vec<CompletionItem> = bindings
+                    .into_iter()
+                    .filter(|b| b.abstract_name.to_lowercase().starts_with(&prefix_lower))
+                    .map(|b| {
+                        let source = b.source_file
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown");
+
+                        CompletionItem {
+                            label: b.abstract_name.clone(),
+                            kind: Some(CompletionItemKind::CLASS),
+                            detail: Some(format!("{} ({})", b.concrete_class, source)),
+                            documentation: None,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} binding completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
             // Check for route context
             if let Some(route_prefix) = Self::get_route_call_context(line_text, position.character) {
                 debug!("   Route context, filter prefix: '{}'", route_prefix);
@@ -7085,6 +8264,52 @@ impl LanguageServer for LaravelLanguageServer {
                     .collect();
 
                 debug!("   Returning {} route completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for middleware context
+            if let Some(middleware_prefix) = Self::get_middleware_call_context(line_text, position.character) {
+                debug!("   Middleware context, filter prefix: '{}'", middleware_prefix);
+
+                // Get all middleware from Salsa
+                let middleware_list = match self.salsa.get_all_parsed_middleware().await {
+                    Ok(mw) => mw,
+                    Err(e) => {
+                        debug!("   Failed to get middleware: {}", e);
+                        Vec::new()
+                    }
+                };
+
+                // Build completion items, filtering by prefix (case-insensitive)
+                let prefix_lower = middleware_prefix.to_lowercase();
+                let items: Vec<CompletionItem> = middleware_list
+                    .into_iter()
+                    .filter(|m| m.alias.to_lowercase().starts_with(&prefix_lower))
+                    .map(|m| {
+                        let source = m.source_file
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown");
+
+                        CompletionItem {
+                            label: m.alias.clone(),
+                            kind: Some(CompletionItemKind::MODULE),
+                            detail: Some(format!("{} ({})", m.class_name, source)),
+                            documentation: None,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} middleware completion items", items.len());
 
                 return if items.is_empty() {
                     Ok(None)

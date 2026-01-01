@@ -18,7 +18,7 @@ use std::time::Instant;
 use lru::LruCache;
 use salsa::Setter;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::kebab_to_pascal_case;
 
@@ -220,6 +220,13 @@ pub struct UrlPath<'db> {
 pub struct ActionName<'db> {
     #[returns(ref)]
     pub action: String,
+}
+
+/// Interned string for package view namespace (e.g., "courier", "mail")
+#[salsa::interned]
+pub struct PackageNamespace<'db> {
+    #[returns(ref)]
+    pub namespace: String,
 }
 
 // ============================================================================
@@ -1142,6 +1149,63 @@ pub struct ParsedBindingReg<'db> {
     pub source_file: PathBuf,
 }
 
+/// A parsed view namespace registration from loadViewsFrom() (Salsa tracked)
+/// Example: $this->loadViewsFrom(__DIR__.'/../resources/views', 'courier')
+#[salsa::tracked]
+pub struct ParsedViewNamespaceReg<'db> {
+    /// Package namespace (e.g., "courier")
+    pub namespace: PackageNamespace<'db>,
+    /// Resolved view path (if found)
+    #[returns(ref)]
+    pub view_path: Option<PathBuf>,
+    /// Line in source file where registered
+    pub source_line: u32,
+    /// Priority (0=framework, 1=package, 2=app)
+    pub priority: u8,
+    /// Source file where registered
+    #[returns(ref)]
+    pub source_file: PathBuf,
+}
+
+/// A parsed Blade component registration from Blade::component() (Salsa tracked)
+/// Example: Blade::component('package-alert', AlertComponent::class)
+#[salsa::tracked]
+pub struct ParsedBladeComponentReg<'db> {
+    /// Component tag name (e.g., "package-alert")
+    pub tag_name: ComponentName<'db>,
+    /// Full class name
+    #[returns(ref)]
+    pub class_name: String,
+    /// Resolved file path (if found)
+    #[returns(ref)]
+    pub file_path: Option<PathBuf>,
+    /// Line in source file where registered
+    pub source_line: u32,
+    /// Priority (0=framework, 1=package, 2=app)
+    pub priority: u8,
+    /// Source file where registered
+    #[returns(ref)]
+    pub source_file: PathBuf,
+}
+
+/// A parsed component namespace registration from Blade::componentNamespace() (Salsa tracked)
+/// Example: Blade::componentNamespace('Nightshade\\Views\\Components', 'nightshade')
+#[salsa::tracked]
+pub struct ParsedComponentNamespaceReg<'db> {
+    /// Component namespace prefix (e.g., "nightshade")
+    pub prefix: PackageNamespace<'db>,
+    /// PHP namespace (e.g., "Nightshade\\Views\\Components")
+    #[returns(ref)]
+    pub php_namespace: String,
+    /// Line in source file where registered
+    pub source_line: u32,
+    /// Priority (0=framework, 1=package, 2=app)
+    pub priority: u8,
+    /// Source file where registered
+    #[returns(ref)]
+    pub source_file: PathBuf,
+}
+
 /// Parsed service provider content
 #[salsa::tracked]
 pub struct ParsedServiceProvider<'db> {
@@ -1151,9 +1215,18 @@ pub struct ParsedServiceProvider<'db> {
     /// Container bindings found in this provider
     #[returns(ref)]
     pub bindings: Vec<ParsedBindingReg<'db>>,
+    /// View namespace registrations from loadViewsFrom()
+    #[returns(ref)]
+    pub view_namespaces: Vec<ParsedViewNamespaceReg<'db>>,
+    /// Manual Blade component registrations from Blade::component()
+    #[returns(ref)]
+    pub blade_components: Vec<ParsedBladeComponentReg<'db>>,
+    /// Component namespace registrations from Blade::componentNamespace()
+    #[returns(ref)]
+    pub component_namespaces: Vec<ParsedComponentNamespaceReg<'db>>,
 }
 
-/// Parse a service provider file and extract middleware and bindings
+/// Parse a service provider file and extract middleware, bindings, views, and components
 #[salsa::tracked]
 pub fn parse_service_provider_source<'db>(
     db: &'db dyn Db,
@@ -1178,6 +1251,21 @@ pub fn parse_service_provider_source<'db>(
         static ref ALIAS_RE: Regex = Regex::new(
             r#"\$this->app->alias\s*\(\s*\\?([A-Za-z0-9_\\]+)(?:::class)?\s*,\s*['"]([^'"]+)['"]\s*\)"#
         ).unwrap();
+
+        /// Matches $this->loadViewsFrom(__DIR__.'/../path', 'namespace')
+        static ref LOAD_VIEWS_RE: Regex = Regex::new(
+            r#"\$this->loadViewsFrom\s*\(\s*__DIR__\s*\.\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#
+        ).unwrap();
+
+        /// Matches Blade::component('tag-name', Class::class)
+        static ref BLADE_COMPONENT_RE: Regex = Regex::new(
+            r#"Blade::component\s*\(\s*['"]([^'"]+)['"]\s*,\s*\\?([A-Za-z0-9_\\]+)::class\s*\)"#
+        ).unwrap();
+
+        /// Matches Blade::componentNamespace('Namespace\\Path', 'prefix')
+        static ref COMPONENT_NAMESPACE_RE: Regex = Regex::new(
+            r#"Blade::componentNamespace\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#
+        ).unwrap();
     }
 
     let text = file.text(db);
@@ -1186,6 +1274,9 @@ pub fn parse_service_provider_source<'db>(
 
     let mut middleware = Vec::new();
     let mut bindings = Vec::new();
+    let mut view_namespaces = Vec::new();
+    let mut blade_components = Vec::new();
+    let mut component_namespaces = Vec::new();
 
     // Parse middleware registrations
     for cap in MIDDLEWARE_RE.captures_iter(text) {
@@ -1266,7 +1357,110 @@ pub fn parse_service_provider_source<'db>(
         }
     }
 
-    ParsedServiceProvider::new(db, middleware, bindings)
+    // Parse loadViewsFrom() registrations
+    // Example: $this->loadViewsFrom(__DIR__.'/../resources/views', 'courier')
+    for cap in LOAD_VIEWS_RE.captures_iter(text) {
+        if let (Some(relative_path), Some(namespace)) = (cap.get(1), cap.get(2)) {
+            let relative_path_str = relative_path.as_str();
+            let namespace_str = namespace.as_str();
+
+            let line = text[..namespace.start()].lines().count() as u32;
+
+            // Resolve __DIR__ + relative path
+            // __DIR__ is the directory containing the service provider file
+            let provider_dir = path.parent().unwrap_or(path.as_path());
+            let view_path = provider_dir.join(relative_path_str);
+            let resolved_path = if view_path.exists() {
+                Some(view_path.canonicalize().unwrap_or(view_path))
+            } else {
+                // Try normalizing the path without canonicalize (for non-existent paths)
+                let normalized = normalize_path(&view_path);
+                if normalized.exists() {
+                    Some(normalized)
+                } else {
+                    Some(normalized) // Still store the expected path
+                }
+            };
+
+            let pkg_namespace = PackageNamespace::new(db, namespace_str.to_string());
+            view_namespaces.push(ParsedViewNamespaceReg::new(
+                db,
+                pkg_namespace,
+                resolved_path,
+                line,
+                priority,
+                path.clone(),
+            ));
+        }
+    }
+
+    // Parse Blade::component() registrations
+    // Example: Blade::component('package-alert', AlertComponent::class)
+    for cap in BLADE_COMPONENT_RE.captures_iter(text) {
+        if let (Some(tag_name), Some(class)) = (cap.get(1), cap.get(2)) {
+            let tag_name_str = tag_name.as_str();
+            let class_str = class.as_str().trim_start_matches('\\');
+
+            let line = text[..tag_name.start()].lines().count() as u32;
+            let file_path = resolve_class_to_file_internal(class_str, &root);
+
+            let component_name = ComponentName::new(db, tag_name_str.to_string());
+            blade_components.push(ParsedBladeComponentReg::new(
+                db,
+                component_name,
+                class_str.to_string(),
+                file_path,
+                line,
+                priority,
+                path.clone(),
+            ));
+        }
+    }
+
+    // Parse Blade::componentNamespace() registrations
+    // Example: Blade::componentNamespace('Nightshade\\Views\\Components', 'nightshade')
+    for cap in COMPONENT_NAMESPACE_RE.captures_iter(text) {
+        if let (Some(php_ns), Some(prefix)) = (cap.get(1), cap.get(2)) {
+            let php_namespace_str = php_ns.as_str();
+            let prefix_str = prefix.as_str();
+
+            let line = text[..prefix.start()].lines().count() as u32;
+
+            let pkg_namespace = PackageNamespace::new(db, prefix_str.to_string());
+            component_namespaces.push(ParsedComponentNamespaceReg::new(
+                db,
+                pkg_namespace,
+                php_namespace_str.to_string(),
+                line,
+                priority,
+                path.clone(),
+            ));
+        }
+    }
+
+    ParsedServiceProvider::new(
+        db,
+        middleware,
+        bindings,
+        view_namespaces,
+        blade_components,
+        component_namespaces,
+    )
+}
+
+/// Normalize a path by resolving . and .. components without requiring the path to exist
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                components.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => components.push(c),
+        }
+    }
+    components.iter().collect()
 }
 
 /// Resolve a class name to a file path using PSR-4 conventions
@@ -1448,6 +1642,12 @@ pub struct LaravelConfigData {
     pub component_paths: Vec<(String, PathBuf)>,
     pub livewire_path: Option<PathBuf>,
     pub has_livewire: bool,
+    /// Package view namespaces from loadViewsFrom() calls
+    /// Maps namespace (e.g., "courier") to view path
+    pub view_namespaces: HashMap<String, PathBuf>,
+    /// Package component namespaces from Blade::componentNamespace() calls
+    /// Maps prefix (e.g., "nightshade") to PHP namespace
+    pub component_namespaces: HashMap<String, String>,
 }
 
 impl LaravelConfigData {
@@ -1470,16 +1670,25 @@ impl LaravelConfigData {
         // Convert dots to path separators
         let view_path = actual_view.replace('.', "/");
 
-        // Check each view path
-        for base_path in &self.view_paths {
-            let mut full_path = self.root.join(base_path).join(&view_path);
-            full_path.set_extension("blade.php");
-            paths.push(full_path);
-        }
-
-        // TODO: Handle namespaced views (would require package discovery)
-        if let Some(_ns) = namespace {
-            warn!("Namespaced views not fully supported yet: {}", view_name);
+        // If there's a namespace, resolve using package view paths
+        if let Some(ns) = namespace {
+            if let Some(package_view_path) = self.view_namespaces.get(ns) {
+                // Package views - use the registered path
+                let mut full_path = package_view_path.join(&view_path);
+                full_path.set_extension("blade.php");
+                paths.push(full_path);
+            }
+            // Also check vendor published views: resources/views/vendor/{namespace}/
+            let mut vendor_path = self.root.join("resources/views/vendor").join(ns).join(&view_path);
+            vendor_path.set_extension("blade.php");
+            paths.push(vendor_path);
+        } else {
+            // Regular views - check each configured view path
+            for base_path in &self.view_paths {
+                let mut full_path = self.root.join(base_path).join(&view_path);
+                full_path.set_extension("blade.php");
+                paths.push(full_path);
+            }
         }
 
         paths
@@ -1489,22 +1698,57 @@ impl LaravelConfigData {
     pub fn resolve_component_path(&self, component_name: &str) -> Vec<PathBuf> {
         let mut paths = Vec::new();
 
+        // Handle package components (e.g., "courier::alert")
+        let (namespace, actual_component) = if let Some(pos) = component_name.find("::") {
+            let namespace = &component_name[..pos];
+            let component = &component_name[pos + 2..];
+            (Some(namespace), component)
+        } else {
+            (None, component_name)
+        };
+
         // Component name uses dots: "forms.input" -> "forms/input.blade.php"
-        let component_path = component_name.replace('.', "/");
+        let component_path = actual_component.replace('.', "/");
 
-        // Check each component path (Vec of tuples instead of HashMap)
-        for (_namespace, base_path) in &self.component_paths {
-            let mut full_path = self.root.join(base_path).join(&component_path);
-            full_path.set_extension("blade.php");
-            paths.push(full_path);
-        }
-
-        // If no component paths found, use default within view paths
-        if paths.is_empty() {
-            for view_path in &self.view_paths {
-                let mut full_path = self.root.join(view_path).join("components").join(&component_path);
+        if let Some(ns) = namespace {
+            // Package component - check package view path first
+            if let Some(package_view_path) = self.view_namespaces.get(ns) {
+                // Anonymous package component: {package_views}/components/{component}.blade.php
+                let mut full_path = package_view_path.join("components").join(&component_path);
                 full_path.set_extension("blade.php");
                 paths.push(full_path);
+            }
+
+            // Also check component namespace (Blade::componentNamespace)
+            if let Some(php_namespace) = self.component_namespaces.get(ns) {
+                // Convert component name to PascalCase class path
+                // "alert" -> "Alert.php", "alert-box" -> "AlertBox.php"
+                let class_name = kebab_to_pascal_case(&component_path.replace('/', "\\"));
+                let class_path = format!("{}/{}.php", php_namespace.replace('\\', "/"), class_name);
+                // Try common locations for package classes
+                paths.push(self.root.join("vendor").join(&class_path));
+                paths.push(self.root.join("app/View/Components").join(&class_name).with_extension("php"));
+            }
+
+            // Check vendor published components: resources/views/vendor/{namespace}/components/
+            let mut vendor_path = self.root.join("resources/views/vendor").join(ns).join("components").join(&component_path);
+            vendor_path.set_extension("blade.php");
+            paths.push(vendor_path);
+        } else {
+            // Regular component - check each component path
+            for (_namespace, base_path) in &self.component_paths {
+                let mut full_path = self.root.join(base_path).join(&component_path);
+                full_path.set_extension("blade.php");
+                paths.push(full_path);
+            }
+
+            // If no component paths found, use default within view paths
+            if paths.is_empty() {
+                for view_path in &self.view_paths {
+                    let mut full_path = self.root.join(view_path).join("components").join(&component_path);
+                    full_path.set_extension("blade.php");
+                    paths.push(full_path);
+                }
             }
         }
 
@@ -1626,6 +1870,56 @@ pub struct EnvVariableData {
     pub value_column: usize,
     /// Whether this variable is commented out
     pub is_commented: bool,
+}
+
+/// Package view namespace data for transfer across async boundaries
+/// From: $this->loadViewsFrom(__DIR__.'/../resources/views', 'courier')
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ViewNamespaceData {
+    /// The namespace prefix (e.g., "courier")
+    pub namespace: String,
+    /// Resolved view path
+    pub view_path: Option<PathBuf>,
+    /// Source file where registered
+    pub source_file: PathBuf,
+    /// Line number in source file
+    pub source_line: u32,
+    /// Priority: 0=framework, 1=package, 2=app
+    pub priority: u8,
+}
+
+/// Blade component registration data for transfer across async boundaries
+/// From: Blade::component('package-alert', AlertComponent::class)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BladeComponentRegData {
+    /// Component tag name (e.g., "package-alert")
+    pub tag_name: String,
+    /// Full class name
+    pub class_name: String,
+    /// Resolved file path of the component class
+    pub file_path: Option<PathBuf>,
+    /// Source file where registered
+    pub source_file: PathBuf,
+    /// Line number in source file
+    pub source_line: u32,
+    /// Priority: 0=framework, 1=package, 2=app
+    pub priority: u8,
+}
+
+/// Component namespace registration data for transfer across async boundaries
+/// From: Blade::componentNamespace('Nightshade\\Views\\Components', 'nightshade')
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ComponentNamespaceData {
+    /// Namespace prefix (e.g., "nightshade")
+    pub prefix: String,
+    /// PHP namespace (e.g., "Nightshade\\Views\\Components")
+    pub php_namespace: String,
+    /// Source file where registered
+    pub source_file: PathBuf,
+    /// Line number in source file
+    pub source_line: u32,
+    /// Priority: 0=framework, 1=package, 2=app
+    pub priority: u8,
 }
 
 // ============================================================================
@@ -1980,6 +2274,33 @@ pub enum SalsaRequest {
         name: String,
         reply: oneshot::Sender<Option<BindingRegistrationData>>,
     },
+    /// Get view namespace by name (e.g., "courier" -> view path)
+    GetViewNamespace {
+        namespace: String,
+        reply: oneshot::Sender<Option<ViewNamespaceData>>,
+    },
+    /// Get all view namespaces (for autocomplete)
+    GetAllViewNamespaces {
+        reply: oneshot::Sender<Vec<ViewNamespaceData>>,
+    },
+    /// Get a Blade component by tag name (e.g., "package-alert")
+    GetBladeComponentReg {
+        tag_name: String,
+        reply: oneshot::Sender<Option<BladeComponentRegData>>,
+    },
+    /// Get all registered Blade components
+    GetAllBladeComponentRegs {
+        reply: oneshot::Sender<Vec<BladeComponentRegData>>,
+    },
+    /// Get component namespace by prefix (e.g., "nightshade")
+    GetComponentNamespace {
+        prefix: String,
+        reply: oneshot::Sender<Option<ComponentNamespaceData>>,
+    },
+    /// Get all component namespaces
+    GetAllComponentNamespaces {
+        reply: oneshot::Sender<Vec<ComponentNamespaceData>>,
+    },
 
     // === Environment Variable Management ===
 
@@ -2263,6 +2584,66 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::GetBindingByName { name, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get view namespace by name (for resolving package::view syntax)
+    pub async fn get_view_namespace(&self, namespace: String) -> Result<Option<ViewNamespaceData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetViewNamespace { namespace, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get all view namespaces (for autocomplete)
+    pub async fn get_all_view_namespaces(&self) -> Result<Vec<ViewNamespaceData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetAllViewNamespaces { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get a Blade component registration by tag name
+    pub async fn get_blade_component_reg(&self, tag_name: String) -> Result<Option<BladeComponentRegData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetBladeComponentReg { tag_name, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get all registered Blade components
+    pub async fn get_all_blade_component_regs(&self) -> Result<Vec<BladeComponentRegData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetAllBladeComponentRegs { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get component namespace by prefix (for resolving <x-package::component>)
+    pub async fn get_component_namespace(&self, prefix: String) -> Result<Option<ComponentNamespaceData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetComponentNamespace { prefix, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get all component namespaces
+    pub async fn get_all_component_namespaces(&self) -> Result<Vec<ComponentNamespaceData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetAllComponentNamespaces { reply: reply_tx })
             .await
             .map_err(|_| "Salsa actor disconnected")?;
         reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
@@ -2576,6 +2957,12 @@ pub struct SalsaActor {
     sp_bindings: HashMap<String, BindingRegistrationData>,
     /// Cached singletons from service provider analysis
     sp_singletons: HashMap<String, BindingRegistrationData>,
+    /// Cached view namespaces from loadViewsFrom() calls
+    sp_view_namespaces: HashMap<String, ViewNamespaceData>,
+    /// Cached Blade component registrations from Blade::component() calls
+    sp_blade_components: HashMap<String, BladeComponentRegData>,
+    /// Cached component namespace registrations from Blade::componentNamespace() calls
+    sp_component_namespaces: HashMap<String, ComponentNamespaceData>,
 
     // === Environment Variables ===
 
@@ -2628,6 +3015,9 @@ impl SalsaActor {
                 sp_middleware_aliases: HashMap::new(),
                 sp_bindings: HashMap::new(),
                 sp_singletons: HashMap::new(),
+                sp_view_namespaces: HashMap::new(),
+                sp_blade_components: HashMap::new(),
+                sp_component_namespaces: HashMap::new(),
                 // Environment variables
                 env_variables: HashMap::new(),
                 // Salsa-based env tracking
@@ -2736,6 +3126,30 @@ impl SalsaActor {
                 }
                 SalsaRequest::GetBindingByName { name, reply } => {
                     let result = self.handle_get_binding_by_name(&name);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetViewNamespace { namespace, reply } => {
+                    let result = self.handle_get_view_namespace(&namespace);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetAllViewNamespaces { reply } => {
+                    let result = self.handle_get_all_view_namespaces();
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetBladeComponentReg { tag_name, reply } => {
+                    let result = self.handle_get_blade_component_reg(&tag_name);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetAllBladeComponentRegs { reply } => {
+                    let result = self.handle_get_all_blade_component_regs();
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetComponentNamespace { prefix, reply } => {
+                    let result = self.handle_get_component_namespace(&prefix);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetAllComponentNamespaces { reply } => {
+                    let result = self.handle_get_all_component_namespaces();
                     let _ = reply.send(result);
                 }
 
@@ -3176,6 +3590,48 @@ impl SalsaActor {
             livewire_config,
         );
 
+        // Collect view namespaces from all parsed service providers
+        let mut view_namespaces: HashMap<String, PathBuf> = HashMap::new();
+        let mut component_namespaces: HashMap<String, String> = HashMap::new();
+
+        if let Some(sp_root) = self.salsa_sp_root.as_ref() {
+            for sp_file in self.salsa_sp_files.values() {
+                let parsed = parse_service_provider_source(&self.db, *sp_file, sp_root.clone());
+
+                // Collect view namespaces
+                for vn in parsed.view_namespaces(&self.db) {
+                    let ns = vn.namespace(&self.db).namespace(&self.db).clone();
+                    if let Some(path) = vn.view_path(&self.db).clone() {
+                        // Higher priority wins
+                        match view_namespaces.get(&ns) {
+                            Some(_) => {} // Keep existing (first wins for now)
+                            None => { view_namespaces.insert(ns, path); }
+                        }
+                    }
+                }
+
+                // Collect component namespaces
+                for cn in parsed.component_namespaces(&self.db) {
+                    let prefix = cn.prefix(&self.db).namespace(&self.db).clone();
+                    let php_ns = cn.php_namespace(&self.db).clone();
+                    match component_namespaces.get(&prefix) {
+                        Some(_) => {} // Keep existing (first wins for now)
+                        None => { component_namespaces.insert(prefix, php_ns); }
+                    }
+                }
+            }
+        }
+
+        // Also include any from the legacy cache
+        for (ns, data) in &self.sp_view_namespaces {
+            if let Some(path) = &data.view_path {
+                view_namespaces.entry(ns.clone()).or_insert_with(|| path.clone());
+            }
+        }
+        for (prefix, data) in &self.sp_component_namespaces {
+            component_namespaces.entry(prefix.clone()).or_insert_with(|| data.php_namespace.clone());
+        }
+
         // Convert to data transfer type
         let data = LaravelConfigData {
             root: config_ref.root(&self.db).clone(),
@@ -3183,6 +3639,8 @@ impl SalsaActor {
             component_paths: config_ref.component_paths(&self.db).clone(),
             livewire_path: config_ref.livewire_path(&self.db).clone(),
             has_livewire: config_ref.has_livewire(&self.db),
+            view_namespaces,
+            component_namespaces,
         };
 
         // Cache the result
@@ -3433,6 +3891,191 @@ impl SalsaActor {
         // Check bindings first, then singletons
         self.sp_bindings.get(name).cloned()
             .or_else(|| self.sp_singletons.get(name).cloned())
+    }
+
+    /// Handle get view namespace by name (queries Salsa-parsed service providers)
+    fn handle_get_view_namespace(&self, namespace: &str) -> Option<ViewNamespaceData> {
+        // First check the legacy cache
+        if let Some(data) = self.sp_view_namespaces.get(namespace) {
+            return Some(data.clone());
+        }
+
+        // Then query Salsa-parsed service providers
+        let root = self.salsa_sp_root.as_ref()?;
+        let mut best: Option<ViewNamespaceData> = None;
+
+        for sp_file in self.salsa_sp_files.values() {
+            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+            for vn in parsed.view_namespaces(&self.db) {
+                if vn.namespace(&self.db).namespace(&self.db) == namespace {
+                    let data = ViewNamespaceData {
+                        namespace: vn.namespace(&self.db).namespace(&self.db).clone(),
+                        view_path: vn.view_path(&self.db).clone(),
+                        source_file: vn.source_file(&self.db).clone(),
+                        source_line: vn.source_line(&self.db),
+                        priority: vn.priority(&self.db),
+                    };
+                    match &best {
+                        Some(existing) if existing.priority >= data.priority => {}
+                        _ => best = Some(data),
+                    }
+                }
+            }
+        }
+
+        best
+    }
+
+    /// Handle get all view namespaces
+    fn handle_get_all_view_namespaces(&self) -> Vec<ViewNamespaceData> {
+        let mut merged: HashMap<String, ViewNamespaceData> = self.sp_view_namespaces.clone();
+
+        if let Some(root) = self.salsa_sp_root.as_ref() {
+            for sp_file in self.salsa_sp_files.values() {
+                let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+                for vn in parsed.view_namespaces(&self.db) {
+                    let ns = vn.namespace(&self.db).namespace(&self.db).clone();
+                    let data = ViewNamespaceData {
+                        namespace: ns.clone(),
+                        view_path: vn.view_path(&self.db).clone(),
+                        source_file: vn.source_file(&self.db).clone(),
+                        source_line: vn.source_line(&self.db),
+                        priority: vn.priority(&self.db),
+                    };
+
+                    match merged.get(&ns) {
+                        Some(existing) if existing.priority >= data.priority => {}
+                        _ => { merged.insert(ns, data); }
+                    }
+                }
+            }
+        }
+
+        merged.into_values().collect()
+    }
+
+    /// Handle get Blade component registration by tag name
+    fn handle_get_blade_component_reg(&self, tag_name: &str) -> Option<BladeComponentRegData> {
+        // First check the legacy cache
+        if let Some(data) = self.sp_blade_components.get(tag_name) {
+            return Some(data.clone());
+        }
+
+        // Then query Salsa-parsed service providers
+        let root = self.salsa_sp_root.as_ref()?;
+        let mut best: Option<BladeComponentRegData> = None;
+
+        for sp_file in self.salsa_sp_files.values() {
+            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+            for bc in parsed.blade_components(&self.db) {
+                if bc.tag_name(&self.db).name(&self.db) == tag_name {
+                    let data = BladeComponentRegData {
+                        tag_name: bc.tag_name(&self.db).name(&self.db).clone(),
+                        class_name: bc.class_name(&self.db).clone(),
+                        file_path: bc.file_path(&self.db).clone(),
+                        source_file: bc.source_file(&self.db).clone(),
+                        source_line: bc.source_line(&self.db),
+                        priority: bc.priority(&self.db),
+                    };
+                    match &best {
+                        Some(existing) if existing.priority >= data.priority => {}
+                        _ => best = Some(data),
+                    }
+                }
+            }
+        }
+
+        best
+    }
+
+    /// Handle get all Blade component registrations
+    fn handle_get_all_blade_component_regs(&self) -> Vec<BladeComponentRegData> {
+        let mut merged: HashMap<String, BladeComponentRegData> = self.sp_blade_components.clone();
+
+        if let Some(root) = self.salsa_sp_root.as_ref() {
+            for sp_file in self.salsa_sp_files.values() {
+                let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+                for bc in parsed.blade_components(&self.db) {
+                    let tag = bc.tag_name(&self.db).name(&self.db).clone();
+                    let data = BladeComponentRegData {
+                        tag_name: tag.clone(),
+                        class_name: bc.class_name(&self.db).clone(),
+                        file_path: bc.file_path(&self.db).clone(),
+                        source_file: bc.source_file(&self.db).clone(),
+                        source_line: bc.source_line(&self.db),
+                        priority: bc.priority(&self.db),
+                    };
+
+                    match merged.get(&tag) {
+                        Some(existing) if existing.priority >= data.priority => {}
+                        _ => { merged.insert(tag, data); }
+                    }
+                }
+            }
+        }
+
+        merged.into_values().collect()
+    }
+
+    /// Handle get component namespace by prefix
+    fn handle_get_component_namespace(&self, prefix: &str) -> Option<ComponentNamespaceData> {
+        // First check the legacy cache
+        if let Some(data) = self.sp_component_namespaces.get(prefix) {
+            return Some(data.clone());
+        }
+
+        // Then query Salsa-parsed service providers
+        let root = self.salsa_sp_root.as_ref()?;
+        let mut best: Option<ComponentNamespaceData> = None;
+
+        for sp_file in self.salsa_sp_files.values() {
+            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+            for cn in parsed.component_namespaces(&self.db) {
+                if cn.prefix(&self.db).namespace(&self.db) == prefix {
+                    let data = ComponentNamespaceData {
+                        prefix: cn.prefix(&self.db).namespace(&self.db).clone(),
+                        php_namespace: cn.php_namespace(&self.db).clone(),
+                        source_file: cn.source_file(&self.db).clone(),
+                        source_line: cn.source_line(&self.db),
+                        priority: cn.priority(&self.db),
+                    };
+                    match &best {
+                        Some(existing) if existing.priority >= data.priority => {}
+                        _ => best = Some(data),
+                    }
+                }
+            }
+        }
+
+        best
+    }
+
+    /// Handle get all component namespaces
+    fn handle_get_all_component_namespaces(&self) -> Vec<ComponentNamespaceData> {
+        let mut merged: HashMap<String, ComponentNamespaceData> = self.sp_component_namespaces.clone();
+
+        if let Some(root) = self.salsa_sp_root.as_ref() {
+            for sp_file in self.salsa_sp_files.values() {
+                let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+                for cn in parsed.component_namespaces(&self.db) {
+                    let pfx = cn.prefix(&self.db).namespace(&self.db).clone();
+                    let data = ComponentNamespaceData {
+                        prefix: pfx.clone(),
+                        php_namespace: cn.php_namespace(&self.db).clone(),
+                        source_file: cn.source_file(&self.db).clone(),
+                        source_line: cn.source_line(&self.db),
+                        priority: cn.priority(&self.db),
+                    };
+
+                    match merged.get(&pfx) {
+                        Some(existing) if existing.priority >= data.priority => {}
+                        _ => { merged.insert(pfx, data); }
+                    }
+                }
+            }
+        }
+
+        merged.into_values().collect()
     }
 
     // === Environment Variable Handlers ===

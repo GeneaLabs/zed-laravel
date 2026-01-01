@@ -114,7 +114,7 @@ $message = __('auth.failed');
 
 ### Autocomplete
 
-Get intelligent suggestions as you type. The extension provides context-aware completions for validation rules, database schemas, config keys, routes, translations, and environment variables. Completions include helpful metadata like resolved values and source file locations.
+Get intelligent suggestions as you type. The extension provides context-aware completions for views, Blade components, validation rules, database schemas, config keys, routes, middleware, translations, and environment variables. Completions include helpful metadata like resolved values and source file locations.
 
 ```php
 $request->validate([
@@ -131,11 +131,22 @@ $request->validate([
 $name = config('app.');
 //                  ^ config keys with resolved values
 
+return view('users.');
+//                 ^ view names from resources/views
+
 $url = route('users.');
 //                  ^ named routes from routes/*.php
 
+Route::middleware('');
+//                ^ middleware aliases from bootstrap/app.php
+
 $message = __('auth.');
 //                  ^ translation keys with values
+```
+
+```blade
+<x-
+{{-- ^ component names from resources/views/components --}}
 ```
 
 ### Diagnostics
@@ -198,7 +209,6 @@ Route::middleware('admin-only')->group(...);
 
 ## Planned Features
 
-- Component name autocomplete (`<x-▌`)
 - Eloquent model field and relationship autocomplete
 - Hover documentation with resolved values
 - Inertia.js support (`Inertia::render('Page')`)
