@@ -219,17 +219,17 @@ jobs:
           files: ${{ env.ASSET_PATH }}
           token: ${{ env.GITHUB_TOKEN }}
 
-  publish:
-    name: Publish Zed Extension
-    runs-on: ubuntu-latest
-    needs:
-      - build-lsp
-      - update-version
-    steps:
-      - uses: huacnlee/zed-extension-action@v1
-        with:
-          extension-name: laravel
-          push-to: GeneaLabs/extensions
-          tag-name: ${{ needs.update-version.outputs.new_version }}
-        env:
-          COMMITTER_TOKEN: ${{ secrets.ZED_PUBLISHING_TOKEN }}
+  # publish:
+  #   name: Publish Zed Extension
+  #   runs-on: ubuntu-latest
+  #   needs:
+  #     - build-lsp
+  #     - update-version
+  #   steps:
+  #     - uses: huacnlee/zed-extension-action@v1
+  #       with:
+  #         extension-name: laravel
+  #         push-to: GeneaLabs/extensions
+  #         tag-name: ${{ needs.update-version.outputs.new_version }}
+  #       env:
+  #         COMMITTER_TOKEN: ${{ secrets.ZED_PUBLISHING_TOKEN }}
