@@ -74,38 +74,6 @@ Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
 ## ✨ Features
 
-### 🎨 Blade Language Support
-
-Full Blade template language support with syntax highlighting, smart completions, and editor integration.
-
-**Syntax Highlighting:** Blade directives, PHP blocks, echo statements, and comments are all properly highlighted.
-
-**Directive Autocomplete:** Type `@` to see all 100+ Blade directives with descriptions:
-```blade
-@fo
-  ↳ @foreach  Loop through collection
-  ↳ @for      For loop
-  ↳ @forelse  Loop with empty fallback
-```
-
-**Smart Bracket Expansion:** Type `{` and select from snippet completions:
-```blade
-{
-  ↳ {{ ... }}      Echo (escaped)
-  ↳ {!! ... !!}    Echo (unescaped)
-  ↳ {{-- ... --}}  Blade comment
-```
-Cursor is automatically positioned between the brackets for immediate typing.
-
-**Closing Tag Navigation:** Cmd+Click works on both opening AND closing tags:
-```blade
-<x-button>Submit</x-button>
-{{-- ^^^^^^           ^^^^^^ Both navigate to component --}}
-
-<livewire:counter></livewire:counter>
-{{--      ^^^^^^^            ^^^^^^^ Both navigate to Livewire class --}}
-```
-
 ### 🔗 Go-to-Definition
 
 Navigate your Laravel codebase by Cmd+Clicking (or `Cmd+D`) on any recognized pattern. The extension understands Laravel's conventions and jumps directly to the source file, whether it's a view, component, route, config key, or translation.
@@ -148,7 +116,7 @@ $message = __('auth.failed');
 
 ### 💡 Autocomplete
 
-Get intelligent suggestions as you type. The extension provides context-aware completions for views, Blade components, validation rules, database schemas, config keys, routes, middleware, translations, environment variables, Eloquent models, and Blade variables.
+Get intelligent suggestions as you type. The extension provides context-aware completions for views, Blade components, validation rules, Eloquent casts, database schemas, config keys, routes, middleware, translations, environment variables, Eloquent models, and Blade variables.
 
 ```php
 $request->validate([
@@ -178,16 +146,33 @@ $message = __('auth.');
 //                  ^ 🌐 translation keys with values
 ```
 
-```blade
-<x-
-{{-- ^ 🧩 component names from resources/views/components --}}
+#### 🎭 Eloquent Cast Types
 
-@if
-{{-- ^ 📋 100+ Blade directives with snippets --}}
+Get autocomplete for Eloquent cast types in `$casts` property or `casts()` method:
 
+```php
+protected $casts = [
+    'is_admin' => '',
+    //            ^ 🎭 cast types appear here
+];
+
+protected function casts(): array
 {
-{{-- ^ 🔤 {{ }}, {!! !!}, {{-- --}} bracket snippets --}}
+    return [
+        'email_verified_at' => 'datetime',
+        'settings' => '',
+        //            ^ string, integer, boolean, datetime, array,
+        //              encrypted, hashed, collection, object...
+    ];
+}
 ```
+
+Cast completions include:
+- **Primitives:** `string`, `integer`, `float`, `boolean`, `array`, `object`, `collection`
+- **Dates:** `datetime`, `date`, `timestamp`, `immutable_date`, `immutable_datetime`
+- **Security:** `encrypted`, `encrypted:array`, `encrypted:collection`, `hashed`
+- **Numbers:** `decimal:` (with precision parameter)
+- **Custom casts** from `app/Casts/` and installed packages
 
 #### 🏗️ Eloquent Model Properties
 
@@ -281,6 +266,57 @@ Route::middleware('admin-only')->group(...);
 - 🛡️ Create middleware
 - 🌐 Add translations to existing files
 - 🔐 Add environment variables to `.env`
+
+## 🎨 Blade Language Support
+
+Full Blade template language support with syntax highlighting, smart completions, and editor integration.
+
+### Syntax Highlighting
+
+Blade directives, PHP blocks, echo statements, and comments are all properly highlighted with distinct colors.
+
+### Directive Autocomplete
+
+Type `@` to see all 100+ Blade directives with descriptions:
+
+```blade
+@fo
+  ↳ @foreach  Loop through collection
+  ↳ @for      For loop
+  ↳ @forelse  Loop with empty fallback
+```
+
+Block directives automatically include their closing tags:
+```blade
+@if($condition)
+    █
+@endif
+```
+
+### Smart Bracket Expansion
+
+Type `{` and select from snippet completions:
+
+```blade
+{
+  ↳ {{ ... }}      Echo (escaped)
+  ↳ {!! ... !!}    Echo (unescaped)
+  ↳ {{-- ... --}}  Blade comment
+```
+
+Cursor is automatically positioned between the brackets for immediate typing.
+
+### Closing Tag Navigation
+
+Cmd+Click works on both opening AND closing tags:
+
+```blade
+<x-button>Submit</x-button>
+{{-- ^^^^^^           ^^^^^^ Both navigate to component --}}
+
+<livewire:counter></livewire:counter>
+{{--      ^^^^^^^            ^^^^^^^ Both navigate to Livewire class --}}
+```
 
 ## 🚧 Planned Features
 
