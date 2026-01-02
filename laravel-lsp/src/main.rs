@@ -390,6 +390,120 @@ struct LaravelLanguageServer {
 /// Default Salsa debounce delay in milliseconds
 const DEFAULT_SALSA_DEBOUNCE_MS: u64 = 200;
 
+/// Built-in Laravel Blade directives for autocomplete
+/// Each entry: (name, description, has_parameters)
+const BLADE_DIRECTIVES: &[(&str, &str, bool)] = &[
+    // Control structures
+    ("if", "Conditional statement", true),
+    ("elseif", "Else-if branch", true),
+    ("else", "Else branch", false),
+    ("endif", "End if block", false),
+    ("unless", "Negative conditional", true),
+    ("endunless", "End unless block", false),
+    ("isset", "Check if variable is set", true),
+    ("endisset", "End isset block", false),
+    ("empty", "Check if variable is empty", true),
+    ("endempty", "End empty block", false),
+    ("switch", "Switch statement", true),
+    ("case", "Switch case", true),
+    ("default", "Switch default case", false),
+    ("endswitch", "End switch block", false),
+    // Loops
+    ("foreach", "Loop through collection", true),
+    ("endforeach", "End foreach loop", false),
+    ("forelse", "Loop with empty fallback", true),
+    ("endforelse", "End forelse loop", false),
+    ("for", "For loop", true),
+    ("endfor", "End for loop", false),
+    ("while", "While loop", true),
+    ("endwhile", "End while loop", false),
+    ("continue", "Continue to next iteration", true),
+    ("break", "Break out of loop", true),
+    // Includes & Components
+    ("include", "Include a view", true),
+    ("includeIf", "Include if view exists", true),
+    ("includeWhen", "Include conditionally", true),
+    ("includeUnless", "Include unless condition", true),
+    ("includeFirst", "Include first existing view", true),
+    ("each", "Render view for each item", true),
+    ("component", "Render component", true),
+    ("endcomponent", "End component", false),
+    ("slot", "Define component slot", true),
+    ("endslot", "End slot", false),
+    // Layouts
+    ("extends", "Extend a layout", true),
+    ("section", "Define section content", true),
+    ("endsection", "End section", false),
+    ("yield", "Yield section content", true),
+    ("parent", "Include parent section", false),
+    ("show", "Show and yield section", false),
+    ("hasSection", "Check if section exists", true),
+    ("sectionMissing", "Check if section is missing", true),
+    ("stack", "Render pushed content", true),
+    ("push", "Push to stack", true),
+    ("endpush", "End push", false),
+    ("pushOnce", "Push once to stack", true),
+    ("endPushOnce", "End push once", false),
+    ("prepend", "Prepend to stack", true),
+    ("endprepend", "End prepend", false),
+    ("prependOnce", "Prepend once to stack", true),
+    ("endPrependOnce", "End prepend once", false),
+    // Authentication & Authorization
+    ("auth", "Authenticated user block", true),
+    ("endauth", "End auth block", false),
+    ("guest", "Guest user block", true),
+    ("endguest", "End guest block", false),
+    ("can", "Authorization check", true),
+    ("endcan", "End can block", false),
+    ("cannot", "Negative authorization", true),
+    ("endcannot", "End cannot block", false),
+    ("canany", "Any permission check", true),
+    ("endcanany", "End canany block", false),
+    // Environment
+    ("env", "Environment check", true),
+    ("endenv", "End env block", false),
+    ("production", "Production environment", false),
+    ("endproduction", "End production", false),
+    // Forms & CSRF
+    ("csrf", "CSRF token field", false),
+    ("method", "HTTP method field", true),
+    ("error", "Validation error", true),
+    ("enderror", "End error block", false),
+    // Assets
+    ("vite", "Vite asset", true),
+    // PHP
+    ("php", "Raw PHP block", false),
+    ("endphp", "End PHP block", false),
+    // Other
+    ("verbatim", "Escape Blade syntax", false),
+    ("endverbatim", "End verbatim", false),
+    ("json", "JSON encode variable", true),
+    ("js", "JavaScript variable", true),
+    ("class", "Conditional CSS classes", true),
+    ("style", "Conditional inline styles", true),
+    ("checked", "Checked attribute helper", true),
+    ("selected", "Selected attribute helper", true),
+    ("disabled", "Disabled attribute helper", true),
+    ("readonly", "Readonly attribute helper", true),
+    ("required", "Required attribute helper", true),
+    ("once", "Render once", false),
+    ("endonce", "End once block", false),
+    ("props", "Component props", true),
+    ("aware", "Component aware props", true),
+    ("fragment", "Fragment for Livewire/htmx", true),
+    ("endfragment", "End fragment", false),
+    ("session", "Session check", true),
+    ("endsession", "End session block", false),
+    // Livewire
+    ("livewire", "Livewire component", true),
+    ("livewireStyles", "Livewire styles", false),
+    ("livewireScripts", "Livewire scripts", false),
+    ("persist", "Persist Livewire state", true),
+    ("endpersist", "End persist", false),
+    ("teleport", "Teleport content", true),
+    ("endteleport", "End teleport", false),
+];
+
 /// Settings structure for Laravel LSP configuration
 /// Configured via: { "lsp": { "laravel-lsp": { "settings": { "laravel": { ... } } } } }
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -3730,6 +3844,54 @@ impl LaravelLanguageServer {
         }
 
         Some(after_dollar.to_string())
+    }
+
+    /// Detect if user is typing a Blade directive (e.g., `@if`, `@foreach`)
+    /// Returns the partial directive name typed so far (e.g., "fo" for "@fo|")
+    fn get_blade_directive_context(line_text: &str, cursor_col: u32) -> Option<String> {
+        let cursor = cursor_col as usize;
+        if cursor == 0 || cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Look backwards for @ that starts a directive
+        let mut at_pos = None;
+        for (i, c) in before_cursor.char_indices().rev() {
+            if c == '@' {
+                at_pos = Some(i);
+                break;
+            }
+            // If we hit non-alphanumeric chars before finding @, we're not in directive context
+            if !c.is_alphanumeric() {
+                break;
+            }
+        }
+
+        let at_pos = at_pos?;
+
+        // Get the text after @
+        let after_at = &before_cursor[at_pos + 1..];
+
+        // Check it's a valid directive name prefix (only alphanumeric chars)
+        if !after_at.chars().all(|c| c.is_alphanumeric()) {
+            return None;
+        }
+
+        // Make sure we're not inside a string or already completed directive
+        // Check if @ is at start of line or preceded by whitespace/bracket
+        if at_pos > 0 {
+            let char_before_at = before_cursor.chars().nth(at_pos - 1);
+            if let Some(c) = char_before_at {
+                // @ should be preceded by whitespace, start of tag, or at start of PHP block
+                if !c.is_whitespace() && c != '>' && c != '(' && c != '{' && c != ';' && c != '\t' {
+                    return None;
+                }
+            }
+        }
+
+        Some(after_at.to_string())
     }
 
     /// Get all available variables for a Blade file
@@ -9113,21 +9275,31 @@ impl LanguageServer for LaravelLanguageServer {
                 // - { for ${...} in .env files
                 // - | for pipe-delimited validation rules
                 // - : for validation rule parameters (exists:, after:, etc.)
+                // - @ for Blade directives (@if, @foreach, etc.)
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
                         "'".to_string(),  // env(', config(', route(', etc.
                         "\"".to_string(), // env(", config(", route(", etc.
-                        "{".to_string(),  // ${
+                        "{".to_string(),  // {{ for echo, {!! for unescaped, {{-- for comment
+                        "!".to_string(),  // {!! for unescaped echo
+                        "-".to_string(),  // {{-- for Blade comment
                         "|".to_string(),  // validation rules: 'required|'
                         ":".to_string(),  // validation rule params: 'exists:'
                         ".".to_string(),  // connection.table in exists:/unique:
                         ",".to_string(),  // table,column in exists:/unique:
+                        "@".to_string(),  // Blade directives: @if, @foreach, etc.
                     ]),
                     ..Default::default()
                 }),
 
                 // ✅ Code actions for quick fixes (create missing views, etc.)
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+
+                // On-type formatting (currently unused, bracket expansion uses completions)
+                document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
+                    first_trigger_character: "{".to_string(),
+                    more_trigger_character: Some(vec!["!".to_string(), "-".to_string()]),
+                }),
 
                 ..Default::default()
             },
@@ -9204,6 +9376,38 @@ impl LanguageServer for LaravelLanguageServer {
 
         info!("Laravel LSP: Shutdown complete");
         Ok(())
+    }
+
+    async fn on_type_formatting(
+        &self,
+        params: DocumentOnTypeFormattingParams,
+    ) -> jsonrpc::Result<Option<Vec<TextEdit>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        // Only handle Blade files
+        if !uri.path().ends_with(".blade.php") {
+            return Ok(None);
+        }
+
+        // Get document content
+        let documents = self.documents.read().await;
+        let content = match documents.get(uri) {
+            Some((text, _)) => text.clone(),
+            None => return Ok(None),
+        };
+        drop(documents);
+
+        // Get the current line
+        let lines: Vec<&str> = content.lines().collect();
+        let line_text = match lines.get(position.line as usize) {
+            Some(line) => *line,
+            None => return Ok(None),
+        };
+
+        // Blade bracket expansion is handled via snippet completions, not on_type_formatting
+        let _ = (line_text, position); // Silence unused warnings
+        Ok(None)
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -9635,6 +9839,121 @@ impl LanguageServer for LaravelLanguageServer {
                     debug!("   Returning {} variable completion items", items.len());
 
                     if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::List(CompletionList {
+                            is_incomplete: false,
+                            items,
+                        })));
+                    }
+                }
+
+                // Check for Blade directive context (typing @if, @foreach, etc.)
+                if let Some(directive_prefix) = Self::get_blade_directive_context(line_text, position.character) {
+                    debug!("   Blade directive context, prefix: '{}'", directive_prefix);
+
+                    let prefix_lower = directive_prefix.to_lowercase();
+                    let items: Vec<CompletionItem> = BLADE_DIRECTIVES
+                        .iter()
+                        .filter(|(name, _, _)| name.to_lowercase().starts_with(&prefix_lower))
+                        .map(|(name, description, has_params)| {
+                            let insert_text = if *has_params {
+                                format!("{}($1)$0", name)
+                            } else {
+                                name.to_string()
+                            };
+
+                            CompletionItem {
+                                label: format!("@{}", name),
+                                kind: Some(CompletionItemKind::KEYWORD),
+                                detail: Some(description.to_string()),
+                                insert_text: Some(insert_text),
+                                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                                documentation: None,
+                                ..Default::default()
+                            }
+                        })
+                        .collect();
+
+                    debug!("   Returning {} directive completion items", items.len());
+
+                    if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::List(CompletionList {
+                            is_incomplete: false,
+                            items,
+                        })));
+                    }
+                }
+
+                // Check for Blade bracket context - show all options after first {
+                let cursor_col = position.character as usize;
+                let text_before = if cursor_col <= line_text.len() {
+                    &line_text[..cursor_col]
+                } else {
+                    line_text
+                };
+
+                // Check if we're in a Blade bracket context (starts with {)
+                // Find what the user has typed so far
+                let (trigger_start, typed_prefix) = if text_before.ends_with("{{--") {
+                    (4, "{{--")
+                } else if text_before.ends_with("{{-") {
+                    (3, "{{-")
+                } else if text_before.ends_with("{!!") {
+                    (3, "{!!")
+                } else if text_before.ends_with("{!") {
+                    (2, "{!")
+                } else if text_before.ends_with("{{") {
+                    (2, "{{")
+                } else if text_before.ends_with("{") && !text_before.ends_with("${") {
+                    (1, "{")
+                } else {
+                    (0, "")
+                };
+
+                if trigger_start > 0 {
+                    let start_col = position.character.saturating_sub(trigger_start as u32);
+
+                    // Define all bracket snippets
+                    let all_brackets = [
+                        ("{{", "{{ $0 }}", "Echo (escaped)"),
+                        ("{!!", "{!! $0 !!}", "Echo (unescaped)"),
+                        ("{{--", "{{-- $0 --}}", "Blade comment"),
+                    ];
+
+                    // Filter to those matching what user has typed
+                    let items: Vec<CompletionItem> = all_brackets
+                        .iter()
+                        .filter(|(trigger, _, _)| trigger.starts_with(typed_prefix))
+                        .map(|(trigger, snippet, description)| {
+                            CompletionItem {
+                                label: snippet.replace(" $0 ", " ... "),
+                                kind: Some(CompletionItemKind::SNIPPET),
+                                detail: Some(description.to_string()),
+                                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                    range: Range {
+                                        start: Position {
+                                            line: position.line,
+                                            character: start_col,
+                                        },
+                                        end: position,
+                                    },
+                                    new_text: snippet.to_string(),
+                                })),
+                                // Preselect {{ as the most common
+                                preselect: Some(*trigger == "{{"),
+                                sort_text: Some(match *trigger {
+                                    "{{" => "0".to_string(),
+                                    "{!!" => "1".to_string(),
+                                    "{{--" => "2".to_string(),
+                                    _ => "9".to_string(),
+                                }),
+                                ..Default::default()
+                            }
+                        })
+                        .collect();
+
+                    if !items.is_empty() {
+                        debug!("   Returning {} Blade bracket snippets", items.len());
                         return Ok(Some(CompletionResponse::List(CompletionList {
                             is_incomplete: false,
                             items,

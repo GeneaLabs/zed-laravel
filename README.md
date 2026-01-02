@@ -72,6 +72,38 @@ Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
 ## ✨ Features
 
+### 🎨 Blade Language Support
+
+Full Blade template language support with syntax highlighting, smart completions, and editor integration.
+
+**Syntax Highlighting:** Blade directives, PHP blocks, echo statements, and comments are all properly highlighted.
+
+**Directive Autocomplete:** Type `@` to see all 100+ Blade directives with descriptions:
+```blade
+@fo
+  ↳ @foreach  Loop through collection
+  ↳ @for      For loop
+  ↳ @forelse  Loop with empty fallback
+```
+
+**Smart Bracket Expansion:** Type `{` and select from snippet completions:
+```blade
+{
+  ↳ {{ ... }}      Echo (escaped)
+  ↳ {!! ... !!}    Echo (unescaped)
+  ↳ {{-- ... --}}  Blade comment
+```
+Cursor is automatically positioned between the brackets for immediate typing.
+
+**Closing Tag Navigation:** Cmd+Click works on both opening AND closing tags:
+```blade
+<x-button>Submit</x-button>
+{{-- ^^^^^^           ^^^^^^ Both navigate to component --}}
+
+<livewire:counter></livewire:counter>
+{{--      ^^^^^^^            ^^^^^^^ Both navigate to Livewire class --}}
+```
+
 ### 🔗 Go-to-Definition
 
 Navigate your Laravel codebase by Cmd+Clicking (or `Cmd+D`) on any recognized pattern. The extension understands Laravel's conventions and jumps directly to the source file, whether it's a view, component, route, config key, or translation.
@@ -110,7 +142,7 @@ $message = __('auth.failed');
 ```
 
 **Supported patterns:**
-`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `<livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()`
+`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()`
 
 ### 💡 Autocomplete
 
@@ -147,6 +179,12 @@ $message = __('auth.');
 ```blade
 <x-
 {{-- ^ 🧩 component names from resources/views/components --}}
+
+@if
+{{-- ^ 📋 100+ Blade directives with snippets --}}
+
+{
+{{-- ^ 🔤 {{ }}, {!! !!}, {{-- --}} bracket snippets --}}
 ```
 
 #### 🏗️ Eloquent Model Properties

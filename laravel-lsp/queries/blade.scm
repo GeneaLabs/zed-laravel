@@ -24,6 +24,12 @@
     (tag_name) @tag_name)
   (#match? @tag_name "^x-"))
 
+; Match closing tags like </x-button>
+(element
+  (end_tag
+    (tag_name) @tag_name)
+  (#match? @tag_name "^x-"))
+
 ; Also match self-closing tags like <x-button />
 (self_closing_tag
   (tag_name) @tag_name
@@ -39,6 +45,12 @@
 
 (element
   (start_tag
+    (tag_name) @tag_name)
+  (#match? @tag_name "^livewire:"))
+
+; Match closing Livewire tags like </livewire:counter>
+(element
+  (end_tag
     (tag_name) @tag_name)
   (#match? @tag_name "^livewire:"))
 
