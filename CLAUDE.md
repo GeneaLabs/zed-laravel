@@ -355,69 +355,42 @@ When working on this project:
 
 ---
 
-## Session State (2025-12-28)
+## Session State (2026-01-02)
 
 ### Last Session Summary
 
-**Focus**: Blade component code actions and README restructure
+**Focus**: Blade language support implementation
 
-### Code Actions Implemented
+### Blade Language Features Completed
 
-All quick actions (code actions) are now complete:
-
-| Diagnostic | Quick Action(s) |
-|------------|-----------------|
-| View file not found | "Create view: {name}" |
-| Blade component not found | 1. "Create component: {name}" (view only)<br>2. "Create component with class: {name}" (view + PHP class) |
-| Livewire component not found | "Create Livewire: {name}" (creates PHP class + Blade view) |
-| Middleware not found | "Create middleware: {name}" |
-| Translation not found | "Create translation: {key}" or "Add translation: {key}" |
-| Config not found | "Create config: {key}" or "Add config: {key}" |
-| Environment variable not found | "Create .env with {VAR}" or "Add env var: {VAR}" or "Copy .env.example to .env" |
-
-### Key Architecture Changes
-
-1. **`FileAction::from_diagnostic()` returns `Vec<Self>`** - Allows multiple actions per diagnostic (e.g., Blade component offers both anonymous and class-based options)
-
-2. **Removed `BladeComponentClass` type** - User decided no diagnostic should show when view exists but class doesn't (anonymous components are valid)
-
-3. **Cleaned up dead code** - Removed 6 unused methods:
-   - `has_diagnostic_at_position()`
-   - `run_background_rescans()`
-   - `refresh_env_cache_from_buffers()`
-   - `file_exists()`
-   - `clear_file_exists_cache()`
-   - `schedule_debounced_diagnostics()`
-
-### README Restructured
-
-Completely rewrote `/Users/mike/Developer/zed-laravel/README.md`:
-- Centered hero with Laravel logo
-- Navigation TOC at top
-- Collapsible `<details>` sections throughout
-- Laravel developer perspective (familiar terminology)
-- ⚡ lightning emoji for quick actions (Zed's icon)
-- Configuration section with `debounceMs` setting documented
-
-### Current Status
-
-- Build: **Passing** (no warnings)
-- Tests: **112 tests passing** (35 unit + 77 integration)
+| Feature | Description |
+|---------|-------------|
+| Syntax Highlighting | Directives highlight as functions (blue), proper HTML/PHP coloring |
+| Bracket Snippets | `{` triggers autocomplete for `{{ }}`, `{!! !!}`, `{{-- --}}` with cursor positioning |
+| Directive Autocomplete | 100+ directives with descriptions; block directives include closing tags |
+| Closing Tag Navigation | Cmd+Click works on `</x-*>` and `</livewire:*>` closing tags |
+| Directive Spacing Setting | Configurable space before parentheses (`@if($x)` vs `@if ($x)`) |
 
 ### Key Files Modified
 
-- `laravel-lsp/src/main.rs` - Code action refactoring, dead code removal
-- `README.md` - Complete restructure with collapsible sections
+- `languages/blade/config.toml` - Language config with bracket definitions
+- `languages/blade/highlights.scm` - Syntax highlighting (directives as `@function`)
+- `laravel-lsp/queries/blade.scm` - Added `end_tag` queries for closing tag navigation
+- `laravel-lsp/src/main.rs` - Directive completions, settings restructure
+- `README.md` - Blade features documented, settings updated
 
-### Configuration Setting
+### Settings Structure
+
+Settings were reorganized for clarity:
 
 ```json
 {
   "lsp": {
     "laravel-lsp": {
       "settings": {
-        "laravel": {
-          "debounceMs": 200
+        "autoCompleteDebounce": 200,
+        "blade": {
+          "directiveSpacing": false
         }
       }
     }
@@ -425,6 +398,18 @@ Completely rewrote `/Users/mike/Developer/zed-laravel/README.md`:
 }
 ```
 
-- **50-100ms**: Fast machine, instant feedback
-- **200ms** (default): Balanced - skips brief pauses, feels instant when you stop
-- **300-500ms**: Slower machine/large project, reduce CPU
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `autoCompleteDebounce` | `200` | Delay (ms) before autocomplete updates |
+| `blade.directiveSpacing` | `false` | Space between directive and parentheses |
+
+### Technical Notes
+
+- **Tree-sitter aliasing**: `keyword` rule is aliased to `directive` in AST, so use `(directive) @function` not `(keyword) @function`
+- **Multi-char brackets**: Zed doesn't auto-close multi-char brackets properly; use snippet completions instead
+- **Block directive snippets**: Format is `@if($1)\n\t$0\n@endif` with configurable spacing
+
+### Current Status
+
+- Build: **Passing** (no warnings)
+- Tests: **77 integration tests passing**

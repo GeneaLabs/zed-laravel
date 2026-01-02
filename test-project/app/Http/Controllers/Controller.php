@@ -14,7 +14,8 @@ abstract class Controller
         ];
 
         throw new \Exception('Not implemented');
-        view('asset-test');
+        view('component-test')
+            ->with('data', $rules);
     }
     //
 }

@@ -13,6 +13,7 @@ class Logout
     public function __invoke()
     {
         Auth::guard('web')->logout();
+        $rules = ['required|accepted|after:']
 
         Session::invalidate();
         Session::regenerateToken();

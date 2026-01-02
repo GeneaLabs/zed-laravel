@@ -208,6 +208,153 @@ struct ValidationParamContext {
     param_index: usize,
 }
 
+/// Represents the type of PHP array context we're inside
+/// Used to distinguish validation arrays from model property arrays
+#[derive(Debug, Clone, PartialEq)]
+enum ArrayContext {
+    /// Validation rules: $rules, rules() method, validate(), Validator::make()
+    Validation,
+    /// Model casts: $casts property or casts() method
+    Casts,
+    /// Model fillable/guarded: $fillable, $guarded
+    MassAssignment,
+    /// Model visibility: $hidden, $visible, $appends
+    Visibility,
+    /// Model relationships: $with, $withCount
+    Relationships,
+    /// Unknown or generic array context
+    Unknown,
+}
+
+/// An Eloquent cast type for autocomplete
+struct CastTypeInfo {
+    /// The cast type name (e.g., "string", "datetime", "array")
+    name: String,
+    /// Brief description
+    description: String,
+    /// Whether this cast type has parameters (e.g., "decimal:2")
+    has_params: bool,
+    /// Source: "laravel" for built-in, or "app/Casts" for custom
+    source: String,
+}
+
+/// Laravel's built-in Eloquent cast types
+/// Reference: https://laravel.com/docs/12.x/eloquent-mutators#attribute-casting
+fn get_laravel_cast_types() -> Vec<CastTypeInfo> {
+    vec![
+        // Primitive types
+        CastTypeInfo { name: "array".into(), description: "JSON to PHP array".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "boolean".into(), description: "Cast to boolean".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "collection".into(), description: "JSON to Laravel Collection".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "date".into(), description: "Cast to Carbon date (without time)".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "datetime".into(), description: "Cast to Carbon datetime".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "immutable_date".into(), description: "Cast to CarbonImmutable date".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "immutable_datetime".into(), description: "Cast to CarbonImmutable datetime".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "decimal".into(), description: "Cast to decimal with precision (e.g., decimal:2)".into(), has_params: true, source: "laravel".into() },
+        CastTypeInfo { name: "double".into(), description: "Cast to double/float".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "float".into(), description: "Cast to float".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "hashed".into(), description: "Hash value when setting (Laravel 10+)".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "integer".into(), description: "Cast to integer".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "object".into(), description: "JSON to PHP stdClass object".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "real".into(), description: "Cast to real/float".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "string".into(), description: "Cast to string".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "timestamp".into(), description: "Cast to Unix timestamp".into(), has_params: false, source: "laravel".into() },
+
+        // Encrypted types
+        CastTypeInfo { name: "encrypted".into(), description: "Encrypt/decrypt value".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "encrypted:array".into(), description: "Encrypt/decrypt as array".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "encrypted:collection".into(), description: "Encrypt/decrypt as Collection".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "encrypted:object".into(), description: "Encrypt/decrypt as object".into(), has_params: false, source: "laravel".into() },
+
+        // Castable classes (common ones)
+        CastTypeInfo { name: "AsStringable::class".into(), description: "Cast to Stringable instance".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "AsArrayObject::class".into(), description: "Cast to ArrayObject instance".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "AsCollection::class".into(), description: "Cast to Collection instance".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "AsEncryptedArrayObject::class".into(), description: "Encrypted ArrayObject".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "AsEncryptedCollection::class".into(), description: "Encrypted Collection".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "AsEnumArrayObject::class".into(), description: "Cast to EnumArrayObject".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo { name: "AsEnumCollection::class".into(), description: "Cast to EnumCollection".into(), has_params: false, source: "laravel".into() },
+    ]
+}
+
+/// Scan for cast classes from Laravel framework, packages, and app/Casts
+fn scan_all_casts(project_root: &Path) -> Vec<CastTypeInfo> {
+    let mut casts = Vec::new();
+
+    // 1. Scan Laravel framework's built-in casts
+    let laravel_casts_path = project_root
+        .join("vendor/laravel/framework/src/Illuminate/Database/Eloquent/Casts");
+    if laravel_casts_path.exists() {
+        casts.extend(scan_cast_directory(
+            &laravel_casts_path,
+            "Illuminate\\Database\\Eloquent\\Casts",
+            "laravel",
+        ));
+    }
+
+    // 2. Scan common package locations for casts
+    let package_paths = [
+        // Spatie packages
+        ("vendor/spatie/laravel-data/src/Casts", "Spatie\\LaravelData\\Casts"),
+        ("vendor/spatie/laravel-enum/src/Casts", "Spatie\\Enum\\Laravel\\Casts"),
+        // Add more common packages as needed
+    ];
+
+    for (rel_path, namespace) in package_paths {
+        let package_path = project_root.join(rel_path);
+        if package_path.exists() {
+            casts.extend(scan_cast_directory(&package_path, namespace, "package"));
+        }
+    }
+
+    // 3. Scan app/Casts for custom casts
+    let app_casts_path = project_root.join("app/Casts");
+    if app_casts_path.exists() {
+        casts.extend(scan_cast_directory(&app_casts_path, "App\\Casts", "app/Casts"));
+    }
+
+    casts
+}
+
+/// Scan a directory for cast classes
+fn scan_cast_directory(dir_path: &Path, namespace: &str, source: &str) -> Vec<CastTypeInfo> {
+    let mut casts = Vec::new();
+
+    for entry in WalkDir::new(dir_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "php"))
+    {
+        let path = entry.path();
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            // Skip interfaces, traits, and abstract classes by naming convention
+            if stem.ends_with("Interface") || stem.ends_with("Trait") || stem.starts_with("Abstract") {
+                continue;
+            }
+
+            // Build the relative path for nested directories
+            let relative = path.strip_prefix(dir_path).unwrap_or(path);
+            let class_path = relative
+                .with_extension("")
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "\\");
+
+            let full_class = format!("{}\\{}", namespace, class_path);
+            let cast_name = format!("{}::class", class_path);
+            let description = format!("{}", full_class);
+
+            casts.push(CastTypeInfo {
+                name: cast_name,
+                description,
+                has_params: true, // Casts might accept parameters
+                source: source.into(),
+            });
+        }
+    }
+
+    casts
+}
+
 /// Laravel's built-in validation rules
 /// Reference: https://laravel.com/docs/12.x/validation#available-validation-rules
 fn get_laravel_validation_rules() -> Vec<ValidationRuleInfo> {
@@ -374,9 +521,12 @@ struct LaravelLanguageServer {
     /// Pending debounced Salsa updates per file (uri -> task handle)
     /// Used to debounce did_change events before updating Salsa
     pending_salsa_updates: Arc<RwLock<HashMap<Url, tokio::task::JoinHandle<()>>>>,
-    /// Configurable debounce delay for Salsa updates in milliseconds (default: 200ms)
-    /// Can be configured via LSP settings: { "laravel": { "debounceMs": 200 } }
-    salsa_debounce_ms: Arc<RwLock<u64>>,
+    /// Configurable debounce delay for autocomplete updates in milliseconds (default: 200ms)
+    /// Can be configured via LSP settings: { "autoCompleteDebounce": 200 }
+    auto_complete_debounce_ms: Arc<RwLock<u64>>,
+    /// Add space between directive name and parentheses in completions
+    /// false: @if($condition)  |  true: @if ($condition)
+    directive_spacing: Arc<RwLock<bool>>,
     /// Whether we've shown the vendor missing diagnostic this session
     vendor_diagnostic_shown: Arc<RwLock<bool>>,
     /// Cached validation rule names (parsed from Laravel framework at startup)
@@ -391,140 +541,116 @@ struct LaravelLanguageServer {
 const DEFAULT_SALSA_DEBOUNCE_MS: u64 = 200;
 
 /// Built-in Laravel Blade directives for autocomplete
-/// Each entry: (name, description, has_parameters)
-const BLADE_DIRECTIVES: &[(&str, &str, bool)] = &[
+/// Each entry: (name, description, has_params, closing_directive)
+const BLADE_DIRECTIVES: &[(&str, &str, bool, Option<&str>)] = &[
     // Control structures
-    ("if", "Conditional statement", true),
-    ("elseif", "Else-if branch", true),
-    ("else", "Else branch", false),
-    ("endif", "End if block", false),
-    ("unless", "Negative conditional", true),
-    ("endunless", "End unless block", false),
-    ("isset", "Check if variable is set", true),
-    ("endisset", "End isset block", false),
-    ("empty", "Check if variable is empty", true),
-    ("endempty", "End empty block", false),
-    ("switch", "Switch statement", true),
-    ("case", "Switch case", true),
-    ("default", "Switch default case", false),
-    ("endswitch", "End switch block", false),
+    ("if", "Conditional statement", true, Some("endif")),
+    ("elseif", "Else-if branch", true, None),
+    ("else", "Else branch", false, None),
+    ("unless", "Negative conditional", true, Some("endunless")),
+    ("isset", "Check if variable is set", true, Some("endisset")),
+    ("empty", "Check if variable is empty", true, Some("endempty")),
+    ("switch", "Switch statement", true, Some("endswitch")),
+    ("case", "Switch case", true, None),
+    ("default", "Switch default case", false, None),
     // Loops
-    ("foreach", "Loop through collection", true),
-    ("endforeach", "End foreach loop", false),
-    ("forelse", "Loop with empty fallback", true),
-    ("endforelse", "End forelse loop", false),
-    ("for", "For loop", true),
-    ("endfor", "End for loop", false),
-    ("while", "While loop", true),
-    ("endwhile", "End while loop", false),
-    ("continue", "Continue to next iteration", true),
-    ("break", "Break out of loop", true),
+    ("foreach", "Loop through collection", true, Some("endforeach")),
+    ("forelse", "Loop with empty fallback", true, Some("endforelse")),
+    ("for", "For loop", true, Some("endfor")),
+    ("while", "While loop", true, Some("endwhile")),
+    ("continue", "Continue to next iteration", true, None),
+    ("break", "Break out of loop", true, None),
     // Includes & Components
-    ("include", "Include a view", true),
-    ("includeIf", "Include if view exists", true),
-    ("includeWhen", "Include conditionally", true),
-    ("includeUnless", "Include unless condition", true),
-    ("includeFirst", "Include first existing view", true),
-    ("each", "Render view for each item", true),
-    ("component", "Render component", true),
-    ("endcomponent", "End component", false),
-    ("slot", "Define component slot", true),
-    ("endslot", "End slot", false),
+    ("include", "Include a view", true, None),
+    ("includeIf", "Include if view exists", true, None),
+    ("includeWhen", "Include conditionally", true, None),
+    ("includeUnless", "Include unless condition", true, None),
+    ("includeFirst", "Include first existing view", true, None),
+    ("each", "Render view for each item", true, None),
+    ("component", "Render component", true, Some("endcomponent")),
+    ("slot", "Define component slot", true, Some("endslot")),
     // Layouts
-    ("extends", "Extend a layout", true),
-    ("section", "Define section content", true),
-    ("endsection", "End section", false),
-    ("yield", "Yield section content", true),
-    ("parent", "Include parent section", false),
-    ("show", "Show and yield section", false),
-    ("hasSection", "Check if section exists", true),
-    ("sectionMissing", "Check if section is missing", true),
-    ("stack", "Render pushed content", true),
-    ("push", "Push to stack", true),
-    ("endpush", "End push", false),
-    ("pushOnce", "Push once to stack", true),
-    ("endPushOnce", "End push once", false),
-    ("prepend", "Prepend to stack", true),
-    ("endprepend", "End prepend", false),
-    ("prependOnce", "Prepend once to stack", true),
-    ("endPrependOnce", "End prepend once", false),
+    ("extends", "Extend a layout", true, None),
+    ("section", "Define section content", true, Some("endsection")),
+    ("yield", "Yield section content", true, None),
+    ("parent", "Include parent section", false, None),
+    ("show", "Show and yield section", false, None),
+    ("hasSection", "Check if section exists", true, None),
+    ("sectionMissing", "Check if section is missing", true, None),
+    ("stack", "Render pushed content", true, None),
+    ("push", "Push to stack", true, Some("endpush")),
+    ("pushOnce", "Push once to stack", true, Some("endPushOnce")),
+    ("prepend", "Prepend to stack", true, Some("endprepend")),
+    ("prependOnce", "Prepend once to stack", true, Some("endPrependOnce")),
     // Authentication & Authorization
-    ("auth", "Authenticated user block", true),
-    ("endauth", "End auth block", false),
-    ("guest", "Guest user block", true),
-    ("endguest", "End guest block", false),
-    ("can", "Authorization check", true),
-    ("endcan", "End can block", false),
-    ("cannot", "Negative authorization", true),
-    ("endcannot", "End cannot block", false),
-    ("canany", "Any permission check", true),
-    ("endcanany", "End canany block", false),
+    ("auth", "Authenticated user block", true, Some("endauth")),
+    ("guest", "Guest user block", true, Some("endguest")),
+    ("can", "Authorization check", true, Some("endcan")),
+    ("cannot", "Negative authorization", true, Some("endcannot")),
+    ("canany", "Any permission check", true, Some("endcanany")),
     // Environment
-    ("env", "Environment check", true),
-    ("endenv", "End env block", false),
-    ("production", "Production environment", false),
-    ("endproduction", "End production", false),
+    ("env", "Environment check", true, Some("endenv")),
+    ("production", "Production environment", false, Some("endproduction")),
     // Forms & CSRF
-    ("csrf", "CSRF token field", false),
-    ("method", "HTTP method field", true),
-    ("error", "Validation error", true),
-    ("enderror", "End error block", false),
+    ("csrf", "CSRF token field", false, None),
+    ("method", "HTTP method field", true, None),
+    ("error", "Validation error", true, Some("enderror")),
     // Assets
-    ("vite", "Vite asset", true),
+    ("vite", "Vite asset", true, None),
     // PHP
-    ("php", "Raw PHP block", false),
-    ("endphp", "End PHP block", false),
+    ("php", "Raw PHP block", false, Some("endphp")),
     // Other
-    ("verbatim", "Escape Blade syntax", false),
-    ("endverbatim", "End verbatim", false),
-    ("json", "JSON encode variable", true),
-    ("js", "JavaScript variable", true),
-    ("class", "Conditional CSS classes", true),
-    ("style", "Conditional inline styles", true),
-    ("checked", "Checked attribute helper", true),
-    ("selected", "Selected attribute helper", true),
-    ("disabled", "Disabled attribute helper", true),
-    ("readonly", "Readonly attribute helper", true),
-    ("required", "Required attribute helper", true),
-    ("once", "Render once", false),
-    ("endonce", "End once block", false),
-    ("props", "Component props", true),
-    ("aware", "Component aware props", true),
-    ("fragment", "Fragment for Livewire/htmx", true),
-    ("endfragment", "End fragment", false),
-    ("session", "Session check", true),
-    ("endsession", "End session block", false),
+    ("verbatim", "Escape Blade syntax", false, Some("endverbatim")),
+    ("json", "JSON encode variable", true, None),
+    ("js", "JavaScript variable", true, None),
+    ("class", "Conditional CSS classes", true, None),
+    ("style", "Conditional inline styles", true, None),
+    ("checked", "Checked attribute helper", true, None),
+    ("selected", "Selected attribute helper", true, None),
+    ("disabled", "Disabled attribute helper", true, None),
+    ("readonly", "Readonly attribute helper", true, None),
+    ("required", "Required attribute helper", true, None),
+    ("once", "Render once", false, Some("endonce")),
+    ("props", "Component props", true, None),
+    ("aware", "Component aware props", true, None),
+    ("fragment", "Fragment for Livewire/htmx", true, Some("endfragment")),
+    ("session", "Session check", true, Some("endsession")),
     // Livewire
-    ("livewire", "Livewire component", true),
-    ("livewireStyles", "Livewire styles", false),
-    ("livewireScripts", "Livewire scripts", false),
-    ("persist", "Persist Livewire state", true),
-    ("endpersist", "End persist", false),
-    ("teleport", "Teleport content", true),
-    ("endteleport", "End teleport", false),
+    ("livewire", "Livewire component", true, None),
+    ("livewireStyles", "Livewire styles", false, None),
+    ("livewireScripts", "Livewire scripts", false, None),
+    ("persist", "Persist Livewire state", true, Some("endpersist")),
+    ("teleport", "Teleport content", true, Some("endteleport")),
 ];
 
-/// Settings structure for Laravel LSP configuration
-/// Configured via: { "lsp": { "laravel-lsp": { "settings": { "laravel": { ... } } } } }
+/// Blade-specific settings
+/// Configured via: { "lsp": { "laravel-lsp": { "settings": { "blade": { ... } } } } }
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct LaravelSettings {
-    /// Debounce delay for Salsa updates in milliseconds (default: 250)
-    /// Lower values = faster updates but more CPU usage during typing
-    /// Higher values = less CPU but slower feedback
-    #[serde(default = "default_debounce_ms")]
-    debounce_ms: u64,
+struct BladeSettings {
+    /// Add space between directive name and parentheses (default: false)
+    /// false: @if($condition)
+    /// true:  @if ($condition)
+    #[serde(default)]
+    directive_spacing: bool,
 }
 
-fn default_debounce_ms() -> u64 {
+fn default_auto_complete_debounce() -> u64 {
     DEFAULT_SALSA_DEBOUNCE_MS
 }
 
-/// Wrapper for the full settings object from Zed
+/// LSP settings object from Zed
+/// Configured via: { "lsp": { "laravel-lsp": { "settings": { ... } } } }
 #[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct LspSettings {
+    /// Debounce delay for autocomplete updates in milliseconds (default: 200)
+    /// Lower values = faster updates but more CPU usage during typing
+    /// Higher values = less CPU but slower feedback
+    #[serde(default = "default_auto_complete_debounce")]
+    auto_complete_debounce: u64,
     #[serde(default)]
-    laravel: LaravelSettings,
+    blade: BladeSettings,
 }
 
 // ============================================================================
@@ -1241,7 +1367,8 @@ impl LaravelLanguageServer {
             last_goto_request: Arc::new(RwLock::new(HashMap::new())),
             initialized_root: Arc::new(RwLock::new(None)),
             pending_salsa_updates: Arc::new(RwLock::new(HashMap::new())),
-            salsa_debounce_ms: Arc::new(RwLock::new(DEFAULT_SALSA_DEBOUNCE_MS)),
+            auto_complete_debounce_ms: Arc::new(RwLock::new(DEFAULT_SALSA_DEBOUNCE_MS)),
+            directive_spacing: Arc::new(RwLock::new(false)),
             vendor_diagnostic_shown: Arc::new(RwLock::new(false)),
             cached_validation_rule_names: Arc::new(RwLock::new(Vec::new())),
             database_schema: Arc::new(RwLock::new(None)),
@@ -1251,12 +1378,22 @@ impl LaravelLanguageServer {
 
     /// Update settings from LSP configuration
     async fn update_settings(&self, settings: &LspSettings) {
-        let new_debounce = settings.laravel.debounce_ms;
-        let old_debounce = *self.salsa_debounce_ms.read().await;
+        // Autocomplete debounce setting
+        let new_debounce = settings.auto_complete_debounce;
+        let old_debounce = *self.auto_complete_debounce_ms.read().await;
 
         if new_debounce != old_debounce {
-            info!("⚙️  Updating Salsa debounce: {}ms → {}ms", old_debounce, new_debounce);
-            *self.salsa_debounce_ms.write().await = new_debounce;
+            info!("⚙️  Updating autocomplete debounce: {}ms → {}ms", old_debounce, new_debounce);
+            *self.auto_complete_debounce_ms.write().await = new_debounce;
+        }
+
+        // Blade settings
+        let new_spacing = settings.blade.directive_spacing;
+        let old_spacing = *self.directive_spacing.read().await;
+
+        if new_spacing != old_spacing {
+            info!("⚙️  Updating directive spacing: {} → {}", old_spacing, new_spacing);
+            *self.directive_spacing.write().await = new_spacing;
         }
     }
 
@@ -2628,7 +2765,7 @@ impl LaravelLanguageServer {
     /// the file is updated in Salsa which triggers incremental recomputation
     /// of all affected queries.
     async fn queue_salsa_update(&self, uri: Url, content: String, version: i32) {
-        let debounce_ms = *self.salsa_debounce_ms.read().await;
+        let debounce_ms = *self.auto_complete_debounce_ms.read().await;
         let debounce_delay = Duration::from_millis(debounce_ms);
 
         // Cancel any existing pending Salsa update for this file
@@ -5142,12 +5279,27 @@ impl LaravelLanguageServer {
         let before_cursor = &line_text[..cursor];
         info!("      📍 before_cursor: '{}'", before_cursor);
 
-        // First verify we're in a validation context
-        let line_has_context = Self::is_validation_context(line_text, cached_rules);
-        let surrounding_has_context = surrounding_lines.iter().any(|l| Self::is_validation_context(l, cached_rules));
-        let in_validation_context = line_has_context || surrounding_has_context;
+        // Use context-aware detection to determine what type of array we're in
+        // This prevents triggering validation completions in $casts and other non-validation arrays
+        let context = Self::detect_array_context(line_text, surrounding_lines);
+        info!("      🔍 Array context: {:?}", context);
 
-        info!("      🔍 Validation context: line={}, surrounding={}", line_has_context, surrounding_has_context);
+        let in_validation_context = match context {
+            // Explicit validation context
+            ArrayContext::Validation => true,
+            // Explicit non-validation contexts
+            ArrayContext::Casts
+            | ArrayContext::MassAssignment
+            | ArrayContext::Visibility
+            | ArrayContext::Relationships => false,
+            // Unknown - fall back to pattern matching
+            ArrayContext::Unknown => {
+                let line_has_context = Self::is_validation_context(line_text, cached_rules);
+                let surrounding_has_context =
+                    surrounding_lines.iter().any(|l| Self::is_validation_context(l, cached_rules));
+                line_has_context || surrounding_has_context
+            }
+        };
 
         if !in_validation_context {
             info!("      ❌ Not in validation context");
@@ -5760,6 +5912,94 @@ impl LaravelLanguageServer {
     // Validation Rule Context Detection (for rule name completion)
     // ========================================================================
 
+    /// Detect what type of array context we're in by scanning surrounding lines
+    /// Looks for property/method definitions that indicate the array's purpose
+    fn detect_array_context(current_line: &str, surrounding_lines: &[&str]) -> ArrayContext {
+        // Combine current line with surrounding lines for analysis
+        let all_lines: Vec<&str> = std::iter::once(current_line)
+            .chain(surrounding_lines.iter().copied())
+            .collect();
+
+        info!("      🔎 detect_array_context: checking {} lines", all_lines.len());
+        info!("         Current line: '{}'", current_line.chars().take(80).collect::<String>());
+        for (i, line) in surrounding_lines.iter().enumerate() {
+            info!("         Surrounding[{}]: '{}'", i, line.chars().take(80).collect::<String>());
+        }
+
+        for line in &all_lines {
+            let line_lower = line.to_lowercase();
+            let line_trimmed = line.trim();
+
+            // === VALIDATION CONTEXTS (highest priority - check first) ===
+
+            // Request/controller validation
+            if line_lower.contains("->validate(")
+                || line_lower.contains("->validatewithbag(")
+                || line_lower.contains("validator::make(")
+                || line_lower.contains("validator(")
+            {
+                info!("      ✅ Detected ArrayContext::Validation (request/validator) from line: '{}'", line.chars().take(50).collect::<String>());
+                return ArrayContext::Validation;
+            }
+
+            // $rules property or variable
+            if line_lower.contains("$rules")
+                && (line_lower.contains("=") || line_lower.contains("["))
+            {
+                return ArrayContext::Validation;
+            }
+
+            // rules() method definition (Form Request, Livewire)
+            if line_lower.contains("function rules(") || line_lower.contains("function rules (") {
+                return ArrayContext::Validation;
+            }
+
+            // Livewire validation attributes
+            if line_trimmed.starts_with("#[Rule(") || line_trimmed.starts_with("#[Validate(") {
+                return ArrayContext::Validation;
+            }
+
+            // === NON-VALIDATION CONTEXTS ===
+
+            // Casts context: $casts property or casts() method
+            if line_lower.contains("$casts")
+                || line_lower.contains("function casts(")
+                || line_lower.contains("function casts (")
+            {
+                info!("      ✅ Detected ArrayContext::Casts from line: '{}'", line.chars().take(60).collect::<String>());
+                return ArrayContext::Casts;
+            }
+
+            // Mass assignment: $fillable, $guarded
+            if line_lower.contains("$fillable") || line_lower.contains("$guarded") {
+                return ArrayContext::MassAssignment;
+            }
+
+            // Visibility: $hidden, $visible, $appends
+            if line_lower.contains("$hidden")
+                || line_lower.contains("$visible")
+                || line_lower.contains("$appends")
+            {
+                return ArrayContext::Visibility;
+            }
+
+            // Relationships: $with, $withCount
+            if (line_lower.contains("$with") && !line_lower.contains("$without"))
+                || line_lower.contains("$withcount")
+            {
+                return ArrayContext::Relationships;
+            }
+        }
+
+        // No specific context found
+        info!("      ⚠️  No specific context found in {} lines, returning ArrayContext::Unknown", all_lines.len());
+        info!("         First 3 surrounding lines:");
+        for (i, line) in surrounding_lines.iter().take(3).enumerate() {
+            info!("           [{}]: '{}'", i, line.chars().take(70).collect::<String>());
+        }
+        ArrayContext::Unknown
+    }
+
     /// Check if cursor is inside a validation rule context
     /// Returns the partial rule text typed so far (for filtering completions)
     ///
@@ -5771,6 +6011,12 @@ impl LaravelLanguageServer {
     /// - function rules() { return [...]; }
     /// - #[Rule('...')] or #[Validate('...')]
     /// - $this->validate([...])
+    ///
+    /// Explicitly excludes non-validation contexts:
+    /// - $casts / casts() - Eloquent attribute casting
+    /// - $fillable / $guarded - Mass assignment
+    /// - $hidden / $visible / $appends - Model serialization
+    /// - $with / $withCount - Eager loading
     ///
     /// `surrounding_lines` provides context from previous lines (for multi-line arrays)
     fn get_validation_rule_context(
@@ -5789,19 +6035,36 @@ impl LaravelLanguageServer {
         // First, extract the partial rule text if we're in a string
         let partial_rule = Self::extract_partial_validation_rule(before_cursor)?;
 
-        // Then verify we're in a validation context (check current line first)
-        if Self::is_validation_context(line_text, cached_rules) {
-            return Some(partial_rule);
-        }
+        // Use context-aware detection to determine what type of array we're in
+        // This prevents triggering validation completions in $casts and other non-validation arrays
+        let context = Self::detect_array_context(line_text, surrounding_lines);
 
-        // Check surrounding lines for validation context
-        for surrounding in surrounding_lines {
-            if Self::is_validation_context(surrounding, cached_rules) {
-                return Some(partial_rule);
+        match context {
+            // Explicit validation context - allow completions
+            ArrayContext::Validation => Some(partial_rule),
+
+            // Explicit non-validation contexts - no completions
+            ArrayContext::Casts
+            | ArrayContext::MassAssignment
+            | ArrayContext::Visibility
+            | ArrayContext::Relationships => None,
+
+            // Unknown context - fall back to pattern matching for validation indicators
+            ArrayContext::Unknown => {
+                // Check if line or surrounding lines have validation indicators
+                if Self::is_validation_context(line_text, cached_rules) {
+                    return Some(partial_rule);
+                }
+
+                for surrounding in surrounding_lines {
+                    if Self::is_validation_context(surrounding, cached_rules) {
+                        return Some(partial_rule);
+                    }
+                }
+
+                None
             }
         }
-
-        None
     }
 
     /// Extract the partial validation rule text from before the cursor
@@ -5894,6 +6157,66 @@ impl LaravelLanguageServer {
         None
     }
 
+    /// Check if cursor is inside a cast type context (VALUE position in $casts or casts())
+    /// Returns the partial cast type text typed so far (for filtering completions)
+    ///
+    /// Detects cast contexts in Eloquent models:
+    /// - protected $casts = ['field' => '█']
+    /// - protected function casts(): array { return ['field' => '█']; }
+    ///
+    /// `surrounding_lines` provides context from previous lines (for multi-line arrays)
+    fn get_cast_type_context(
+        line_text: &str,
+        character: u32,
+        surrounding_lines: &[&str],
+    ) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // First, check if we're in a cast context at all
+        let context = Self::detect_array_context(line_text, surrounding_lines);
+
+        if context != ArrayContext::Casts {
+            return None;
+        }
+
+        // Extract the partial cast type if we're in VALUE position (after =>)
+        Self::extract_partial_cast_type(before_cursor)
+    }
+
+    /// Extract the partial cast type text from before the cursor
+    /// Returns None if cursor is not inside a quoted string in VALUE position
+    fn extract_partial_cast_type(before_cursor: &str) -> Option<String> {
+        // Cast types are always values (right side of =>)
+        // Pattern: 'field_name' => '█' or 'field_name' => "█"
+
+        let value_patterns: &[(&str, char)] = &[
+            // Arrow patterns (for 'field' => '█')
+            ("=> '", '\''),
+            ("=> \"", '"'),
+            ("=>'", '\''),
+            ("=>\"", '"'),
+        ];
+
+        for (pattern, quote_char) in value_patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                let start_pos = pos + pattern.len();
+                let after_pattern = &before_cursor[start_pos..];
+
+                // Make sure there's no closing quote
+                if !after_pattern.contains(*quote_char) {
+                    return Some(after_pattern.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
     /// Check if the line appears to be in a validation context
     /// This verifies we're not just in any random string
     /// `cached_rules` - optional slice of rule names (with colon suffix) from Laravel framework
@@ -5958,6 +6281,7 @@ impl LaravelLanguageServer {
             }
 
             // Fallback: common rules without parameters (stable, rarely change)
+            // NOTE: These also match cast types! Only use when context is Unknown
             let base_indicators = [
                 "required", "nullable", "string", "integer", "email",
                 "confirmed", "accepted", "boolean", "numeric", "array",
@@ -5965,6 +6289,7 @@ impl LaravelLanguageServer {
             ];
             for indicator in base_indicators {
                 if line_lower.contains(indicator) {
+                    info!("      🔴 is_validation_context: matched base indicator '{}' in line '{}'", indicator, line_text.chars().take(60).collect::<String>());
                     return true;
                 }
             }
@@ -8325,7 +8650,8 @@ return [
             last_goto_request: self.last_goto_request.clone(),
             initialized_root: self.initialized_root.clone(),
             pending_salsa_updates: self.pending_salsa_updates.clone(),
-            salsa_debounce_ms: self.salsa_debounce_ms.clone(),
+            auto_complete_debounce_ms: self.auto_complete_debounce_ms.clone(),
+            directive_spacing: self.directive_spacing.clone(),
             vendor_diagnostic_shown: self.vendor_diagnostic_shown.clone(),
             cached_validation_rule_names: self.cached_validation_rule_names.clone(),
             database_schema: self.database_schema.clone(),
@@ -9219,7 +9545,8 @@ impl LanguageServer for LaravelLanguageServer {
         if let Some(init_options) = params.initialization_options {
             match serde_json::from_value::<LspSettings>(init_options) {
                 Ok(settings) => {
-                    info!("⚙️  Initial settings: debounceMs={}ms", settings.laravel.debounce_ms);
+                    info!("⚙️  Initial settings: autoCompleteDebounce={}ms, blade.directiveSpacing={}",
+                        settings.auto_complete_debounce, settings.blade.directive_spacing);
                     self.update_settings(&settings).await;
                 }
                 Err(e) => {
@@ -9563,7 +9890,8 @@ impl LanguageServer for LaravelLanguageServer {
 
         match serde_json::from_value::<LspSettings>(params.settings) {
             Ok(settings) => {
-                info!("⚙️  Configuration updated: debounceMs={}ms", settings.laravel.debounce_ms);
+                info!("⚙️  Configuration updated: autoCompleteDebounce={}ms, blade.directiveSpacing={}",
+                    settings.auto_complete_debounce, settings.blade.directive_spacing);
                 self.update_settings(&settings).await;
             }
             Err(e) => {
@@ -9850,19 +10178,36 @@ impl LanguageServer for LaravelLanguageServer {
                 if let Some(directive_prefix) = Self::get_blade_directive_context(line_text, position.character) {
                     debug!("   Blade directive context, prefix: '{}'", directive_prefix);
 
+                    // Get directive spacing preference
+                    let use_spacing = *self.directive_spacing.read().await;
+                    let paren = if use_spacing { " (" } else { "(" };
+
                     let prefix_lower = directive_prefix.to_lowercase();
                     let items: Vec<CompletionItem> = BLADE_DIRECTIVES
                         .iter()
-                        .filter(|(name, _, _)| name.to_lowercase().starts_with(&prefix_lower))
-                        .map(|(name, description, has_params)| {
-                            let insert_text = if *has_params {
-                                format!("{}($1)$0", name)
+                        .filter(|(name, _, _, _)| name.to_lowercase().starts_with(&prefix_lower))
+                        .map(|(name, description, has_params, closing)| {
+                            // Build snippet based on params and closing directive
+                            // Use configured spacing: @if($1) or @if ($1)
+                            let insert_text = match (has_params, closing) {
+                                // Block directive with params: @if($1)\n\t$0\n@endif
+                                (true, Some(end)) => format!("{}{}$1)\n\t$0\n@{}", name, paren, end),
+                                // Block directive without params: @php\n\t$0\n@endphp
+                                (false, Some(end)) => format!("{}\n\t$0\n@{}", name, end),
+                                // Inline directive with params: @include($1)$0
+                                (true, None) => format!("{}{}$1)$0", name, paren),
+                                // Inline directive without params: @csrf
+                                (false, None) => name.to_string(),
+                            };
+
+                            let label = if closing.is_some() {
+                                format!("@{}...@{}", name, closing.unwrap())
                             } else {
-                                name.to_string()
+                                format!("@{}", name)
                             };
 
                             CompletionItem {
-                                label: format!("@{}", name),
+                                label,
                                 kind: Some(CompletionItemKind::KEYWORD),
                                 detail: Some(description.to_string()),
                                 insert_text: Some(insert_text),
@@ -10518,7 +10863,8 @@ impl LanguageServer for LaravelLanguageServer {
                 &surrounding_lines,
                 &cached_rules,
             ) {
-                debug!("   Validation rule context, filter prefix: '{}'", rule_prefix);
+                info!("   🔵 VALIDATION RULE context detected, filter prefix: '{}', line: '{}'",
+                    rule_prefix, line_text.chars().take(60).collect::<String>());
 
                 // Get all validation rules (built-in + custom)
                 let validation_rules = self.get_all_validation_rules().await;
@@ -10547,6 +10893,60 @@ impl LanguageServer for LaravelLanguageServer {
                     .collect();
 
                 debug!("   Returning {} validation rule completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for cast type context ($casts array or casts() method)
+            if let Some(cast_prefix) = Self::get_cast_type_context(
+                line_text,
+                position.character,
+                &surrounding_lines,
+            ) {
+                info!("   🟢 CAST TYPE context detected, filter prefix: '{}', line: '{}'",
+                    cast_prefix, line_text.chars().take(60).collect::<String>());
+
+                // Get all cast types (built-in primitives + scanned from vendor/app)
+                let mut cast_types = get_laravel_cast_types();
+
+                // Add casts from Laravel framework, packages, and app/Casts
+                if let Some(root) = self.root_path.read().await.clone() {
+                    let scanned_casts = scan_all_casts(&root);
+                    debug!("   Found {} casts from vendor/app", scanned_casts.len());
+                    cast_types.extend(scanned_casts);
+                }
+
+                // Build completion items, filtering by prefix (case-insensitive)
+                let prefix_lower = cast_prefix.to_lowercase();
+                let items: Vec<CompletionItem> = cast_types
+                    .into_iter()
+                    .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
+                    .map(|c| {
+                        let label = if c.has_params {
+                            format!("{}:", c.name)
+                        } else {
+                            c.name.clone()
+                        };
+
+                        CompletionItem {
+                            label,
+                            kind: Some(CompletionItemKind::KEYWORD),
+                            detail: Some(format!("({})", c.source)),
+                            documentation: Some(Documentation::String(c.description)),
+                            insert_text: Some(c.name.clone()),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} cast type completion items", items.len());
 
                 return if items.is_empty() {
                     Ok(None)
@@ -10650,7 +11050,327 @@ impl LanguageServer for LaravelLanguageServer {
 // Zed doesn't support custom LSP commands, so code lens was not functional.
 
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    mod array_context_detection {
+        use super::*;
+
+        #[test]
+        fn test_detect_casts_property() {
+            let current = "            'email_verified_at' => 'datetime',";
+            let surrounding = vec![
+                "    protected $casts = [",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Casts
+            );
+        }
+
+        #[test]
+        fn test_detect_casts_method() {
+            let current = "            'email_verified_at' => 'datetime',";
+            let surrounding = vec![
+                "    protected function casts(): array",
+                "    {",
+                "        return [",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Casts
+            );
+        }
+
+        #[test]
+        fn test_detect_rules_property() {
+            let current = "            'email' => 'required|email',";
+            let surrounding = vec![
+                "    protected $rules = [",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Validation
+            );
+        }
+
+        #[test]
+        fn test_detect_rules_method() {
+            let current = "            'email' => 'required|email',";
+            let surrounding = vec![
+                "    public function rules(): array",
+                "    {",
+                "        return [",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Validation
+            );
+        }
+
+        #[test]
+        fn test_detect_validate_call() {
+            let current = "            'email' => 'required|email',";
+            let surrounding = vec![
+                "        $request->validate([",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Validation
+            );
+        }
+
+        #[test]
+        fn test_detect_validator_make() {
+            let current = "            'email' => 'required',";
+            let surrounding = vec![
+                "        $validator = Validator::make($data, [",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Validation
+            );
+        }
+
+        #[test]
+        fn test_detect_livewire_rule_attribute() {
+            let current = "    #[Rule('required|email')]";
+            let surrounding: Vec<&str> = vec![];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Validation
+            );
+        }
+
+        #[test]
+        fn test_detect_fillable() {
+            let current = "        'name',";
+            let surrounding = vec![
+                "    protected $fillable = [",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::MassAssignment
+            );
+        }
+
+        #[test]
+        fn test_detect_hidden() {
+            let current = "        'password',";
+            let surrounding = vec![
+                "    protected $hidden = [",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Visibility
+            );
+        }
+
+        #[test]
+        fn test_detect_with_property() {
+            let current = "        'posts',";
+            let surrounding = vec![
+                "    protected $with = [",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Relationships
+            );
+        }
+
+        #[test]
+        fn test_unknown_context() {
+            let current = "        'some_value',";
+            let surrounding = vec![
+                "        $randomArray = [",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Unknown
+            );
+        }
+
+        #[test]
+        fn test_validation_priority_over_generic() {
+            // When on a line that has validation-like content but surrounding is ambiguous,
+            // validation patterns should be detected
+            let current = "        $request->validate([";
+            let surrounding: Vec<&str> = vec![];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Validation
+            );
+        }
+
+        #[test]
+        fn test_casts_blocks_validation_completion() {
+            // Even if line contains validation-like words (string, integer, boolean),
+            // being in a casts context should return Casts, not Validation
+            let current = "            'is_active' => 'boolean',";
+            let surrounding = vec![
+                "    protected function casts(): array",
+                "    {",
+                "        return [",
+            ];
+            // "boolean" is both a cast type and a validation rule,
+            // but context should win
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Casts
+            );
+        }
+
+        #[test]
+        fn test_casts_with_realistic_line_order() {
+            // Test with lines in the order they'd actually be collected
+            // (closest line first, furthest last)
+            let current = "            'email_verified_at' => 'datetime',";
+            // Simulating User model casts() method - lines closest to current first
+            let surrounding = vec![
+                "        return [",                         // line N-1
+                "    {",                                    // line N-2
+                "    protected function casts(): array",   // line N-3
+                "     */",                                  // line N-4 (docblock end)
+                "     * @return array<string, string>",    // line N-5
+            ];
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Casts
+            );
+        }
+
+        #[test]
+        fn test_casts_with_docblock_beyond_10_lines() {
+            // If casts() is more than 10 lines away due to large docblock,
+            // context should be Unknown (not incorrectly Validation)
+            let current = "            'field' => 'str";
+            // No casts() or rules() in surrounding 10 lines
+            let surrounding = vec![
+                "        return [",
+                "    {",
+                "     */",
+                "     * Line 1 of long docblock",
+                "     * Line 2 of long docblock",
+                "     * Line 3 of long docblock",
+                "     * Line 4 of long docblock",
+                "     * Line 5 of long docblock",
+                "     * Line 6 of long docblock",
+                "    /**",
+            ];
+            // Should be Unknown, NOT Validation
+            assert_eq!(
+                LaravelLanguageServer::detect_array_context(current, &surrounding),
+                ArrayContext::Unknown
+            );
+        }
+    }
+
+    mod cast_type_context {
+        use super::*;
+
+        #[test]
+        fn test_extract_partial_cast_type_basic() {
+            // After typing => ' we should get empty string
+            let before = "        'email_verified_at' => '";
+            assert_eq!(
+                LaravelLanguageServer::extract_partial_cast_type(before),
+                Some("".to_string())
+            );
+        }
+
+        #[test]
+        fn test_extract_partial_cast_type_with_prefix() {
+            // After typing => 'date we should get "date"
+            let before = "        'email_verified_at' => 'date";
+            assert_eq!(
+                LaravelLanguageServer::extract_partial_cast_type(before),
+                Some("date".to_string())
+            );
+        }
+
+        #[test]
+        fn test_extract_partial_cast_type_double_quotes() {
+            let before = "        'field' => \"int";
+            assert_eq!(
+                LaravelLanguageServer::extract_partial_cast_type(before),
+                Some("int".to_string())
+            );
+        }
+
+        #[test]
+        fn test_extract_partial_cast_type_no_arrow() {
+            // Key position, not value - should return None
+            let before = "        'field";
+            assert_eq!(
+                LaravelLanguageServer::extract_partial_cast_type(before),
+                None
+            );
+        }
+
+        #[test]
+        fn test_extract_partial_cast_type_closed_string() {
+            // Already closed string - cursor is outside
+            let before = "        'field' => 'datetime',";
+            assert_eq!(
+                LaravelLanguageServer::extract_partial_cast_type(before),
+                None
+            );
+        }
+
+        #[test]
+        fn test_get_cast_type_context_in_casts_array() {
+            let line = "        'email_verified_at' => 'date";
+            let surrounding = vec![
+                "    protected $casts = [",
+            ];
+            // Character position should be at end of line (after 'date')
+            assert_eq!(
+                LaravelLanguageServer::get_cast_type_context(line, line.len() as u32, &surrounding),
+                Some("date".to_string())
+            );
+        }
+
+        #[test]
+        fn test_get_cast_type_context_in_casts_method() {
+            let line = "        'is_admin' => 'bool";
+            let surrounding = vec![
+                "    protected function casts(): array",
+                "    {",
+                "        return [",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::get_cast_type_context(line, line.len() as u32, &surrounding),
+                Some("bool".to_string())
+            );
+        }
+
+        #[test]
+        fn test_get_cast_type_context_not_in_casts() {
+            // In validation context, not casts
+            let line = "        'email' => 'req";
+            let surrounding = vec![
+                "    protected $rules = [",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::get_cast_type_context(line, line.len() as u32, &surrounding),
+                None
+            );
+        }
+
+        #[test]
+        fn test_get_cast_type_context_empty_prefix() {
+            let line = "        'field' => '";
+            let surrounding = vec![
+                "    protected $casts = [",
+            ];
+            assert_eq!(
+                LaravelLanguageServer::get_cast_type_context(line, line.len() as u32, &surrounding),
+                Some("".to_string())
+            );
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {

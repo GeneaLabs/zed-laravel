@@ -48,27 +48,79 @@ impl LaravelExtension {
     /// Get or download the language server binary
     ///
     /// Search order (optimized for development workflow):
-    /// 1. DEV MODE: Check cargo build output (laravel-lsp/target/release/)
-    ///    - Only exists when running as dev extension from source
+    /// 1. DEV MODE: Check cargo build output (multiple locations)
+    ///    - Relative path (for dev extension from source)
+    ///    - Absolute path in ~/Developer/zed-laravel (for installed extension)
     ///    - Not cached - always checks fresh so rebuilds are picked up immediately
     /// 2. Check cached path (for production, verify still exists)
     /// 3. Check versioned extension directory (laravel-lsp-{VERSION}/)
     /// 4. Try system PATH via worktree.which()
     /// 5. Download from GitHub releases
     fn language_server_binary_path(&mut self, worktree: &zed::Worktree) -> Result<String> {
-        // Step 1: DEV MODE - Check for cargo build output
-        // This path only exists when running as a dev extension from source.
+        // Step 1: DEV MODE - Check for cargo build output in multiple locations
         // We check this FIRST and DON'T cache it, so rebuilds are picked up
         // immediately after "zed: reload extensions".
         let (os, _) = zed::current_platform();
-        let dev_binary = match os {
-            zed::Os::Windows => "laravel-lsp/target/release/laravel-lsp.exe",
-            _ => "laravel-lsp/target/release/laravel-lsp",
+
+        // Paths to check for dev builds (in priority order)
+        // Get HOME from shell environment (more reliable in WASM)
+        let shell_env = worktree.shell_env();
+        let home = shell_env.iter()
+            .find(|(k, _)| k == "HOME" || k == "USERPROFILE")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("HOME").ok())
+            .or_else(|| std::env::var("USERPROFILE").ok());
+
+        let dev_paths: Vec<String> = match os {
+            zed::Os::Windows => {
+                let mut paths = vec![
+                    // Relative path (works when running as dev extension from source)
+                    "laravel-lsp/target/release/laravel-lsp.exe".to_string(),
+                ];
+                // Absolute path in common dev location
+                if let Some(ref h) = home {
+                    paths.push(format!("{}/Developer/zed-laravel/laravel-lsp/target/release/laravel-lsp.exe", h));
+                }
+                paths
+            }
+            _ => {
+                let mut paths = vec![
+                    // Relative path (works when running as dev extension from source)
+                    "laravel-lsp/target/release/laravel-lsp".to_string(),
+                ];
+                // Absolute path in common dev location (macOS/Linux)
+                if let Some(ref h) = home {
+                    paths.push(format!("{}/Developer/zed-laravel/laravel-lsp/target/release/laravel-lsp", h));
+                }
+                paths
+            }
         };
 
-        if fs::metadata(dev_binary).is_ok() {
-            // Don't cache - always check fresh for dev builds
-            return Ok(dev_binary.to_string());
+        // Check if we're running as a dev extension by looking for Cargo.toml
+        // (only exists in the source directory, not in published extensions)
+        let is_dev_extension = fs::metadata("Cargo.toml").is_ok();
+
+        for dev_binary in dev_paths.iter().filter(|p| !p.is_empty()) {
+            // Try fs::metadata first
+            if fs::metadata(dev_binary).is_ok() {
+                // Don't cache - always check fresh for dev builds
+                return Ok(dev_binary.to_string());
+            }
+        }
+
+        // If we detected this is a dev extension but couldn't find the binary via fs::metadata,
+        // try the absolute path anyway. WASM sandbox restrictions may prevent fs::metadata
+        // from seeing files outside the sandbox, but Zed can still exec them.
+        if is_dev_extension {
+            if let Some(ref h) = home {
+                let dev_build_path = match os {
+                    zed::Os::Windows => format!("{}/Developer/zed-laravel/laravel-lsp/target/release/laravel-lsp.exe", h),
+                    _ => format!("{}/Developer/zed-laravel/laravel-lsp/target/release/laravel-lsp", h),
+                };
+                // Return the dev path - if file doesn't exist, LSP will fail to start
+                // which is the correct behavior for dev mode
+                return Ok(dev_build_path);
+            }
         }
 
         // Step 2: Check cached path (for production use)

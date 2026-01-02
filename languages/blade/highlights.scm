@@ -1,15 +1,16 @@
-; html
+; HTML
 (tag_name) @tag
-(doctype) @tag.doctype
+(doctype) @tag
 (attribute_name) @attribute
+(attribute_value) @string
+(comment) @comment
+
 [
   "\""
   "'"
-  (attribute_value)
 ] @string
-(comment) @comment
 
-"=" @punctuation.delimiter.html
+"=" @punctuation.delimiter
 
 [
   "<"
@@ -17,20 +18,27 @@
   "<!"
   "</"
   "/>"
-] @punctuation.bracket.html
+] @punctuation.bracket
 
-; blade
-(directive) @tag
-(directive_start) @tag
-(directive_end) @tag
-(comment) @comment
+; Blade directives - these are the actual AST node types
+; (keyword rule gets aliased to directive in the AST)
+(directive) @function
+(directive_start) @function
+(directive_end) @function
+
+; Directives used as HTML attributes
 (attribute (directive) @attribute)
-(keyword) @function
+
+; Blade echo delimiters
 [
   "{{"
   "}}"
   "{!!"
   "!!}"
+] @punctuation.bracket
+
+; Parentheses in directives
+[
   "("
   ")"
 ] @punctuation.bracket
