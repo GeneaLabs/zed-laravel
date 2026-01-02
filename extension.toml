@@ -1,7 +1,7 @@
 id = "laravel"
 name = "Laravel"
 description = "Laravel development support for Zed with go-to-definition for Blade, Livewire, and Flux components"
-version = "0.1.3"
+version = "0.1.5"
 schema_version = 1
 authors = ["Mike"]
 repository = "https://github.com/GeneaLabs/zed-laravel"
