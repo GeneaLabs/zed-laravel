@@ -209,13 +209,54 @@ Variables are resolved from:
 - `@props(['title' => string])` in Blade components
 - Livewire component public properties
 
-### ⚠️ Diagnostics
+#### 🔄 Loop Variables (Scope-Aware)
+
+Variables from loop directives are available **only inside** the loop block:
+
+```blade
+@foreach($users as $user)
+    {{ $user->name }}   {{-- ✅ $user available here --}}
+    {{ $loop->index }}  {{-- ✅ $loop available in all loops --}}
+@endforeach
+{{ $user }}  {{-- ❌ $user NOT available outside loop --}}
+```
+
+Supported loop directives:
+- `@foreach($items as $item)` / `@foreach($items as $key => $value)`
+- `@forelse($items as $item)`
+- `@for($i = 0; $i < 10; $i++)`
+- `@while($condition)`
+
+Nested loops work correctly—inner loop variables are scoped to their block.
+
+#### 🎰 Slot Variables (Components)
+
+In component files (`resources/views/components/*.blade.php`), slot variables are detected from usage:
+
+```blade
+{{-- components/card.blade.php --}}
+<div class="card">
+    <header>{{ $header }}</header>   {{-- $header autocomplete available --}}
+    <div>{{ $slot }}</div>           {{-- $slot always available --}}
+    <footer>{{ $footer }}</footer>   {{-- $footer autocomplete available --}}
+</div>
+```
+
+Component files automatically get:
+- `$slot` — default slot content
+- `$attributes` — component attribute bag
+- `$component` — component instance
+- Named slots detected from `{{ $name }}` usage
+
+### ❌ Diagnostics
 
 See problems in real-time as you type. The extension validates your Laravel code against your actual project structure, highlighting missing views, undefined components, invalid validation rules, and other issues before you run your application.
 
+**Missing files are reported as errors** to catch issues early:
+
 ```php
 return view('users.dashboard');
-//          ^^^^^^^^^^^^^^^^^ ⚠️ View not found: resources/views/users/dashboard.blade.php
+//          ^^^^^^^^^^^^^^^^^ ❌ View not found: resources/views/users/dashboard.blade.php
 
 Route::middleware('admin-only')->group(...);
 //                ^^^^^^^^^^^^ ⚠️ Middleware not found
@@ -228,10 +269,13 @@ $request->validate([
 
 ```blade
 <x-dashboard-widget />
-{{-- ^^^^^^^^^^^^^^^^ ⚠️ Component not found --}}
+{{-- ^^^^^^^^^^^^^^^^ ❌ Component not found --}}
 
 <livewire:admin-panel />
-{{--       ^^^^^^^^^^^ ⚠️ Livewire component not found --}}
+{{--       ^^^^^^^^^^^ ❌ Livewire component not found --}}
+
+@extends('layouts.missing')
+{{--      ^^^^^^^^^^^^^^^^ ❌ View not found --}}
 ```
 
 ### ⚡ Quick Actions

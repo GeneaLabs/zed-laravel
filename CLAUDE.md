@@ -359,57 +359,58 @@ When working on this project:
 
 ### Last Session Summary
 
-**Focus**: Blade language support implementation
+**Focus**: Eloquent cast type autocomplete and extension troubleshooting
 
-### Blade Language Features Completed
+### Features Completed This Session
 
 | Feature | Description |
 |---------|-------------|
-| Syntax Highlighting | Directives highlight as functions (blue), proper HTML/PHP coloring |
-| Bracket Snippets | `{` triggers autocomplete for `{{ }}`, `{!! !!}`, `{{-- --}}` with cursor positioning |
-| Directive Autocomplete | 100+ directives with descriptions; block directives include closing tags |
-| Closing Tag Navigation | Cmd+Click works on `</x-*>` and `</livewire:*>` closing tags |
-| Directive Spacing Setting | Configurable space before parentheses (`@if($x)` vs `@if ($x)`) |
+| Cast Type Autocomplete | Autocomplete for `$casts` property and `casts()` method with 27+ built-in types |
+| Cast Type Scanning | Scans Laravel framework, packages (Spatie), and `app/Casts/` for custom casts |
+| Context-Aware Detection | `ArrayContext` enum distinguishes validation vs casts vs other model arrays |
+| README Reorganization | Blade moved to its own section; cast types documented |
 
 ### Key Files Modified
 
-- `languages/blade/config.toml` - Language config with bracket definitions
-- `languages/blade/highlights.scm` - Syntax highlighting (directives as `@function`)
-- `laravel-lsp/queries/blade.scm` - Added `end_tag` queries for closing tag navigation
-- `laravel-lsp/src/main.rs` - Directive completions, settings restructure
-- `README.md` - Blade features documented, settings updated
+- `laravel-lsp/src/main.rs` - Cast type autocomplete, context detection, debug logging
+- `README.md` - Reorganized with Blade section, added Eloquent Cast Types docs
+- `~/.config/zed/settings.json` - Removed `blade` from `auto_install_extensions`
 
-### Settings Structure
+### Cast Type Implementation
 
-Settings were reorganized for clarity:
+```rust
+// Built-in cast types (get_laravel_cast_types)
+string, integer, float, boolean, array, object, collection,
+datetime, date, timestamp, immutable_date, immutable_datetime,
+encrypted, encrypted:array, encrypted:collection, encrypted:object,
+hashed, decimal:, real, double, AsEnumCollection:, AsEnumArrayObject:
 
-```json
-{
-  "lsp": {
-    "laravel-lsp": {
-      "settings": {
-        "autoCompleteDebounce": 200,
-        "blade": {
-          "directiveSpacing": false
-        }
-      }
-    }
-  }
-}
+// Scanned from vendor/app (scan_all_casts)
+- vendor/laravel/framework/src/Illuminate/Database/Eloquent/Casts/
+- vendor/spatie/laravel-data/src/Casts/
+- vendor/spatie/laravel-enum/src/Casts/
+- app/Casts/
 ```
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `autoCompleteDebounce` | `200` | Delay (ms) before autocomplete updates |
-| `blade.directiveSpacing` | `false` | Space between directive and parentheses |
+### Context Detection (ArrayContext enum)
 
-### Technical Notes
+| Context | Triggers | Result |
+|---------|----------|--------|
+| `Validation` | `$rules`, `rules()`, `->validate()`, `Validator::make()` | Show validation rules |
+| `Casts` | `$casts`, `function casts()` | Show cast types |
+| `MassAssignment` | `$fillable`, `$guarded` | No completions |
+| `Visibility` | `$hidden`, `$visible`, `$appends` | No completions |
+| `Unknown` | None of above | Fall back to pattern matching |
 
-- **Tree-sitter aliasing**: `keyword` rule is aliased to `directive` in AST, so use `(directive) @function` not `(keyword) @function`
-- **Multi-char brackets**: Zed doesn't auto-close multi-char brackets properly; use snippet completions instead
-- **Block directive snippets**: Format is `@if($1)\n\t$0\n@endif` with configurable spacing
+### Troubleshooting Notes
+
+- **Dev extension not loading**: Must use "zed: install dev extension" after deleting installed version
+- **Extension auto-reinstalling**: Check `auto_install_extensions` in Zed settings
+- **WASM parse errors**: Delete corrupted extension from `~/Library/Application Support/Zed/extensions/installed/`
+- **Debug logging**: Uses `info!()` macro, visible in Zed's LSP logs panel
 
 ### Current Status
 
-- Build: **Passing** (no warnings)
+- Build: **Passing**
 - Tests: **77 integration tests passing**
+- Cast autocomplete: **Working** with `CompletionItemKind::KEYWORD`

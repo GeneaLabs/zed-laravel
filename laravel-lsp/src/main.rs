@@ -1346,7 +1346,28 @@ struct VariableAccess {
 struct BladeVariableInfo {
     name: String,
     php_type: String,
-    source: String, // "props", "controller", "component", "livewire", "framework"
+    source: String, // "props", "controller", "component", "livewire", "framework", "loop"
+}
+
+/// Represents a loop block in a Blade file for scope-aware variable resolution
+#[derive(Debug, Clone)]
+struct BladeLoopBlock {
+    /// The type of loop directive (foreach, forelse, for, while)
+    loop_type: BladeLoopType,
+    /// Variables introduced by this loop (e.g., $item, $key from @foreach)
+    variables: Vec<(String, String)>, // (name, php_type)
+    /// Start line (0-indexed)
+    start_line: usize,
+    /// End line (0-indexed), None if unclosed
+    end_line: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum BladeLoopType {
+    Foreach,
+    Forelse,
+    For,
+    While,
 }
 
 impl LaravelLanguageServer {
@@ -4031,9 +4052,164 @@ impl LaravelLanguageServer {
         Some(after_at.to_string())
     }
 
+    /// Parse variables from @foreach or @forelse directive arguments
+    /// Handles: @foreach($items as $item), @foreach($items as $key => $value)
+    /// Also handles complex expressions: @foreach($category->items as $item)
+    fn parse_foreach_variables(arguments: &str) -> Vec<(String, String)> {
+        use regex::Regex;
+        use lazy_static::lazy_static;
+
+        lazy_static! {
+            // Match: (expression as $key => $value) or (expression as $item)
+            // The expression can be complex like $category->items or $this->getUsers()
+            static ref FOREACH_RE: Regex = Regex::new(
+                r#"\([^)]+\s+as\s+(?:\$(\w+)\s*=>\s*)?\$(\w+)\s*\)"#
+            ).unwrap();
+        }
+
+        let mut vars = Vec::new();
+
+        if let Some(caps) = FOREACH_RE.captures(arguments) {
+            // $key if present (group 1)
+            if let Some(key_match) = caps.get(1) {
+                vars.push((key_match.as_str().to_string(), "mixed".to_string()));
+            }
+            // $value (group 2)
+            if let Some(value_match) = caps.get(2) {
+                vars.push((value_match.as_str().to_string(), "mixed".to_string()));
+            }
+        }
+
+        vars
+    }
+
+    /// Parse variables from @for directive arguments
+    /// Handles: @for($i = 0; $i < 10; $i++)
+    fn parse_for_variables(arguments: &str) -> Vec<(String, String)> {
+        use regex::Regex;
+        use lazy_static::lazy_static;
+
+        lazy_static! {
+            // Match the loop variable in: ($i = 0; ...) or ($i=0; ...)
+            static ref FOR_RE: Regex = Regex::new(
+                r#"\(\s*\$(\w+)\s*="#
+            ).unwrap();
+        }
+
+        let mut vars = Vec::new();
+
+        if let Some(caps) = FOR_RE.captures(arguments) {
+            if let Some(var_match) = caps.get(1) {
+                vars.push((var_match.as_str().to_string(), "int".to_string()));
+            }
+        }
+
+        vars
+    }
+
+    /// Find all loop blocks in Blade content and their boundaries
+    /// Returns a list of loop blocks with start/end lines and extracted variables
+    fn find_loop_blocks(content: &str) -> Vec<BladeLoopBlock> {
+        use regex::Regex;
+        use lazy_static::lazy_static;
+
+        lazy_static! {
+            // Match loop start directives with their arguments
+            static ref LOOP_START_RE: Regex = Regex::new(
+                r#"@(foreach|forelse|for|while)\s*(\([^)]*\))"#
+            ).unwrap();
+            // Match loop end directives
+            static ref LOOP_END_RE: Regex = Regex::new(
+                r#"@(endforeach|endforelse|endfor|endwhile)"#
+            ).unwrap();
+        }
+
+        let mut blocks = Vec::new();
+        let mut open_loops: Vec<(BladeLoopType, Vec<(String, String)>, usize)> = Vec::new(); // (type, vars, start_line)
+
+        for (line_idx, line) in content.lines().enumerate() {
+            // Check for loop starts
+            for caps in LOOP_START_RE.captures_iter(line) {
+                let directive = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                let arguments = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+
+                let (loop_type, variables) = match directive {
+                    "foreach" => (BladeLoopType::Foreach, Self::parse_foreach_variables(arguments)),
+                    "forelse" => (BladeLoopType::Forelse, Self::parse_foreach_variables(arguments)),
+                    "for" => (BladeLoopType::For, Self::parse_for_variables(arguments)),
+                    "while" => (BladeLoopType::While, Vec::new()),
+                    _ => continue,
+                };
+
+                open_loops.push((loop_type, variables, line_idx));
+            }
+
+            // Check for loop ends
+            for caps in LOOP_END_RE.captures_iter(line) {
+                let end_directive = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+
+                let expected_type = match end_directive {
+                    "endforeach" => Some(BladeLoopType::Foreach),
+                    "endforelse" => Some(BladeLoopType::Forelse),
+                    "endfor" => Some(BladeLoopType::For),
+                    "endwhile" => Some(BladeLoopType::While),
+                    _ => None,
+                };
+
+                if let Some(expected) = expected_type {
+                    // Find the matching open loop (last one of this type)
+                    if let Some(pos) = open_loops.iter().rposition(|(t, _, _)| *t == expected) {
+                        let (loop_type, variables, start_line) = open_loops.remove(pos);
+                        blocks.push(BladeLoopBlock {
+                            loop_type,
+                            variables,
+                            start_line,
+                            end_line: Some(line_idx),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Add any unclosed loops (cursor might be inside them)
+        for (loop_type, variables, start_line) in open_loops {
+            blocks.push(BladeLoopBlock {
+                loop_type,
+                variables,
+                start_line,
+                end_line: None,
+            });
+        }
+
+        blocks
+    }
+
+    /// Get all loop blocks that enclose the given cursor position
+    /// Returns loops in order from innermost to outermost
+    fn get_enclosing_loops(content: &str, cursor_line: usize) -> Vec<BladeLoopBlock> {
+        let blocks = Self::find_loop_blocks(content);
+
+        let mut enclosing: Vec<BladeLoopBlock> = blocks
+            .into_iter()
+            .filter(|block| {
+                let after_start = cursor_line > block.start_line;
+                let before_end = match block.end_line {
+                    Some(end) => cursor_line < end,
+                    None => true, // Unclosed loop, assume cursor is inside
+                };
+                after_start && before_end
+            })
+            .collect();
+
+        // Sort by start_line descending to get innermost first
+        enclosing.sort_by(|a, b| b.start_line.cmp(&a.start_line));
+
+        enclosing
+    }
+
     /// Get all available variables for a Blade file
-    /// Collects variables from @props, controller, Livewire, and view component
-    fn get_blade_available_variables(&self, uri: &Url) -> Vec<BladeVariableInfo> {
+    /// Collects variables from @props, controller, Livewire, view component, and loop directives
+    fn get_blade_available_variables(&self, uri: &Url, content: Option<&str>, cursor_line: Option<u32>) -> Vec<BladeVariableInfo> {
         let path = uri.path();
 
         if !path.ends_with(".blade.php") {
@@ -4049,11 +4225,20 @@ impl LaravelLanguageServer {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let view_name = self.extract_view_name_from_path(path, &root);
-        let blade_content = std::fs::read_to_string(path).ok();
+
+        // Use provided content or read from disk
+        let owned_content: Option<String>;
+        let blade_content: Option<&str> = match content {
+            Some(c) => Some(c),
+            None => {
+                owned_content = std::fs::read_to_string(path).ok();
+                owned_content.as_deref()
+            }
+        };
 
         // 1. Extract from @props directive
-        if let Some(ref content) = blade_content {
-            let props_vars = Self::extract_all_props_variables(content);
+        if let Some(content_str) = blade_content {
+            let props_vars = Self::extract_all_props_variables(content_str);
             for (name, php_type) in props_vars {
                 if seen.insert(name.clone()) {
                     variables.push(BladeVariableInfo {
@@ -4105,13 +4290,55 @@ impl LaravelLanguageServer {
             }
         }
 
+        // 5. Extract loop variables from enclosing loop directives (scope-aware)
+        if let (Some(content_str), Some(line)) = (blade_content, cursor_line) {
+            let enclosing_loops = Self::get_enclosing_loops(content_str, line as usize);
+
+            // Add variables from each enclosing loop
+            for loop_block in &enclosing_loops {
+                for (name, php_type) in &loop_block.variables {
+                    if seen.insert(name.clone()) {
+                        let source = match loop_block.loop_type {
+                            BladeLoopType::Foreach => "foreach",
+                            BladeLoopType::Forelse => "forelse",
+                            BladeLoopType::For => "for",
+                            BladeLoopType::While => "while",
+                        };
+                        variables.push(BladeVariableInfo {
+                            name: name.clone(),
+                            php_type: php_type.clone(),
+                            source: source.to_string(),
+                        });
+                    }
+                }
+            }
+
+            // Add $loop variable if inside any loop (foreach, forelse, for, while)
+            if !enclosing_loops.is_empty() && seen.insert("loop".to_string()) {
+                variables.push(BladeVariableInfo {
+                    name: "loop".to_string(),
+                    php_type: "Loop".to_string(),
+                    source: "loop".to_string(),
+                });
+            }
+        }
+
         // Add common Blade framework variables
-        let framework_vars = [
-            ("errors", "MessageBag", "framework"),
-            ("slot", "string", "framework"),
-            ("attributes", "ComponentAttributeBag", "framework"),
-            ("component", "Component", "framework"),
-        ];
+        // Note: $slot, $attributes, $component are only meaningful in component files
+        let is_component = Self::is_component_file(path);
+        let framework_vars: Vec<(&str, &str, &str)> = if is_component {
+            vec![
+                ("errors", "MessageBag", "framework"),
+                ("slot", "Slot", "framework"),
+                ("attributes", "ComponentAttributeBag", "framework"),
+                ("component", "Component", "framework"),
+            ]
+        } else {
+            vec![
+                ("errors", "MessageBag", "framework"),
+            ]
+        };
+
         for (name, php_type, source) in framework_vars {
             if seen.insert(name.to_string()) {
                 variables.push(BladeVariableInfo {
@@ -4119,6 +4346,25 @@ impl LaravelLanguageServer {
                     php_type: php_type.to_string(),
                     source: source.to_string(),
                 });
+            }
+        }
+
+        // 6. For component files, extract named slot variable usages
+        // These are variables like $header, $footer that are used in the component
+        // and should be provided via <x-slot:name> when the component is used
+        if is_component {
+            if let Some(content_str) = blade_content {
+                let slot_vars = Self::extract_slot_variable_usages(content_str);
+                for (name, php_type) in slot_vars {
+                    // Only add if not already defined from other sources (props, controller, etc.)
+                    if seen.insert(name.clone()) {
+                        variables.push(BladeVariableInfo {
+                            name,
+                            php_type,
+                            source: "slot".to_string(),
+                        });
+                    }
+                }
             }
         }
 
@@ -4182,6 +4428,67 @@ impl LaravelLanguageServer {
         }
 
         vars
+    }
+
+    /// Extract slot variable usages from a component blade file
+    /// Looks for patterns like {{ $header }}, {{ $footer }}, $title->isEmpty(), etc.
+    /// These are variables that should be provided via <x-slot:name>
+    fn extract_slot_variable_usages(content: &str) -> Vec<(String, String)> {
+        use regex::Regex;
+        use lazy_static::lazy_static;
+
+        lazy_static! {
+            // Match variable usages in echo statements: {{ $varname }}
+            // Also matches {!! $varname !!} and {{ $var->method() }}
+            static ref ECHO_VAR_RE: Regex = Regex::new(
+                r#"\{\{[^}]*\$([a-zA-Z_][a-zA-Z0-9_]*)"#
+            ).unwrap();
+
+            // Match variable method calls like $slot->isEmpty(), $header->attributes
+            static ref VAR_METHOD_RE: Regex = Regex::new(
+                r#"\$([a-zA-Z_][a-zA-Z0-9_]*)\s*->"#
+            ).unwrap();
+        }
+
+        let mut vars = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Known non-slot variables to exclude
+        let exclude_vars: std::collections::HashSet<&str> = [
+            // Framework variables
+            "errors", "slot", "attributes", "component",
+            // Loop variables
+            "loop",
+            // Common non-slot variables
+            "this", "self",
+        ].into_iter().collect();
+
+        // Find all variable usages in echo statements
+        for cap in ECHO_VAR_RE.captures_iter(content) {
+            if let Some(var_match) = cap.get(1) {
+                let var_name = var_match.as_str();
+                if !exclude_vars.contains(var_name) && seen.insert(var_name.to_string()) {
+                    vars.push((var_name.to_string(), "Slot".to_string()));
+                }
+            }
+        }
+
+        // Find variable method calls (like $header->attributes)
+        for cap in VAR_METHOD_RE.captures_iter(content) {
+            if let Some(var_match) = cap.get(1) {
+                let var_name = var_match.as_str();
+                if !exclude_vars.contains(var_name) && seen.insert(var_name.to_string()) {
+                    vars.push((var_name.to_string(), "Slot".to_string()));
+                }
+            }
+        }
+
+        vars
+    }
+
+    /// Check if a blade file is a component file (in resources/views/components/)
+    fn is_component_file(path: &str) -> bool {
+        path.contains("/components/") && path.ends_with(".blade.php")
     }
 
     /// Extract variables passed to a view from any PHP file that renders it
@@ -8737,13 +9044,8 @@ return [
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|| "unknown".to_string());
 
-                    // Route::view() and Volt::route() should be ERROR
-                    // Regular view() calls should be WARNING
-                    let severity = if view_ref.is_route_view {
-                        DiagnosticSeverity::ERROR
-                    } else {
-                        DiagnosticSeverity::WARNING
-                    };
+                    // All view() calls with missing files should be ERROR
+                    let severity = DiagnosticSeverity::ERROR;
 
                     let diagnostic = Diagnostic {
                         range: Range {
@@ -9300,7 +9602,7 @@ return [
                                         character: dir_ref.end_column,
                                     },
                                 },
-                                severity: Some(DiagnosticSeverity::WARNING),
+                                severity: Some(DiagnosticSeverity::ERROR),
                                 code: None,
                                 source: Some("laravel-lsp".to_string()),
                                 message: format!(
@@ -9343,7 +9645,7 @@ return [
                             character: comp_ref.end_column,
                         },
                     },
-                    severity: Some(DiagnosticSeverity::WARNING),
+                    severity: Some(DiagnosticSeverity::ERROR),
                     code: None,
                     source: Some("laravel-lsp".to_string()),
                     message: format!(
@@ -9378,7 +9680,7 @@ return [
                                 character: lw_ref.end_column,
                             },
                         },
-                        severity: Some(DiagnosticSeverity::WARNING),
+                        severity: Some(DiagnosticSeverity::ERROR),
                         code: None,
                         source: Some("laravel-lsp".to_string()),
                         message: format!(
@@ -10144,8 +10446,8 @@ impl LanguageServer for LaravelLanguageServer {
                 if let Some(var_prefix) = Self::get_variable_name_context(line_text, position.character) {
                     debug!("   Variable name context in Blade, prefix: '{}'", var_prefix);
 
-                    // Get all available variables for this Blade file
-                    let variables = self.get_blade_available_variables(uri);
+                    // Get all available variables for this Blade file (with loop scope awareness)
+                    let variables = self.get_blade_available_variables(uri, Some(&content), Some(position.line));
 
                     // Filter by prefix and build completion items
                     let prefix_lower = var_prefix.to_lowercase();
@@ -11368,6 +11670,293 @@ mod tests {
                 LaravelLanguageServer::get_cast_type_context(line, line.len() as u32, &surrounding),
                 Some("".to_string())
             );
+        }
+    }
+
+    mod loop_variable_resolution {
+        use super::*;
+
+        #[test]
+        fn test_parse_foreach_single_variable() {
+            let vars = LaravelLanguageServer::parse_foreach_variables("($users as $user)");
+            assert_eq!(vars, vec![("user".to_string(), "mixed".to_string())]);
+        }
+
+        #[test]
+        fn test_parse_foreach_key_value() {
+            let vars = LaravelLanguageServer::parse_foreach_variables("($items as $key => $value)");
+            assert_eq!(vars, vec![
+                ("key".to_string(), "mixed".to_string()),
+                ("value".to_string(), "mixed".to_string()),
+            ]);
+        }
+
+        #[test]
+        fn test_parse_foreach_with_spaces() {
+            let vars = LaravelLanguageServer::parse_foreach_variables("( $users as $user )");
+            assert_eq!(vars, vec![("user".to_string(), "mixed".to_string())]);
+        }
+
+        #[test]
+        fn test_parse_for_variable() {
+            let vars = LaravelLanguageServer::parse_for_variables("($i = 0; $i < 10; $i++)");
+            assert_eq!(vars, vec![("i".to_string(), "int".to_string())]);
+        }
+
+        #[test]
+        fn test_parse_for_variable_no_spaces() {
+            let vars = LaravelLanguageServer::parse_for_variables("($i=0;$i<10;$i++)");
+            assert_eq!(vars, vec![("i".to_string(), "int".to_string())]);
+        }
+
+        #[test]
+        fn test_find_loop_blocks_single_foreach() {
+            let content = r#"
+@foreach($users as $user)
+    {{ $user->name }}
+@endforeach
+"#;
+            let blocks = LaravelLanguageServer::find_loop_blocks(content);
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].loop_type, BladeLoopType::Foreach);
+            assert_eq!(blocks[0].variables, vec![("user".to_string(), "mixed".to_string())]);
+            assert_eq!(blocks[0].start_line, 1);
+            assert_eq!(blocks[0].end_line, Some(3));
+        }
+
+        #[test]
+        fn test_find_loop_blocks_nested() {
+            let content = r#"
+@foreach($categories as $category)
+    @foreach($category->items as $item)
+        {{ $item->name }}
+    @endforeach
+@endforeach
+"#;
+            let blocks = LaravelLanguageServer::find_loop_blocks(content);
+            assert_eq!(blocks.len(), 2);
+
+            // Inner loop ends first
+            let inner = blocks.iter().find(|b| b.variables.iter().any(|(n, _)| n == "item")).unwrap();
+            assert_eq!(inner.start_line, 2);
+            assert_eq!(inner.end_line, Some(4));
+
+            // Outer loop
+            let outer = blocks.iter().find(|b| b.variables.iter().any(|(n, _)| n == "category")).unwrap();
+            assert_eq!(outer.start_line, 1);
+            assert_eq!(outer.end_line, Some(5));
+        }
+
+        #[test]
+        fn test_find_loop_blocks_for() {
+            let content = r#"
+@for($i = 0; $i < 10; $i++)
+    {{ $i }}
+@endfor
+"#;
+            let blocks = LaravelLanguageServer::find_loop_blocks(content);
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].loop_type, BladeLoopType::For);
+            assert_eq!(blocks[0].variables, vec![("i".to_string(), "int".to_string())]);
+        }
+
+        #[test]
+        fn test_find_loop_blocks_forelse() {
+            let content = r#"
+@forelse($users as $user)
+    {{ $user->name }}
+@empty
+    No users
+@endforelse
+"#;
+            let blocks = LaravelLanguageServer::find_loop_blocks(content);
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].loop_type, BladeLoopType::Forelse);
+            assert_eq!(blocks[0].variables, vec![("user".to_string(), "mixed".to_string())]);
+        }
+
+        #[test]
+        fn test_get_enclosing_loops_inside() {
+            let content = r#"
+@foreach($users as $user)
+    {{ $user->name }}
+@endforeach
+"#;
+            // Line 2 (0-indexed) is inside the loop
+            let enclosing = LaravelLanguageServer::get_enclosing_loops(content, 2);
+            assert_eq!(enclosing.len(), 1);
+            assert_eq!(enclosing[0].variables, vec![("user".to_string(), "mixed".to_string())]);
+        }
+
+        #[test]
+        fn test_get_enclosing_loops_outside() {
+            let content = r#"
+@foreach($users as $user)
+    {{ $user->name }}
+@endforeach
+"#;
+            // Line 0 and 4 are outside the loop
+            let before = LaravelLanguageServer::get_enclosing_loops(content, 0);
+            assert_eq!(before.len(), 0);
+
+            let after = LaravelLanguageServer::get_enclosing_loops(content, 4);
+            assert_eq!(after.len(), 0);
+        }
+
+        #[test]
+        fn test_get_enclosing_loops_nested() {
+            let content = r#"
+@foreach($categories as $category)
+    @foreach($category->items as $item)
+        {{ $item->name }}
+    @endforeach
+@endforeach
+"#;
+            // Line 3 is inside both loops
+            let enclosing = LaravelLanguageServer::get_enclosing_loops(content, 3);
+            assert_eq!(enclosing.len(), 2);
+
+            // Innermost first
+            assert!(enclosing[0].variables.iter().any(|(n, _)| n == "item"));
+            assert!(enclosing[1].variables.iter().any(|(n, _)| n == "category"));
+        }
+
+        #[test]
+        fn test_get_enclosing_loops_between_nested() {
+            let content = r#"
+@foreach($categories as $category)
+    @foreach($category->items as $item)
+        {{ $item->name }}
+    @endforeach
+    {{ $category->name }}
+@endforeach
+"#;
+            // Line 5 is only inside outer loop (between inner endforeach and outer endforeach)
+            let enclosing = LaravelLanguageServer::get_enclosing_loops(content, 5);
+            assert_eq!(enclosing.len(), 1);
+            assert!(enclosing[0].variables.iter().any(|(n, _)| n == "category"));
+        }
+
+        #[test]
+        fn test_while_loop() {
+            let content = r#"
+@while($condition)
+    something
+@endwhile
+"#;
+            let blocks = LaravelLanguageServer::find_loop_blocks(content);
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].loop_type, BladeLoopType::While);
+            assert!(blocks[0].variables.is_empty()); // @while doesn't introduce variables
+
+            // But cursor inside should still get $loop
+            let enclosing = LaravelLanguageServer::get_enclosing_loops(content, 2);
+            assert_eq!(enclosing.len(), 1);
+        }
+    }
+
+    mod slot_variable_resolution {
+        use super::*;
+
+        #[test]
+        fn test_extract_slot_variable_usages_basic() {
+            let content = r#"
+<div>
+    <h1>{{ $title }}</h1>
+    {{ $slot }}
+    <footer>{{ $footer }}</footer>
+</div>
+"#;
+            let vars = LaravelLanguageServer::extract_slot_variable_usages(content);
+
+            // $slot is excluded (framework var), $title and $footer should be found
+            assert!(vars.iter().any(|(n, _)| n == "title"));
+            assert!(vars.iter().any(|(n, _)| n == "footer"));
+            assert!(!vars.iter().any(|(n, _)| n == "slot")); // Excluded
+        }
+
+        #[test]
+        fn test_extract_slot_variable_usages_method_calls() {
+            let content = r#"
+@if($header->isNotEmpty())
+    <header>{{ $header }}</header>
+@endif
+"#;
+            let vars = LaravelLanguageServer::extract_slot_variable_usages(content);
+            assert!(vars.iter().any(|(n, _)| n == "header"));
+        }
+
+        #[test]
+        fn test_extract_slot_variable_usages_excludes_framework() {
+            let content = r#"
+{{ $errors->first('email') }}
+{{ $slot }}
+{{ $attributes->merge(['class' => 'btn']) }}
+{{ $component->data() }}
+"#;
+            let vars = LaravelLanguageServer::extract_slot_variable_usages(content);
+
+            // All framework variables should be excluded
+            assert!(!vars.iter().any(|(n, _)| n == "errors"));
+            assert!(!vars.iter().any(|(n, _)| n == "slot"));
+            assert!(!vars.iter().any(|(n, _)| n == "attributes"));
+            assert!(!vars.iter().any(|(n, _)| n == "component"));
+        }
+
+        #[test]
+        fn test_extract_slot_variable_usages_excludes_loop() {
+            let content = r#"
+@foreach($items as $item)
+    {{ $loop->index }}
+    {{ $item->name }}
+@endforeach
+"#;
+            let vars = LaravelLanguageServer::extract_slot_variable_usages(content);
+
+            // $loop should be excluded (framework variable)
+            // $item is found in echo {{ $item->name }}
+            assert!(!vars.iter().any(|(n, _)| n == "loop"));
+            assert!(vars.iter().any(|(n, _)| n == "item")); // Found in echo statement
+            // Note: $items is not found because it's only in directive, not in echo
+        }
+
+        #[test]
+        fn test_is_component_file() {
+            assert!(LaravelLanguageServer::is_component_file("/app/resources/views/components/button.blade.php"));
+            assert!(LaravelLanguageServer::is_component_file("/app/resources/views/components/forms/input.blade.php"));
+            assert!(!LaravelLanguageServer::is_component_file("/app/resources/views/welcome.blade.php"));
+            assert!(!LaravelLanguageServer::is_component_file("/app/resources/views/layouts/app.blade.php"));
+            assert!(!LaravelLanguageServer::is_component_file("/app/app/Http/Controllers/UserController.php"));
+        }
+
+        #[test]
+        fn test_extract_slot_variable_usages_complex() {
+            let content = r#"
+@props(['type' => 'info'])
+
+<div class="alert alert-{{ $type }}">
+    @if($title ?? false)
+        <h4>{{ $title }}</h4>
+    @endif
+
+    <div class="alert-body">
+        {{ $slot }}
+    </div>
+
+    @if($footer->isNotEmpty())
+        <div class="alert-footer">
+            {{ $footer }}
+        </div>
+    @endif
+</div>
+"#;
+            let vars = LaravelLanguageServer::extract_slot_variable_usages(content);
+
+            // Should find $type, $title, $footer but not $slot
+            assert!(vars.iter().any(|(n, _)| n == "type"));
+            assert!(vars.iter().any(|(n, _)| n == "title"));
+            assert!(vars.iter().any(|(n, _)| n == "footer"));
+            assert!(!vars.iter().any(|(n, _)| n == "slot"));
         }
     }
 }

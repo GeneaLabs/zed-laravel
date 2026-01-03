@@ -117,6 +117,18 @@ pub struct LivewireMatch<'a> {
     pub end_column: usize,
 }
 
+/// Represents a matched Blade slot (<x-slot:name> or <x-slot name="...">)
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlotMatch<'a> {
+    /// The slot name (e.g., "header" from <x-slot:header>)
+    pub slot_name: &'a str,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub row: usize,
+    pub column: usize,
+    pub end_column: usize,
+}
+
 /// Represents a matched Blade directive
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectiveMatch<'a> {
@@ -288,6 +300,8 @@ pub struct ExtractedBladePatterns<'a> {
     pub directives: Vec<DirectiveMatch<'a>>,
     /// PHP content inside {{ ... }} echo statements
     pub echo_php: Vec<EchoPhpMatch<'a>>,
+    /// Slot tags (<x-slot:name> or <x-slot name="...">)
+    pub slots: Vec<SlotMatch<'a>>,
 }
 
 // ============================================================================
@@ -735,13 +749,28 @@ pub fn extract_all_blade_patterns<'a>(
                 });
             }
 
+            // Slot tags: <x-slot:name> or <x-slot name="...">
+            "slot_tag" => {
+                // Extract slot name from x-slot:name syntax
+                if let Some(slot_name) = text.strip_prefix("x-slot:") {
+                    result.slots.push(SlotMatch {
+                        slot_name,
+                        byte_start: node.start_byte(),
+                        byte_end: node.end_byte(),
+                        row: start_pos.row,
+                        column: start_pos.column,
+                        end_column: end_pos.column,
+                    });
+                }
+            }
+
             // Ignore vite_directive and other captures
             _ => {}
         }
     }
 
     let total_time = start.elapsed();
-    let pattern_count = result.components.len() + result.livewire.len() + result.directives.len() + result.echo_php.len();
+    let pattern_count = result.components.len() + result.livewire.len() + result.directives.len() + result.echo_php.len() + result.slots.len();
     info!(
         "📊 Blade extraction: {:?} total (query fetch: {:?}), {} patterns found",
         total_time, query_fetch_time, pattern_count

@@ -119,3 +119,23 @@
 
 (php_statement
   (php_only) @echo_php_content)
+
+; ============================================================================
+; Pattern 7: <x-slot:name> Blade slot tags
+; ============================================================================
+; Matches: <x-slot:header>
+;          <x-slot:footer>
+;          <x-slot name="header">
+;
+; Slots are used to pass named content sections to components
+
+; Match slot tags with colon syntax: <x-slot:name>
+(element
+  (start_tag
+    (tag_name) @slot_tag)
+  (#match? @slot_tag "^x-slot:"))
+
+; Match self-closing slot tags: <x-slot:name />
+(self_closing_tag
+  (tag_name) @slot_tag
+  (#match? @slot_tag "^x-slot:"))
