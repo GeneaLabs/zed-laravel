@@ -112,7 +112,7 @@ $message = __('auth.failed');
 ```
 
 **Supported patterns:**
-`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()`
+`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature`
 
 ### 💡 Autocomplete
 
@@ -248,6 +248,28 @@ Component files automatically get:
 - `$component` — component instance
 - Named slots detected from `{{ $name }}` usage
 
+#### 🚩 Laravel Pennant Feature Flags
+
+Get autocomplete for Laravel Pennant feature flags in PHP and Blade:
+
+```php
+Feature::active('');
+//               ^ 🚩 feature names from app/Features/
+
+Feature::for($user)->active('');
+//                          ^ 🚩 same completions for scoped checks
+
+Feature::allAreActive(['']);
+//                     ^ 🚩 works in array methods too
+```
+
+```blade
+@feature('')
+{{--     ^ 🚩 feature names appear here --}}
+```
+
+Features are discovered from `app/Features/*.php` class files. Both string keys (`'new-api'`) and class references (`NewApi::class`) are supported.
+
 ### ❌ Diagnostics
 
 See problems in real-time as you type. The extension validates your Laravel code against your actual project structure, highlighting missing views, undefined components, invalid validation rules, and other issues before you run your application.
@@ -265,6 +287,9 @@ $request->validate([
     'email' => 'required|emal|unique:users',
     //                   ^^^^ ❌ Unknown validation rule: 'emal'
 ]);
+
+Feature::active('undefined-feature');
+//               ^^^^^^^^^^^^^^^^^^ ❌ Feature not found: app/Features/UndefinedFeature.php
 ```
 
 ```blade
@@ -276,6 +301,9 @@ $request->validate([
 
 @extends('layouts.missing')
 {{--      ^^^^^^^^^^^^^^^^ ❌ View not found --}}
+
+@feature('undefined-feature')
+{{--      ^^^^^^^^^^^^^^^^^^ ❌ Feature not found --}}
 ```
 
 ### ⚡ Quick Actions
@@ -308,6 +336,7 @@ Route::middleware('admin-only')->group(...);
 - 🧩 Create Blade components (anonymous or with class)
 - ⚡ Create Livewire components
 - 🛡️ Create middleware
+- 🚩 Create Laravel Pennant feature classes
 - 🌐 Add translations to existing files
 - 🔐 Add environment variables to `.env`
 

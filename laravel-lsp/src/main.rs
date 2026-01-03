@@ -22,7 +22,7 @@ use laravel_lsp::salsa_impl::{
     ViewReferenceData, ComponentReferenceData, DirectiveReferenceData,
     EnvReferenceData, ConfigReferenceData, LivewireReferenceData,
     MiddlewareReferenceData, TranslationReferenceData, AssetReferenceData, BindingReferenceData,
-    RouteReferenceData, UrlReferenceData, ActionReferenceData,
+    RouteReferenceData, UrlReferenceData, ActionReferenceData, FeatureReferenceData,
 };
 
 // ============================================================================
@@ -355,6 +355,99 @@ fn scan_cast_directory(dir_path: &Path, namespace: &str, source: &str) -> Vec<Ca
     casts
 }
 
+/// Convert a feature key to a class name
+/// Examples:
+///   "new-api" -> "NewApi"
+///   "purchase_button" -> "PurchaseButton"
+///   "myFeature" -> "MyFeature"
+fn feature_key_to_class_name(key: &str) -> String {
+    key.split(|c| c == '-' || c == '_')
+        .map(|s| {
+            let mut chars = s.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(c) => c.to_uppercase().chain(chars).collect()
+            }
+        })
+        .collect()
+}
+
+/// Convert a class name to a feature key
+/// Examples:
+///   "NewApi" -> "new-api"
+///   "PurchaseButton" -> "purchase-button"
+fn class_name_to_feature_key(class_name: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in class_name.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('-');
+            }
+            result.push(c.to_lowercase().next().unwrap_or(c));
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Information about a Laravel Pennant feature class
+#[derive(Debug, Clone)]
+struct FeatureInfo {
+    /// The string key used in Feature::active('key')
+    pub feature_key: String,
+    /// The class name (e.g., "NewApi")
+    pub class_name: String,
+    /// The full PHP namespace (e.g., "App\\Features\\NewApi")
+    pub full_class: String,
+    /// The file path to the feature class
+    pub file_path: PathBuf,
+}
+
+/// Scan for feature classes in app/Features/
+fn scan_feature_classes(project_root: &Path) -> Vec<FeatureInfo> {
+    let mut features = Vec::new();
+
+    let features_dir = project_root.join("app/Features");
+    if !features_dir.exists() {
+        return features;
+    }
+
+    for entry in WalkDir::new(&features_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "php"))
+    {
+        let path = entry.path();
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            // Skip interfaces, traits, and abstract classes by naming convention
+            if stem.ends_with("Interface") || stem.ends_with("Trait") || stem.starts_with("Abstract") {
+                continue;
+            }
+
+            // Build the relative path for nested directories
+            let relative = path.strip_prefix(&features_dir).unwrap_or(path);
+            let class_path = relative
+                .with_extension("")
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "\\");
+
+            let full_class = format!("App\\Features\\{}", class_path);
+            let class_name = stem.to_string();
+            let feature_key = class_name_to_feature_key(stem);
+
+            features.push(FeatureInfo {
+                feature_key,
+                class_name,
+                full_class,
+                file_path: path.to_path_buf(),
+            });
+        }
+    }
+
+    features
+}
+
 /// Laravel's built-in validation rules
 /// Reference: https://laravel.com/docs/12.x/validation#available-validation-rules
 fn get_laravel_validation_rules() -> Vec<ValidationRuleInfo> {
@@ -675,6 +768,8 @@ enum FileActionType {
     ConfigPhp,
     /// Environment variable in .env file
     EnvVar,
+    /// Laravel Pennant feature class
+    Feature,
 }
 
 /// Represents a file creation action parsed from a diagnostic
@@ -815,6 +910,20 @@ impl FileAction {
                 file_exists,
                 copy_from,
             }]
+        } else if message.starts_with("Feature not found") || message.starts_with("Feature class not found") {
+            // Extract the feature name from the message
+            let name = LaravelLanguageServer::extract_name_from_diagnostic(message, "Feature not found: '", "'")
+                .or_else(|| LaravelLanguageServer::extract_name_from_diagnostic(message, "Feature class not found: '", "'"))
+                .unwrap_or("feature")
+                .to_string();
+
+            vec![FileAction {
+                action_type: FileActionType::Feature,
+                name,
+                target_path: PathBuf::from(target_path),
+                file_exists: false,
+                copy_from: None,
+            }]
         } else {
             Vec::new()
         }
@@ -850,6 +959,11 @@ impl FileAction {
                 } else {
                     format!("Create .env with {}", self.name)
                 }
+            }
+            FileActionType::Feature => {
+                // Convert the feature key to PascalCase for the class name
+                let class_name = feature_key_to_class_name(&self.name);
+                format!("Create feature class: {}", class_name)
             }
         }
     }
@@ -3665,6 +3779,115 @@ impl LaravelLanguageServer {
         }
 
         None
+    }
+
+    /// Check if cursor is inside Feature::active('...'), Feature::for($user)->active('...'), etc.
+    /// Returns the partial feature name typed so far (for filtering completions)
+    ///
+    /// Examples:
+    /// - `Feature::active('` returns Some("")
+    /// - `Feature::active('new` returns Some("new")
+    /// - `Feature::for($user)->active('beta` returns Some("beta")
+    fn get_feature_call_context(line_text: &str, character: u32) -> Option<String> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        // Pattern: (pattern_string, quote_char, pattern_length)
+        let patterns: Vec<(&str, char, usize)> = vec![
+            // Blade @feature directive
+            ("@feature('", '\'', 10),
+            ("@feature(\"", '"', 10),
+            // Direct Feature:: calls
+            ("Feature::active('", '\'', 17),
+            ("Feature::active(\"", '"', 17),
+            ("Feature::inactive('", '\'', 19),
+            ("Feature::inactive(\"", '"', 19),
+            ("Feature::value('", '\'', 16),
+            ("Feature::value(\"", '"', 16),
+            ("Feature::when('", '\'', 15),
+            ("Feature::when(\"", '"', 15),
+            ("Feature::forget('", '\'', 17),
+            ("Feature::forget(\"", '"', 17),
+            ("Feature::purge('", '\'', 16),
+            ("Feature::purge(\"", '"', 16),
+            // Feature::allAreActive/someAreActive with array
+            ("Feature::allAreActive(['", '\'', 24),
+            ("Feature::allAreActive([\"", '"', 24),
+            ("Feature::someAreActive(['", '\'', 25),
+            ("Feature::someAreActive([\"", '"', 25),
+            ("Feature::allAreInactive(['", '\'', 26),
+            ("Feature::allAreInactive([\"", '"', 26),
+            ("Feature::someAreInactive(['", '\'', 27),
+            ("Feature::someAreInactive([\"", '"', 27),
+            // Chained calls after Feature::for(...)
+            (")->active('", '\'', 11),
+            (")->active(\"", '"', 11),
+            (")->inactive('", '\'', 13),
+            (")->inactive(\"", '"', 13),
+            (")->value('", '\'', 10),
+            (")->value(\"", '"', 10),
+            (")->when('", '\'', 9),
+            (")->when(\"", '"', 9),
+            // Array element patterns (for continuing a list)
+            ("', '", '\'', 4),
+            ("\", \"", '"', 4),
+        ];
+
+        // Find all matches and their positions
+        let mut matches: Vec<(usize, char, usize)> = Vec::new();
+
+        for (pattern, quote, len) in &patterns {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                matches.push((pos, *quote, *len));
+            }
+        }
+
+        if matches.is_empty() {
+            return None;
+        }
+
+        // Find the latest match (closest to cursor)
+        let (pos, quote_char, pattern_len) = matches
+            .into_iter()
+            .max_by_key(|(p, _, _)| *p)?;
+
+        let start_pos = pos + pattern_len;
+
+        // Check that there's no closing quote between start and cursor
+        let after_pattern = &before_cursor[start_pos..];
+        if after_pattern.contains(quote_char) {
+            return None;
+        }
+
+        // For array patterns like "', '", verify we're actually in a Feature context
+        // by checking if Feature:: appears earlier in the line
+        if pattern_len <= 4 {
+            let feature_indicators = [
+                "Feature::allAreActive(",
+                "Feature::someAreActive(",
+                "Feature::allAreInactive(",
+                "Feature::someAreInactive(",
+            ];
+            let has_feature_context = feature_indicators
+                .iter()
+                .any(|ind| before_cursor[..pos].contains(ind));
+            if !has_feature_context {
+                return None;
+            }
+        }
+
+        // For chained patterns like ")->active(", verify Feature::for( appears earlier
+        if pattern_len <= 13 && before_cursor[..pos].contains(")->") {
+            if !before_cursor[..pos].contains("Feature::for(") {
+                return None;
+            }
+        }
+
+        Some(after_pattern.to_string())
     }
 
     /// Check if cursor is after `->` on a model variable or static chain
@@ -7842,6 +8065,10 @@ impl LaravelLanguageServer {
                 "stubs/middleware.stub",
                 Some("vendor/laravel/framework/src/Illuminate/Routing/Console/stubs/middleware.stub"),
             ),
+            FileActionType::Feature => (
+                "stubs/feature.stub",
+                Some("vendor/laravel/pennant/stubs/feature.stub"),
+            ),
             // These types handled above (early return)
             FileActionType::TranslationPhp | FileActionType::TranslationJson |
             FileActionType::ConfigPhp | FileActionType::EnvVar |
@@ -7876,8 +8103,19 @@ impl LaravelLanguageServer {
 
     /// Replace common stub placeholders with actual values
     fn replace_stub_placeholders(content: &str, action: &FileAction) -> String {
-        let class_name = Self::kebab_to_pascal_case(&action.name);
+        let class_name = match action.action_type {
+            FileActionType::Feature => feature_key_to_class_name(&action.name),
+            _ => Self::kebab_to_pascal_case(&action.name),
+        };
         let view_name = action.name.replace('.', "/");
+
+        // Determine namespace based on action type
+        let namespace = match action.action_type {
+            FileActionType::Feature => "App\\Features".to_string(),
+            FileActionType::Livewire => "App\\Livewire".to_string(),
+            FileActionType::Middleware => "App\\Http\\Middleware".to_string(),
+            _ => "App".to_string(),
+        };
 
         content
             .replace("{{ class }}", &class_name)
@@ -7886,6 +8124,8 @@ impl LaravelLanguageServer {
             .replace("{{name}}", &action.name)
             .replace("{{ view }}", &view_name)
             .replace("{{view}}", &view_name)
+            .replace("{{ namespace }}", &namespace)
+            .replace("{{namespace}}", &namespace)
     }
 
     /// Get fallback template when no stub is available
@@ -7952,6 +8192,28 @@ class {}
     public function handle(Request $request, Closure $next): Response
     {{
         return $next($request);
+    }}
+}}
+"#,
+                    class_name
+                )
+            }
+            FileActionType::Feature => {
+                // Convert feature key (e.g., "new-api") to class name (e.g., "NewApi")
+                let class_name = feature_key_to_class_name(&action.name);
+                format!(
+                    r#"<?php
+
+namespace App\Features;
+
+class {}
+{{
+    /**
+     * Resolve the feature's initial value.
+     */
+    public function resolve(mixed $scope): mixed
+    {{
+        return false;
     }}
 }}
 "#,
@@ -8385,6 +8647,22 @@ return [
         // Note: @lang is now handled as Translation patterns (see parse_file_patterns in salsa_impl.rs)
         // Note: @vite is handled as Asset patterns, not Directive patterns
         // See parse_file_patterns in salsa_impl.rs
+
+        // Handle @feature('feature-name') - Laravel Pennant feature directive
+        if dir.name == "feature" {
+            if let Some(feature_name) = Self::extract_view_from_directive_args(arguments) {
+                let root = self.root_path.read().await;
+                if let Some(root) = root.as_ref() {
+                    // Convert feature key to class name and build path
+                    let class_name = feature_key_to_class_name(&feature_name);
+                    let feature_path = root.join(format!("app/Features/{}.php", class_name));
+
+                    if self.file_exists_cached(&feature_path).await {
+                        return self.create_location_link(dir, &feature_path);
+                    }
+                }
+            }
+        }
 
         None
     }
@@ -8848,6 +9126,42 @@ return [
                 let origin_selection_range = Range {
                     start: Position { line: action.line, character: action.column },
                     end: Position { line: action.line, character: action.end_column },
+                };
+                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                    origin_selection_range: Some(origin_selection_range),
+                    target_uri,
+                    target_range: Range::default(),
+                    target_selection_range: Range::default(),
+                }]));
+            }
+        }
+
+        None
+    }
+
+    /// Create a goto location for a Feature::active('feature-name') call
+    /// Navigates to the feature class file in app/Features/
+    async fn create_feature_location_from_salsa(&self, feature: &FeatureReferenceData) -> Option<GotoDefinitionResponse> {
+        let root_guard = self.root_path.read().await;
+        let root = root_guard.as_ref()?;
+
+        // Convert feature name to class path
+        let path = if feature.is_class_reference {
+            // Class-based: Feature::active(NewApi::class)
+            // The feature_name is already the class name like "NewApi" or "App\Features\NewApi"
+            resolve_class_to_file(&feature.feature_name, root)?
+        } else {
+            // String-based: Feature::active('new-api')
+            // Convert kebab-case/snake_case to PascalCase
+            let class_name = feature_key_to_class_name(&feature.feature_name);
+            root.join("app/Features").join(format!("{}.php", class_name))
+        };
+
+        if self.file_exists_cached(&path).await {
+            if let Ok(target_uri) = Url::from_file_path(&path) {
+                let origin_selection_range = Range {
+                    start: Position { line: feature.line, character: feature.column },
+                    end: Position { line: feature.line, character: feature.end_column },
                 };
                 return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                     origin_selection_range: Some(origin_selection_range),
@@ -9537,6 +9851,85 @@ return [
             }
             drop(root_guard);
 
+            // Check Laravel Pennant feature calls - error if feature class not found
+            let root_guard = self.root_path.read().await;
+            if let Some(root) = root_guard.as_ref() {
+                // Get all existing feature classes for comparison
+                let existing_features: std::collections::HashSet<String> = scan_feature_classes(root)
+                    .into_iter()
+                    .map(|f| f.feature_key)
+                    .collect();
+
+                for feature_ref in &patterns.feature_refs {
+                    // Skip class references (they're resolved differently)
+                    if feature_ref.is_class_reference {
+                        // For class references, check if the class file exists
+                        if let Some(class_path) = resolve_class_to_file(&feature_ref.feature_name, root) {
+                            if !class_path.exists() {
+                                let diagnostic = Diagnostic {
+                                    range: Range {
+                                        start: Position {
+                                            line: feature_ref.line,
+                                            character: feature_ref.column,
+                                        },
+                                        end: Position {
+                                            line: feature_ref.line,
+                                            character: feature_ref.end_column,
+                                        },
+                                    },
+                                    severity: Some(DiagnosticSeverity::ERROR),
+                                    code: None,
+                                    source: Some("laravel-lsp".to_string()),
+                                    message: format!(
+                                        "Feature class not found: '{}'\nExpected at: {}",
+                                        feature_ref.feature_name,
+                                        class_path.to_string_lossy()
+                                    ),
+                                    related_information: None,
+                                    tags: None,
+                                    code_description: None,
+                                    data: None,
+                                };
+                                diagnostics.push(diagnostic);
+                            }
+                        }
+                    } else {
+                        // For string references, check if the feature key exists
+                        if !existing_features.contains(&feature_ref.feature_name) {
+                            let expected_class = feature_key_to_class_name(&feature_ref.feature_name);
+                            let expected_path = root.join("app/Features").join(format!("{}.php", expected_class));
+
+                            let diagnostic = Diagnostic {
+                                range: Range {
+                                    start: Position {
+                                        line: feature_ref.line,
+                                        character: feature_ref.column,
+                                    },
+                                    end: Position {
+                                        line: feature_ref.line,
+                                        character: feature_ref.end_column,
+                                    },
+                                },
+                                severity: Some(DiagnosticSeverity::ERROR),
+                                code: None,
+                                source: Some("laravel-lsp".to_string()),
+                                message: format!(
+                                    "Feature not found: '{}'\nExpected at: {}",
+                                    feature_ref.feature_name,
+                                    expected_path.to_string_lossy()
+                                ),
+                                related_information: None,
+                                tags: None,
+                                code_description: None,
+                                data: None,
+                            };
+                            diagnostics.push(diagnostic);
+                        }
+                    }
+                }
+            }
+            drop(root_guard);
+
             // Validate validation rules in PHP files
             let validation_diagnostics = self.validate_validation_rules(source).await;
             diagnostics.extend(validation_diagnostics);
@@ -9716,6 +10109,47 @@ return [
                                     dir_ref.end_column,
                                     DiagnosticSeverity::WARNING, // WARNING for dotted keys in @lang
                                 ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check @feature directives for Laravel Pennant feature classes
+            for dir_ref in &patterns.directives {
+                if dir_ref.name == "feature" {
+                    if let Some(ref args) = dir_ref.arguments {
+                        if let Some(feature_name) = Self::extract_view_from_directive_args(args) {
+                            // Convert feature key to class name and build path
+                            let class_name = feature_key_to_class_name(&feature_name);
+                            let feature_path = root.join(format!("app/Features/{}.php", class_name));
+
+                            if !feature_path.exists() {
+                                let diagnostic = Diagnostic {
+                                    range: Range {
+                                        start: Position {
+                                            line: dir_ref.line,
+                                            character: dir_ref.column,
+                                        },
+                                        end: Position {
+                                            line: dir_ref.line,
+                                            character: dir_ref.end_column,
+                                        },
+                                    },
+                                    severity: Some(DiagnosticSeverity::ERROR),
+                                    code: None,
+                                    source: Some("laravel-lsp".to_string()),
+                                    message: format!(
+                                        "Feature not found: '{}'\nExpected at: {}",
+                                        feature_name,
+                                        feature_path.to_string_lossy()
+                                    ),
+                                    related_information: None,
+                                    tags: None,
+                                    code_description: None,
+                                    data: None,
+                                };
+                                diagnostics.push(diagnostic);
                             }
                         }
                     }
@@ -10334,6 +10768,10 @@ impl LanguageServer for LaravelLanguageServer {
             PatternAtPosition::Action(action) => {
                 debug!("Laravel LSP: Found action: {}", action.action);
                 self.create_action_location_from_salsa(&action).await
+            }
+            PatternAtPosition::Feature(feature) => {
+                debug!("Laravel LSP: Found feature: {}", feature.feature_name);
+                self.create_feature_location_from_salsa(&feature).await
             }
         };
 
@@ -11049,6 +11487,47 @@ impl LanguageServer for LaravelLanguageServer {
                     .collect();
 
                 debug!("   Returning {} middleware completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for feature context (Laravel Pennant)
+            if let Some(feature_prefix) = Self::get_feature_call_context(line_text, position.character) {
+                debug!("   Feature context, filter prefix: '{}'", feature_prefix);
+
+                // Get project root
+                let features = {
+                    let root_guard = self.root_path.read().await;
+                    match root_guard.as_ref() {
+                        Some(root) => scan_feature_classes(root),
+                        None => Vec::new(),
+                    }
+                };
+
+                // Build completion items, filtering by prefix (case-insensitive)
+                let prefix_lower = feature_prefix.to_lowercase();
+                let items: Vec<CompletionItem> = features
+                    .into_iter()
+                    .filter(|f| f.feature_key.to_lowercase().starts_with(&prefix_lower))
+                    .map(|f| {
+                        CompletionItem {
+                            label: f.feature_key.clone(),
+                            kind: Some(CompletionItemKind::CLASS),
+                            detail: Some(format!("Feature: {}", f.class_name)),
+                            documentation: Some(Documentation::String(f.full_class.clone())),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                debug!("   Returning {} feature completion items", items.len());
 
                 return if items.is_empty() {
                     Ok(None)

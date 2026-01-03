@@ -262,6 +262,22 @@ pub struct ActionMatch<'a> {
     pub end_column: usize,
 }
 
+/// Represents a matched Laravel Pennant Feature:: call in PHP code
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeatureMatch<'a> {
+    /// The feature name (string key like 'new-api' or class name like 'NewApi')
+    pub feature_name: &'a str,
+    /// The method being called (active, inactive, value, when, etc.)
+    pub method_name: &'a str,
+    /// Whether this is a class-based feature (Feature::active(NewApi::class))
+    pub is_class_reference: bool,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub row: usize,
+    pub column: usize,
+    pub end_column: usize,
+}
+
 // ============================================================================
 // Extracted Patterns - Result structs for single-pass extraction
 // ============================================================================
@@ -279,6 +295,7 @@ pub struct ExtractedPhpPatterns<'a> {
     pub route_calls: Vec<RouteMatch<'a>>,
     pub url_calls: Vec<UrlMatch<'a>>,
     pub action_calls: Vec<ActionMatch<'a>>,
+    pub feature_calls: Vec<FeatureMatch<'a>>,
 }
 
 /// Represents PHP content inside Blade echo statements {{ ... }}
@@ -601,6 +618,40 @@ pub fn extract_all_php_patterns<'a>(
                 });
             }
 
+            // Feature patterns (Laravel Pennant) - string-based feature names
+            "feature_name" => {
+                // Get the method name from a sibling capture in the same match
+                let method_name = get_feature_method_name(&query_match, query, source_bytes)
+                    .unwrap_or("active");
+                result.feature_calls.push(FeatureMatch {
+                    feature_name: text,
+                    method_name,
+                    is_class_reference: false,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
+            // Feature patterns (Laravel Pennant) - class-based feature references
+            "feature_class_name" => {
+                let clean_class = text.trim_start_matches('\\');
+                let method_name = get_feature_method_name(&query_match, query, source_bytes)
+                    .unwrap_or("active");
+                result.feature_calls.push(FeatureMatch {
+                    feature_name: clean_class,
+                    method_name,
+                    is_class_reference: true,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
             // Ignore other captures (function_name, class_name, etc. used for matching)
             _ => {}
         }
@@ -609,7 +660,8 @@ pub fn extract_all_php_patterns<'a>(
     let total_time = start.elapsed();
     let pattern_count = result.views.len() + result.env_calls.len() + result.config_calls.len()
         + result.middleware_calls.len() + result.translation_calls.len() + result.asset_calls.len()
-        + result.binding_calls.len() + result.route_calls.len() + result.url_calls.len() + result.action_calls.len();
+        + result.binding_calls.len() + result.route_calls.len() + result.url_calls.len()
+        + result.action_calls.len() + result.feature_calls.len();
     info!(
         "📊 PHP extraction: {:?} total (query fetch: {:?}), {} patterns found",
         total_time, query_fetch_time, pattern_count
@@ -782,6 +834,22 @@ pub fn extract_all_blade_patterns<'a>(
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Get the feature method name from a query match
+/// Looks for the feature_method_name capture in the same match
+fn get_feature_method_name<'a>(
+    query_match: &tree_sitter::QueryMatch,
+    query: &Query,
+    source: &'a [u8],
+) -> Option<&'a str> {
+    for capture in query_match.captures.iter() {
+        let capture_name = query.capture_names()[capture.index as usize];
+        if capture_name == "feature_method_name" {
+            return capture.node.utf8_text(source).ok();
+        }
+    }
+    None
+}
 
 /// Check if an env() call has a fallback/default value (second argument)
 fn check_has_fallback_argument(node: tree_sitter::Node) -> bool {
@@ -972,6 +1040,45 @@ mod tests {
         // Should NOT contain closing directives
         assert!(!directive_names.contains(&"endforeach"), "Should not find @endforeach");
         assert!(!directive_names.contains(&"endsection"), "Should not find @endsection");
+    }
+
+    #[test]
+    fn test_extract_blade_feature_directive() {
+        let blade_code = r#"
+@feature('new-api')
+    <p>New API is enabled!</p>
+@else
+    <p>Using old API</p>
+@endfeature
+
+@feature("beta-mode")
+    <x-beta-badge />
+@endfeature
+        "#;
+
+        let tree = parse_blade(blade_code).expect("Should parse Blade");
+        let lang = language_blade();
+        let patterns = extract_all_blade_patterns(&tree, blade_code, &lang)
+            .expect("Should extract patterns");
+
+        // Check that @feature directive is captured
+        let feature_directives: Vec<_> = patterns.directives.iter()
+            .filter(|d| d.directive_name == "feature")
+            .collect();
+
+        assert_eq!(feature_directives.len(), 2, "Should find 2 @feature directives");
+
+        // Verify first @feature directive
+        let first = feature_directives[0];
+        assert_eq!(first.directive_name, "feature");
+        assert!(first.arguments.as_ref().unwrap().contains("new-api"),
+            "First @feature should have 'new-api' argument");
+
+        // Verify second @feature directive
+        let second = feature_directives[1];
+        assert_eq!(second.directive_name, "feature");
+        assert!(second.arguments.as_ref().unwrap().contains("beta-mode"),
+            "Second @feature should have 'beta-mode' argument");
     }
 
     #[test]
@@ -1338,6 +1445,72 @@ mod tests {
         // And we should have captured the {{ __() }} echo content
         assert!(has_echo_php, "Should capture PHP content inside {{ }}");
         assert!(blade_patterns.echo_php[0].php_content.contains("__"), "Echo should contain __() call");
+    }
+
+    #[test]
+    fn test_extract_feature_patterns() {
+        let php_code = r#"<?php
+        Feature::active('new-api');
+        Feature::inactive('beta-mode');
+        Feature::for($user)->active('purchase-button');
+        Feature::value('experiment');
+        Feature::allAreActive(['feature-a', 'feature-b']);
+        Feature::active(NewApi::class);
+        "#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        // Check that we found feature calls
+        assert!(!patterns.feature_calls.is_empty(), "Should find feature calls");
+
+        // Get all feature names
+        let feature_names: Vec<&str> = patterns.feature_calls.iter()
+            .map(|f| f.feature_name).collect();
+
+        println!("Found features: {:?}", feature_names);
+        println!("Feature calls: {:?}", patterns.feature_calls);
+
+        // Check for specific features
+        assert!(feature_names.contains(&"new-api"), "Should find 'new-api' feature");
+        assert!(feature_names.contains(&"beta-mode"), "Should find 'beta-mode' feature");
+
+        // Check method names
+        let new_api = patterns.feature_calls.iter()
+            .find(|f| f.feature_name == "new-api");
+        assert!(new_api.is_some(), "Should find new-api feature");
+        assert_eq!(new_api.unwrap().method_name, "active", "Method should be 'active'");
+
+        // Check class-based feature
+        let class_feature = patterns.feature_calls.iter()
+            .find(|f| f.feature_name == "NewApi");
+        if class_feature.is_some() {
+            assert!(class_feature.unwrap().is_class_reference, "Should be class reference");
+        }
+    }
+
+    #[test]
+    fn test_feature_column_positions() {
+        // Feature::active('new-api')
+        // Position: 0         1         2         3
+        //           0123456789012345678901234567890123
+        //           <?php Feature::active('new-api');
+        // 0-5 = "<?php ", 6-12 = "Feature", 13 = ":", 14 = ":", 15-20 = "active", 21 = "(", 22 = "'", 23 = "n"
+        let php_code = "<?php Feature::active('new-api');";
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        if !patterns.feature_calls.is_empty() {
+            let feature = &patterns.feature_calls[0];
+            assert_eq!(feature.feature_name, "new-api");
+            // In "<?php Feature::active('new-api');", 'n' starts at column 23 (after quote)
+            assert_eq!(feature.column, 23, "column should point to first char of feature name");
+            assert_eq!(feature.end_column, 30, "end_column should be after last char");
+        }
     }
 
 }

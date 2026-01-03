@@ -1634,6 +1634,20 @@ pub struct ActionReferenceData {
     pub end_column: u32,
 }
 
+/// Feature reference data for transfer across async boundaries (Laravel Pennant)
+#[derive(Debug, Clone)]
+pub struct FeatureReferenceData {
+    /// The feature name (string key like 'new-api' or class name like 'NewApi')
+    pub feature_name: String,
+    /// The method being called (active, inactive, value, when, etc.)
+    pub method_name: String,
+    /// Whether this is a class-based feature (Feature::active(NewApi::class))
+    pub is_class_reference: bool,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
 /// Laravel configuration data for transfer across async boundaries
 #[derive(Debug, Clone)]
 pub struct LaravelConfigData {
@@ -2009,6 +2023,7 @@ pub struct ParsedPatternsData {
     pub route_refs: Vec<Arc<RouteReferenceData>>,
     pub url_refs: Vec<Arc<UrlReferenceData>>,
     pub action_refs: Vec<Arc<ActionReferenceData>>,
+    pub feature_refs: Vec<Arc<FeatureReferenceData>>,
     /// Sorted index of all patterns by (line, column) for O(log n) lookup
     sorted_positions: Vec<PositionEntry>,
 }
@@ -2030,6 +2045,7 @@ pub enum PatternAtPosition {
     Route(Arc<RouteReferenceData>),
     Url(Arc<UrlReferenceData>),
     Action(Arc<ActionReferenceData>),
+    Feature(Arc<FeatureReferenceData>),
 }
 
 impl ParsedPatternsData {
@@ -2153,6 +2169,15 @@ impl ParsedPatternsData {
                 column: action.column,
                 end_column: action.end_column,
                 pattern: PatternAtPosition::Action(action.clone()),
+            });
+        }
+
+        for feature in &self.feature_refs {
+            entries.push(PositionEntry {
+                line: feature.line,
+                column: feature.column,
+                end_column: feature.end_column,
+                pattern: PatternAtPosition::Feature(feature.clone()),
             });
         }
 
@@ -3444,6 +3469,7 @@ impl SalsaActor {
         let mut route_refs = Vec::new();
         let mut url_refs = Vec::new();
         let mut action_refs = Vec::new();
+        let mut feature_refs = Vec::new();
 
         if let Ok(tree) = parse_php(text) {
             let lang = language_php();
@@ -3475,6 +3501,17 @@ impl SalsaActor {
                         end_column: a.end_column as u32,
                     }));
                 }
+
+                for f in php_patterns.feature_calls {
+                    feature_refs.push(Arc::new(FeatureReferenceData {
+                        feature_name: f.feature_name.to_string(),
+                        method_name: f.method_name.to_string(),
+                        is_class_reference: f.is_class_reference,
+                        line: f.row as u32,
+                        column: f.column as u32,
+                        end_column: f.end_column as u32,
+                    }));
+                }
             }
         }
 
@@ -3492,6 +3529,7 @@ impl SalsaActor {
             route_refs,
             url_refs,
             action_refs,
+            feature_refs,
             sorted_positions: Vec::new(),
         };
 

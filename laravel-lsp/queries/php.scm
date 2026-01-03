@@ -1259,3 +1259,211 @@
       (encapsed_string
         (string_content) @route_name)))
   (#eq? @method_name "named"))
+
+; ============================================================================
+; Pattern 27: Feature::active('feature-name') - Laravel Pennant feature flags
+; ============================================================================
+; Matches: Feature::active('new-api')
+;          Feature::inactive('new-api')
+;          Feature::value('purchase-button')
+;          Feature::when('new-api', fn() => ...)
+;          Feature::forget('new-api')
+;          Feature::purge('new-api')
+;
+; Pennant provides feature flag functionality for Laravel applications
+
+; Single-quoted strings - simple method calls
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @feature_method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @feature_name)))
+  (#eq? @class_name "Feature")
+  (#match? @feature_method_name "^(active|inactive|value|when|forget|purge)$"))
+
+; Double-quoted strings - simple method calls
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @feature_method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @feature_name)))
+  (#eq? @class_name "Feature")
+  (#match? @feature_method_name "^(active|inactive|value|when|forget|purge)$"))
+
+; Also match fully qualified Feature class - single quotes
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @feature_method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @feature_name)))
+  (#match? @class_name ".*Feature$")
+  (#match? @feature_method_name "^(active|inactive|value|when|forget|purge)$"))
+
+; Also match fully qualified Feature class - double quotes
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @feature_method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @feature_name)))
+  (#match? @class_name ".*Feature$")
+  (#match? @feature_method_name "^(active|inactive|value|when|forget|purge)$"))
+
+; ============================================================================
+; Pattern 28: Feature::for($user)->active('feature-name') - Scoped feature checks
+; ============================================================================
+; Matches: Feature::for($user)->active('new-api')
+;          Feature::for($team)->inactive('new-api')
+;          Feature::for($user)->value('purchase-button')
+;
+; Pennant allows checking features for specific scopes (users, teams, etc.)
+
+; Single-quoted strings - chained after for()
+(member_call_expression
+  object: (scoped_call_expression
+    scope: (name) @class_name
+    name: (name) @for_method
+    (#eq? @class_name "Feature")
+    (#eq? @for_method "for"))
+  name: (name) @feature_method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @feature_name)))
+  (#match? @feature_method_name "^(active|inactive|value|when)$"))
+
+; Double-quoted strings - chained after for()
+(member_call_expression
+  object: (scoped_call_expression
+    scope: (name) @class_name
+    name: (name) @for_method
+    (#eq? @class_name "Feature")
+    (#eq? @for_method "for"))
+  name: (name) @feature_method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @feature_name)))
+  (#match? @feature_method_name "^(active|inactive|value|when)$"))
+
+; ============================================================================
+; Pattern 29: Feature::allAreActive(['feature-a', 'feature-b']) - Multiple features
+; ============================================================================
+; Matches: Feature::allAreActive(['new-api', 'beta-mode'])
+;          Feature::someAreActive(['feature-a', 'feature-b'])
+;          Feature::allAreInactive(['old-api', 'legacy'])
+;          Feature::someAreInactive(['old-api', 'legacy'])
+;
+; Check multiple features at once
+
+; Single-quoted strings in array - allAreActive/someAreActive
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @feature_method_name
+  arguments: (arguments
+    .
+    (argument
+      (array_creation_expression
+        (array_element_initializer
+          (string
+            (string_content) @feature_name)))))
+  (#eq? @class_name "Feature")
+  (#match? @feature_method_name "^(allAreActive|someAreActive|allAreInactive|someAreInactive)$"))
+
+; Double-quoted strings in array - allAreActive/someAreActive
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @feature_method_name
+  arguments: (arguments
+    .
+    (argument
+      (array_creation_expression
+        (array_element_initializer
+          (encapsed_string
+            (string_content) @feature_name)))))
+  (#eq? @class_name "Feature")
+  (#match? @feature_method_name "^(allAreActive|someAreActive|allAreInactive|someAreInactive)$"))
+
+; ============================================================================
+; Pattern 30: Feature::active(NewApi::class) - Class-based features
+; ============================================================================
+; Matches: Feature::active(NewApi::class)
+;          Feature::for($user)->active(NewApi::class)
+;          Feature::inactive(\App\Features\BetaMode::class)
+;
+; Pennant supports class-based features where the class name is the feature
+
+; Class constant with simple name
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @feature_method_name
+  arguments: (arguments
+    .
+    (argument
+      (class_constant_access_expression
+        (name) @feature_class_name
+        (name) @constant_name)))
+  (#eq? @class_name "Feature")
+  (#match? @feature_method_name "^(active|inactive|value|when|forget|purge)$")
+  (#eq? @constant_name "class"))
+
+; Class constant with qualified name
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @feature_method_name
+  arguments: (arguments
+    .
+    (argument
+      (class_constant_access_expression
+        (qualified_name) @feature_class_name
+        (name) @constant_name)))
+  (#eq? @class_name "Feature")
+  (#match? @feature_method_name "^(active|inactive|value|when|forget|purge)$")
+  (#eq? @constant_name "class"))
+
+; Class constant chained after for() - simple name
+(member_call_expression
+  object: (scoped_call_expression
+    scope: (name) @class_name
+    name: (name) @for_method
+    (#eq? @class_name "Feature")
+    (#eq? @for_method "for"))
+  name: (name) @feature_method_name
+  arguments: (arguments
+    .
+    (argument
+      (class_constant_access_expression
+        (name) @feature_class_name
+        (name) @constant_name)))
+  (#match? @feature_method_name "^(active|inactive|value|when)$")
+  (#eq? @constant_name "class"))
+
+; Class constant chained after for() - qualified name
+(member_call_expression
+  object: (scoped_call_expression
+    scope: (name) @class_name
+    name: (name) @for_method
+    (#eq? @class_name "Feature")
+    (#eq? @for_method "for"))
+  name: (name) @feature_method_name
+  arguments: (arguments
+    .
+    (argument
+      (class_constant_access_expression
+        (qualified_name) @feature_class_name
+        (name) @constant_name)))
+  (#match? @feature_method_name "^(active|inactive|value|when)$")
+  (#eq? @constant_name "class"))
