@@ -261,6 +261,12 @@ pub fn build_route_index(root: &Path, files: &[RouteFile]) -> RouteIndex {
             .external_prefixes
             .insert(key, dedup_prefixes(&prefixes));
     }
+
+    // Surface Laravel Folio pages (filesystem-derived routes that never call
+    // `Route::`) through the same index, so goto/completion/diagnostics see
+    // them. No-op for projects that don't use Folio.
+    crate::folio_discovery::inject_folio_routes(root, &mut index);
+
     index
 }
 
