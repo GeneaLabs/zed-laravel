@@ -50,6 +50,16 @@
 //!   partial edit leaving `global $x;` or the file-level `$x` behind), so the
 //!   engine refuses the rename outright. Importing globals is the cross-scope
 //!   flow this feature defers, not a corruption it should emit.
+//! - **`compact()` / `extract()` string-named variables** — `compact('user')`
+//!   references the local `$user` *by string*, and `extract()` can name one the
+//!   same way. That reference lives in a `string` node, not a `variable_name`,
+//!   so a scope-local rename can't see it: it would rewrite `$user` and leave
+//!   `compact('user')` pointing at a variable that no longer exists (broken,
+//!   idiomatic Laravel — `return view('x', compact('user'))`). Same instinct as
+//!   the `global` guard: refuse rather than emit the partial edit. The dynamic
+//!   `extract($data)` form, whose names come from a runtime array with no
+//!   literal in the source, is the cross-scope flow this feature defers and is
+//!   not detectable here.
 //!
 //! Constructor-promoted parameters (`__construct(private $name)`) are treated
 //! as ordinary locals within the constructor — the property side of promotion
@@ -62,6 +72,12 @@ use crate::rename::EditTarget;
 
 /// Function-like node kinds that bound a lexical scope. `program` is the
 /// top-level script scope and always terminates the upward walk.
+///
+/// `anonymous_function_creation_expression` is a vestigial spelling from older
+/// tree-sitter-php grammars (0.24.2 emits `anonymous_function`); it is kept here
+/// to mirror the defensive pairing used across the rest of the crate
+/// (`query_chain`, `member_resolver`, `route_chain`), so this module stays
+/// consistent rather than silently diverging.
 fn is_function_like(node: Node) -> bool {
     matches!(
         node.kind(),
@@ -233,6 +249,86 @@ fn scope_aliases_global(scope: Node, name: &str, bytes: &[u8]) -> bool {
     false
 }
 
+/// The bare function name of a `function_call_expression` (`compact`,
+/// `extract`), or `None` for a dynamic or namespaced call.
+fn call_function_name<'a>(call: Node, bytes: &'a [u8]) -> Option<&'a str> {
+    let f = call.child_by_field_name("function")?;
+    if f.kind() == "name" {
+        f.utf8_text(bytes).ok()
+    } else {
+        None
+    }
+}
+
+/// The decoded content of a single/double-quoted string literal, read from its
+/// `string_content` child so quotes are excluded. `None` for a non-string node
+/// or an empty literal (which can't name a variable anyway).
+fn string_literal_content<'a>(node: Node, bytes: &'a [u8]) -> Option<&'a str> {
+    if !matches!(node.kind(), "string" | "encapsed_string") {
+        return None;
+    }
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        if child.kind() == "string_content" {
+            return child.utf8_text(bytes).ok();
+        }
+    }
+    None
+}
+
+/// Whether the variable `name`, as bound in `scope`, is named by a string
+/// literal argument of a `compact(...)` or `extract(...)` call within that same
+/// scope. Such a call references the local *by string* (`compact('user')`) — a
+/// reference that lives in a `string` node, not a `variable_name`, so the rename
+/// can't rewrite it. Renaming the variable while leaving the string behind is a
+/// silent partial edit that corrupts valid (and, in Laravel, ubiquitous) PHP, so
+/// the engine refuses — the same instinct as [`scope_aliases_global`].
+///
+/// Resolution-aware, so a `compact('user')` in a nested scope that owns its own
+/// `$user` never over-refuses an enclosing scope's distinct local:
+/// - In a function/method/closure scope, the call counts iff the `$name` it
+///   references resolves (from the call site) to that same scope by node id.
+/// - In the top-level `program` scope, any matching call in the file counts.
+///
+/// Only positional **string-literal** arguments are matched. The dynamic
+/// `extract($data)` form carries no literal name in the source and is the
+/// cross-scope flow this feature defers.
+fn scope_references_compact_extract(scope: Node, name: &str, bytes: &[u8]) -> bool {
+    let program_scope = scope.kind() == "program";
+    let mut stack = vec![scope];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "function_call_expression"
+            && matches!(call_function_name(n, bytes), Some("compact" | "extract"))
+        {
+            if let Some(args) = n.child_by_field_name("arguments") {
+                let mut ac = args.walk();
+                for arg in args.named_children(&mut ac) {
+                    // tree-sitter wraps each call argument in an `argument` node;
+                    // the string literal is its last named child.
+                    let expr = if arg.kind() == "argument" {
+                        let mut ic = arg.walk();
+                        arg.named_children(&mut ic).last()
+                    } else {
+                        Some(arg)
+                    };
+                    let Some(expr) = expr else { continue };
+                    if string_literal_content(expr, bytes) == Some(name)
+                        && (program_scope
+                            || resolve_binding_scope(expr, name, bytes).id() == scope.id())
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
 /// Whether a matching `variable_name` node should participate in the rename.
 /// Excludes `$this` and static-property positions (`self::$bar`), which are
 /// spelled as `variable_name` but are not local variables.
@@ -271,15 +367,19 @@ fn renameable_variable_at<'t>(
     if !is_collectible(var_node, bytes) {
         return None;
     }
-    // Refuse a variable that a `global $x;` declaration aliases to the
-    // top-level global — renaming it scope-locally would sever the alias.
-    // Checked here (not in `is_collectible`) so the whole rename is refused
-    // regardless of where the cursor lands: collecting only the in-function
-    // occurrences while leaving `global $x;` (or the file-level `$x`) behind is
-    // the exact partial-rename corruption this guards against.
+    // Refuse a variable whose binding scope references it in a way the rename
+    // can't follow, where a scope-local edit would leave a dangling reference:
+    //  - `global $x;` aliases it to the top-level global, and
+    //  - `compact('x')` / `extract('x')` name it by string.
+    // Both are checked here (not in `is_collectible`) so the *whole* rename is
+    // refused regardless of where the cursor lands — collecting only the
+    // in-scope `variable_name` occurrences while leaving the alias or the string
+    // behind is the exact partial-rename corruption this guards against.
     let name = var_ident(var_node, bytes)?;
     let scope = resolve_binding_scope(var_node, name, bytes);
-    if scope_aliases_global(scope, name, bytes) {
+    if scope_aliases_global(scope, name, bytes)
+        || scope_references_compact_extract(scope, name, bytes)
+    {
         return None;
     }
     Some(var_node)

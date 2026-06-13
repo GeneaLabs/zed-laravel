@@ -408,6 +408,152 @@ echo $user;
     assert!(targets.iter().all(|t| t.new_text == "$account"));
 }
 
+// ── compact() / extract() string references (refusal) ─────────────────────
+
+#[test]
+fn compact_referenced_variable_is_not_renameable() {
+    let src = "\
+<?php
+function profile() {
+    $user = currentUser();
+    $role = $user->role;
+    return view('profile', compact('user', 'role'));
+}
+";
+    // `compact('user', 'role')` references the locals `$user` and `$role` *by
+    // string*. A scope-local rename would rewrite the `$user` tokens and leave
+    // `compact('user')` pointing at a variable that no longer exists — broken
+    // PHP, silently. Refuse from the assignment AND the `$user->role` site (the
+    // cursor can land on either).
+    for nth in [0usize, 1] {
+        let byte = cursor_byte(src, "$user", nth);
+        assert!(
+            variable_at_cursor(src, byte).is_none(),
+            "prepare must refuse at occurrence {nth}"
+        );
+        assert!(
+            variable_rename_targets(src, &PathBuf::from("t.php"), byte, "$account")
+                .unwrap()
+                .is_empty(),
+            "rename must be a no-op at occurrence {nth}"
+        );
+    }
+    // The other compacted local, `$role`, is equally unsafe and equally refused.
+    let role_byte = cursor_byte(src, "$role", 0);
+    assert!(variable_at_cursor(src, role_byte).is_none());
+}
+
+#[test]
+fn compact_referenced_top_level_variable_is_not_renameable() {
+    let src = "\
+<?php
+$user = currentUser();
+$data = compact('user');
+";
+    // The program-scope sibling: at the top level `compact('user')` names the
+    // file-level `$user`, so renaming it would strand the string the same way.
+    let byte = cursor_byte(src, "$user", 0);
+    assert!(variable_at_cursor(src, byte).is_none());
+    assert!(
+        variable_rename_targets(src, &PathBuf::from("t.php"), byte, "$account")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn extract_string_referenced_variable_is_not_renameable() {
+    // `extract` is guarded symmetrically with `compact`: a string-literal
+    // argument naming the variable makes a scope-local rename a partial edit.
+    // (The common dynamic `extract($data)` form carries no literal name and is
+    // the deferred cross-scope case — not detectable here, by design.)
+    let src = "\
+<?php
+function load() {
+    $user = null;
+    extract('user');
+    return $user;
+}
+";
+    let byte = cursor_byte(src, "$user", 0);
+    assert!(variable_at_cursor(src, byte).is_none());
+    assert!(
+        variable_rename_targets(src, &PathBuf::from("t.php"), byte, "$account")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn unrelated_nested_compact_does_not_block_a_real_local() {
+    let src = "\
+<?php
+function outer() {
+    $user = currentUser();
+    $cb = function () {
+        $user = guest();
+        return compact('user');
+    };
+    return [$user, $cb];
+}
+";
+    // `outer`'s `$user` (`$user = currentUser()` and `[$user, ...]`) is a genuine
+    // function-local. The closure's `compact('user')` names the closure's *own*
+    // `$user` (a distinct binding — no `use`), so it must NOT block renaming the
+    // outer local. The refusal is resolution-aware, exactly like the
+    // nested-`global` guard.
+    let outer = rename(src, "$user", 0, "$account");
+    assert_eq!(outer.len(), 2, "only the two outer-local sites");
+    assert!(outer.iter().all(|t| t.new_text == "$account"));
+    let edited = edited_offsets(src, &outer);
+    assert!(!edited.contains(&abs_byte_of_match(src, "$user", 1))); // `$user = guest()`
+
+    // The closure's `$user` *is* named by its own `compact('user')`, so renaming
+    // it is refused.
+    let closure_byte = cursor_byte(src, "$user", 1); // `$user = guest()` in closure
+    assert!(variable_at_cursor(src, closure_byte).is_none());
+}
+
+#[test]
+fn compact_free_function_is_still_renameable() {
+    let src = "\
+<?php
+function show() {
+    $user = currentUser();
+    return $user->name;
+}
+";
+    // Guard against over-refusal: a function with no `compact`/`extract` naming
+    // the variable renames normally.
+    let targets = rename(src, "$user", 0, "$account");
+    assert_eq!(targets.len(), 2, "assignment + $user->name");
+    assert!(targets.iter().all(|t| t.new_text == "$account"));
+}
+
+// ── Sibling-function isolation ────────────────────────────────────────────
+
+#[test]
+fn sibling_functions_isolate_their_own_variables() {
+    let src = "\
+<?php
+function first($user) {
+    return strtoupper($user);
+}
+function second($user) {
+    return strtolower($user);
+}
+";
+    // Two top-level functions each own a `$user`. The `function_definition` hard
+    // boundary means renaming `first`'s `$user` touches only `first` — `second`'s
+    // identically-named param + body are a separate binding and stay put.
+    let targets = rename(src, "$user", 0, "$name");
+    assert_eq!(targets.len(), 2, "only first()'s param + body");
+    assert!(targets.iter().all(|t| t.line == 1 || t.line == 2));
+    let edited = edited_offsets(src, &targets);
+    assert!(!edited.contains(&abs_byte_of_match(src, "$user", 2))); // second's param
+    assert!(!edited.contains(&abs_byte_of_match(src, "$user", 3))); // second's body
+}
+
 // ── Validation + prepare-rename range ─────────────────────────────────────
 
 #[test]
