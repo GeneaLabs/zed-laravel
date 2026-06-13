@@ -307,6 +307,107 @@ fn this_is_not_renameable() {
     );
 }
 
+// ── Global declarations (alias refusal) ───────────────────────────────────
+
+#[test]
+fn global_declared_variable_is_not_renameable() {
+    let src = "\
+<?php
+$count = 10;
+function bump() {
+    global $count;
+    $count = 20;
+    return $count;
+}
+";
+    // `global $count;` makes the in-function `$count` an alias of the top-level
+    // global. A scope-local rename would rewrite only the three in-function
+    // sites and leave the file-level `$count = 10` behind — `global $new;` would
+    // then bind to a non-existent global. Refuse outright, from the `global`
+    // token AND from any body occurrence (the cursor can land on either).
+    for nth in [1usize, 2, 3] {
+        let byte = cursor_byte(src, "$count", nth);
+        assert!(
+            variable_at_cursor(src, byte).is_none(),
+            "prepare must refuse at occurrence {nth}"
+        );
+        assert!(
+            variable_rename_targets(src, &PathBuf::from("t.php"), byte, "$total")
+                .unwrap()
+                .is_empty(),
+            "rename must be a no-op at occurrence {nth}"
+        );
+    }
+}
+
+#[test]
+fn top_level_variable_aliased_by_global_is_not_renameable() {
+    let src = "\
+<?php
+$count = 10;
+function bump() {
+    global $count;
+    $count++;
+}
+";
+    // The sibling of the in-function case: renaming the file-level `$count`
+    // (program scope) would leave the function's `global $count;` aliasing a
+    // global that no longer exists. Any `global $count;` in the file aliases the
+    // one true top-level `$count`, so the program-scope rename is refused too.
+    let byte = cursor_byte(src, "$count", 0); // `$count = 10` at top level
+    assert!(variable_at_cursor(src, byte).is_none());
+    assert!(
+        variable_rename_targets(src, &PathBuf::from("t.php"), byte, "$total")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn unrelated_nested_global_does_not_block_a_real_local() {
+    let src = "\
+<?php
+function outer() {
+    $x = 1;
+    $c = function () {
+        global $x;
+        $x = 2;
+    };
+    return $x;
+}
+";
+    // `outer`'s `$x` (`$x = 1` and `return $x`) is a genuine function-local,
+    // distinct from the closure's `global $x` (which binds to the global). The
+    // refusal must be resolution-aware: renaming the outer local stays allowed
+    // and touches only its two sites — the closure's `global $x` / `$x = 2` are
+    // a different binding and stay put.
+    let outer = rename(src, "$x", 0, "$seed");
+    assert_eq!(outer.len(), 2, "only the two outer-local sites");
+    assert!(outer.iter().all(|t| t.new_text == "$seed"));
+    let edited = edited_offsets(src, &outer);
+    assert!(!edited.contains(&abs_byte_of_match(src, "$x", 1))); // `global $x`
+    assert!(!edited.contains(&abs_byte_of_match(src, "$x", 2))); // `$x = 2`
+
+    // The closure's `$x` is global-aliased there, so renaming *it* is refused.
+    let closure_byte = cursor_byte(src, "$x", 2); // `$x = 2` inside the closure
+    assert!(variable_at_cursor(src, closure_byte).is_none());
+}
+
+#[test]
+fn plain_top_level_variable_without_global_is_renameable() {
+    let src = "\
+<?php
+$user = 'a';
+echo $user;
+";
+    // Guard against over-refusal: a top-level script variable with no `global`
+    // alias anywhere is a normal, safe rename — the global guard must not reach
+    // for it.
+    let targets = rename(src, "$user", 0, "$account");
+    assert_eq!(targets.len(), 2, "assignment + echo");
+    assert!(targets.iter().all(|t| t.new_text == "$account"));
+}
+
 // ── Validation + prepare-rename range ─────────────────────────────────────
 
 #[test]

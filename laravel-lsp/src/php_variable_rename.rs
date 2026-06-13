@@ -44,6 +44,12 @@
 //!   class property, not a local variable, even though tree-sitter spells it as
 //!   a `variable_name`. Object properties (`$this->foo`, `$obj->prop`) are
 //!   `name` nodes, not `variable_name`, so they fall out naturally.
+//! - **`global`-imported variables** (`global $x;`) — a `global $x` declaration
+//!   makes the in-scope `$x` an alias of the top-level global, so it is no
+//!   longer function-local. A scope-local rename would sever the alias (a
+//!   partial edit leaving `global $x;` or the file-level `$x` behind), so the
+//!   engine refuses the rename outright. Importing globals is the cross-scope
+//!   flow this feature defers, not a corruption it should emit.
 //!
 //! Constructor-promoted parameters (`__construct(private $name)`) are treated
 //! as ordinary locals within the constructor — the property side of promotion
@@ -193,6 +199,40 @@ fn resolve_binding_scope<'t>(var_node: Node<'t>, name: &str, bytes: &[u8]) -> No
     }
 }
 
+/// Whether the variable `name`, as bound in `scope`, is connected to a
+/// `global $name;` declaration — making it an alias of the top-level global
+/// rather than a pure function-local. A scope-local rename of such a variable
+/// would emit a partial edit (severing the alias by leaving `global $x;` or the
+/// file-level `$x` behind), so the engine refuses it: importing globals is the
+/// cross-scope flow this feature defers.
+///
+/// The distinction is resolution-aware, so an unrelated `global` never
+/// over-refuses a genuine local:
+/// - In a function/method/closure scope, `name` is global-aliased iff a
+///   `global $name;` declaration **bound to that same scope** (by node id)
+///   appears within it — a `global $name;` in a *nested* scope binds there, not
+///   here, so it doesn't taint this scope's distinct local.
+/// - In the top-level `program` scope, *any* `global $name;` anywhere in the
+///   file aliases the one true global `$name`, so all of them count.
+fn scope_aliases_global(scope: Node, name: &str, bytes: &[u8]) -> bool {
+    let program_scope = scope.kind() == "program";
+    let mut stack = vec![scope];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "variable_name"
+            && n.parent().map(|p| p.kind()) == Some("global_declaration")
+            && var_ident(n, bytes) == Some(name)
+            && (program_scope || resolve_binding_scope(n, name, bytes).id() == scope.id())
+        {
+            return true;
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
 /// Whether a matching `variable_name` node should participate in the rename.
 /// Excludes `$this` and static-property positions (`self::$bar`), which are
 /// spelled as `variable_name` but are not local variables.
@@ -229,6 +269,17 @@ fn renameable_variable_at<'t>(
         return None;
     };
     if !is_collectible(var_node, bytes) {
+        return None;
+    }
+    // Refuse a variable that a `global $x;` declaration aliases to the
+    // top-level global — renaming it scope-locally would sever the alias.
+    // Checked here (not in `is_collectible`) so the whole rename is refused
+    // regardless of where the cursor lands: collecting only the in-function
+    // occurrences while leaving `global $x;` (or the file-level `$x`) behind is
+    // the exact partial-rename corruption this guards against.
+    let name = var_ident(var_node, bytes)?;
+    let scope = resolve_binding_scope(var_node, name, bytes);
+    if scope_aliases_global(scope, name, bytes) {
         return None;
     }
     Some(var_node)
