@@ -208,6 +208,17 @@ fn mask_php_blocks(source: &str, out: &mut [u8]) {
     while let Some(rel) = source[search_from..].find("@php") {
         let start = search_from + rel;
         let after_open = start + "@php".len();
+        // Require a word boundary after `@php` so a longer directive like
+        // `@phpunit` / `@phpdoc` can't anchor a spurious block. A real `@php`
+        // directive is followed by `(` (inline form), whitespace, or EOF.
+        if source[after_open..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            search_from = after_open;
+            continue;
+        }
         let Some(rel_end) = source[after_open..].find("@endphp") else {
             break; // unclosed `@php` (inline `@php(...)`) — not a block.
         };
@@ -347,8 +358,9 @@ pub struct ViewBinding {
 /// controller, return the binding. Recognized shapes (cursor on the key):
 /// - `view('users.profile', ['name' => $expr])`
 /// - `view('users.profile', compact('name'))`
-/// - `view('users.profile')->with(['name' => $expr])`
-/// - `view('users.profile')->with('name', $expr)`
+///
+/// The `->with(['name' => …])` / `->with('name', …)` chained forms are not yet
+/// routed (out of scope for #55) and return `None`.
 ///
 /// Returns `None` when the cursor is anywhere else (the view name, a value
 /// expression, an unrelated string), or when the view name can't be resolved
@@ -517,6 +529,12 @@ pub fn enclosing_function_local_spans(
             node.kind(),
             "function_definition"
                 | "method_declaration"
+                // tree-sitter-php 0.24 names the closure node `anonymous_function`;
+                // the `_creation_expression` alias is the older grammar's name. Match
+                // both (repo convention, e.g. `route_chain.rs`, `query_chain/flow.rs`)
+                // so a `compact()` inside a route closure elects the closure as its
+                // scope instead of falling back to the whole file.
+                | "anonymous_function"
                 | "anonymous_function_creation_expression"
                 | "arrow_function"
         ) {

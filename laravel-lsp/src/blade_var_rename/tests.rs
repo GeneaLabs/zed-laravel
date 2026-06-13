@@ -465,6 +465,38 @@ class C
     assert_eq!(lines, vec![5, 6, 6]);
 }
 
+#[test]
+fn compact_inside_route_closure_does_not_leak_to_sibling_closure() {
+    // The Laravel route-closure pattern: `compact('name')` sits INSIDE a
+    // closure, so the closure itself must be elected as the rename scope. A
+    // sibling closure's unrelated `$name` must stay untouched. Regression for
+    // the round-2 fix: `enclosing_function_local_spans` previously matched only
+    // the legacy `anonymous_function_creation_expression` node kind (which never
+    // exists in tree-sitter-php 0.24), so the real `anonymous_function` closure
+    // was never elected and scope fell back to the whole file.
+    let src = "\
+<?php
+
+Route::get('/a', function () use ($name) {
+    return view('users.index', compact('name'));
+});
+
+Route::get('/b', function () use ($name) {
+    return response($name);
+});";
+    // Anchor on the `view(...)` line inside the `/a` closure (line 3).
+    let anchor = VarSpan::new(3, 0, 0);
+    let spans = enclosing_function_local_spans(src, "name", anchor);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    // Only the `/a` closure's `use ($name)` capture on line 2 — NOT the sibling
+    // `/b` closure's `$name` on lines 6 and 7.
+    assert_eq!(
+        lines,
+        vec![2],
+        "rename must stay inside the enclosing closure, not leak file-wide"
+    );
+}
+
 // ── is_template_variable: prepare_rename admissibility gate (AC #5) ─────────
 
 #[test]
@@ -506,6 +538,16 @@ fn inline_php_directive_does_not_mask_rest_of_file() {
     // The inline `@php(expr)` form has no `@endphp`; masking must not blank the
     // rest of the file, which would wrongly reject every later variable.
     let src = "@php($total = 1)\n{{ $total }}";
+    assert!(is_template_variable(src, "total"));
+}
+
+#[test]
+fn php_word_prefix_does_not_anchor_a_mask_block() {
+    // `@phpdoc` shares the `@php` prefix but is NOT a `@php` block opener. The
+    // bare-substring match used to anchor a spurious mask region here, swallowing
+    // the real `{{ $total }}` markup that follows and wrongly rejecting the
+    // rename. The genuine `@php … @endphp` block later must still mask only itself.
+    let src = "@phpdoc note\n{{ $total }}\n@php $x = 1; @endphp";
     assert!(is_template_variable(src, "total"));
 }
 
