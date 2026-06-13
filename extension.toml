@@ -1,6 +1,6 @@
 id = "laravel"
 name = "Laravel"
-description = "Laravel development support for Zed with go-to-definition for Blade, Livewire, and Flux components. Install the separate Blade extension for syntax highlighting."
+description = "Laravel support for Zed — go-to-definition, hover & find-references for Blade, Livewire, Flux, views, routes, and config. 📖 See the README for setup & configuration; custom PHP/Blade language servers need a one-line settings tweak."
 version = "0.4.1"
 schema_version = 1
 authors = ["Mike Bronner <mike.bronner@icloud.com>"]
