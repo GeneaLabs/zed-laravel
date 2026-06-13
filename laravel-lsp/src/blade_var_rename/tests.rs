@@ -130,9 +130,9 @@ fn for_loop_scopes_rename() {
 {{ $i }}";
     let spans = in_scope_spans(src, "i", 1);
     let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
-    // Lines 0 (three `$i` occurrences) and 1 are in-loop; line 3 is out.
-    assert!(lines.iter().all(|&l| l == 0 || l == 1));
-    assert!(!lines.contains(&3));
+    // The three `$i` in the header (init / condition / step) plus the body
+    // `$i` on line 1 — and NOT the out-of-loop `$i` on line 3.
+    assert_eq!(lines, vec![0, 0, 0, 1]);
 }
 
 // ── in_scope_spans: @php block (file-scoped) ────────────────────────────────
@@ -245,22 +245,110 @@ fn cursor_on_view_name_is_not_a_binding_key() {
 
 #[test]
 fn multiple_controllers_different_keys_do_not_cross_contaminate() {
-    // Same view rendered from two controllers under different key names.
-    // A controller-initiated rename of one key only rewrites that key's
-    // in-view usages; the other key's `$other` is a different identifier and
-    // is left untouched (AC: no cross-contamination across key names).
+    // The SAME view is rendered from two controllers under different key names.
+    // Each binding rename is driven end-to-end through `binding_rename_spans`
+    // (cursor → binding → cross-file spans). A rename initiated from one
+    // controller rewrites only that key's in-view usages; the other
+    // controller's key is a different identifier and is never touched (AC #6:
+    // no cross-contamination across key names).
     let view = "\
 {{ $name }}
 {{ $other }}
 {{ $name->email }}";
-    let name_spans = file_scope_spans(view, "name");
-    let other_spans = file_scope_spans(view, "other");
-    let name_lines: Vec<u32> = name_spans.iter().map(|s| s.line).collect();
-    let other_lines: Vec<u32> = other_spans.iter().map(|s| s.line).collect();
-    assert_eq!(name_lines, vec![0, 2], "only $name usages move");
-    assert_eq!(other_lines, vec![1], "the other key's usages are untouched");
-    // The two rename sets are disjoint — no span is shared.
-    assert!(name_spans.iter().all(|s| !other_spans.contains(s)));
+
+    let ctrl_a = "<?php\nreturn view('shared', ['name' => $u->name]);";
+    let ctrl_b = "<?php\nreturn view('shared', ['other' => $u->other]);";
+
+    let a_line = ctrl_a.lines().nth(1).unwrap();
+    let a_cursor = (a_line.find("'name'").unwrap() + 2) as u32;
+    let binding_a = view_binding_key_at(ctrl_a, 1, a_cursor).expect("name key under cursor");
+    let spans_a = binding_rename_spans(&binding_a, ctrl_a, Some(view));
+    assert_eq!(
+        spans_a.view.iter().map(|s| s.line).collect::<Vec<_>>(),
+        vec![0, 2],
+        "controller A's rename moves only the in-view $name usages"
+    );
+
+    let b_line = ctrl_b.lines().nth(1).unwrap();
+    let b_cursor = (b_line.find("'other'").unwrap() + 2) as u32;
+    let binding_b = view_binding_key_at(ctrl_b, 1, b_cursor).expect("other key under cursor");
+    let spans_b = binding_rename_spans(&binding_b, ctrl_b, Some(view));
+    assert_eq!(
+        spans_b.view.iter().map(|s| s.line).collect::<Vec<_>>(),
+        vec![1],
+        "controller B's rename moves only the in-view $other usage"
+    );
+
+    // The two renames' in-view edit sets are disjoint — no shared span.
+    assert!(spans_a.view.iter().all(|s| !spans_b.view.contains(s)));
+}
+
+// ── binding_rename_spans: cross-file orchestration (AC #6) ──────────────────
+
+#[test]
+fn binding_rename_spans_cover_compact_controller_and_view() {
+    // The full cross-file pipeline for `compact('name')`: the controller gets
+    // the local `$name` AND the compact key; the resolved view gets the
+    // in-view `$name` usages, with an unrelated `$other` left alone.
+    let view = "\
+{{ $name }}
+{{ $other }}
+{{ $name->email }}";
+    let line = COMPACT_CONTROLLER.lines().nth(6).unwrap();
+    let cursor = (line.find("'name'").unwrap() + 2) as u32;
+    let binding = view_binding_key_at(COMPACT_CONTROLLER, 6, cursor).expect("compact key");
+
+    let spans = binding_rename_spans(&binding, COMPACT_CONTROLLER, Some(view));
+    // Controller: the enclosing-function local `$name` (line 5) and the compact
+    // key string (line 6), sorted by position.
+    assert_eq!(
+        spans.controller.iter().map(|s| s.line).collect::<Vec<_>>(),
+        vec![5, 6]
+    );
+    // View: `$name` on lines 0 and 2 — `$other` (line 1) is untouched.
+    assert_eq!(
+        spans.view.iter().map(|s| s.line).collect::<Vec<_>>(),
+        vec![0, 2],
+        "only $name usages move; $other is left alone"
+    );
+}
+
+#[test]
+fn binding_rename_spans_array_key_leaves_controller_value_untouched() {
+    // The `['name' => $user->name]` form: only the key string moves in the
+    // controller (the value `$user->name` is independent of the key), plus the
+    // in-view usages.
+    let view = "{{ $name }}\n{{ $name }}";
+    let line = ARRAY_CONTROLLER.lines().nth(5).unwrap();
+    let cursor = (line.find("'name'").unwrap() + 2) as u32;
+    let binding = view_binding_key_at(ARRAY_CONTROLLER, 5, cursor).expect("array key");
+
+    let spans = binding_rename_spans(&binding, ARRAY_CONTROLLER, Some(view));
+    assert_eq!(
+        spans.controller.iter().map(|s| s.line).collect::<Vec<_>>(),
+        vec![5],
+        "only the key string moves — no compact local for the array form"
+    );
+    assert_eq!(
+        spans.view.iter().map(|s| s.line).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn binding_rename_spans_without_resolved_view_only_touch_controller() {
+    // When the view can't be located/read, only the controller-side spans are
+    // produced (no panic, no view edits).
+    let line = COMPACT_CONTROLLER.lines().nth(6).unwrap();
+    let cursor = (line.find("'name'").unwrap() + 2) as u32;
+    let binding = view_binding_key_at(COMPACT_CONTROLLER, 6, cursor).unwrap();
+
+    let spans = binding_rename_spans(&binding, COMPACT_CONTROLLER, None);
+    assert_eq!(
+        spans.controller.iter().map(|s| s.line).collect::<Vec<_>>(),
+        vec![5, 6]
+    );
+    assert!(spans.view.is_empty());
 }
 
 // ── view_binding_key_at: compact ────────────────────────────────────────────
@@ -321,6 +409,104 @@ class C
     let spans = enclosing_function_local_spans(src, "name", anchor);
     let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
     assert_eq!(lines, vec![9]);
+}
+
+#[test]
+fn compact_local_skips_non_capturing_closure() {
+    // A plain `function () { … }` does NOT capture the outer `$name` (PHP
+    // closures capture nothing without a `use` clause), so renaming the
+    // `compact('name')` local must leave the closure's own `$name` untouched.
+    // Regression for the issue #55 correctness fix.
+    let src = "\
+<?php
+class C
+{
+    public function show()
+    {
+        $name = 'Alice';
+        $fn = function () { $name = 'inner'; };
+        return view('v', compact('name'));
+    }
+}";
+    // Anchor on the `view(...)` line (line 7).
+    let anchor = VarSpan::new(7, 0, 0);
+    let spans = enclosing_function_local_spans(src, "name", anchor);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    // Only the outer `$name` on line 5 — NOT the closure body's `$name` (line 6).
+    assert_eq!(
+        lines,
+        vec![5],
+        "the independent closure variable must be left alone"
+    );
+}
+
+#[test]
+fn compact_local_descends_into_use_capturing_closure() {
+    // A closure that captures `$name` via `use ($name)` binds its body `$name`
+    // to the outer variable's name, so the rename MUST descend — both the
+    // `use` capture and the body usage move with the outer local, or the
+    // closure would reference a renamed-away variable.
+    let src = "\
+<?php
+class C
+{
+    public function show()
+    {
+        $name = 'Alice';
+        $fn = function () use ($name) { return strtoupper($name); };
+        return view('v', compact('name'));
+    }
+}";
+    let anchor = VarSpan::new(7, 0, 0);
+    let spans = enclosing_function_local_spans(src, "name", anchor);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    // Line 5 (outer local) plus line 6 twice: the `use ($name)` capture and the
+    // body `$name`.
+    assert_eq!(lines, vec![5, 6, 6]);
+}
+
+// ── is_template_variable: prepare_rename admissibility gate (AC #5) ─────────
+
+#[test]
+fn template_variable_recognized_when_used_in_markup() {
+    // A controller-passed / echoed variable surfaces in markup — renameable.
+    assert!(is_template_variable("{{ $user->name }}", "user"));
+    // A loop variable surfaces in its header — renameable.
+    assert!(is_template_variable(
+        "@foreach ($items as $row)\n    {{ $row }}\n@endforeach",
+        "row"
+    ));
+    // A `@php`-assigned variable that is then echoed surfaces in markup.
+    assert!(is_template_variable(
+        "@php $total = 0; @endphp\n{{ $total }}",
+        "total"
+    ));
+}
+
+#[test]
+fn out_of_context_variable_is_not_a_template_variable() {
+    // Undefined `$ghost`: appears nowhere → not renameable (AC #5).
+    assert!(!is_template_variable("{{ $user }}", "ghost"));
+
+    // A PHP-block / function-local confined to `@php … @endphp`, never echoed,
+    // is not a Blade template variable — rename must reject it.
+    let src = "\
+@php
+    $helper = function () {
+        $local = 5;
+        return $local;
+    };
+@endphp
+{{ $user }}";
+    assert!(!is_template_variable(src, "local"));
+}
+
+#[test]
+fn inline_php_directive_does_not_mask_rest_of_file() {
+    // The inline `@php(expr)` form has no `@endphp`; masking must not blank the
+    // rest of the file, which would wrongly reject every later variable.
+    let src = "@php($total = 1)\n{{ $total }}";
+    assert!(is_template_variable(src, "total"));
 }
 
 // ── view_binding_key_at: ->with chains ──────────────────────────────────────

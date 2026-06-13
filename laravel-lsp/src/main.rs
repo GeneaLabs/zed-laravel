@@ -18632,6 +18632,14 @@ impl LaravelLanguageServer {
         if property.is_some() || var_name.is_empty() {
             return None;
         }
+        // issue #55 AC: reject rename for variables outside a recognized
+        // binding context. A `$var` that never surfaces in template markup —
+        // an undefined `$ghost`, or a PHP-block / function-local confined to
+        // `@php … @endphp` — is not a renameable Blade variable, so return
+        // `None` and let the cursor fall through to the other classifiers.
+        if !laravel_lsp::blade_var_rename::is_template_variable(&content, &var_name) {
+            return None;
+        }
         let span = laravel_lsp::blade_var_rename::variable_spans(line_text, &var_name)
             .into_iter()
             .find(|s| {
@@ -18739,7 +18747,7 @@ impl LaravelLanguageServer {
         position: Position,
         new_name: &str,
     ) -> jsonrpc::Result<Option<WorkspaceEdit>> {
-        use laravel_lsp::blade_var_rename::{self, BindingForm};
+        use laravel_lsp::blade_var_rename;
 
         let path = match uri.to_file_path() {
             Ok(p) => p,
@@ -18770,58 +18778,62 @@ impl LaravelLanguageServer {
             ));
         }
 
+        // Resolve the view template — but only after validating the view NAME.
+        // `binding.view_name` comes from the `view('…')` source, so a hostile
+        // workspace could write `view('/tmp/evil', compact('k'))`; without
+        // validation `resolve_view_path` would `join` an absolute / `..`
+        // segment and read an out-of-project file, leaking its absolute path
+        // into the WorkspaceEdit (issue #55 security review). `validate_view_name`
+        // rejects slashes, `..`, and extensions; we additionally require the
+        // resolved path to live under the project root. A view that fails either
+        // check is skipped — the controller-side rename (key + compact local)
+        // still applies.
+        let view_path: Option<std::path::PathBuf> = match self.get_cached_config().await {
+            Some(config)
+                if laravel_lsp::view_declaration_locator::validate_view_name(
+                    &binding.view_name,
+                )
+                .is_ok() =>
+            {
+                laravel_lsp::view_declaration_locator::locate_view_file(&binding.view_name, &config)
+                    .filter(|p| p.starts_with(&config.root))
+            }
+            _ => None,
+        };
+        let view_source: Option<String> = match view_path.as_ref() {
+            Some(p) => match (p.to_str(), Url::from_file_path(p)) {
+                (Some(s), Ok(view_uri)) => self.rename_document_text(&view_uri, s).await,
+                _ => None,
+            },
+            None => None,
+        };
+
+        // Compute every rewrite span across the controller and the resolved view
+        // via the unit-tested cross-file core (issue #55 AC #6). The controller
+        // gets the key string plus — for `compact` — the enclosing-function
+        // local `$key`; the view gets the file-scoped `$key` usages.
+        let spans =
+            blade_var_rename::binding_rename_spans(&binding, &content, view_source.as_deref());
+
         let mut targets: Vec<laravel_lsp::rename::EditTarget> = Vec::new();
-
-        // 1. The controller key string (array key or compact arg).
-        targets.push(laravel_lsp::rename::EditTarget {
-            file_path: path.clone(),
-            line: binding.key_span.line,
-            start_column: binding.key_span.start_col,
-            end_column: binding.key_span.end_col,
-            new_text: new_bare.clone(),
-        });
-
-        // 2. compact: the enclosing-function local `$key` moves with the key,
-        //    because compact binds the view variable BY the local's name.
-        if binding.form == BindingForm::Compact {
-            for s in blade_var_rename::enclosing_function_local_spans(
-                &content,
-                &binding.key,
-                binding.key_span,
-            ) {
+        for s in spans.controller {
+            targets.push(laravel_lsp::rename::EditTarget {
+                file_path: path.clone(),
+                line: s.line,
+                start_column: s.start_col,
+                end_column: s.end_col,
+                new_text: new_bare.clone(),
+            });
+        }
+        if let Some(view_path) = view_path.as_ref() {
+            for s in spans.view {
                 targets.push(laravel_lsp::rename::EditTarget {
-                    file_path: path.clone(),
+                    file_path: view_path.clone(),
                     line: s.line,
                     start_column: s.start_col,
                     end_column: s.end_col,
                     new_text: new_bare.clone(),
                 });
-            }
-        }
-
-        // 3. In-view `$key` usages (file-scoped, minus loop re-binds).
-        if let Some(config) = self.get_cached_config().await {
-            if let Some(view_path) =
-                laravel_lsp::view_declaration_locator::locate_view_file(&binding.view_name, &config)
-            {
-                if let Some(view_str) = view_path.to_str() {
-                    if let Ok(view_uri) = Url::from_file_path(&view_path) {
-                        if let Some(view_content) =
-                            self.rename_document_text(&view_uri, view_str).await
-                        {
-                            for s in blade_var_rename::file_scope_spans(&view_content, &binding.key)
-                            {
-                                targets.push(laravel_lsp::rename::EditTarget {
-                                    file_path: view_path.clone(),
-                                    line: s.line,
-                                    start_column: s.start_col,
-                                    end_column: s.end_col,
-                                    new_text: new_bare.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
             }
         }
 

@@ -152,6 +152,75 @@ fn mask_delimited(source: &str, out: &mut [u8], open: &str, close: &str) {
     }
 }
 
+/// True if `name` surfaces as a Blade *template* variable — at least one
+/// `$name` occurrence in template markup (an echo `{{ $name }}`, a directive, a
+/// loop header), i.e. OUTSIDE every `@php … @endphp` block, `@verbatim` region,
+/// and `{{-- --}}` comment.
+///
+/// This is the `prepare_rename` admissibility gate (issue #55 AC: rename rejects
+/// variables outside a recognized binding context). A `$name` whose only
+/// occurrences live inside `@php` blocks — a PHP-block / function-local temp —
+/// or that appears nowhere is NOT a renameable Blade variable and returns
+/// `false`. Loop variables surface in their headers/bodies, `@php`-assigned
+/// variables that are actually used surface at their echo sites, and
+/// controller-passed variables surface at their usages, so all legitimately
+/// renameable variables pass.
+pub fn is_template_variable(source: &str, name: &str) -> bool {
+    if !is_valid_identifier(name) {
+        return false;
+    }
+    let pattern = match regex::Regex::new(&format!(r"\${}\b", regex::escape(name))) {
+        Ok(re) => re,
+        Err(_) => return false,
+    };
+    mask_non_template(source)
+        .lines()
+        .any(|line| pattern.is_match(line))
+}
+
+/// Blank everything that is NOT live template markup: comments, `@verbatim`
+/// regions, and closed `@php … @endphp` blocks. Used by [`is_template_variable`]
+/// to tell a real Blade variable (surfaces in markup) from a PHP-block-only
+/// local. Length/newlines are preserved, like [`mask_non_code`].
+fn mask_non_template(source: &str) -> String {
+    // Stage 1: blank comments + verbatim (these genuinely extend to EOF when
+    // unclosed, matching `mask_non_code`).
+    let stage1 = {
+        let mut out: Vec<u8> = source.as_bytes().to_vec();
+        mask_delimited(source, &mut out, "{{--", "--}}");
+        mask_delimited(source, &mut out, "@verbatim", "@endverbatim");
+        String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+    };
+    // Stage 2: blank closed `@php … @endphp` blocks, searching the
+    // comment-masked text so a `@php` token inside a comment can't anchor a
+    // spurious block.
+    let mut out: Vec<u8> = stage1.as_bytes().to_vec();
+    mask_php_blocks(&stage1, &mut out);
+    String::from_utf8(out).unwrap_or(stage1)
+}
+
+/// Blank each *closed* `@php … @endphp` block (replacing non-newline bytes with
+/// spaces). An unclosed `@php` is the inline `@php(expr)` directive form, not a
+/// block — leave it as markup rather than masking the rest of the file, which
+/// would wrongly reject every later variable as out-of-context.
+fn mask_php_blocks(source: &str, out: &mut [u8]) {
+    let mut search_from = 0;
+    while let Some(rel) = source[search_from..].find("@php") {
+        let start = search_from + rel;
+        let after_open = start + "@php".len();
+        let Some(rel_end) = source[after_open..].find("@endphp") else {
+            break; // unclosed `@php` (inline `@php(...)`) — not a block.
+        };
+        let end = after_open + rel_end + "@endphp".len();
+        for b in out.iter_mut().take(end).skip(start) {
+            if *b != b'\n' {
+                *b = b' ';
+            }
+        }
+        search_from = end;
+    }
+}
+
 /// The set of variable spans a rename should rewrite when the user invokes
 /// rename on the `$name` occurrence at `cursor_line` in a Blade template.
 ///
@@ -474,8 +543,63 @@ pub fn enclosing_function_local_spans(
     spans
 }
 
+/// Every rewrite span a controller→view binding-key rename produces, split by
+/// file. Pure data — the caller (`main.rs`) owns view-file location, name
+/// validation, and turning spans into LSP `TextEdit`s.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BindingRenameSpans {
+    /// Spans inside the controller: the binding key string, plus (for
+    /// `compact`) the enclosing-function local `$key`. Sorted by position.
+    pub controller: Vec<VarSpan>,
+    /// File-scoped `$key` spans inside the resolved view template.
+    pub view: Vec<VarSpan>,
+}
+
+/// Cross-file orchestration core: given a located [`ViewBinding`], the
+/// controller source, and the resolved view source, compute every rewrite span
+/// across BOTH files. This is the I/O-free heart of `view_binding_rename_edit`,
+/// unit-tested independently of LSP file location and config.
+///
+/// - The controller always gets the key-string span. For [`BindingForm::Compact`]
+///   it also gets the enclosing-function local `$key` spans (compact binds the
+///   view variable BY the local's name, so the local must move too).
+/// - The view gets the file-scoped `$key` usages
+///   ([`file_scope_spans`] — minus any loop block that re-binds `key`, a
+///   separate scope). Pass `view_source = None` when the view can't be located;
+///   only the controller spans are then returned.
+///
+/// Because the view spans are restricted to `binding.key`, a different binding
+/// key bound to the same view from another controller (e.g. `$other`) is never
+/// touched — its spans don't intersect this rename's.
+pub fn binding_rename_spans(
+    binding: &ViewBinding,
+    controller_source: &str,
+    view_source: Option<&str>,
+) -> BindingRenameSpans {
+    let mut controller = vec![binding.key_span];
+    if binding.form == BindingForm::Compact {
+        controller.extend(enclosing_function_local_spans(
+            controller_source,
+            &binding.key,
+            binding.key_span,
+        ));
+    }
+    controller.sort();
+
+    let view = view_source
+        .map(|src| file_scope_spans(src, &binding.key))
+        .unwrap_or_default();
+
+    BindingRenameSpans { controller, view }
+}
+
 /// Walk `node`, pushing a name-only [`VarSpan`] for every `variable_name`
-/// whose identifier equals `name` (`$name`).
+/// whose identifier equals `name` (`$name`) — but NOT descending into a nested
+/// closure that captures `name` in a separate scope. A plain
+/// `function () { … }` doesn't see the enclosing `$name` (PHP closures capture
+/// nothing without a `use` clause), so its body `$name` is a *different*
+/// variable and must be left untouched; an arrow function or a `use ($name)`
+/// closure shares the outer variable, so we keep descending.
 fn collect_variable_name_spans(node: Node, bytes: &[u8], name: &str, out: &mut Vec<VarSpan>) {
     if node.kind() == "variable_name" {
         if let Ok(text) = node.utf8_text(bytes) {
@@ -493,8 +617,47 @@ fn collect_variable_name_spans(node: Node, bytes: &[u8], name: &str, out: &mut V
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if is_isolated_closure(child, bytes, name) {
+            continue;
+        }
         collect_variable_name_spans(child, bytes, name, out);
     }
+}
+
+/// True if `node` is an anonymous function that does NOT see the enclosing
+/// `$name` — a `function () { … }` (or its `_creation_expression` form) with no
+/// `use ($name)` clause. Such a closure is an independent scope, so a rename of
+/// the enclosing-function `$name` must not descend into it (issue #55: renaming
+/// a `compact()` binding once clobbered an unrelated closure variable). Arrow
+/// functions auto-capture, and `use ($name)` closures explicitly capture, so
+/// both return `false` and the caller keeps descending. Mirrors the capture
+/// rule in [`crate::query_chain::flow`].
+fn is_isolated_closure(node: Node, bytes: &[u8], name: &str) -> bool {
+    if !matches!(
+        node.kind(),
+        "anonymous_function" | "anonymous_function_creation_expression"
+    ) {
+        return false;
+    }
+    // A `use (…)` clause that lists `$name` (by value or `&`-reference) binds
+    // the body `$name` to the outer variable's name, so the closure is NOT
+    // isolated — descend so the capture and its uses rename together.
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "anonymous_function_use_clause" {
+            let mut inner = child.walk();
+            for v in child.children(&mut inner) {
+                if v.kind() == "variable_name" {
+                    if let Ok(t) = v.utf8_text(bytes) {
+                        if t.trim_start_matches('$') == name {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 // ── tree-sitter helpers ───────────────────────────────────────────────────
@@ -515,10 +678,11 @@ fn call_function_name<'a>(call: Node<'a>, bytes: &'a [u8]) -> Option<&'a str> {
 fn string_literal_text(node: Node, bytes: &[u8]) -> Option<String> {
     let raw = node.utf8_text(bytes).ok()?;
     let trimmed = raw.trim();
-    if trimmed.len() >= 2
-        && (trimmed.starts_with('\'') || trimmed.starts_with('"'))
-        && (trimmed.ends_with('\'') || trimmed.ends_with('"'))
-    {
+    // Require the SAME quote on both ends (`'foo'` / `"foo"`), not just any
+    // quote on each end — otherwise a mismatched `"foo'` would slip through.
+    let open = trimmed.chars().next()?;
+    let close = trimmed.chars().next_back()?;
+    if trimmed.len() >= 2 && (open == '\'' || open == '"') && open == close {
         Some(trimmed[1..trimmed.len() - 1].to_string())
     } else {
         None
@@ -537,8 +701,11 @@ fn string_content_span_at(node: Node, bytes: &[u8], line: u32, col: u32) -> Opti
         return None; // multi-line strings can't be a simple binding key
     }
     let content_start = start.column as u32 + 1; // inside opening quote
-    let content_end = end.column as u32 - 1; // before closing quote
-    if line == start.row as u32 && col >= content_start && col <= content_end {
+    let content_end = end.column as u32 - 1; // before (== position of) closing quote
+                                             // `content_end` is the closing quote's column; the key text occupies
+                                             // `content_start..content_end`, so accept the cursor only strictly before
+                                             // the closing quote (landing ON the quote isn't on the key).
+    if line == start.row as u32 && col >= content_start && col < content_end {
         Some(VarSpan::new(line, content_start, content_end))
     } else {
         None
