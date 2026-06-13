@@ -56,6 +56,13 @@ impl ViewNameError {
 /// Validate a user-typed new view name. Returns `Ok(())` only when the name
 /// is a well-formed dotted segment list — what Laravel's `view()` helper
 /// actually resolves at runtime.
+///
+/// **Limitation:** namespaced views (`package::view`) are not supported — the
+/// `:` namespace separator trips the [`ViewNameError::InvalidCharacter`] check.
+/// This is intentional for now: rename only handles application views, and the
+/// cross-file binding rename (issue #55) skips a namespaced source `view(...)`
+/// rather than mis-resolving it. Supporting `package::view` would mean parsing
+/// the namespace segment against the registered view hints — a separate change.
 pub fn validate_view_name(name: &str) -> Result<(), ViewNameError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {

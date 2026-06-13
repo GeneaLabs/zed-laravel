@@ -245,3 +245,74 @@ fn test_find_loop_blocks_captures_iterable() {
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].iterable, Some("$this->audits".to_string()));
 }
+
+// ── parenthesized iterables (issue #55 regression) ───────────────────────────
+// A method-call iterable contains its own `)`; the loop arg list must be
+// captured by balancing parens, not a `[^)]` run that truncates at the first
+// `)`. A truncated capture dropped the ` as $var` tail, leaving the loop with
+// no variables — which made the loop scope invisible and let a rename clobber
+// every `$var` in the file.
+
+#[test]
+fn test_parse_foreach_variables_method_call_iterable() {
+    let vars = parse_foreach_variables("($users->where('active', true) as $user)");
+    assert_eq!(vars, vec![("user".to_string(), "mixed".to_string())]);
+}
+
+#[test]
+fn test_parse_foreach_variables_method_call_iterable_key_value() {
+    let vars = parse_foreach_variables("($items->take(5) as $key => $value)");
+    assert_eq!(
+        vars,
+        vec![
+            ("key".to_string(), "mixed".to_string()),
+            ("value".to_string(), "mixed".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_parse_foreach_iterable_method_call() {
+    assert_eq!(
+        parse_foreach_iterable("($users->where('active', true) as $user)"),
+        Some("$users->where('active', true)".to_string())
+    );
+}
+
+#[test]
+fn test_find_loop_blocks_method_call_iterable_keeps_variable() {
+    let content = r#"
+@foreach($users->where('active', true) as $user)
+    {{ $user->name }}
+@endforeach
+"#;
+    let blocks = find_loop_blocks(content);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        blocks[0].variables,
+        vec![("user".to_string(), "mixed".to_string())],
+        "the loop variable must survive a parenthesized iterable"
+    );
+    assert_eq!(
+        blocks[0].iterable,
+        Some("$users->where('active', true)".to_string())
+    );
+    assert_eq!(blocks[0].start_line, 1);
+    assert_eq!(blocks[0].end_line, Some(3));
+}
+
+#[test]
+fn test_find_loop_blocks_nested_parens_in_iterable() {
+    // Iterable with nested parens — `Model::query()->whereIn('id', f(1, 2))`.
+    let content = r#"
+@foreach(Model::query()->whereIn('id', collect([1, 2])) as $row)
+    {{ $row }}
+@endforeach
+"#;
+    let blocks = find_loop_blocks(content);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        blocks[0].variables,
+        vec![("row".to_string(), "mixed".to_string())]
+    );
+}

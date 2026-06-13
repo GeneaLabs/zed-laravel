@@ -36,15 +36,21 @@ pub enum BladeLoopType {
 
 /// Parse variables from `@foreach` / `@forelse` directive arguments.
 /// Handles: `@foreach($items as $item)`, `@foreach($items as $key => $value)`,
-/// `@foreach($category->items as $item)`.
+/// `@foreach($category->items as $item)`, and iterables containing their own
+/// parens — `@foreach($users->where('active', true) as $user)`.
 pub fn parse_foreach_variables(arguments: &str) -> Vec<(String, String)> {
     lazy_static! {
-        static ref FOREACH_RE: Regex =
-            Regex::new(r#"\([^)]+\s+as\s+(?:\$(\w+)\s*=>\s*)?\$(\w+)\s*\)"#).unwrap();
+        // Match only the binding (right of the LAST ` as `), so a parenthesized
+        // iterable in the arg list can't truncate the capture.
+        static ref BINDING_RE: Regex =
+            Regex::new(r#"^\s*(?:\$(\w+)\s*=>\s*)?\$(\w+)\s*$"#).unwrap();
     }
 
     let mut vars = Vec::new();
-    if let Some(caps) = FOREACH_RE.captures(arguments) {
+    let Some(binding) = foreach_binding(arguments) else {
+        return vars;
+    };
+    if let Some(caps) = BINDING_RE.captures(binding) {
         if let Some(key_match) = caps.get(1) {
             vars.push((key_match.as_str().to_string(), "mixed".to_string()));
         }
@@ -56,16 +62,32 @@ pub fn parse_foreach_variables(arguments: &str) -> Vec<(String, String)> {
 }
 
 /// Parse the iterable expression from `@foreach` / `@forelse` arguments.
-/// e.g. `($this->audits as $audit)` -> `Some("$this->audits")`.
+/// e.g. `($this->audits as $audit)` -> `Some("$this->audits")`,
+/// `($users->where('active', true) as $user)` -> `Some("$users->where('active', true)")`.
 pub fn parse_foreach_iterable(arguments: &str) -> Option<String> {
-    lazy_static! {
-        static ref ITER_RE: Regex = Regex::new(r#"\(\s*(.+?)\s+as\s+\$"#).unwrap();
-    }
+    strip_outer_parens(arguments.trim())
+        .rsplit_once(" as ")
+        .map(|(iterable, _)| iterable.trim().to_string())
+}
 
-    ITER_RE
-        .captures(arguments)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().trim().to_string())
+/// Return the binding portion (right of the LAST ` as `) of a foreach argument
+/// list. Splitting on the last keyword — rather than regex-capturing the
+/// iterable with a `[^)]` run — keeps iterables that contain their own parens
+/// or `as` (method calls like `$users->where('active', true)`) intact, so the
+/// loop variable is still recovered. `None` when the directive has no ` as `.
+fn foreach_binding(arguments: &str) -> Option<&str> {
+    strip_outer_parens(arguments.trim())
+        .rsplit_once(" as ")
+        .map(|(_, binding)| binding)
+}
+
+/// Strip a single matching outer parenthesis pair, if both are present.
+/// Only the outermost pair is removed, so nested parens inside the iterable are
+/// preserved.
+fn strip_outer_parens(s: &str) -> &str {
+    s.strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .unwrap_or(s)
 }
 
 /// Parse variables from `@for` directive arguments.
@@ -84,12 +106,78 @@ pub fn parse_for_variables(arguments: &str) -> Vec<(String, String)> {
     vars
 }
 
+/// Find every loop directive on a single line, returning
+/// `(directive_keyword, full_argument_substring_including_parens)` for each.
+///
+/// The argument list is captured by *balancing* parentheses rather than a
+/// `\([^)]*\)` regex, which stops at the first `)`. Without balancing, an
+/// iterable containing a call — `@foreach($users->where('active', true) as
+/// $user)` — truncates to `($users->where('active', true)`, the ` as $user`
+/// tail is lost, and the loop's variable goes unrecognized. That made the loop
+/// scope invisible and the rename clobber the whole file (issue #55). Parens
+/// inside single/double-quoted strings are ignored so a string argument can't
+/// throw off the depth count.
+fn loop_directives_on_line(line: &str) -> Vec<(&str, &str)> {
+    lazy_static! {
+        static ref LOOP_HEAD_RE: Regex =
+            Regex::new(r#"@(foreach|forelse|for|while)\s*\("#).unwrap();
+    }
+
+    let mut out = Vec::new();
+    for caps in LOOP_HEAD_RE.captures_iter(line) {
+        let Some(directive) = caps.get(1) else {
+            continue;
+        };
+        // The opening paren is the final byte of the whole match.
+        let open = caps.get(0).unwrap().end() - 1;
+        if let Some(close) = matching_paren(line, open) {
+            out.push((directive.as_str(), &line[open..=close]));
+        }
+    }
+    out
+}
+
+/// Given the byte index of an opening `(` in `s`, return the byte index of its
+/// matching `)`, balancing nested parens and ignoring any parens that sit
+/// inside single- or double-quoted string literals. Returns `None` when the
+/// parens are unbalanced on this line. `(`, `)`, `'`, `"`, `\` are ASCII, so
+/// the returned indices always land on char boundaries.
+fn matching_paren(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = open;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 1; // skip the escaped byte
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Find all loop blocks in Blade content and their boundaries.
 /// Returns a list of loop blocks with start/end lines and extracted variables.
 pub fn find_loop_blocks(content: &str) -> Vec<BladeLoopBlock> {
     lazy_static! {
-        static ref LOOP_START_RE: Regex =
-            Regex::new(r#"@(foreach|forelse|for|while)\s*(\([^)]*\))"#).unwrap();
         static ref LOOP_END_RE: Regex =
             Regex::new(r#"@(endforeach|endforelse|endfor|endwhile)"#).unwrap();
     }
@@ -99,10 +187,7 @@ pub fn find_loop_blocks(content: &str) -> Vec<BladeLoopBlock> {
         Vec::new();
 
     for (line_idx, line) in content.lines().enumerate() {
-        for caps in LOOP_START_RE.captures_iter(line) {
-            let directive = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let arguments = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
+        for (directive, arguments) in loop_directives_on_line(line) {
             let (loop_type, variables, iterable) = match directive {
                 "foreach" => (
                     BladeLoopType::Foreach,

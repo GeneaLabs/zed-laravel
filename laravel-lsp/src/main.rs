@@ -18366,6 +18366,20 @@ fn zero_anchor() -> Range {
     }
 }
 
+/// True if `path` resolves to a location inside `root`. Both sides are
+/// canonicalized first — `locate_view_file` builds the path by joining and
+/// `Path::starts_with` is purely textual, so a symlink under the project could
+/// otherwise resolve outside the root and leak an absolute, out-of-project path
+/// into a `WorkspaceEdit` (issue #55 cross-file binding rename). When either
+/// side can't be canonicalized (e.g. the file vanished mid-edit) we fall back
+/// to the textual prefix check rather than admitting an unverified path.
+fn path_within_root(path: &std::path::Path, root: &std::path::Path) -> bool {
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(real_path), Ok(real_root)) => real_path.starts_with(&real_root),
+        _ => path.starts_with(root),
+    }
+}
+
 impl LaravelLanguageServer {
     /// Collect every code-lens item for a file — each a `(range, symbols)` pair.
     /// Position lenses (magic members, routes, env, config, translation) carry
@@ -18796,7 +18810,7 @@ impl LaravelLanguageServer {
                 .is_ok() =>
             {
                 laravel_lsp::view_declaration_locator::locate_view_file(&binding.view_name, &config)
-                    .filter(|p| p.starts_with(&config.root))
+                    .filter(|p| path_within_root(p, &config.root))
             }
             _ => None,
         };

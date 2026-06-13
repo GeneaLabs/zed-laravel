@@ -102,6 +102,48 @@ fn file_scoped_variable_skips_loop_rebinding_same_name() {
     assert_eq!(lines, vec![0, 4]);
 }
 
+#[test]
+fn foreach_with_method_call_iterable_still_scopes_to_the_loop() {
+    // issue #55 regression: a parenthesized iterable (`->where(...)`) must not
+    // defeat loop-scope detection. Before the paren-balancing fix the loop's
+    // `$user` binding was lost, `loop_binding_ranges` returned empty, and the
+    // file-scope arm admitted EVERY `$user` — clobbering the out-of-loop one.
+    let src = "\
+{{ $user }}
+@foreach ($users->where('active', true) as $user)
+    {{ $user->name }}
+@endforeach
+{{ $user }}";
+    // Cursor inside the loop body (line 2) — rename only the in-loop `$user`s,
+    // never the file-level ones on lines 0 and 4.
+    let spans = in_scope_spans(src, "user", 2);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    assert_eq!(
+        lines,
+        vec![1, 2],
+        "loop directive + body only, not lines 0/4"
+    );
+}
+
+#[test]
+fn file_scoped_var_skips_loop_with_method_call_iterable() {
+    // The mirror case: a file-level `$user` must not bleed into a loop that
+    // re-binds `$user` via a parenthesized iterable.
+    let src = "\
+{{ $user }}
+@foreach ($users->where('active', true) as $user)
+    {{ $user }}
+@endforeach
+{{ $user }}";
+    let spans = in_scope_spans(src, "user", 0);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    assert_eq!(
+        lines,
+        vec![0, 4],
+        "file-level occurrences only, loop excluded"
+    );
+}
+
 // ── in_scope_spans: @forelse ────────────────────────────────────────────────
 
 #[test]
