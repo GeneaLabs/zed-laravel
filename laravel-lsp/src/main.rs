@@ -17864,6 +17864,21 @@ async fn classify_with_decl_fallback(
     // aren't tagged by php.scm. Use the mtime-cached decl walker so
     // subsequent invocations don't re-parse the file.
     if !is_in_routes_dir(file_path) {
+        // A Folio page's `name('...')` helper declares its route name, but the
+        // page lives outside `routes/` and the bare helper isn't tagged by
+        // php.scm. If the cursor sits on that call, resolve it to the page's
+        // (mount-prefixed) route name so find-references / rename reach every
+        // `route('...')` usage of the page.
+        if let Some(root) = root {
+            if let Some(name) = laravel_lsp::folio_discovery::folio_name_at(
+                root,
+                file_path,
+                position.line,
+                position.character,
+            ) {
+                return Some(laravel_lsp::references::SymbolRef::Route(name));
+            }
+        }
         return None;
     }
     let decls = server.cached_route_decls(file_path).await?;
@@ -18084,6 +18099,43 @@ async fn collect_declaration_locations(
                             },
                         });
                     }
+                }
+            }
+
+            // Folio pages are filesystem-derived routes injected into the index
+            // with their backing `.blade.php` file as the declaration site (top
+            // of file). They live outside `routes/`, so the walk above never
+            // sees them — surface the page itself. A conventional route of the
+            // same name shadows the Folio page in the index (keep-first
+            // insertion), so this only fires for genuinely Folio-owned names; no
+            // double-counting with the `routes/` walk above.
+            let folio_decl = {
+                let guard = server.route_index.read().await;
+                guard
+                    .as_ref()
+                    .and_then(|idx| idx.get(name))
+                    .filter(|def| {
+                        def.file
+                            .to_str()
+                            .is_some_and(|s| s.ends_with(".blade.php"))
+                    })
+                    .map(|def| (def.file.clone(), def.line, def.column, def.end_column))
+            };
+            if let Some((file, line, column, end_column)) = folio_decl {
+                if let Ok(uri) = Url::from_file_path(&file) {
+                    out.push(Location {
+                        uri,
+                        range: Range {
+                            start: Position {
+                                line,
+                                character: column,
+                            },
+                            end: Position {
+                                line,
+                                character: end_column,
+                            },
+                        },
+                    });
                 }
             }
         }

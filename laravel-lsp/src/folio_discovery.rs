@@ -56,9 +56,12 @@ pub struct FolioRoute {
 }
 
 lazy_static! {
-    /// `Folio::path('resources/views/folio')` — captures the directory string.
-    static ref FOLIO_PATH_RE: Regex =
-        Regex::new(r#"Folio::path\s*\(\s*['"]([^'"]+)['"]"#).unwrap();
+    /// The head of a `Folio::path(` call. The argument expression — a bare
+    /// string literal, or a `resource_path(...)` / `base_path(...)` helper
+    /// wrapping one (the form `php artisan folio:install` scaffolds) — is parsed
+    /// by balancing parens from the match end (see [`resolve_folio_path`]), so
+    /// helper-call forms are handled, not only bare literals.
+    static ref FOLIO_PATH_HEAD_RE: Regex = Regex::new(r#"Folio::path\s*\("#).unwrap();
 
     /// A chained `->uri('admin')` link. Searched within a single `Folio::path`
     /// statement.
@@ -71,11 +74,12 @@ lazy_static! {
         Regex::new(r#"->\s*name\s*\(\s*['"]([^'"]+)['"]"#).unwrap();
 
     /// A page-level `name('users.show')` call (Folio's `Laravel\Folio\name`
-    /// helper). The leading boundary class excludes `>`, `:` and `\` so it
-    /// never matches the route-chain `->name(`, the static `::name(`, or the
-    /// `use function Laravel\Folio\name;` import.
+    /// helper). The leading boundary class excludes `>`, `:`, `\`, `(` and `[`
+    /// so it never matches the route-chain `->name(`, the static `::name(`, the
+    /// `use function Laravel\Folio\name;` import, or a `name(` nested inside
+    /// another call/index expression (e.g. `usort($a, name('cmp'))`).
     static ref PAGE_NAME_RE: Regex =
-        Regex::new(r#"(?:\A|[^A-Za-z0-9_>:\\])name\s*\(\s*['"]([^'"]+)['"]"#).unwrap();
+        Regex::new(r#"(?:\A|[^A-Za-z0-9_>:\\(\[])name\s*\(\s*['"]([^'"]+)['"]"#).unwrap();
 }
 
 /// Whether the project uses Folio at all. Gates the page-directory walk so
@@ -103,6 +107,7 @@ fn provider_files(root: &Path) -> Vec<PathBuf> {
     if providers.exists() {
         for entry in WalkDir::new(&providers)
             .max_depth(4)
+            .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_file())
@@ -137,18 +142,34 @@ pub fn discover_folio_mounts(root: &Path) -> Vec<FolioMount> {
 }
 
 /// Parse every `Folio::path(...)` statement out of one provider's source,
-/// resolving each mount's directory (relative to `root`) and its chained URI /
-/// name prefixes. Pulled out of [`discover_folio_mounts`] for direct testing.
+/// resolving each mount's directory (relative to `root`, containment-checked)
+/// and its chained URI / name prefixes. Pulled out of [`discover_folio_mounts`]
+/// for direct testing.
 fn parse_folio_mounts(content: &str, root: &Path) -> Vec<FolioMount> {
+    let bytes = content.as_bytes();
     let mut mounts = Vec::new();
-    for m in FOLIO_PATH_RE.captures_iter(content) {
-        let whole = m.get(0).unwrap();
-        let rel = m.get(1).unwrap().as_str();
+    for head in FOLIO_PATH_HEAD_RE.find_iter(content) {
+        // `head.end()` is one past the opening `(`. Balance parens to find the
+        // argument's close, so a wrapped helper (`resource_path('...')`) is
+        // captured whole rather than truncated at its inner `)`.
+        let open = head.end() - 1;
+        let Some(close) = matching_paren(bytes, open) else {
+            continue;
+        };
+        let arg = &content[open + 1..close];
+        let Some(directory) = resolve_folio_path(arg, root) else {
+            // Unparseable argument (a variable, an unsupported helper), or a
+            // path that escapes the project root (`Folio::path('/etc')`,
+            // `Folio::path('../../x')`) — a traversal vector we refuse to walk.
+            // Skip; the default-mount fallback in [`discover_folio_mounts`]
+            // still applies when nothing else parses.
+            continue;
+        };
 
         // The chained `->uri(...)` / `->name(...)` links live between this
-        // `Folio::path(` call and the statement terminator. Bound the search to
+        // call's close paren and the statement terminator. Bound the search to
         // that statement so a later mount's prefixes don't bleed in.
-        let stmt_start = whole.end();
+        let stmt_start = close + 1;
         let stmt_end = content[stmt_start..]
             .find(';')
             .map(|i| stmt_start + i)
@@ -165,12 +186,99 @@ fn parse_folio_mounts(content: &str, root: &Path) -> Vec<FolioMount> {
             .unwrap_or_default();
 
         mounts.push(FolioMount {
-            directory: root.join(rel),
+            directory,
             uri_prefix,
             name_prefix,
         });
     }
     mounts
+}
+
+/// Find the index of the `)` that closes the `(` at byte `open`, balancing
+/// nested parens and skipping over single/double-quoted string contents (so a
+/// `)` inside a path literal never ends the scan early).
+fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// Parse a single- or double-quoted PHP string literal, returning its inner
+/// content. `None` for anything that isn't a bare quoted literal (e.g. a
+/// variable or a concatenation we can't resolve statically).
+fn parse_literal(expr: &str) -> Option<String> {
+    let expr = expr.trim();
+    let bytes = expr.as_bytes();
+    let &first = bytes.first()?;
+    if (first == b'\'' || first == b'"') && bytes.len() >= 2 && bytes[bytes.len() - 1] == first {
+        return Some(expr[1..expr.len() - 1].to_string());
+    }
+    None
+}
+
+/// If `expr` is a `<name>('literal')` or `<name>()` call, return the inner
+/// literal (the empty string for the no-arg form). `None` when `expr` isn't
+/// that helper or its argument isn't a static string.
+fn helper_call(expr: &str, name: &str) -> Option<String> {
+    let rest = expr.strip_prefix(name)?.trim_start();
+    let inner = rest.strip_prefix('(')?.strip_suffix(')')?.trim();
+    if inner.is_empty() {
+        return Some(String::new());
+    }
+    parse_literal(inner)
+}
+
+/// Resolve a `Folio::path(...)` argument to an absolute mount directory that is
+/// guaranteed to stay under `root`. Handles the bare string literal and the
+/// `resource_path('...')` / `base_path('...')` helper-wrapped forms that
+/// `php artisan folio:install` scaffolds.
+///
+/// Returns `None` when the argument isn't a static path, or when it resolves
+/// outside the project: Folio mounts are walked and every `.blade.php` beneath
+/// them is read into the route index, so a mount escaping the opened project
+/// (`Folio::path('/etc')`, `Folio::path('../../x')`) is a path-traversal vector
+/// and is refused. Mirrors the containment convention in
+/// [`crate::route_discovery`]'s `resolve_path_argument`.
+fn resolve_folio_path(expr: &str, root: &Path) -> Option<PathBuf> {
+    let expr = expr.trim();
+    let candidate = if let Some(sub) = helper_call(expr, "resource_path") {
+        root.join("resources").join(sub.trim_start_matches('/'))
+    } else if let Some(sub) = helper_call(expr, "base_path") {
+        root.join(sub.trim_start_matches('/'))
+    } else {
+        let literal = parse_literal(expr)?;
+        let p = Path::new(&literal);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        }
+    };
+
+    let normalized = normalize_path(&candidate);
+    normalized
+        .starts_with(normalize_path(root))
+        .then_some(normalized)
 }
 
 /// Derive a Folio route URI from a page path relative to its mount directory
@@ -221,6 +329,42 @@ pub fn extract_page_name(content: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The fully-qualified route name a Folio page declares, IF the cursor at
+/// (`line`, `character`) sits on the page's `name('...')` helper call.
+///
+/// Powers find-references and rename triggered from *inside* a Folio page: the
+/// page lives outside `routes/` and its bare `name(...)` helper isn't tagged by
+/// the PHP parser, so without this the request resolves to nothing. The
+/// returned name carries the mount's `->name(...)` prefix, matching what the
+/// route index is keyed by — so it reaches every `route('...')` usage. Returns
+/// `None` when the file isn't a named Folio page or the cursor isn't on its
+/// `name(...)` call.
+pub fn folio_name_at(root: &Path, file: &Path, line: u32, character: u32) -> Option<String> {
+    let normalized = normalize_path(file);
+    let name = discover_folio_routes(root)
+        .into_iter()
+        .find(|r| normalize_path(&r.file) == normalized)
+        .and_then(|r| r.name)?;
+
+    let content = std::fs::read_to_string(file).ok()?;
+    let (name_line, start_col, end_col) = page_name_span(&content)?;
+    (line == name_line && character >= start_col && character <= end_col).then_some(name)
+}
+
+/// Source span of a Folio page's `name('...')` argument string, including the
+/// surrounding quotes, as `(line, start_column, end_column)`. Used to decide
+/// whether a cursor is on the call. `None` when the page declares no name.
+fn page_name_span(content: &str) -> Option<(u32, u32, u32)> {
+    let inner = PAGE_NAME_RE.captures(content)?.get(1)?;
+    // Widen one byte each side to cover the enclosing quotes.
+    let start = inner.start().saturating_sub(1);
+    let end = (inner.end() + 1).min(content.len());
+    let start_pos = crate::query_chain::byte_offset_to_position(content, start);
+    let end_pos = crate::query_chain::byte_offset_to_position(content, end);
+    // The `name('...')` argument is single-line; anchor to its start line.
+    Some((start_pos.line, start_pos.character, end_pos.character))
+}
+
 /// Discover every Folio page across the project's mounts and resolve it to a
 /// [`FolioRoute`]. Returns an empty vector when the project doesn't use Folio.
 pub fn discover_folio_routes(root: &Path) -> Vec<FolioRoute> {
@@ -235,6 +379,9 @@ pub fn discover_folio_routes(root: &Path) -> Vec<FolioRoute> {
         }
         for entry in WalkDir::new(&mount.directory)
             .max_depth(12)
+            // Don't traverse symlinks: a link out of the mount would otherwise
+            // let the walk read `.blade.php` files outside the opened project.
+            .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_file())
