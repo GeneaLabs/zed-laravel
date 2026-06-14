@@ -4790,11 +4790,18 @@ impl LaravelLanguageServer {
     /// editor buffer or disk asynchronously. So this find-references / rename hot
     /// path never blocks a Tokio worker thread on a synchronous project walk
     /// (the walk happens at most once, inside `spawn_blocking`, when the index is
-    /// built). Containment is structural: the file text is read only after the
-    /// index match succeeds, and the index holds only mounts that stayed under
-    /// the project root, so an out-of-tree page is never read here. Returns
-    /// `None` when the file isn't a named Folio page or the cursor isn't on its
-    /// `name(...)` call.
+    /// built).
+    ///
+    /// Containment is enforced explicitly: after the index name lookup the page
+    /// path is checked against the project root (`self.root_path`, compared
+    /// lexically with `normalize_path` — the same check
+    /// `folio_discovery::resolve_folio_path` applies) and an out-of-tree page
+    /// returns `None` *before* any disk read. The index already holds only
+    /// contained mounts, so this guard is defense in depth: it keeps the disk
+    /// read unreachable for out-of-root paths even if a future discovery path
+    /// ever seeded the index without that structural guarantee. Returns `None`
+    /// when the file isn't a named Folio page, the cursor isn't on its
+    /// `name(...)` call, or the path escapes the project root.
     async fn folio_route_name_for_cursor(
         &self,
         file_path: &Path,
@@ -4804,6 +4811,14 @@ impl LaravelLanguageServer {
             let guard = self.route_index.read().await;
             laravel_lsp::folio_discovery::folio_name_for_file(guard.as_ref()?, file_path)?
         };
+        // Defense-in-depth containment guard: refuse to read a page that sits
+        // outside the project root, even if the index were ever seeded with one.
+        // Checked lexically with `normalize_path` (matching `resolve_folio_path`)
+        // before any disk access, so an out-of-tree path never reaches the read.
+        let root = self.root_path.read().await.clone()?;
+        if !normalize_path(file_path).starts_with(normalize_path(&root)) {
+            return None;
+        }
         let uri = Url::from_file_path(file_path).ok()?;
         let content = self.document_or_disk_content(&uri, file_path).await?;
         laravel_lsp::folio_discovery::cursor_on_page_name(
