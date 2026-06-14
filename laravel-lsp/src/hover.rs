@@ -210,6 +210,124 @@ pub fn magic_member_card(
     })
 }
 
+// ============================================================================
+// Curated helper-function hover (#58)
+// ============================================================================
+
+/// A curated hover card for one Laravel global helper function.
+///
+/// The seven curated helpers are exactly those whose framework `helpers.php`
+/// docblock is thin or generic, so a Laravel-aware synopsis adds value over
+/// what Intelephense already shows. Keeping the set narrow IS the dedup policy:
+/// every other helper is simply never indexed, so we never emit a duplicate
+/// card — no runtime Intelephense detection needed.
+#[derive(Debug, Clone, Copy)]
+pub struct HelperCard {
+    /// One-line, Laravel-aware synopsis (the hover's detail line).
+    pub synopsis: &'static str,
+    /// Path, relative to the workspace root, of the framework file that DEFINES
+    /// this helper. All seven curated helpers live in Foundation's `helpers.php`
+    /// (`Support/helpers.php` holds the lower-level `collect`/`str`/… helpers).
+    /// Used to build the `file://` source link when the framework is vendored.
+    pub vendor_path: &'static str,
+    /// Canonical laravel.com docs anchor — the source-link fallback used when
+    /// the framework file above isn't present under the workspace root.
+    pub docs_url: &'static str,
+}
+
+/// All seven curated framework helpers live in this one file.
+const FOUNDATION_HELPERS: &str = "vendor/laravel/framework/src/Illuminate/Foundation/helpers.php";
+
+/// The curated allow-list of Laravel helper identifiers we provide hover cards
+/// for, keyed by helper name. This is the canonical allow-list; the `#any-of?`
+/// predicate in `queries/php.scm` mirrors it as a parse-time pre-filter.
+pub static HELPER_CARDS: &[(&str, HelperCard)] = &[
+    (
+        "route",
+        HelperCard {
+            synopsis: "Generate a URL for a named route.",
+            vendor_path: FOUNDATION_HELPERS,
+            docs_url: "https://laravel.com/docs/helpers#method-route",
+        },
+    ),
+    (
+        "view",
+        HelperCard {
+            synopsis: "Get the evaluated view contents for the given view.",
+            vendor_path: FOUNDATION_HELPERS,
+            docs_url: "https://laravel.com/docs/helpers#method-view",
+        },
+    ),
+    (
+        "config",
+        HelperCard {
+            synopsis: "Get / set the value of a configuration variable.",
+            vendor_path: FOUNDATION_HELPERS,
+            docs_url: "https://laravel.com/docs/helpers#method-config",
+        },
+    ),
+    (
+        "auth",
+        HelperCard {
+            synopsis: "Get the available auth guard / authenticator instance.",
+            vendor_path: FOUNDATION_HELPERS,
+            docs_url: "https://laravel.com/docs/helpers#method-auth",
+        },
+    ),
+    (
+        "app",
+        HelperCard {
+            synopsis: "Get the container instance, or resolve a binding from it.",
+            vendor_path: FOUNDATION_HELPERS,
+            docs_url: "https://laravel.com/docs/helpers#method-app",
+        },
+    ),
+    (
+        "session",
+        HelperCard {
+            synopsis: "Get / set a session value, or the session store instance.",
+            vendor_path: FOUNDATION_HELPERS,
+            docs_url: "https://laravel.com/docs/helpers#method-session",
+        },
+    ),
+    (
+        "cache",
+        HelperCard {
+            synopsis: "Get / set a cache value, or the cache store instance.",
+            vendor_path: FOUNDATION_HELPERS,
+            docs_url: "https://laravel.com/docs/helpers#method-cache",
+        },
+    ),
+];
+
+/// Look up the curated card for a helper name. `None` for anything outside the
+/// allow-list (the caller then renders no card).
+pub fn helper_card(name: &str) -> Option<&'static HelperCard> {
+    HELPER_CARDS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, card)| card)
+}
+
+/// Build a hover card for a curated Laravel helper identifier (`route`, `view`,
+/// `config`, …). `header` is the function name, `detail` the curated synopsis
+/// (both from [`HELPER_CARDS`]). `source_link` is the pre-resolved markdown link
+/// — built caller-side because it needs the workspace root to decide between a
+/// `file://` link into the vendored framework `helpers.php` and the docs-URL
+/// fallback.
+///
+/// Returns `None` when `name` isn't in the curated allow-list, so the caller
+/// renders nothing (the structural dedup policy — Intelephense owns the rest).
+pub fn helper_identifier_card(name: &str, source_link: Option<&str>) -> Option<String> {
+    let card = helper_card(name)?;
+    Some(render(&HoverContent {
+        header: Some(name),
+        detail: Some(card.synopsis),
+        source_link,
+        ..Default::default()
+    }))
+}
+
 /// The declaring method names a magic-member usage name could map to, by kind.
 /// Relationships/finders are accessed under their method name verbatim
 /// (`$user->account` ← `account()`); scopes and accessors transform

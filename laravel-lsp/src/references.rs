@@ -102,10 +102,13 @@ pub fn classify_pattern_at_cursor(
         // Patterns that don't yet participate in cross-file references.
         // `MemberAccess` is captured (M2) but not yet resolved/classified —
         // it gets armed for find-references in M4.
+        // `HelperIdentifier` is a hover-only feature (#58) — no cross-file
+        // rename / find-references participation.
         PatternAtPosition::Asset(_)
         | PatternAtPosition::Url(_)
         | PatternAtPosition::Action(_)
         | PatternAtPosition::Feature(_)
+        | PatternAtPosition::HelperIdentifier(_)
         | PatternAtPosition::MemberAccess(_) => None,
     }
 }

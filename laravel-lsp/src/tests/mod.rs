@@ -7,6 +7,7 @@ mod code_lens_opt_in;
 mod diagnostic_severity;
 mod dynamic_where_sparseness;
 mod generic_type_parsing;
+mod helper_identifier_hover;
 mod livewire_component_resolution;
 mod loop_variable_resolution;
 mod rename_integration;

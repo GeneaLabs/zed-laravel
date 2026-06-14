@@ -381,3 +381,67 @@ fn magic_member_card_without_link_omits_source_section() {
         "**Database column**\n\n`email` on `App\\Models\\User`\n\nType `string`"
     );
 }
+
+// ============================================================================
+// helper-function hover (#58) — curated allow-list + card rendering
+// ============================================================================
+
+#[test]
+fn helper_card_covers_exactly_the_seven_curated_helpers() {
+    for name in ["route", "view", "config", "auth", "app", "session", "cache"] {
+        assert!(
+            helper_card(name).is_some(),
+            "`{name}` should be in the curated allow-list"
+        );
+    }
+    assert_eq!(HELPER_CARDS.len(), 7, "exactly seven curated helpers");
+    // Non-curated helpers are Intelephense's job — never carded.
+    for name in ["bcrypt", "abort", "collect", "str", "dd", "tap"] {
+        assert!(
+            helper_card(name).is_none(),
+            "`{name}` must not be in the curated allow-list"
+        );
+    }
+}
+
+#[test]
+fn helper_card_synopsis_and_links_are_populated() {
+    for (name, card) in HELPER_CARDS {
+        assert!(!card.synopsis.is_empty(), "{name} needs a synopsis");
+        assert!(
+            card.docs_url.starts_with("https://laravel.com/docs/"),
+            "{name} docs_url should be a canonical laravel.com anchor"
+        );
+        assert!(
+            card.vendor_path.ends_with("helpers.php"),
+            "{name} vendor_path should point at a framework helpers.php"
+        );
+    }
+}
+
+#[test]
+fn helper_identifier_card_renders_header_detail_and_link() {
+    let link = "[Laravel documentation](https://laravel.com/docs/helpers#method-route)";
+    let out = helper_identifier_card("route", Some(link)).expect("curated helper");
+    assert_eq!(
+        out,
+        format!("**route**\n\nGenerate a URL for a named route.\n\n{link}")
+    );
+}
+
+#[test]
+fn helper_identifier_card_omits_link_section_when_absent() {
+    let out = helper_identifier_card("config", None).expect("curated helper");
+    assert_eq!(
+        out,
+        "**config**\n\nGet / set the value of a configuration variable."
+    );
+}
+
+#[test]
+fn helper_identifier_card_is_none_for_non_curated_helper() {
+    assert!(
+        helper_identifier_card("bcrypt", None).is_none(),
+        "non-curated helpers render no card"
+    );
+}

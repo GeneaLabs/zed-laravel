@@ -29,9 +29,9 @@ use crate::queries::{
 use crate::salsa_impl::{
     ActionReferenceData, AssetHelperType, AssetReferenceData, BindingReferenceData,
     ComponentReferenceData, Confidence, ConfigReferenceData, DirectiveReferenceData,
-    EnvReferenceData, FeatureReferenceData, LivewireReferenceData, MemberAccessReferenceData,
-    MiddlewareReferenceData, ParsedPatternsData, RouteReferenceData, TranslationReferenceData,
-    UrlReferenceData, ViewReferenceData,
+    EnvReferenceData, FeatureReferenceData, HelperReferenceData, LivewireReferenceData,
+    MemberAccessReferenceData, MiddlewareReferenceData, ParsedPatternsData, RouteReferenceData,
+    TranslationReferenceData, UrlReferenceData, ViewReferenceData,
 };
 
 /// Parse a file and return its `ParsedPatternsData` directly. Detects Blade
@@ -267,6 +267,15 @@ fn push_php_patterns(
         let (line, col, end_col) = xform(r.row, r.column, r.end_column);
         data.route_refs.push(Arc::new(RouteReferenceData {
             name: r.route_name.to_string(),
+            line,
+            column: col,
+            end_column: end_col,
+        }));
+    }
+    for h in &snippet.helper_identifiers {
+        let (line, col, end_col) = xform(h.row, h.column, h.end_column);
+        data.helper_refs.push(Arc::new(HelperReferenceData {
+            name: h.name.to_string(),
             line,
             column: col,
             end_column: end_col,

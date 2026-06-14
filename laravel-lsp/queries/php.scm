@@ -2271,3 +2271,28 @@
 
 (scoped_call_expression
   name: (name) @scoped_call_name)
+
+; ============================================================================
+; Pattern 42: Curated Laravel helper-function IDENTIFIERS (hover on the name)
+; ============================================================================
+; Matches the FUNCTION-NAME token of a curated global helper call — `route` in
+; route('home'), `config` in config('app.name'), `auth` in auth(), etc. This is
+; the identifier span, NOT the string argument (that is captured by the
+; pattern-specific rules above). Both fire on the same call; their column ranges
+; are disjoint, so the cursor position selects the right one at hover time.
+;
+; The allow-list is the seven helpers whose framework docblock is thin/generic
+; and where a Laravel-aware card adds value (#58). Keeping the set narrow IS the
+; dedup policy — everything else is left to Intelephense, never indexed, so no
+; runtime duplicate-card detection is needed. The canonical allow-list lives in
+; `hover::HELPER_CARDS`; this query mirrors it as a parse-time pre-filter.
+;
+; Bare `(name)` only — `$obj->route()` (member_call_expression) and
+; `Route::route()` (scoped_call_expression) are different node kinds and never
+; match here. No `arguments:` constraint, so arg-less forms like `auth()` and
+; `app()` are captured alongside `cache('key')` / `session('k')`.
+
+(function_call_expression
+  function: (name) @helper_identifier
+  (#any-of? @helper_identifier
+    "route" "view" "config" "auth" "app" "session" "cache"))

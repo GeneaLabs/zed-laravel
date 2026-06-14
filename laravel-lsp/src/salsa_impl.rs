@@ -2530,6 +2530,19 @@ pub struct UrlReferenceData {
     pub end_column: u32,
 }
 
+/// Curated-helper-identifier reference data for transfer across async
+/// boundaries. `name` is one of the seven curated global helpers (`route`,
+/// `view`, `config`, `auth`, `app`, `session`, `cache`); the position spans the
+/// function-NAME token (`route` in `route('home')`), not its string argument.
+/// Drives the Laravel-aware helper hover card (#58).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HelperReferenceData {
+    pub name: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
 /// Action reference data for transfer across async boundaries
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ActionReferenceData {
@@ -3417,6 +3430,17 @@ pub struct ParsedPatternsData {
     pub asset_refs: Vec<Arc<AssetReferenceData>>,
     pub binding_refs: Vec<Arc<BindingReferenceData>>,
     pub route_refs: Vec<Arc<RouteReferenceData>>,
+    /// Curated Laravel helper-function identifiers (`route`, `view`, `config`,
+    /// `auth`, `app`, `session`, `cache`) at their name span — drives the
+    /// helper hover card (#58). Like `route_refs`, extracted in
+    /// `handle_get_patterns` rather than as a `ParsedPatterns` Salsa field
+    /// (that struct is at the 12-element tuple-Hash cap).
+    ///
+    /// `#[serde(default)]` so disk-cache entries written by older builds (which
+    /// lacked this field) deserialize with an empty list rather than failing
+    /// the whole entry; the next edit re-runs extraction and repopulates.
+    #[serde(default)]
+    pub helper_refs: Vec<Arc<HelperReferenceData>>,
     pub url_refs: Vec<Arc<UrlReferenceData>>,
     pub action_refs: Vec<Arc<ActionReferenceData>>,
     pub feature_refs: Vec<Arc<FeatureReferenceData>>,
@@ -3482,6 +3506,12 @@ pub enum PatternAtPosition {
     Asset(Arc<AssetReferenceData>),
     Binding(Arc<BindingReferenceData>),
     Route(Arc<RouteReferenceData>),
+    /// A curated global helper-function identifier (`route`, `view`, `config`,
+    /// `auth`, `app`, `session`, `cache`) under the cursor. Carries the helper
+    /// name (via `HelperReferenceData.name`, per the issue's `{ name }` intent)
+    /// plus the position the index and `pattern_range_at` need — matching the
+    /// `Arc<…ReferenceData>` shape every sibling variant uses.
+    HelperIdentifier(Arc<HelperReferenceData>),
     Url(Arc<UrlReferenceData>),
     Action(Arc<ActionReferenceData>),
     Feature(Arc<FeatureReferenceData>),
@@ -3591,6 +3621,15 @@ impl ParsedPatternsData {
                 column: route.column,
                 end_column: route.end_column,
                 pattern: PatternAtPosition::Route(route.clone()),
+            });
+        }
+
+        for helper in &self.helper_refs {
+            entries.push(PositionEntry {
+                line: helper.line,
+                column: helper.column,
+                end_column: helper.end_column,
+                pattern: PatternAtPosition::HelperIdentifier(helper.clone()),
             });
         }
 
@@ -6242,6 +6281,7 @@ impl SalsaActor {
 
         let text = file.text(&self.db);
         let mut route_refs = Vec::new();
+        let mut helper_refs: Vec<Arc<HelperReferenceData>> = Vec::new();
         let mut url_refs = Vec::new();
         let mut action_refs = Vec::new();
         let mut feature_refs = Vec::new();
@@ -6266,6 +6306,15 @@ impl SalsaActor {
                             line: r.row as u32,
                             column: r.column as u32,
                             end_column: r.end_column as u32,
+                        }));
+                    }
+
+                    for h in php_patterns.helper_identifiers {
+                        helper_refs.push(Arc::new(HelperReferenceData {
+                            name: h.name.to_string(),
+                            line: h.row as u32,
+                            column: h.column as u32,
+                            end_column: h.end_column as u32,
                         }));
                     }
 
@@ -6382,6 +6431,26 @@ impl SalsaActor {
                     );
                     route_refs.push(Arc::new(RouteReferenceData {
                         name: r.route_name.to_string(),
+                        line,
+                        column: col,
+                        end_column: end_col,
+                    }));
+                }
+                for h in snippet_patterns.helper_identifiers {
+                    let (line, col) = adjust_inner_position(
+                        h.row as u32,
+                        h.column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    let (_, end_col) = adjust_inner_position(
+                        h.row as u32,
+                        h.end_column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    helper_refs.push(Arc::new(HelperReferenceData {
+                        name: h.name.to_string(),
                         line,
                         column: col,
                         end_column: end_col,
@@ -6521,6 +6590,7 @@ impl SalsaActor {
             asset_refs,
             binding_refs,
             route_refs,
+            helper_refs,
             url_refs,
             action_refs,
             feature_refs,

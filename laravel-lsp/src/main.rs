@@ -16383,6 +16383,9 @@ return [
             PatternAtPosition::Component(comp) => self.hover_for_component(&comp.name).await,
             PatternAtPosition::Livewire(lw) => self.hover_for_livewire(&lw.name).await,
             PatternAtPosition::Route(route) => self.hover_for_route(&route.name).await,
+            PatternAtPosition::HelperIdentifier(helper) => {
+                self.hover_for_helper(&helper.name, root.as_deref()).await
+            }
             PatternAtPosition::ConfigRef(cfg) => {
                 self.hover_for_config(&cfg.key, root.as_deref()).await
             }
@@ -17379,6 +17382,38 @@ return [
         })
     }
 
+    /// Curated Laravel helper identifier (`route`, `view`, `config`, …) — a
+    /// Laravel-aware synopsis from [`hover::HELPER_CARDS`] plus a source link.
+    /// The link points into the vendored framework `helpers.php` when it exists
+    /// under the workspace root (a single existence stat — no vendor scan),
+    /// falling back to the canonical laravel.com docs anchor otherwise.
+    ///
+    /// Returns `""` for any name outside the curated allow-list, which the
+    /// parser never produces — the `helper_card` guard is purely defensive.
+    async fn hover_for_helper(&self, name: &str, root: Option<&Path>) -> String {
+        use laravel_lsp::hover;
+        let Some(card) = hover::helper_card(name) else {
+            return String::new();
+        };
+        // Prefer a file:// link into the vendored framework source; fall back to
+        // the docs URL when the framework isn't vendored under the workspace.
+        let vendored = match root {
+            Some(r) => {
+                let p = r.join(card.vendor_path);
+                tokio::fs::try_exists(&p)
+                    .await
+                    .unwrap_or(false)
+                    .then_some(p)
+            }
+            None => None,
+        };
+        let link = match vendored {
+            Some(p) => self.source_link(&p, None).await,
+            None => hover::source_link("Laravel documentation", card.docs_url, None),
+        };
+        hover::helper_identifier_card(name, Some(&link)).unwrap_or_default()
+    }
+
     /// Config — resolved value as a `php` code block, link to the
     /// `config/<group>.php` file.
     async fn hover_for_config(&self, key: &str, root: Option<&Path>) -> String {
@@ -17953,6 +17988,9 @@ fn pattern_range_at(
     let (l, start, end) = match pat {
         laravel_lsp::salsa_impl::PatternAtPosition::View(v) => (v.line, v.column, v.end_column),
         laravel_lsp::salsa_impl::PatternAtPosition::Route(r) => (r.line, r.column, r.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::HelperIdentifier(h) => {
+            (h.line, h.column, h.end_column)
+        }
         laravel_lsp::salsa_impl::PatternAtPosition::ConfigRef(c) => {
             (c.line, c.column, c.end_column)
         }
@@ -19709,6 +19747,12 @@ impl LanguageServer for LaravelLanguageServer {
             PatternAtPosition::Route(route) => {
                 debug!("Laravel: Found route: {}", route.name);
                 self.create_route_location_from_salsa(&route).await
+            }
+            // Curated helper identifiers are a hover-only feature (#58) — no
+            // goto target (the synopsis card carries a source link instead).
+            PatternAtPosition::HelperIdentifier(helper) => {
+                debug!("Laravel: Found helper identifier: {}", helper.name);
+                None
             }
             PatternAtPosition::Url(url) => {
                 debug!("Laravel: Found url: {}", url.path);

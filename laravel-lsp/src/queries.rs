@@ -292,6 +292,21 @@ pub struct RouteMatch<'a> {
     pub end_column: usize,
 }
 
+/// Represents the FUNCTION-NAME identifier of a curated Laravel helper call
+/// (`route` in `route('home')`, `config` in `config('app.name')`, …). Unlike
+/// [`RouteMatch`] / [`ConfigMatch`] — which capture the string ARGUMENT — this
+/// captures the identifier span so hover can fire on the helper name itself.
+/// Only the seven curated helpers (see `hover::HELPER_CARDS`) are matched.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HelperIdentifierMatch<'a> {
+    pub name: &'a str,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub row: usize,
+    pub column: usize,
+    pub end_column: usize,
+}
+
 /// Represents a matched url('path') call in PHP code
 #[derive(Debug, Clone, PartialEq)]
 pub struct UrlMatch<'a> {
@@ -393,6 +408,9 @@ pub struct ExtractedPhpPatterns<'a> {
     pub asset_calls: Vec<AssetMatch<'a>>,
     pub binding_calls: Vec<BindingMatch<'a>>,
     pub route_calls: Vec<RouteMatch<'a>>,
+    /// Curated Laravel helper-function identifiers (`route`, `view`, `config`,
+    /// `auth`, `app`, `session`, `cache`) captured at their name span for hover.
+    pub helper_identifiers: Vec<HelperIdentifierMatch<'a>>,
     pub url_calls: Vec<UrlMatch<'a>>,
     pub action_calls: Vec<ActionMatch<'a>>,
     pub feature_calls: Vec<FeatureMatch<'a>>,
@@ -806,6 +824,20 @@ pub fn extract_all_php_patterns<'a>(
                 });
             }
 
+            // Curated helper-function identifier (the name token, e.g. `route`
+            // in `route('home')`). The `#any-of?` predicate in php.scm has
+            // already restricted this to the seven curated helpers.
+            "helper_identifier" => {
+                result.helper_identifiers.push(HelperIdentifierMatch {
+                    name: text,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
             // URL patterns
             "url_path" => {
                 result.url_calls.push(UrlMatch {
@@ -977,6 +1009,7 @@ pub fn extract_all_php_patterns<'a>(
         + result.asset_calls.len()
         + result.binding_calls.len()
         + result.route_calls.len()
+        + result.helper_identifiers.len()
         + result.url_calls.len()
         + result.action_calls.len()
         + result.feature_calls.len()
