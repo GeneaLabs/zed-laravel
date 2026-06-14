@@ -151,6 +151,13 @@ fn parse_folio_mounts_rejects_traversal_paths() {
         Path::new("/app")
     )
     .is_empty());
+    // The `resource_path(...)` helper form is normalized + containment-checked
+    // too, so a `..` escape through it is rejected — not just `base_path`.
+    assert!(parse_folio_mounts(
+        "<?php Folio::path(resource_path('../../outside'));",
+        Path::new("/app")
+    )
+    .is_empty());
 }
 
 #[test]
@@ -392,25 +399,25 @@ fn injected_folio_route_points_at_the_page_as_declaration() {
 }
 
 #[test]
-fn folio_name_at_resolves_cursor_on_the_name_call() {
-    let dir = make_project(
-        DEFAULT_FOLIO_MOUNT,
-        &[("about.blade.php", "<?php name('about'); ?>")],
-    );
-    let page = dir.path().join(DEFAULT_FOLIO_MOUNT).join("about.blade.php");
-
+fn cursor_on_page_name_true_inside_the_call_false_outside() {
     // `<?php name('about'); ?>` — the `'about'` literal (with quotes) spans
-    // columns 11..=18 on line 0. A cursor inside it resolves to the name.
-    assert_eq!(
-        folio_name_at(dir.path(), &page, 0, 12),
-        Some("about".to_string())
-    );
-    // A cursor away from the `name(...)` call (column 0) resolves to nothing.
-    assert_eq!(folio_name_at(dir.path(), &page, 0, 0), None);
+    // columns 11..=18 on line 0. A cursor inside it is "on the call".
+    let content = "<?php name('about'); ?>";
+    assert!(cursor_on_page_name(content, 0, 12));
+    // A cursor away from the `name(...)` call (column 0) is not.
+    assert!(!cursor_on_page_name(content, 0, 0));
 }
 
 #[test]
-fn folio_name_at_applies_mount_name_prefix() {
+fn cursor_on_page_name_false_for_unnamed_page() {
+    // A page with no `name('...')` helper has no span to land on.
+    assert!(!cursor_on_page_name("<div>no name here</div>", 0, 0));
+}
+
+#[test]
+fn folio_name_for_file_resolves_from_the_index() {
+    // Build the in-memory index the same way the route-index build does, then
+    // recover a page's (mount-prefixed) route name straight from it — no walk.
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     fs::create_dir_all(root.join("app/Providers")).unwrap();
@@ -423,20 +430,40 @@ fn folio_name_at_applies_mount_name_prefix() {
     fs::create_dir_all(page.parent().unwrap()).unwrap();
     fs::write(&page, "<?php name('contact'); ?>").unwrap();
 
-    // The cursor sits on `'contact'`; the resolved name carries the mount's
-    // `->name('site.')` prefix, matching the route-index key.
+    let mut index = RouteIndex::new();
+    inject_folio_routes(root, &mut index);
+
+    // The resolved name carries the mount's `->name('site.')` prefix.
     assert_eq!(
-        folio_name_at(root, &page, 0, 13),
+        folio_name_for_file(&index, &page),
         Some("site.contact".to_string())
+    );
+    // A file with no entry in the index resolves to nothing.
+    assert_eq!(
+        folio_name_for_file(&index, &root.join("resources/views/folio/other.blade.php")),
+        None
     );
 }
 
 #[test]
-fn folio_name_at_none_for_unnamed_page() {
-    let dir = make_project(
-        DEFAULT_FOLIO_MOUNT,
-        &[("plain.blade.php", "<div>no name here</div>")],
+fn folio_name_for_file_ignores_conventional_non_blade_definition() {
+    // The reverse lookup only returns `.blade.php`-backed definitions, so a
+    // conventional route (a `routes/*.php` file) is never mistaken for a Folio
+    // page — even when it shadows a same-named page in the index.
+    let mut index = RouteIndex::new();
+    let conventional = PathBuf::from("/app/routes/web.php");
+    index.insert(
+        "dashboard".to_string(),
+        RouteDefinition {
+            file: conventional.clone(),
+            line: 4,
+            column: 0,
+            end_column: 10,
+            priority: PRIORITY_APP,
+            method: Some("get".to_string()),
+            uri: Some("/dashboard".to_string()),
+            action: None,
+        },
     );
-    let page = dir.path().join(DEFAULT_FOLIO_MOUNT).join("plain.blade.php");
-    assert_eq!(folio_name_at(dir.path(), &page, 0, 0), None);
+    assert_eq!(folio_name_for_file(&index, &conventional), None);
 }

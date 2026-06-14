@@ -329,26 +329,44 @@ pub fn extract_page_name(content: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The fully-qualified route name a Folio page declares, IF the cursor at
-/// (`line`, `character`) sits on the page's `name('...')` helper call.
+/// The fully-qualified route name a `.blade.php` Folio page owns in `index`, if
+/// any. A reverse lookup of the in-memory route index that
+/// [`inject_folio_routes`] populated during the route-index build: it finds the
+/// entry whose definition file is this page. Folio pages are the only
+/// `.blade.php`-backed route definitions, so the suffix filter isolates them
+/// from a same-named conventional route that shadows the page (keep-first
+/// insertion keeps the conventional entry, whose file is a `routes/*.php`).
+///
+/// Find-references / rename use this to resolve a page's route name straight
+/// from the already-built index instead of re-walking the project filesystem on
+/// every request — the walk happened once, inside `spawn_blocking`, when the
+/// index was built ([`crate::route_discovery::build_route_index`]). The returned
+/// name carries the mount's `->name(...)` prefix, since that's the key the index
+/// is stored under, so it reaches every `route('...')` usage of the page.
+pub fn folio_name_for_file(index: &RouteIndex, file: &Path) -> Option<String> {
+    let normalized = normalize_path(file);
+    index.routes.iter().find_map(|(name, def)| {
+        (def.file.to_str().is_some_and(|s| s.ends_with(".blade.php"))
+            && normalize_path(&def.file) == normalized)
+            .then(|| name.clone())
+    })
+}
+
+/// Whether the cursor at (`line`, `character`) sits on a Folio page's own
+/// `name('...')` helper call (the argument string, quotes included).
 ///
 /// Powers find-references and rename triggered from *inside* a Folio page: the
 /// page lives outside `routes/` and its bare `name(...)` helper isn't tagged by
-/// the PHP parser, so without this the request resolves to nothing. The
-/// returned name carries the mount's `->name(...)` prefix, matching what the
-/// route index is keyed by — so it reaches every `route('...')` usage. Returns
-/// `None` when the file isn't a named Folio page or the cursor isn't on its
-/// `name(...)` call.
-pub fn folio_name_at(root: &Path, file: &Path, line: u32, character: u32) -> Option<String> {
-    let normalized = normalize_path(file);
-    let name = discover_folio_routes(root)
-        .into_iter()
-        .find(|r| normalize_path(&r.file) == normalized)
-        .and_then(|r| r.name)?;
-
-    let content = std::fs::read_to_string(file).ok()?;
-    let (name_line, start_col, end_col) = page_name_span(&content)?;
-    (line == name_line && character >= start_col && character <= end_col).then_some(name)
+/// the PHP parser, so the caller pairs this with [`folio_name_for_file`] to
+/// recover the route name. Pure over `content` — no filesystem access — so the
+/// caller decides how to source the page text (editor buffer or disk).
+pub fn cursor_on_page_name(content: &str, line: u32, character: u32) -> bool {
+    match page_name_span(content) {
+        Some((name_line, start_col, end_col)) => {
+            line == name_line && character >= start_col && character <= end_col
+        }
+        None => false,
+    }
 }
 
 /// Source span of a Folio page's `name('...')` argument string, including the
