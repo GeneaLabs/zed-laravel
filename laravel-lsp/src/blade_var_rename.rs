@@ -36,7 +36,9 @@
 
 use tree_sitter::Node;
 
-use crate::blade_loops::find_loop_blocks;
+use crate::blade_loops::{
+    find_loop_blocks, unbalanced_loop_head_lines, BladeLoopBlock, BladeLoopType,
+};
 use crate::parser::parse_php;
 
 /// A 0-based span of an identifier name to rewrite. `start_col`..`end_col`
@@ -169,6 +171,14 @@ pub fn is_template_variable(source: &str, name: &str) -> bool {
     if !is_valid_identifier(name) {
         return false;
     }
+    // `$loop` is Blade's reserved loop-status variable, injected inside every
+    // `@foreach`/`@forelse`/`@for`/`@while` body — it never appears in a header,
+    // so it has no resolvable binding scope and a rename would clobber every
+    // `$loop` across unrelated loops. Renaming it is also semantically always
+    // wrong (the name is framework-defined). Refuse at the prepare gate.
+    if name == "loop" {
+        return false;
+    }
     let pattern = match regex::Regex::new(&format!(r"\${}\b", regex::escape(name))) {
         Ok(re) => re,
         Err(_) => return false,
@@ -251,7 +261,24 @@ pub fn in_scope_spans(source: &str, name: &str, cursor_line: u32) -> Vec<VarSpan
         return all;
     }
 
-    let binding_blocks = loop_binding_ranges(source, name);
+    // Fail-closed: a rename whose cursor sits in an *unresolved* loop region —
+    // an opaque loop (binding unparseable) or below a broken (unbalanced-paren)
+    // loop header — is refused rather than risk a file-wide clobber. Safe over
+    // complete, mirroring the `global`/`compact` refusals in the PHP engine.
+    let unresolved = unresolved_loop_ranges(source);
+    if range_contains_line(&unresolved, cursor_line) {
+        return Vec::new();
+    }
+
+    // Loop blocks are resolved over the comment/`@verbatim`-masked copy, exactly
+    // like `variable_spans`. Without this, a `@foreach` inside a `{{-- --}}`
+    // comment is a phantom binding block, and a paren inside such a comment
+    // desyncs the header parse — both collapse the scope and clobber the file.
+    let binding_blocks: Vec<(u32, u32)> = find_loop_blocks(&mask_non_code(source))
+        .iter()
+        .filter(|b| b.variables.iter().any(|(v, _)| v == name))
+        .map(block_range)
+        .collect();
 
     // The cursor's binding scope: the innermost (largest start_line) binding
     // block that contains the cursor line. `None` ⇒ file scope.
@@ -272,49 +299,97 @@ pub fn in_scope_spans(source: &str, name: &str, cursor_line: u32) -> Vec<VarSpan
                     }
                     !in_nested_shadow(span.line, (start, end), &binding_blocks)
                 }
-                // File-scoped: keep every span EXCEPT those that belong to a
-                // loop block that binds `name` (a separate scope).
-                None => !binding_blocks
-                    .iter()
-                    .any(|(start, end)| span.line >= *start && span.line <= *end),
+                // File-scoped: keep every span EXCEPT those inside a loop that
+                // re-binds `name` (a distinct scope) or inside an unresolved
+                // loop region (whose scope is unknown — never clobber into it).
+                None => {
+                    !range_contains_line(&binding_blocks, span.line)
+                        && !range_contains_line(&unresolved, span.line)
+                }
             }
         })
         .collect()
 }
 
 /// File-scoped variable spans: every `$name` occurrence EXCEPT those inside a
-/// loop block that re-binds `name`. This is the set a controller→view rename
-/// rewrites in the template — a controller-passed variable is file-scoped, but
-/// must never clobber a loop's same-named iteration variable (a distinct
-/// scope). Equivalent to [`in_scope_spans`] for a cursor that sits outside
-/// every binding block.
+/// loop block that re-binds `name` (a distinct scope) or an unresolved loop
+/// region (an opaque loop or a broken header — never clobber into one). This is
+/// the set a controller→view rename rewrites in the template — a
+/// controller-passed variable is file-scoped, but must never clobber a loop's
+/// same-named iteration variable. Equivalent to [`in_scope_spans`] for a cursor
+/// that sits outside every binding block.
 pub fn file_scope_spans(source: &str, name: &str) -> Vec<VarSpan> {
     let all = variable_spans(source, name);
     if all.is_empty() {
         return all;
     }
-    let binding_blocks = loop_binding_ranges(source, name);
+    let mut exclude: Vec<(u32, u32)> = find_loop_blocks(&mask_non_code(source))
+        .iter()
+        .filter(|b| b.variables.iter().any(|(v, _)| v == name))
+        .map(block_range)
+        .collect();
+    exclude.extend(unresolved_loop_ranges(source));
     all.into_iter()
-        .filter(|span| {
-            !binding_blocks
-                .iter()
-                .any(|(start, end)| span.line >= *start && span.line <= *end)
-        })
+        .filter(|span| !range_contains_line(&exclude, span.line))
         .collect()
 }
 
-/// Inclusive `[start_line, end_line]` ranges of every loop block that binds a
-/// variable named `name`. An unclosed loop extends to `u32::MAX`.
-fn loop_binding_ranges(source: &str, name: &str) -> Vec<(u32, u32)> {
-    find_loop_blocks(source)
+/// Inclusive `[start_line, end_line]` range of a loop block. An unclosed loop
+/// extends to `u32::MAX`.
+fn block_range(b: &BladeLoopBlock) -> (u32, u32) {
+    let start = b.start_line as u32;
+    let end = b.end_line.map(|e| e as u32).unwrap_or(u32::MAX);
+    (start, end)
+}
+
+/// A `@foreach`/`@forelse` whose binding yielded no variable — a header the
+/// parser couldn't resolve (a garbled or commented binding, an unsupported
+/// destructuring shape). Such a loop's scope is unknown, so a rename touching it
+/// must fail closed. `@for`/`@while` legitimately bind nothing (`@for(;;)`,
+/// `@while($cond)`), so they are never opaque.
+fn is_opaque_loop(b: &BladeLoopBlock) -> bool {
+    matches!(b.loop_type, BladeLoopType::Foreach | BladeLoopType::Forelse) && b.variables.is_empty()
+}
+
+/// Whether `line` falls within any of the inclusive `[start, end]` ranges.
+fn range_contains_line(ranges: &[(u32, u32)], line: u32) -> bool {
+    ranges
         .iter()
-        .filter(|b| b.variables.iter().any(|(v, _)| v == name))
-        .map(|b| {
-            let start = b.start_line as u32;
-            let end = b.end_line.map(|e| e as u32).unwrap_or(u32::MAX);
-            (start, end)
-        })
-        .collect()
+        .any(|(start, end)| line >= *start && line <= *end)
+}
+
+/// Inclusive line ranges where loop scope is *unresolved*, so a rename must fail
+/// closed rather than guess. Two sources:
+/// - **Opaque loops** — a `@foreach`/`@forelse` whose binding the parser
+///   couldn't resolve into any `$ident` (a garbled or commented binding, an
+///   unsupported destructuring shape). Range = the block.
+/// - **Broken headers** — a loop directive whose parentheses never balance
+///   (e.g. a missing `)`). [`find_loop_blocks`] can't form a block and the
+///   scope structure below it is unreliable, so the range runs to EOF.
+///
+/// Computed over the comment/`@verbatim`-masked copy, so a paren or `@foreach`
+/// inside a comment never counts. A rename whose cursor sits in one of these is
+/// refused; a file-scoped rename never rewrites occurrences inside one.
+fn unresolved_loop_ranges(source: &str) -> Vec<(u32, u32)> {
+    let masked = mask_non_code(source);
+    let mut ranges: Vec<(u32, u32)> = find_loop_blocks(&masked)
+        .iter()
+        .filter(|b| is_opaque_loop(b))
+        .map(block_range)
+        .collect();
+    for line in unbalanced_loop_head_lines(&masked) {
+        ranges.push((line as u32, u32::MAX));
+    }
+    ranges
+}
+
+/// Whether `cursor_line` sits in an unresolved loop region — an opaque loop or
+/// below a broken loop header (see [`unresolved_loop_ranges`]). A rename there
+/// would risk a file-wide clobber, so it is refused. Backs the `prepare_rename`
+/// gate so F2 is never offered there; [`in_scope_spans`] enforces the same
+/// refusal on the edit path.
+pub fn cursor_in_unresolved_loop(source: &str, cursor_line: u32) -> bool {
+    range_contains_line(&unresolved_loop_ranges(source), cursor_line)
 }
 
 /// True if `line` falls inside a binding block that is strictly nested within

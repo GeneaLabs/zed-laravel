@@ -189,6 +189,166 @@ fn file_scoped_var_skips_multiline_loop_directive() {
     );
 }
 
+#[test]
+fn foreach_destructuring_binding_scopes_to_the_loop() {
+    // Array destructuring binds `$a` inside the loop; renaming it stays
+    // loop-scoped and never touches the file-level `$a` on lines 0 and 4.
+    let src = "\
+{{ $a }}
+@foreach ($pairs as [$a, $b])
+    {{ $a }}: {{ $b }}
+@endforeach
+{{ $a }}";
+    let spans = in_scope_spans(src, "a", 2);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    assert_eq!(
+        lines,
+        vec![1, 2],
+        "destructured binding + body, not file 0/4"
+    );
+}
+
+#[test]
+fn foreach_by_reference_binding_scopes_to_the_loop() {
+    // By-reference binding `&$item` is recovered; rename stays loop-scoped.
+    let src = "\
+{{ $item }}
+@foreach ($items as &$item)
+    {{ $item }}
+@endforeach
+{{ $item }}";
+    let spans = in_scope_spans(src, "item", 2);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    assert_eq!(lines, vec![1, 2]);
+}
+
+#[test]
+fn commented_out_loop_does_not_create_a_phantom_binding_block() {
+    // A `@foreach` inside a `{{-- --}}` comment must not register as a binding
+    // block. Loop detection runs over the masked copy (like variable_spans), so
+    // the commented loop is invisible and a file-scoped rename of `$item`
+    // touches the file-level occurrences only — the real loop (lines 2–4) is
+    // excluded as a re-binding scope, the commented one contributes nothing.
+    let src = "\
+{{-- @foreach ($x as $item) --}}
+{{ $item }}
+@foreach ($real as $item)
+    {{ $item }}
+@endforeach
+{{ $item }}";
+    let spans = in_scope_spans(src, "item", 1);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    assert_eq!(
+        lines,
+        vec![1, 5],
+        "file-level only; no phantom block from the comment"
+    );
+}
+
+#[test]
+fn opaque_loop_refuses_rename_rather_than_clobbering() {
+    // A PHP block comment inside the header desyncs the paren scan, so the
+    // binding can't be resolved — an opaque loop. A rename whose cursor sits
+    // inside it is refused (no spans) rather than falling through to the
+    // file-scope arm and clobbering every `$user`. `cursor_in_unresolved_loop`
+    // gates prepare_rename identically.
+    let src = "\
+{{ $user }}
+@foreach ($users /* :) */ as $user)
+    {{ $user }}
+@endforeach
+{{ $user }}";
+    assert!(
+        cursor_in_unresolved_loop(src, 2),
+        "cursor is inside the opaque loop"
+    );
+    assert!(
+        in_scope_spans(src, "user", 2).is_empty(),
+        "rename refused inside an opaque loop"
+    );
+}
+
+#[test]
+fn broken_loop_header_refuses_rename_rather_than_clobbering() {
+    // A loop header whose parens never close is broken Blade that forms no
+    // block at all — so the opaque-loop backstop alone wouldn't catch it. The
+    // scope below it is unreliable, so a rename there is refused (cursor inside
+    // the unresolved region) rather than clobbering every `$user` file-wide.
+    let src = "\
+{{ $user }}
+@foreach ($users as $user
+    {{ $user->name }}
+@endforeach
+{{ $user }}";
+    assert!(
+        cursor_in_unresolved_loop(src, 2),
+        "cursor is below a broken loop header"
+    );
+    assert!(
+        in_scope_spans(src, "user", 2).is_empty(),
+        "rename refused below a broken header"
+    );
+}
+
+#[test]
+fn blade_comment_inside_a_multiline_header_still_scopes() {
+    // A `{{-- --}}` comment inside a wrapped header is masked before loop
+    // detection, so the binding is recovered and the rename stays loop-scoped
+    // (rewritten correctly, NOT refused and NOT clobbered). Before masking, the
+    // `)` inside the comment desynced the paren scan and clobbered the file.
+    let src = "\
+{{ $user }}
+@foreach ($users
+    {{-- pick the active ones :) --}}
+    as $user)
+    {{ $user->name }}
+@endforeach
+{{ $user }}";
+    let spans = in_scope_spans(src, "user", 4);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    assert_eq!(
+        lines,
+        vec![3, 4],
+        "binding line + body, comment masked away"
+    );
+}
+
+#[test]
+fn file_scoped_rename_skips_an_opaque_loop() {
+    // A file-scoped rename (cursor outside any loop) must not clobber INTO an
+    // opaque loop whose scope is unknown — those occurrences are left alone.
+    let src = "\
+{{ $user }}
+@foreach ($users /* :) */ as $user)
+    {{ $user }}
+@endforeach
+{{ $user }}";
+    let spans = in_scope_spans(src, "user", 0);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    assert_eq!(
+        lines,
+        vec![0, 4],
+        "file-level occurrences only, opaque loop skipped"
+    );
+}
+
+#[test]
+fn loop_magic_variable_is_not_renameable() {
+    // `$loop` is Blade-injected, never in a header, and renaming it would
+    // clobber across unrelated loops — refused at the prepare gate.
+    let src = "\
+@foreach ($users as $user)
+    {{ $loop->index }}
+@endforeach
+@foreach ($posts as $post)
+    {{ $loop->index }}
+@endforeach";
+    assert!(
+        !is_template_variable(src, "loop"),
+        "$loop is reserved and not renameable"
+    );
+}
+
 // ── in_scope_spans: @forelse ────────────────────────────────────────────────
 
 #[test]

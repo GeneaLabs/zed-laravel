@@ -1,6 +1,6 @@
 use laravel_lsp::blade_loops::{
     find_loop_blocks, get_enclosing_loops, parse_for_variables, parse_foreach_iterable,
-    parse_foreach_variables, BladeLoopType,
+    parse_foreach_variables, unbalanced_loop_head_lines, BladeLoopType,
 };
 
 #[test]
@@ -25,6 +25,87 @@ fn test_parse_foreach_key_value() {
 fn test_parse_foreach_with_spaces() {
     let vars = parse_foreach_variables("( $users as $user )");
     assert_eq!(vars, vec![("user".to_string(), "mixed".to_string())]);
+}
+
+#[test]
+fn test_parse_foreach_list_destructuring() {
+    // Short-syntax array destructuring binds every name inside `[...]`.
+    let vars = parse_foreach_variables("($pairs as [$a, $b])");
+    assert_eq!(
+        vars,
+        vec![
+            ("a".to_string(), "mixed".to_string()),
+            ("b".to_string(), "mixed".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_parse_foreach_list_function_destructuring() {
+    // Long-syntax `list(...)` destructuring is equivalent.
+    let vars = parse_foreach_variables("($pairs as list($a, $b))");
+    assert_eq!(
+        vars,
+        vec![
+            ("a".to_string(), "mixed".to_string()),
+            ("b".to_string(), "mixed".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_parse_foreach_by_reference() {
+    // The `&` is not a name; only `$item` is bound.
+    let vars = parse_foreach_variables("($items as &$item)");
+    assert_eq!(vars, vec![("item".to_string(), "mixed".to_string())]);
+}
+
+#[test]
+fn test_parse_foreach_key_with_destructured_value() {
+    // `$k => [$a, $b]` binds the key and both destructured names, in order.
+    let vars = parse_foreach_variables("($rows as $k => [$a, $b])");
+    assert_eq!(
+        vars,
+        vec![
+            ("k".to_string(), "mixed".to_string()),
+            ("a".to_string(), "mixed".to_string()),
+            ("b".to_string(), "mixed".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_parse_foreach_no_binding_is_empty() {
+    // A header with no ` as ` binding yields no variables — the caller treats
+    // such a foreach as an opaque loop and refuses the rename.
+    assert!(parse_foreach_variables("($items)").is_empty());
+}
+
+#[test]
+fn test_unbalanced_loop_head_flags_broken_header() {
+    // A header with an unclosed paren never balances — flag its line so the
+    // rename can fail closed instead of clobbering file-wide.
+    let content = "\
+<p>ok</p>
+@foreach ($users as $user
+    {{ $user }}
+@endforeach";
+    assert_eq!(unbalanced_loop_head_lines(content), vec![1]);
+}
+
+#[test]
+fn test_unbalanced_loop_head_empty_for_valid_headers() {
+    // Both a single-line and a legitimately-wrapped header balance — neither is
+    // flagged as broken.
+    let content = "\
+@foreach ($users as $user)
+    {{ $user }}
+@endforeach
+@foreach ($posts
+    as $post)
+    {{ $post }}
+@endforeach";
+    assert!(unbalanced_loop_head_lines(content).is_empty());
 }
 
 #[test]

@@ -18654,6 +18654,14 @@ impl LaravelLanguageServer {
         if !laravel_lsp::blade_var_rename::is_template_variable(&content, &var_name) {
             return None;
         }
+        // Refuse when the cursor sits in an unresolved loop region — an opaque
+        // loop (a `@foreach`/`@forelse` whose binding the parser couldn't
+        // resolve) or below a broken (unbalanced-paren) loop header. The scope
+        // there is unknown, so a scope-local rename would risk a file-wide
+        // clobber. Fail closed: don't offer F2.
+        if laravel_lsp::blade_var_rename::cursor_in_unresolved_loop(&content, position.line) {
+            return None;
+        }
         let span = laravel_lsp::blade_var_rename::variable_spans(line_text, &var_name)
             .into_iter()
             .find(|s| {
