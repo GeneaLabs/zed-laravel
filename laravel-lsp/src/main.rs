@@ -18114,11 +18114,7 @@ async fn collect_declaration_locations(
                 guard
                     .as_ref()
                     .and_then(|idx| idx.get(name))
-                    .filter(|def| {
-                        def.file
-                            .to_str()
-                            .is_some_and(|s| s.ends_with(".blade.php"))
-                    })
+                    .filter(|def| def.file.to_str().is_some_and(|s| s.ends_with(".blade.php")))
                     .map(|def| (def.file.clone(), def.line, def.column, def.end_column))
             };
             if let Some((file, line, column, end_column)) = folio_decl {

@@ -113,12 +113,12 @@ fn parse_folio_mounts_resolves_path_helpers() {
         Path::new("/app"),
     );
     assert_eq!(resource.len(), 1);
-    assert_eq!(resource[0].directory, Path::new("/app/resources/views/pages"));
-
-    let base = parse_folio_mounts(
-        "<?php Folio::path(base_path('pages'));",
-        Path::new("/app"),
+    assert_eq!(
+        resource[0].directory,
+        Path::new("/app/resources/views/pages")
     );
+
+    let base = parse_folio_mounts("<?php Folio::path(base_path('pages'));", Path::new("/app"));
     assert_eq!(base.len(), 1);
     assert_eq!(base[0].directory, Path::new("/app/pages"));
 }
