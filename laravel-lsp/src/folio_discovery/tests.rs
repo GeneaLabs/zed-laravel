@@ -1,7 +1,11 @@
 use super::*;
 
 use std::fs;
+use std::sync::Arc;
 use tempfile::TempDir;
+
+use crate::salsa_impl::{ParsedPatternsData, RouteReferenceData, SymbolRefData};
+use crate::symbol_index::SymbolIndex;
 
 // ---------------------------------------------------------------------------
 // derive_uri — static, dynamic, catch-all, and index segments
@@ -442,6 +446,73 @@ fn folio_name_for_file_resolves_from_the_index() {
     assert_eq!(
         folio_name_for_file(&index, &root.join("resources/views/folio/other.blade.php")),
         None
+    );
+}
+
+// ---------------------------------------------------------------------------
+// find-references — the *usages* leg (AC #4). The declaration tests above prove
+// the Folio page is reachable as a route's declaration; this one proves the
+// other half: a `route('users.show')` *call-site* for a Folio-injected route
+// name is returned by the shared symbol index, identically to a conventional
+// route. The same name the Folio page produces is the key under which
+// `SymbolIndex::find` resolves call-sites — so Folio and conventional routes
+// flow through one code path.
+//
+// End-to-end but cheap: it anchors the expected name through the real Folio
+// pipeline (`inject_folio_routes` + `folio_name_for_file`) and builds the
+// call-site `ParsedPatternsData` + `SymbolIndex` directly — no `Backend`,
+// `SalsaActor`, or tokio runtime.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn folio_route_usages_are_returned_by_symbol_index() {
+    // 1. Anchor the expected name in the real Folio machinery rather than
+    //    hard-coding it: a page calling `name('users.show')` injects a route,
+    //    and the reverse lookup recovers exactly that name from the index.
+    let dir = make_project(
+        DEFAULT_FOLIO_MOUNT,
+        &[("users/[id].blade.php", "<?php name('users.show'); ?>")],
+    );
+    let mut routes = RouteIndex::new();
+    inject_folio_routes(dir.path(), &mut routes);
+    let page = dir
+        .path()
+        .join(DEFAULT_FOLIO_MOUNT)
+        .join("users/[id].blade.php");
+    let route_name =
+        folio_name_for_file(&routes, &page).expect("Folio page resolves to its route name");
+    assert_eq!(route_name, "users.show", "default mount applies no prefix");
+
+    // 2. A controller elsewhere calls `route('users.show')`. The PHP parse pass
+    //    tags that as a `route_refs` call-site; build that entry directly (no
+    //    parser, no Salsa) and feed it to a fresh symbol index — the same
+    //    `insert_file` path conventional route refs take.
+    let call_site = PathBuf::from("/proj/app/Http/Controllers/UserController.php");
+    let mut patterns = ParsedPatternsData::default();
+    patterns.route_refs.push(Arc::new(RouteReferenceData {
+        name: route_name.clone(),
+        line: 17,
+        column: 23,
+        end_column: 23 + route_name.len() as u32,
+    }));
+    let mut index = SymbolIndex::default();
+    index.insert_file(&call_site, &patterns);
+
+    // 3. find-references on the Folio route name returns exactly that call-site,
+    //    with file path, line, and column all correct.
+    let hits = index.find(&SymbolRefData::Route(route_name.clone()));
+    assert_eq!(hits.len(), 1, "the lone call-site is returned");
+    assert_eq!(hits[0].file_path, call_site);
+    assert_eq!(hits[0].line, 17);
+    assert_eq!(hits[0].column, 23);
+
+    // 4. An unrelated route name shares no bucket — no cross-contamination
+    //    between the Folio route and other names in the same index.
+    assert!(
+        index
+            .find(&SymbolRefData::Route("other.route".into()))
+            .is_empty(),
+        "querying an unrelated route name returns nothing"
     );
 }
 
