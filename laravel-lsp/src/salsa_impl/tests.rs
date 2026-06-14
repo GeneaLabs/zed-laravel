@@ -978,6 +978,36 @@ fn flux_component_props_are_offered_for_completion() {
 }
 
 #[test]
+fn flux_tag_skips_invalid_colon_class_candidate() {
+    // A namespaced tag must not emit a conventional class candidate — the
+    // colon-bearing `app/View/Components/Flux:button.php` is an invalid path on
+    // Windows and a guaranteed-miss `stat` on POSIX. (Follow-up from PR #99
+    // round-2 review; `component_candidate_paths` doesn't touch the FS, so an
+    // empty project root is enough.)
+    let (_dir, root) = project_with_files(&[]);
+    let autoload = ComposerAutoload::load(&root);
+    let config = config_with_component_namespaces(&root, &[]);
+
+    let candidates = component_candidate_paths("flux:button", &config, &autoload);
+    assert!(
+        candidates.iter().all(|p| !p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .contains(':')),
+        "no candidate may carry a `:` in its filename: {:#?}",
+        candidates,
+    );
+    assert!(
+        !candidates
+            .iter()
+            .any(|p| p.starts_with(root.join("app/View/Components"))),
+        "a namespaced Flux tag must not probe the conventional class dir: {:#?}",
+        candidates,
+    );
+}
+
+#[test]
 fn psr4_class_namespace_component_resolves_across_two_namespaces() {
     // Two separate package namespaces registered via componentNamespace, each
     // shipped under a PSR-4 vendor layout that the naive

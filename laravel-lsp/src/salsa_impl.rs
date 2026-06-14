@@ -3155,9 +3155,15 @@ pub fn component_candidate_paths(
 ) -> Vec<PathBuf> {
     let mut candidates = config.resolve_component_path(name);
 
-    // Conventional class-backed component (non-namespaced names).
-    candidates
-        .push(crate::component_declaration_locator::conventional_class_file_path(name, config));
+    // Conventional class-backed component (non-namespaced names only). A
+    // namespaced tag like `flux:button` or `pkg::badge` would produce an
+    // invalid `app/View/Components/Flux:button.php` candidate — illegal on
+    // Windows and a wasted `stat` on POSIX. Namespaced forms resolve via the
+    // PSR-4 `componentNamespace` block below instead, so skip them here.
+    if !name.contains(':') {
+        candidates
+            .push(crate::component_declaration_locator::conventional_class_file_path(name, config));
+    }
 
     // Explicit class-backed registration: Blade::component('tag', Class::class)
     // in any provider (facade or instance form). Laravel core registers
