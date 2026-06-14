@@ -18097,7 +18097,7 @@ async fn classify_with_decl_fallback(
     // Fallback path: route-name declarations live in `routes/*.php` and
     // aren't tagged by php.scm. Use the mtime-cached decl walker so
     // subsequent invocations don't re-parse the file.
-    if !is_in_routes_dir(file_path) {
+    if !is_in_routes_dir(root, file_path) {
         // A Folio page's `name('...')` helper declares its route name, but the
         // page lives outside `routes/` and the bare helper isn't tagged by
         // php.scm. If the cursor sits on that call, resolve it to the page's
@@ -18180,12 +18180,22 @@ async fn decl_range_at(
     None
 }
 
-/// Heuristic: is this file under a `routes/` subdirectory anywhere in its
-/// path? Used to gate the declaration-fallback walk so we don't pay the
-/// parse cost on every PHP file.
-fn is_in_routes_dir(path: &Path) -> bool {
-    path.components()
-        .any(|c| c.as_os_str() == std::ffi::OsStr::new("routes"))
+/// Is this file a conventional route file — i.e. does it live directly under
+/// the project root's `routes/` directory? Used to gate the declaration-fallback
+/// walk so we don't pay the parse cost on every PHP file.
+///
+/// Only the project-root `routes/` qualifies. A `routes` component nested
+/// deeper — a package's `vendor/.../routes/`, or a Folio mount that happens to
+/// carry a `routes` segment (issue #98) — must NOT be treated as the
+/// conventional routes dir, or find-references from such a file would be routed
+/// into the decl walk and never reach its real resolver. When the project root
+/// is unknown (`None`), default to `false` so the walk never triggers without a
+/// root to anchor against.
+fn is_in_routes_dir(root: Option<&Path>, path: &Path) -> bool {
+    match root {
+        Some(r) => path.starts_with(r.join("routes")),
+        None => false,
+    }
 }
 
 /// Return the column range of the classified pattern under the cursor.
