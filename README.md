@@ -60,7 +60,7 @@ Each feature has a focused reference under [`docs/`](docs/) — click through to
 | [🔗 Go-to-Definition](docs/go-to-definition.md) | Jump to views, components, routes, config, translations, env, assets, middleware, bindings, Artisan commands — plus query-chain columns / relations / tables and Eloquent magic members |
 | [ℹ️ Hover](docs/hover.md) | Intelephense-style summary cards for every recognised pattern, including semantic cards for Eloquent magic (scopes, accessors, relationships, cast-aware column types) |
 | [🔍 Find References](docs/find-references.md) | Every call site across the project, vendor packages included — including the magic-member usages Intelephense can't see |
-| [✏️ Rename](docs/rename.md) | Atomic rename of routes, configs, translations, env vars, views, components, Livewire, middleware, bindings, PHP classes (models, controllers, jobs, services, form requests), magic members, database columns (migration included) — and scope-aware Blade template variables, including the controller→view `view('x', ['key' => …])` / `compact('key')` binding linkage |
+| [✏️ Rename](docs/rename.md) | Atomic rename of routes, configs, translations, env vars, views, components, Livewire, middleware, bindings, PHP classes (models, controllers, jobs, services, form requests), magic members, function-local PHP variables, database columns (migration included) — and scope-aware Blade template variables, including the controller→view `view('x', ['key' => …])` / `compact('key')` binding linkage |
 | [🔢 Code Lens](docs/code-lens.md) | Opt-in reference counts above magic members, routes, config / translation / env keys, and Blade templates — plus an unused-symbol warning |
 | [💡 Autocomplete](docs/autocomplete.md) | Cast types, model properties, query chains, builder methods, Blade / loop / slot variables, Pennant flags |
 | [❌ Diagnostics](docs/diagnostics.md) | Missing views / components / features, invalid rules, query-chain typos against your real schema |
@@ -88,7 +88,24 @@ Clone the repo, run `cargo build --release` in `laravel-lsp/`, then use "zed: in
 
 The extension works out of the box with zero configuration. It automatically discovers your Laravel project structure, including view paths, component namespaces, route files, and service providers.
 
-Everything below is optional.
+Everything below is optional — **with one exception**: if you've customized which language servers run for PHP or Blade, see [🔌 Coexisting with your PHP / Blade language servers](#-coexisting-with-your-php--blade-language-servers) first, or the extension won't activate in those files.
+
+### 🔌 Coexisting with your PHP / Blade language servers
+
+This extension registers a language server called `laravel-lsp` for **PHP**, **Blade**, **XML**, and `.env` (Shell Script) files. By default Zed runs it automatically alongside your other servers — no setup needed.
+
+**If you've customized `language_servers` for PHP or Blade** (common when pinning a specific PHP LSP), you must add `laravel-lsp` to those lists, or it won't attach and none of the Blade/PHP features appear. An explicit list *replaces* Zed's defaults — keep the `"..."` token to preserve them:
+
+```json
+{
+  "languages": {
+    "PHP":   { "language_servers": ["laravel-lsp", "..."] },
+    "Blade": { "language_servers": ["laravel-lsp", "..."] }
+  }
+}
+```
+
+> 💡 **Symptom:** features work in `.env` files (you see code-lens counts) but do nothing in `.php` / `.blade.php`. That's this setting — `.env` is treated as Shell Script, which you likely didn't override.
 
 ### 🎛️ Extension settings
 
@@ -226,11 +243,46 @@ If you use Intelephense as your PHP language server, goto-definition on a class 
 
 After saving, restart Intelephense (`Cmd+Shift+P → lsp: restart`). For the licence-key shape, the `_ide_helper*.php` / `.phpstorm.meta.php` trade-offs, the cache caveat, and per-project `.intelephense.json`, see the **[full Intelephense tuning guide](docs/tuning-intelephense.md)**.
 
+## 🩺 Troubleshooting
+
+**The extension installed but nothing happens — no features, no Laravel entry in the language-server list.** Work through these in order; each is a real cause we've seen.
+
+### 1. Is your Zed new enough?
+
+The extension is built against `zed_extension_api 0.7.0`, which requires **Zed 0.205 or newer**. Older versions silently refuse to load it — the extension appears installed but never activates, and the log stays quiet. Check `Zed → About Zed` (or `zed --version`) and update if you're behind.
+
+### 2. Does Zed recognize the file as PHP / Blade?
+
+The language server only attaches to files Zed has classified as **PHP**, **Blade**, **XML**, or `.env` (Shell Script). Open a `.php` file and check the **bottom-right status bar**:
+
+- Says **"PHP"** → good, the language is registered.
+- Says **"Plain Text"** → install the official [**PHP**](https://github.com/zed-extensions/php) extension (and [**Laravel Blade**](https://github.com/bajrangCoder/zed-laravel-blade) for `.blade.php`). Without a language registered, no language server — ours included — can attach.
+
+### 3. Did you override `language_servers` for PHP or Blade?
+
+If features work in `.env` files but not in `.php` / `.blade.php`, you've almost certainly set an explicit `language_servers` list that omits `laravel-lsp`. See [🔌 Coexisting with your PHP / Blade language servers](#-coexisting-with-your-php--blade-language-servers) for the fix.
+
+### 4. Check the language-server log
+
+The running servers show under the **lightning-bolt icon** in the status bar. For the full log: `Cmd+Shift+P → "open language server logs"` and look for **Laravel**. If it's missing entirely, the server never started (revisit steps 1–3). If it's present but erroring, the log will say why — please [open an issue](https://github.com/mike-bronner/zed-laravel/issues) with that output.
+
+### 5. Manual binary fallback
+
+The extension downloads its server binary from GitHub releases on first use. If that download is blocked (proxy, firewall, offline), drop the binary on your `PATH` instead — Zed will find it there. Grab the archive for your platform from the [latest release](https://github.com/mike-bronner/zed-laravel/releases/latest), then (macOS x86_64 shown):
+
+```bash
+tar -xzf ~/Downloads/laravel-lsp-macos-x64.tar.gz
+mkdir -p ~/.local/bin && mv laravel-lsp-macos-x64 ~/.local/bin/laravel-lsp
+chmod +x ~/.local/bin/laravel-lsp
+xattr -d com.apple.quarantine ~/.local/bin/laravel-lsp 2>/dev/null
+# ensure ~/.local/bin is on your PATH, then fully restart Zed
+```
+
 ## 🚧 Planned Features
 
-**Rename — remaining work** (the class-backed kinds, the FQCN class-rename engine across all common PHP class kinds, magic members, database columns, and scope-aware Blade template variables shipped; PHP function-local variables didn't):
+**Rename — remaining work** (the class-backed kinds, the FQCN class-rename engine across all common PHP class kinds, magic members, database columns, function-local PHP variables, and scope-aware Blade template variables shipped):
 
-- 🔧 **PHP variable rename** — scope-aware function-local. Class properties (`$this->foo`) are out of scope for this round and folded into a future class-property rename.
+- 🔧 **Class-property rename** — `$this->foo`, `self::$bar`, and dynamic property access have different reference shapes than local variables, so they get their own scope-aware pass.
 
 **Framework integrations:**
 

@@ -14835,6 +14835,69 @@ return [
         }))
     }
 
+    /// prepare-rename for a plain PHP local variable (`$user`): return the
+    /// range of the `$name` token under the cursor, or `None` if the cursor
+    /// isn't on a renameable local variable. Pure-PHP, single-file —
+    /// scope-aware analysis lives in [`laravel_lsp::php_variable_rename`].
+    async fn variable_rename_at(&self, uri: &Url, position: Position) -> Option<Range> {
+        use laravel_lsp::query_chain::position_to_byte_offset;
+        let content = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(c, _)| c.clone())?;
+        let byte = position_to_byte_offset(&content, position.line, position.character)?;
+        let (line, start, end) =
+            laravel_lsp::php_variable_rename::variable_at_cursor(&content, byte)?;
+        Some(Range {
+            start: Position {
+                line,
+                character: start,
+            },
+            end: Position {
+                line,
+                character: end,
+            },
+        })
+    }
+
+    /// rename for a plain PHP local variable: rewrite every occurrence that
+    /// resolves to the same binding scope (function-local, scope-aware).
+    ///
+    /// Returns `Ok(None)` when the cursor isn't on a local variable, so the
+    /// caller can fall through to the Laravel-pattern / class rename pipeline.
+    /// Returns `Err` only when the cursor *is* on a variable but the new name
+    /// isn't a legal PHP identifier — surfaced to the user as a toast.
+    async fn variable_rename_edit(
+        &self,
+        uri: &Url,
+        position: Position,
+        new_name: &str,
+    ) -> jsonrpc::Result<Option<WorkspaceEdit>> {
+        use laravel_lsp::query_chain::position_to_byte_offset;
+        let Some(content) = self.documents.read().await.get(uri).map(|(c, _)| c.clone()) else {
+            return Ok(None);
+        };
+        let Ok(file_path) = uri.to_file_path() else {
+            return Ok(None);
+        };
+        let Some(byte) = position_to_byte_offset(&content, position.line, position.character)
+        else {
+            return Ok(None);
+        };
+        // Not on a local variable → let the caller continue the pipeline.
+        if laravel_lsp::php_variable_rename::variable_at_cursor(&content, byte).is_none() {
+            return Ok(None);
+        }
+        match laravel_lsp::php_variable_rename::variable_rename_targets(
+            &content, &file_path, byte, new_name,
+        ) {
+            Ok(targets) => Ok(laravel_lsp::rename::build_rename_edit(&targets)),
+            Err(msg) => Err(laravel_lsp::rename::rename_error(msg)),
+        }
+    }
+
     /// Create a goto location for a url('path') call
     /// Navigates to the file in public directory if it exists
     async fn create_url_location_from_salsa(
@@ -20324,17 +20387,27 @@ impl LanguageServer for LaravelLanguageServer {
             }
         }
 
-        // issue #55 — Blade variable (`$foo` in a .blade.php template). Checked
-        // before the literal-symbol classifier, which never tags a variable.
+        // issue #55 / #56 — variable & view-binding rename, before the
+        // literal-symbol classifier (a `$variable` or binding key is never
+        // tagged as a Laravel string-keyed pattern, so this can't shadow route
+        // / config / view renames). A `.blade.php` file is owned by the Blade
+        // template handler — including its scope refusals — and never falls
+        // through to the plain-PHP path, which doesn't understand Blade scope.
         if path_str.ends_with(".blade.php") {
             if let Some(range) = self.prepare_blade_var_rename(uri, position).await {
                 return Ok(Some(PrepareRenameResponse::Range(range)));
             }
-        } else if let Some(range) = self.prepare_view_binding_rename(uri, position).await {
-            // issue #55 — controller view-data binding key. Only in plain
-            // `.php` files; the `else` keeps a Blade `view(...)` from
-            // shadowing the variable path above.
-            return Ok(Some(PrepareRenameResponse::Range(range)));
+        } else {
+            // Plain `.php`: a PHP local variable (`$user`), then a controller
+            // view-data binding key (`compact('name')` / `view('v', ['name' =>
+            // …])`). Both run after the property-oriented magic / column member
+            // renames above (so `$user->email` still routes there).
+            if let Some(range) = self.variable_rename_at(uri, position).await {
+                return Ok(Some(PrepareRenameResponse::Range(range)));
+            }
+            if let Some(range) = self.prepare_view_binding_rename(uri, position).await {
+                return Ok(Some(PrepareRenameResponse::Range(range)));
+            }
         }
 
         let root_path = self.root_path.read().await.clone();
@@ -20446,12 +20519,12 @@ impl LanguageServer for LaravelLanguageServer {
             return Ok(Some(edit));
         }
 
-        // issue #55 — scope-aware Blade variable rename (`$foo` in a template)
-        // and controller→view binding-key rename. Both run before the
-        // literal-symbol classifier: a variable / binding key is never tagged
-        // as a Laravel string-keyed pattern, so this can't shadow route /
-        // config / view renames (a cursor on the view NAME returns `None` from
-        // `view_binding_key_at` and falls through).
+        // issue #55 / #56 — variable & view-binding rename, before the
+        // literal-symbol classifier (a `$variable` or binding key is never
+        // tagged as a Laravel string-keyed pattern, so this can't shadow route
+        // / config / view renames). A `.blade.php` file is owned by the Blade
+        // template handler — including its scope refusals — and never falls
+        // through to the plain-PHP path, which doesn't understand Blade scope.
         if path_str.ends_with(".blade.php") {
             match self.blade_var_rename_edit(uri, position, &new_name).await {
                 Ok(Some(edit)) => return Ok(Some(edit)),
@@ -20459,6 +20532,14 @@ impl LanguageServer for LaravelLanguageServer {
                 Err(e) => return Err(e),
             }
         } else {
+            // Plain `.php`: a PHP local variable (`$user`), then a controller
+            // view-data binding key. `Ok(None)` falls through to the rest of
+            // the pipeline.
+            match self.variable_rename_edit(uri, position, &new_name).await {
+                Ok(Some(edit)) => return Ok(Some(edit)),
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
             match self
                 .view_binding_rename_edit(uri, position, &new_name)
                 .await
