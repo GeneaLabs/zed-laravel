@@ -30,7 +30,6 @@ use crate::salsa_impl::LaravelConfigData;
 pub enum ComponentNameError {
     Empty,
     ContainsSlash,
-    ContainsDoubleDot,
     EmptySegment,
     HasExtension,
     InvalidCharacter(char),
@@ -42,7 +41,6 @@ impl ComponentNameError {
         match self {
             Self::Empty => "component name cannot be empty".to_string(),
             Self::ContainsSlash => "use dots instead of slashes (e.g., forms.input)".to_string(),
-            Self::ContainsDoubleDot => "component name cannot contain '..'".to_string(),
             Self::EmptySegment => {
                 "component name cannot have empty segments (no leading, trailing, \
                  or double dots)"
@@ -84,9 +82,6 @@ pub fn validate_component_name(name: &str) -> Result<(), ComponentNameError> {
     for segment in trimmed.split('.') {
         if segment.is_empty() {
             return Err(ComponentNameError::EmptySegment);
-        }
-        if segment == ".." {
-            return Err(ComponentNameError::ContainsDoubleDot);
         }
         for c in segment.chars() {
             if !c.is_alphanumeric() && c != '-' && c != '_' {

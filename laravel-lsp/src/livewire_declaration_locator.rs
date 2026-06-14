@@ -21,7 +21,6 @@ use crate::naming;
 pub enum LivewireNameError {
     Empty,
     ContainsSlash,
-    ContainsDoubleDot,
     EmptySegment,
     HasExtension,
     InvalidCharacter(char),
@@ -35,7 +34,6 @@ impl LivewireNameError {
             Self::ContainsSlash => {
                 "use dots instead of slashes (e.g., admin.user-list)".to_string()
             }
-            Self::ContainsDoubleDot => "Livewire component name cannot contain '..'".to_string(),
             Self::EmptySegment => "Livewire component name cannot have empty segments \
                  (no leading, trailing, or double dots)"
                 .to_string(),
@@ -74,9 +72,6 @@ pub fn validate_livewire_name(name: &str) -> Result<(), LivewireNameError> {
     for segment in trimmed.split('.') {
         if segment.is_empty() {
             return Err(LivewireNameError::EmptySegment);
-        }
-        if segment == ".." {
-            return Err(LivewireNameError::ContainsDoubleDot);
         }
         for c in segment.chars() {
             if !c.is_alphanumeric() && c != '-' && c != '_' {

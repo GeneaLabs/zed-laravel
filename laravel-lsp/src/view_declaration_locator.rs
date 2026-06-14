@@ -21,7 +21,6 @@ use crate::salsa_impl::LaravelConfigData;
 pub enum ViewNameError {
     Empty,
     ContainsSlash,
-    ContainsDoubleDot,
     EmptySegment,
     HasExtension,
     InvalidCharacter(char),
@@ -35,7 +34,6 @@ impl ViewNameError {
         match self {
             Self::Empty => "view name cannot be empty".to_string(),
             Self::ContainsSlash => "use dots instead of slashes (e.g., users.profile)".to_string(),
-            Self::ContainsDoubleDot => "view name cannot contain '..'".to_string(),
             Self::EmptySegment => "view name cannot have empty segments (no leading, trailing, \
                  or double dots)"
                 .to_string(),
@@ -77,9 +75,6 @@ pub fn validate_view_name(name: &str) -> Result<(), ViewNameError> {
     for segment in trimmed.split('.') {
         if segment.is_empty() {
             return Err(ViewNameError::EmptySegment);
-        }
-        if segment == ".." {
-            return Err(ViewNameError::ContainsDoubleDot);
         }
         for c in segment.chars() {
             if !c.is_alphanumeric() && c != '-' && c != '_' {
