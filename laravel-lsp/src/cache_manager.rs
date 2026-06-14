@@ -143,7 +143,6 @@ impl ScanResult {
 /// Results from scanning node_modules
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeModulesScan {
-    pub flux_components: Vec<String>,
     pub livewire_volt_components: Vec<String>,
 }
 

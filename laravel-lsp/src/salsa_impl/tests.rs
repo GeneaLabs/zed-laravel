@@ -330,6 +330,107 @@ fn anonymous_component_namespace_resolves_relative_to_view_paths() {
     );
 }
 
+// ─── Flux component resolution (issue #60) ─────────────────────────────
+
+fn make_bare_config() -> LaravelConfigData {
+    LaravelConfigData {
+        root: PathBuf::from("/project"),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
+    }
+}
+
+#[test]
+fn normalize_flux_tag_name_rewrites_single_colon_prefix() {
+    assert_eq!(
+        normalize_flux_tag_name("flux:button").as_deref(),
+        Some("flux::button"),
+    );
+    assert_eq!(
+        normalize_flux_tag_name("flux:icon.arrow-right").as_deref(),
+        Some("flux::icon.arrow-right"),
+    );
+}
+
+#[test]
+fn normalize_flux_tag_name_leaves_non_flux_and_namespaced_alone() {
+    // Already-namespaced `<x-flux::button>` arrives pre-normalized.
+    assert_eq!(normalize_flux_tag_name("flux::button"), None);
+    // Non-Flux names untouched.
+    assert_eq!(normalize_flux_tag_name("button"), None);
+    assert_eq!(normalize_flux_tag_name("livewire:counter"), None);
+}
+
+#[test]
+fn flux_tag_resolves_to_conventional_sources() {
+    // `<flux:button>` resolves with no explicit registration via the
+    // convention fallback: app-published views, the package source, and Flux Pro.
+    let config = make_bare_config();
+    let paths = config.resolve_component_path("flux:button");
+
+    assert!(
+        paths
+            .iter()
+            .any(|p| p == &PathBuf::from("/project/resources/views/flux/button.blade.php")),
+        "published view path missing: {:?}",
+        paths,
+    );
+    assert!(
+        paths.iter().any(|p| p
+            == &PathBuf::from(
+                "/project/vendor/livewire/flux/stubs/resources/views/flux/button.blade.php"
+            )),
+        "package source path missing: {:?}",
+        paths,
+    );
+    assert!(
+        paths.iter().any(|p| p
+            == &PathBuf::from(
+                "/project/vendor/livewire/flux-pro/stubs/resources/views/flux/button.blade.php"
+            )),
+        "Flux Pro path missing: {:?}",
+        paths,
+    );
+}
+
+#[test]
+fn flux_dotted_tag_maps_dots_to_directories() {
+    // `<flux:icon.arrow-right>` → `flux/icon/arrow-right.blade.php`.
+    let config = make_bare_config();
+    let paths = config.resolve_component_path("flux:icon.arrow-right");
+
+    assert!(
+        paths.iter().any(
+            |p| p == &PathBuf::from("/project/resources/views/flux/icon/arrow-right.blade.php")
+        ),
+        "dotted Flux name must map dots to directories: {:?}",
+        paths,
+    );
+}
+
+#[test]
+fn flux_namespace_tag_resolves_same_as_single_colon() {
+    // The `<x-flux::button>` namespace form resolves through the same fallback.
+    let config = make_bare_config();
+    let paths = config.resolve_component_path("flux::button");
+    assert!(
+        paths
+            .iter()
+            .any(|p| p == &PathBuf::from("/project/resources/views/flux/button.blade.php")),
+        "namespace form must resolve via the Flux fallback: {:?}",
+        paths,
+    );
+}
+
 #[test]
 fn unregistered_anonymous_prefix_does_not_borrow_registered_directory() {
     let config = make_config_with_anonymous_path(

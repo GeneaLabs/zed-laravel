@@ -1318,6 +1318,19 @@ pub fn extract_all_blade_patterns<'a>(
                             end_column: end_pos.column,
                         });
                     }
+                } else if let Some(rest) = text.strip_prefix("flux:") {
+                    if !rest.starts_with(':') && !name_is_runtime_constructed(rest) {
+                        result.components.push(ComponentMatch {
+                            component_name: text,
+                            tag_name: text,
+                            byte_start: node.start_byte(),
+                            byte_end: node.end_byte(),
+                            row: start_pos.row,
+                            column: start_pos.column,
+                            end_column: end_pos.column,
+                            resolved_path: None,
+                        });
+                    }
                 }
             }
 

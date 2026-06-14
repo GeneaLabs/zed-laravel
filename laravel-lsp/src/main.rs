@@ -5538,13 +5538,15 @@ impl LaravelLanguageServer {
         );
     }
 
-    /// Rescan node_modules (for Flux, etc.)
+    /// Rescan node_modules (JS-side packages).
+    ///
+    /// Flux is intentionally not scanned here: it ships via Composer under
+    /// `vendor/livewire/flux`, not node_modules. Flux components are discovered
+    /// through the vendor service-provider scan and the conventional-path
+    /// fallback in `LaravelConfigData::resolve_component_path`.
     async fn rescan_node_modules(&self, _root: &Path) {
         info!("🔍 Rescanning node_modules...");
         let start = std::time::Instant::now();
-
-        // TODO: Scan for Flux components in node_modules
-        // For now, just update the mtime
 
         let mut cache_guard = self.cache.write().await;
         if let Some(ref mut cache) = *cache_guard {
@@ -8066,6 +8068,47 @@ impl LaravelLanguageServer {
                     start_col: start_pos as u32,
                     end_col: cursor as u32,
                     quote_char: ' ', // Not applicable for tag syntax
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Check if cursor is inside a Flux component tag like `<flux:button` or
+    /// `<flux:icon.arrow-right`. Returns the partial name typed after `<flux:`
+    /// (for filtering completions), or `None` when the cursor is past the name
+    /// (hit a space, `>`, or `/`).
+    fn get_flux_component_context(line_text: &str, character: u32) -> Option<StringContext> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        if let Some(pos) = before_cursor.rfind("<flux:") {
+            let start_pos = pos + 6; // After "<flux:"
+            let after_prefix = &before_cursor[start_pos..];
+
+            if after_prefix.contains(' ')
+                || after_prefix.contains('>')
+                || after_prefix.contains('/')
+            {
+                return None;
+            }
+
+            // Flux names are dotted/kebab (`icon.arrow-right`); reject anything
+            // else so attribute text after the name isn't treated as a name.
+            if after_prefix
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+            {
+                return Some(StringContext {
+                    prefix: after_prefix.to_string(),
+                    start_col: start_pos as u32,
+                    end_col: cursor as u32,
+                    quote_char: ' ',
                 });
             }
         }
@@ -16140,6 +16183,14 @@ return [
         // `resolve_component_existing_file` guarantees diagnostics and
         // goto-definition can never disagree about whether a component exists.
         for comp_ref in &patterns.components {
+            // Flux's `<flux:...>` tags resolve through vendor/published paths
+            // that may be absent in a given editing session; goto/hover degrade
+            // gracefully, so skip the hard not-found error for them (Flux
+            // diagnostics are out of scope). `<x-flux::...>` keeps its check.
+            if comp_ref.name.starts_with("flux:") && !comp_ref.name.starts_with("flux::") {
+                continue;
+            }
+
             if self
                 .resolve_component_existing_file(&comp_ref.name)
                 .await
@@ -21736,6 +21787,66 @@ impl LanguageServer for LaravelLanguageServer {
 
                 debug!(
                     "   Returning {} Blade component completion items",
+                    items.len()
+                );
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for Flux component context (<flux:...)
+            if let Some(flux_ctx) = Self::get_flux_component_context(line_text, position.character)
+            {
+                debug!(
+                    "   Flux component context, filter prefix: '{}'",
+                    flux_ctx.prefix
+                );
+
+                let candidates = match self.root_path.read().await.clone() {
+                    Some(root) => laravel_lsp::component_completion::collect_flux_components(&root),
+                    None => Vec::new(),
+                };
+
+                let prefix_lower = flux_ctx.prefix.to_lowercase();
+                let items: Vec<CompletionItem> = candidates
+                    .into_iter()
+                    .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
+                    .map(|c| CompletionItem {
+                        label: c.name.clone(),
+                        kind: Some(CompletionItemKind::STRUCT),
+                        detail: Some(c.detail.clone()),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(format!("<flux:{}>", c.name))
+                                .summary("Flux component.")
+                                .section(format!("Source: {}", c.detail))
+                                .into_documentation(),
+                        ),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: flux_ctx.start_col,
+                                },
+                                end: Position {
+                                    line: position.line,
+                                    character: flux_ctx.end_col,
+                                },
+                            },
+                            new_text: c.name.clone(),
+                        })),
+                        ..Default::default()
+                    })
+                    .collect();
+
+                debug!(
+                    "   Returning {} Flux component completion items",
                     items.len()
                 );
 

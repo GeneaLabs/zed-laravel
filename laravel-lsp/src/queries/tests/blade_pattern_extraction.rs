@@ -41,6 +41,40 @@ fn extract_all_blade_patterns_components() {
 }
 
 #[test]
+fn extract_flux_component_tags() {
+    // Issue #60: `<flux:...>` tags are captured as components, keeping the raw
+    // single-colon name (`flux:button`) that the resolver later normalizes.
+    let blade_code = r#"
+    <div>
+        <flux:button variant="primary">Save</flux:button>
+        <flux:icon.arrow-right />
+    </div>
+    "#;
+
+    let tree = parse_blade(blade_code).expect("Should parse Blade");
+    let lang = language_blade();
+    let patterns =
+        extract_all_blade_patterns(&tree, blade_code, &lang).expect("Should extract patterns");
+
+    let names: Vec<&str> = patterns
+        .components
+        .iter()
+        .map(|m| m.component_name)
+        .collect();
+
+    assert!(
+        names.contains(&"flux:button"),
+        "Should capture <flux:button>: {:?}",
+        names,
+    );
+    assert!(
+        names.contains(&"flux:icon.arrow-right"),
+        "Should capture dotted <flux:icon.arrow-right>: {:?}",
+        names,
+    );
+}
+
+#[test]
 fn extract_all_blade_patterns_directives() {
     let blade_code = r#"
 @extends('layouts.app')

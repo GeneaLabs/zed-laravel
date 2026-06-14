@@ -59,6 +59,30 @@
   (#match? @tag_name "^livewire:"))
 
 ; ============================================================================
+; Pattern 2b: <flux:component> Flux component tags
+; ============================================================================
+; Matches: <flux:button>
+;          <flux:icon.arrow-right>
+;
+; Flux's single-colon tag syntax is sugar for the `flux` anonymous-component
+; namespace; captured here so it resolves like a Blade component.
+
+(element
+  (start_tag
+    (tag_name) @tag_name)
+  (#match? @tag_name "^flux:"))
+
+; Match closing Flux tags like </flux:button>
+(element
+  (end_tag
+    (tag_name) @tag_name)
+  (#match? @tag_name "^flux:"))
+
+(self_closing_tag
+  (tag_name) @tag_name
+  (#match? @tag_name "^flux:"))
+
+; ============================================================================
 ; Pattern 3: Blade Directives (all types)
 ; ============================================================================
 ; Matches: @extends('layout')

@@ -152,6 +152,23 @@ fn scan_dir(
     out
 }
 
+/// Collect Flux component tag bodies for `<flux:...>` autocomplete. Scans the
+/// app-published `resources/views/flux/` plus the Flux and Flux Pro package
+/// sources under `vendor/`, returning bare dotted names (`button`,
+/// `icon.arrow-right`) deduped and sorted.
+pub fn collect_flux_components(root: &Path) -> Vec<ComponentCandidate> {
+    let dirs = [
+        root.join("resources/views/flux"),
+        root.join("vendor/livewire/flux/stubs/resources/views/flux"),
+        root.join("vendor/livewire/flux-pro/stubs/resources/views/flux"),
+    ];
+    let mut out = Vec::new();
+    for dir in &dirs {
+        out.extend(scan_anonymous_dir(dir, "", root));
+    }
+    dedup_and_sort(out)
+}
+
 /// Dedup candidates by tag name and sort by name. When two candidates share a
 /// name, a `Class` beats an `AnonymousView` (Laravel resolves the class first);
 /// otherwise the first occurrence wins.
