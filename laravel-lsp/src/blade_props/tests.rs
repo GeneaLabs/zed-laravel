@@ -72,3 +72,48 @@ fn returns_none_for_nonexistent_file() {
     let nonexistent = std::path::PathBuf::from("/nonexistent/view.blade.php");
     assert_eq!(extract_props_directive(&nonexistent), None);
 }
+
+// ─── prop name extraction (issue #60: Flux attribute completion) ─────────
+
+#[test]
+fn prop_names_from_keyed_entries() {
+    let src = "@props(['user' => null, 'showAvatar' => true])\n<div></div>\n";
+    assert_eq!(extract_prop_names(src), vec!["user", "showAvatar"]);
+}
+
+#[test]
+fn prop_names_from_shorthand_entries() {
+    // Bare string entries (no default) are still prop names.
+    let src = "@props(['variant', 'size'])\n";
+    assert_eq!(extract_prop_names(src), vec!["variant", "size"]);
+}
+
+#[test]
+fn prop_names_mix_shorthand_and_keyed() {
+    let src = "@props([\n    'variant',\n    'size' => 'base',\n    'icon' => null,\n])\n";
+    assert_eq!(extract_prop_names(src), vec!["variant", "size", "icon"]);
+}
+
+#[test]
+fn prop_names_ignore_nested_array_defaults() {
+    // Only the first string of each top-level entry is the name — strings
+    // inside a nested-array default must not be mistaken for props.
+    let src = "@props(['opts' => ['a', 'b'], 'label' => 'Hi'])\n";
+    assert_eq!(extract_prop_names(src), vec!["opts", "label"]);
+}
+
+#[test]
+fn prop_names_ignore_commas_inside_string_defaults() {
+    let src = "@props(['note' => 'a, b, c', 'count' => 0])\n";
+    assert_eq!(extract_prop_names(src), vec!["note", "count"]);
+}
+
+#[test]
+fn prop_names_empty_without_directive() {
+    assert!(extract_prop_names("<div>no props</div>\n").is_empty());
+}
+
+#[test]
+fn prop_names_empty_for_empty_props() {
+    assert!(extract_prop_names("@props([])\n").is_empty());
+}

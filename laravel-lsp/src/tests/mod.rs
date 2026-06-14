@@ -6,6 +6,7 @@ mod class_locator_and_properties;
 mod code_lens_opt_in;
 mod diagnostic_severity;
 mod dynamic_where_sparseness;
+mod flux_component_context;
 mod generic_type_parsing;
 mod livewire_component_resolution;
 mod loop_variable_resolution;

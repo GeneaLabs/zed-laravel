@@ -130,6 +130,34 @@ fn collect_flux_components_empty_without_flux_dirs() {
     assert!(collect_flux_components(&root).is_empty());
 }
 
+#[test]
+fn collect_flux_components_ignores_node_modules_tree() {
+    // AC #4: the corrected stub discovers Flux via Composer (`vendor/`), never
+    // `node_modules`. A flux-shaped blade sitting under a node_modules tree
+    // must NOT be picked up — only the real Composer source counts.
+    let (_dir, root) = dir_with_files(&[
+        // Decoy: flux-named blade under node_modules — must be ignored.
+        (
+            "node_modules/@livewire/flux/stubs/resources/views/flux/decoy.blade.php",
+            "x",
+        ),
+        ("node_modules/flux/views/flux/ghost.blade.php", "x"),
+        // The genuine Composer source — the only thing that should surface.
+        (
+            "vendor/livewire/flux/stubs/resources/views/flux/button.blade.php",
+            "x",
+        ),
+    ]);
+
+    let got = collect_flux_components(&root);
+
+    assert_eq!(
+        names(&got),
+        vec!["button"],
+        "only the Composer vendor source is scanned; node_modules is ignored",
+    );
+}
+
 // ─── dedup ──────────────────────────────────────────────────────────────
 
 #[test]

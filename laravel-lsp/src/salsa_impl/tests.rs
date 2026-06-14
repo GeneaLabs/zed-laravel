@@ -928,6 +928,55 @@ fn resolves(name: &str, config: &LaravelConfigData, autoload: &ComposerAutoload)
         .any(|p| p.exists())
 }
 
+/// End-to-end for issue #60's completion criterion: a Flux component resolved
+/// from its conventional vendor source must surface its declared `@props` as
+/// offered attributes. Exercises the same chain the completion handler runs —
+/// `resolve_component_path` → first on-disk candidate → `extract_prop_names`.
+#[test]
+fn flux_component_props_are_offered_for_completion() {
+    let (_dir, root) = project_with_files(&[(
+        "vendor/livewire/flux/stubs/resources/views/flux/button.blade.php",
+        "@props([\n    'variant' => 'primary',\n    'size',\n    'icon' => null,\n])\n\
+         <button {{ $attributes }}>{{ $slot }}</button>\n",
+    )]);
+    let config = LaravelConfigData {
+        root: root.clone(),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
+    };
+
+    // Resolve `<flux:button>` the way goto/hover/completion do, then read the
+    // first candidate that actually exists on disk.
+    let resolved = config
+        .resolve_component_path("flux:button")
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("flux:button should resolve to its vendor blade source");
+
+    let content = std::fs::read_to_string(&resolved).unwrap();
+    let props = crate::blade_props::extract_prop_names(&content);
+
+    assert!(
+        props.contains(&"variant".to_string()),
+        "known prop `variant` must be offered for a resolved Flux component: {:?}",
+        props,
+    );
+    assert_eq!(
+        props,
+        vec!["variant", "size", "icon"],
+        "all declared props offered, in declaration order",
+    );
+}
+
 #[test]
 fn psr4_class_namespace_component_resolves_across_two_namespaces() {
     // Two separate package namespaces registered via componentNamespace, each
