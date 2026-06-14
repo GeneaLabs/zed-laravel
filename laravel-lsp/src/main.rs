@@ -8164,10 +8164,16 @@ impl LaravelLanguageServer {
             return None;
         }
 
-        // The partial attribute is the word after the last whitespace.
+        // The partial attribute is the word after the last whitespace. Walk
+        // back over char boundaries: a raw byte index from `rfind` + 1 lands
+        // inside a multi-byte whitespace (e.g. U+00A0 NO-BREAK SPACE) and
+        // panics the slice below. Mirrors the `char_indices().rev()` helpers
+        // used elsewhere in this file.
         let word_start = before_cursor
-            .rfind(char::is_whitespace)
-            .map(|i| i + 1)
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
             .unwrap_or(cursor);
         let partial = &before_cursor[word_start..];
         // `=`, `"` or `'` in the partial means we're past the name into a value.

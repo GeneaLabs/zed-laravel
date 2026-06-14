@@ -134,3 +134,15 @@ fn attribute_context_none_after_tag_closed() {
         "a closed tag (`>` before cursor) is not an attribute position",
     );
 }
+
+#[test]
+fn attribute_context_handles_multibyte_whitespace() {
+    // Regression: U+00A0 NO-BREAK SPACE (2 bytes) separating the name from the
+    // attribute. A raw `rfind(is_whitespace) + 1` lands inside the encoding and
+    // panics the byte slice; the boundary-safe walk must keep working.
+    let line = "<flux:button\u{00A0}vari";
+    let (name, ctx) = LaravelLanguageServer::get_flux_attribute_context(line, line.len() as u32)
+        .expect("multi-byte whitespace must not break attribute detection");
+    assert_eq!(name, "flux:button");
+    assert_eq!(ctx.prefix, "vari", "partial after the NBSP, not a panic");
+}
