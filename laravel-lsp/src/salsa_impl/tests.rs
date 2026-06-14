@@ -977,6 +977,144 @@ fn flux_component_props_are_offered_for_completion() {
     );
 }
 
+/// End-to-end for issue #107's hover criterion: hovering a `<flux:button>`
+/// whose only on-disk source is the conventional Flux *vendor* layout must
+/// render a hover card whose source link points at `vendor/livewire/flux` —
+/// not the published `resources/views/flux` path. Mirrors the anonymous-
+/// component leg of `Backend::hover_for_component`: resolve → first on-disk
+/// candidate → `extract_props_directive` + `source_link` → `hover::render`.
+///
+/// PR #99 pinned the *resolution* leg (`flux_component_props_are_offered_for_completion`,
+/// above); this pins the *rendered hover card* the resolution feeds.
+#[test]
+fn flux_hover_source_link_points_at_vendor_source() {
+    let (_dir, root) = project_with_files(&[(
+        "vendor/livewire/flux/stubs/resources/views/flux/button.blade.php",
+        "@props(['type' => 'button', 'variant' => 'primary'])\n\
+         <button {{ $attributes }}>{{ $slot }}</button>\n",
+    )]);
+    let config = LaravelConfigData {
+        root: root.clone(),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
+    };
+
+    // Resolve the way hover does, then take the first candidate on disk. The
+    // published `resources/views/flux` path is never created, so the vendor
+    // source is the first (and only) existing candidate.
+    let resolved = config
+        .resolve_component_path("flux:button")
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("flux:button should resolve to its vendor blade source");
+    assert!(
+        resolved.starts_with(root.join("vendor/livewire/flux")),
+        "first on-disk candidate must be the vendor source, not the published \
+         resources/views/flux path: {:?}",
+        resolved,
+    );
+
+    // Build the hover card exactly as `hover_for_component` does for an
+    // anonymous component: the `@props` directive as the code block, a source
+    // link built from the resolved path, and no trailer (the file exists).
+    let url = tower_lsp::lsp_types::Url::from_file_path(&resolved).unwrap();
+    let display = resolved
+        .strip_prefix(&root)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let link = crate::hover::source_link(&display, url.as_str(), None);
+    let snippet = crate::blade_props::extract_props_directive(&resolved);
+    let rendered = crate::hover::render(&crate::hover::HoverContent {
+        code: snippet.as_deref().map(|s| crate::hover::CodeBlock {
+            language: crate::hover::CodeLanguage::Php,
+            content: s,
+        }),
+        source_link: Some(&link),
+        trailer: None,
+        ..Default::default()
+    });
+
+    assert!(
+        rendered.contains("](file://"),
+        "rendered hover must carry a markdown source link: {rendered}",
+    );
+    assert!(
+        rendered.contains("vendor/livewire/flux"),
+        "the source-link URL must point at the vendor flux source, not the \
+         published path: {rendered}",
+    );
+}
+
+/// Complementary to the above: when no Flux source exists on disk, the hover
+/// card must degrade to the `*(file not found)*` trailer with no source link —
+/// the same shape `hover_for_component` renders when resolution finds no file.
+#[test]
+fn flux_hover_without_vendor_file_shows_file_not_found() {
+    // Project rooted at a temp dir with NO flux source anywhere, so every
+    // resolve candidate is a guaranteed miss.
+    let (_dir, root) = project_with_files(&[]);
+    let config = LaravelConfigData {
+        root: root.clone(),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
+    };
+
+    let resolved = config
+        .resolve_component_path("flux:button")
+        .into_iter()
+        .find(|p| p.exists());
+    assert!(
+        resolved.is_none(),
+        "no flux source should exist on disk for an empty project, got {:?}",
+        resolved,
+    );
+
+    // Derive the link from the (absent) resolution the same way the handler
+    // does — `None` path → no link → file-not-found trailer.
+    let link = resolved.as_ref().map(|p| {
+        let url = tower_lsp::lsp_types::Url::from_file_path(p).unwrap();
+        crate::hover::source_link(&p.to_string_lossy(), url.as_str(), None)
+    });
+    let trailer = if link.is_none() {
+        Some("*(file not found)*")
+    } else {
+        None
+    };
+    let rendered = crate::hover::render(&crate::hover::HoverContent {
+        source_link: link.as_deref(),
+        trailer,
+        ..Default::default()
+    });
+
+    assert!(
+        rendered.contains("*(file not found)*"),
+        "absent flux source must render the file-not-found trailer: {rendered}",
+    );
+    assert!(
+        !rendered.contains("](file://"),
+        "no source link may be rendered when the file is absent: {rendered}",
+    );
+}
+
 #[test]
 fn flux_tag_skips_invalid_colon_class_candidate() {
     // A namespaced tag must not emit a conventional class candidate — the
