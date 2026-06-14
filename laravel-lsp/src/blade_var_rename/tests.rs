@@ -144,6 +144,51 @@ fn file_scoped_var_skips_loop_with_method_call_iterable() {
     );
 }
 
+#[test]
+fn foreach_with_multiline_directive_still_scopes_to_the_loop() {
+    // issue #55 regression: a `@foreach` whose argument list wraps across
+    // physical lines must still register as a loop block. Before the multi-line
+    // paren-balancing fix, `matching_paren` gave up at the first line end, the
+    // loop's `$user` binding was lost, `loop_binding_ranges` came back empty,
+    // and the file-scope arm admitted EVERY `$user` — clobbering the file-level
+    // occurrences on lines 0 and 5.
+    let src = "\
+{{ $user }}
+@foreach ($users->where('active', true)
+    as $user)
+    {{ $user->name }}
+@endforeach
+{{ $user }}";
+    // Cursor inside the loop body (line 3) — only the in-loop `$user`s.
+    let spans = in_scope_spans(src, "user", 3);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    assert_eq!(
+        lines,
+        vec![2, 3],
+        "binding line + body only, never the file-level lines 0/5"
+    );
+}
+
+#[test]
+fn file_scoped_var_skips_multiline_loop_directive() {
+    // The mirror case: a file-level `$user` must not bleed into a loop that
+    // re-binds `$user` via a multi-line directive header.
+    let src = "\
+{{ $user }}
+@foreach ($users->where('active', true)
+    as $user)
+    {{ $user }}
+@endforeach
+{{ $user }}";
+    let spans = in_scope_spans(src, "user", 0);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    assert_eq!(
+        lines,
+        vec![0, 5],
+        "file-level occurrences only, multi-line loop excluded"
+    );
+}
+
 // ── in_scope_spans: @forelse ────────────────────────────────────────────────
 
 #[test]

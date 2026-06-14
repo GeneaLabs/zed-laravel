@@ -106,35 +106,45 @@ pub fn parse_for_variables(arguments: &str) -> Vec<(String, String)> {
     vars
 }
 
-/// Find every loop directive on a single line, returning
-/// `(directive_keyword, full_argument_substring_including_parens)` for each.
+/// The balanced `(…)` argument list of a loop directive whose opening `(` is at
+/// byte `open` on line `start_line`, joining continuation lines when the header
+/// wraps across physical lines. Returns the argument substring **including** the
+/// outer parens (interior runs of whitespace between joined lines collapsed to a
+/// single space), or `None` if the parens never balance before end of file.
 ///
-/// The argument list is captured by *balancing* parentheses rather than a
-/// `\([^)]*\)` regex, which stops at the first `)`. Without balancing, an
-/// iterable containing a call — `@foreach($users->where('active', true) as
-/// $user)` — truncates to `($users->where('active', true)`, the ` as $user`
-/// tail is lost, and the loop's variable goes unrecognized. That made the loop
-/// scope invisible and the rename clobber the whole file (issue #55). Parens
-/// inside single/double-quoted strings are ignored so a string argument can't
-/// throw off the depth count.
-fn loop_directives_on_line(line: &str) -> Vec<(&str, &str)> {
-    lazy_static! {
-        static ref LOOP_HEAD_RE: Regex =
-            Regex::new(r#"@(foreach|forelse|for|while)\s*\("#).unwrap();
+/// Two reasons the parens must be balanced rather than regex-captured:
+/// - An iterable containing a call — `@foreach($users->where('active', true) as
+///   $user)` — would truncate at the first `)` under a `\([^)]*\)` regex, losing
+///   the ` as $user` tail.
+/// - A long header is routinely broken across lines:
+///   `@foreach($users->where('active', true)` ⏎ `    as $user)`. A per-line scan
+///   gives up at the first line end.
+///
+/// In both cases the binding goes unrecognized, the loop scope turns invisible,
+/// and a rename inside it silently clobbers the whole file — the file-scope
+/// fallback admits every occurrence (issue #55). Parens inside single/double-
+/// quoted strings are ignored so a string argument can't throw off the depth
+/// count. Reads forward only as far as needed for the depth to return to zero.
+fn balanced_directive_arguments(lines: &[&str], start_line: usize, open: usize) -> Option<String> {
+    // Fast path: balanced on the opening line — the overwhelmingly common case.
+    // Returns the exact source slice, byte-for-byte as the old per-line scan did.
+    if let Some(close) = matching_paren(lines[start_line], open) {
+        return Some(lines[start_line][open..=close].to_string());
     }
 
-    let mut out = Vec::new();
-    for caps in LOOP_HEAD_RE.captures_iter(line) {
-        let Some(directive) = caps.get(1) else {
-            continue;
-        };
-        // The opening paren is the final byte of the whole match.
-        let open = caps.get(0).unwrap().end() - 1;
-        if let Some(close) = matching_paren(line, open) {
-            out.push((directive.as_str(), &line[open..=close]));
+    // Slow path: the header wraps. Accumulate continuation lines (joined by a
+    // single space, so a binding split as `… as` ⏎ `$user` still parses) until
+    // the parens balance.
+    let mut buf = lines[start_line][open..].to_string();
+    for line in &lines[start_line + 1..] {
+        buf.push(' ');
+        buf.push_str(line.trim_start());
+        if let Some(close) = matching_paren(&buf, 0) {
+            buf.truncate(close + 1);
+            return Some(buf);
         }
     }
-    out
+    None
 }
 
 /// Given the byte index of an opening `(` in `s`, return the byte index of its
@@ -178,28 +188,41 @@ fn matching_paren(s: &str, open: usize) -> Option<usize> {
 /// Returns a list of loop blocks with start/end lines and extracted variables.
 pub fn find_loop_blocks(content: &str) -> Vec<BladeLoopBlock> {
     lazy_static! {
+        static ref LOOP_HEAD_RE: Regex =
+            Regex::new(r#"@(foreach|forelse|for|while)\s*\("#).unwrap();
         static ref LOOP_END_RE: Regex =
             Regex::new(r#"@(endforeach|endforelse|endfor|endwhile)"#).unwrap();
     }
 
+    let lines: Vec<&str> = content.lines().collect();
     let mut blocks = Vec::new();
     let mut open_loops: Vec<(BladeLoopType, Vec<(String, String)>, Option<String>, usize)> =
         Vec::new();
 
-    for (line_idx, line) in content.lines().enumerate() {
-        for (directive, arguments) in loop_directives_on_line(line) {
-            let (loop_type, variables, iterable) = match directive {
+    for line_idx in 0..lines.len() {
+        let line = lines[line_idx];
+        for caps in LOOP_HEAD_RE.captures_iter(line) {
+            let Some(directive) = caps.get(1) else {
+                continue;
+            };
+            // The opening paren is the final byte of the whole match; the
+            // argument list may continue onto following lines.
+            let open = caps.get(0).unwrap().end() - 1;
+            let Some(arguments) = balanced_directive_arguments(&lines, line_idx, open) else {
+                continue;
+            };
+            let (loop_type, variables, iterable) = match directive.as_str() {
                 "foreach" => (
                     BladeLoopType::Foreach,
-                    parse_foreach_variables(arguments),
-                    parse_foreach_iterable(arguments),
+                    parse_foreach_variables(&arguments),
+                    parse_foreach_iterable(&arguments),
                 ),
                 "forelse" => (
                     BladeLoopType::Forelse,
-                    parse_foreach_variables(arguments),
-                    parse_foreach_iterable(arguments),
+                    parse_foreach_variables(&arguments),
+                    parse_foreach_iterable(&arguments),
                 ),
-                "for" => (BladeLoopType::For, parse_for_variables(arguments), None),
+                "for" => (BladeLoopType::For, parse_for_variables(&arguments), None),
                 "while" => (BladeLoopType::While, Vec::new(), None),
                 _ => continue,
             };
