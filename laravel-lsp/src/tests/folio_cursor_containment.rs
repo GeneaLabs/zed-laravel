@@ -8,7 +8,7 @@
 //! tests drive the private methods directly by building the server through
 //! `tower_lsp::LspService` and reaching its inner value with `inner()`.
 
-use crate::LaravelLanguageServer;
+use crate::{path_within_root, LaravelLanguageServer};
 use laravel_lsp::route_discovery::{RouteDefinition, RouteIndex, PRIORITY_APP};
 use std::fs;
 use std::path::Path;
@@ -242,5 +242,54 @@ async fn decl_range_under_root_symlink_to_outside_target_returns_none() {
          project root must not yield a decl range — the canonicalize-based \
          containment guard refuses it even though the link path is lexically \
          inside the root"
+    );
+}
+
+// --- path_within_root: fail-closed on canonicalize failure (issue #134) ---
+//
+// The guard above proved the *live*-symlink escape leg (a link whose target
+// resolves outside the root). This exercises the helper directly on the
+// *dangling*-symlink leg: a link under the root whose target does not exist, so
+// `canonicalize` returns `Err(ENOENT)`. The fail-closed contract must refuse it
+// rather than fall back to a lexical prefix check that would admit it.
+
+#[cfg(unix)]
+#[test]
+fn path_within_root_refuses_dangling_under_root_symlink() {
+    // A symlink at `<root>/dangling` pointing at a target that was never
+    // created. `dangling.canonicalize()` fails (the target is missing), so the
+    // (Err, _) arm of `path_within_root` decides the outcome.
+    let root = TempDir::new().unwrap();
+    let missing_target = root.path().join("never-created.blade.php");
+    let dangling = root.path().join("dangling");
+    std::os::unix::fs::symlink(&missing_target, &dangling).unwrap();
+
+    // Sanity: the link itself exists on disk, but it cannot be canonicalized
+    // because its target is missing — this is exactly the case the old
+    // `_ => path.starts_with(root)` fallback admitted.
+    assert!(
+        std::fs::symlink_metadata(&dangling).is_ok(),
+        "the dangling symlink must exist on disk for this to be a real test"
+    );
+    assert!(
+        dangling.canonicalize().is_err(),
+        "a dangling symlink must fail to canonicalize"
+    );
+
+    // Discriminating companion assertion: the dangling path PASSES the old
+    // lexical `path.starts_with(root)` check (its link path is textually inside
+    // the root). So this test would FAIL against the previous
+    // `_ => path.starts_with(root)` fallback, which admitted the path, and only
+    // passes against the fail-closed `_ => false`.
+    assert!(
+        dangling.starts_with(root.path()),
+        "precondition: the dangling link path is lexically inside the root, so \
+         the old lexical fallback would have admitted it"
+    );
+
+    assert!(
+        !path_within_root(&dangling, root.path()),
+        "a dangling under-root symlink (canonicalize fails) must be refused — \
+         path_within_root is fail-closed, not fail-open via a lexical prefix check"
     );
 }
