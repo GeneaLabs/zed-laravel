@@ -109,8 +109,15 @@ fn helper_identifier_hover_works_in_blade_embedded_php() {
         .iter()
         .find(|h| h.name == "route")
         .expect("route helper identifier captured in Blade-embedded PHP");
-    // The card renders the same regardless of host file type.
-    assert!(hover::helper_identifier_card(&route.name, None).is_some());
+    // The card renders the same regardless of host file type — assert its
+    // content, not mere existence, so a wrong or empty card can't pass.
+    let card = hover::helper_identifier_card(&route.name, None)
+        .expect("route is curated, so a card renders in Blade-embedded PHP too");
+    assert!(card.contains("**route**"), "card headers the helper name");
+    assert!(
+        card.contains("named route"),
+        "card carries the Laravel-aware synopsis"
+    );
 }
 
 #[test]
