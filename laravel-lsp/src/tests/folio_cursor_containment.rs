@@ -97,3 +97,45 @@ async fn in_tree_page_still_resolves() {
         "an in-tree page on its name() call must still resolve to its route name"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn under_root_symlink_to_outside_target_returns_none() {
+    // The discriminating case the lexical guard could not catch (issue #116): the
+    // page path lives *under* the project root — a symlink at
+    // `<root>/pages/contact.blade.php` — yet it resolves to a file OUTSIDE the
+    // root. The target exists on disk (through the link), the page is indexed
+    // under its in-root link path, and the cursor sits on its `name(...)` call,
+    // so a missing index entry can't explain a `None` result. A purely lexical
+    // `starts_with` check would *admit* this path (the link itself is under the
+    // root); only canonicalization — `path_within_root` resolving the symlink to
+    // its out-of-tree target — can reject it. That makes the test fail against
+    // the old lexical guard and pass against the canonicalize guard.
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+
+    // Real target file, outside the project root.
+    let target = outside.path().join("contact.blade.php");
+    fs::write(&target, PAGE_SRC).unwrap();
+
+    // Symlink under the root that points at the outside target.
+    let pages = root.path().join("pages");
+    fs::create_dir_all(&pages).unwrap();
+    let link = pages.join("contact.blade.php");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let server = test_server();
+    *server.root_path.write().await = Some(root.path().to_path_buf());
+    // Index under the in-root symlink path so `folio_name_for_file` matches and
+    // the containment guard — not a missing entry — decides the outcome.
+    seed_folio_page(&server, "contact", &link).await;
+
+    let result = server.folio_route_name_for_cursor(&link, CURSOR).await;
+
+    assert_eq!(
+        result, None,
+        "a page reached through an under-root symlink that resolves outside the \
+         project root must not resolve — the canonicalize-based containment guard \
+         refuses it even though the link path is lexically inside the root"
+    );
+}

@@ -4793,15 +4793,16 @@ impl LaravelLanguageServer {
     /// built).
     ///
     /// Containment is enforced explicitly: after the index name lookup the page
-    /// path is checked against the project root (`self.root_path`, compared
-    /// lexically with `normalize_path` — the same check
-    /// `folio_discovery::resolve_folio_path` applies) and an out-of-tree page
-    /// returns `None` *before* any disk read. The index already holds only
-    /// contained mounts, so this guard is defense in depth: it keeps the disk
-    /// read unreachable for out-of-root paths even if a future discovery path
-    /// ever seeded the index without that structural guarantee. Returns `None`
-    /// when the file isn't a named Folio page, the cursor isn't on its
-    /// `name(...)` call, or the path escapes the project root.
+    /// path is checked against the project root (`self.root_path`) with
+    /// `path_within_root`, which canonicalizes both sides — so a symlink *under*
+    /// the root that resolves outside it is rejected, not just a lexically
+    /// out-of-prefix path — and an out-of-tree page returns `None` *before* any
+    /// disk read. The index already holds only contained mounts, so this guard
+    /// is defense in depth: it keeps the disk read unreachable for out-of-root
+    /// paths even if a future discovery path ever seeded the index without that
+    /// structural guarantee. Returns `None` when the file isn't a named Folio
+    /// page, the cursor isn't on its `name(...)` call, or the path escapes the
+    /// project root.
     async fn folio_route_name_for_cursor(
         &self,
         file_path: &Path,
@@ -4813,10 +4814,12 @@ impl LaravelLanguageServer {
         };
         // Defense-in-depth containment guard: refuse to read a page that sits
         // outside the project root, even if the index were ever seeded with one.
-        // Checked lexically with `normalize_path` (matching `resolve_folio_path`)
-        // before any disk access, so an out-of-tree path never reaches the read.
+        // `path_within_root` canonicalizes both sides before comparing, so a
+        // symlink *under* the root that points outside it is rejected here —
+        // before any disk access — rather than slipping past a purely lexical
+        // prefix check.
         let root = self.root_path.read().await.clone()?;
-        if !normalize_path(file_path).starts_with(normalize_path(&root)) {
+        if !path_within_root(file_path, &root) {
             return None;
         }
         let uri = Url::from_file_path(file_path).ok()?;
