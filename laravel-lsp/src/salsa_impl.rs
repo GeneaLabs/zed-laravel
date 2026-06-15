@@ -2891,15 +2891,63 @@ impl LaravelConfigData {
         paths
     }
 
-    /// Resolve a component name to file path
+    /// Resolve a component name to file path.
+    ///
+    /// Defense-in-depth (#109): the component name comes straight from a Blade
+    /// tag, and the dot→slash substitution below turns a leading-dot or empty
+    /// name into an absolute or empty filesystem path — `PathBuf::join`
+    /// discards the receiver when the argument is absolute, so
+    /// `<flux:.etc.passwd>` would otherwise yield `/etc/passwd`. We reject such
+    /// names up front and, as a backstop, drop any built candidate that escapes
+    /// `self.root` before returning.
     pub fn resolve_component_path(&self, component_name: &str) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-
         // Flux's `<flux:button>` sugar maps to the `flux` anonymous-component
         // namespace; rewrite the single-colon prefix to the `::` form so the
-        // namespace resolution below treats it like `<x-flux::button>`.
+        // namespace resolution treats it like `<x-flux::button>`.
         let flux_normalized = normalize_flux_tag_name(component_name);
         let component_name = flux_normalized.as_deref().unwrap_or(component_name);
+
+        // Reject names that would escape the project root before building any
+        // path. The "actual" component is the part after a `::` namespace
+        // prefix; its dots become slashes downstream, so bail out with no
+        // candidates when it is empty, starts with a dot, or turns absolute
+        // after the substitution. Covers `<flux:>` (empty), leading-dot names,
+        // and the `flux:.etc.passwd` → `/etc/passwd` attack shape.
+        let actual_component = match component_name.find("::") {
+            Some(pos) => &component_name[pos + 2..],
+            None => component_name,
+        };
+        if actual_component.is_empty()
+            || actual_component.starts_with('.')
+            || actual_component.replace('.', "/").starts_with('/')
+        {
+            return Vec::new();
+        }
+
+        // Build the raw candidates, then enforce a project-root containment
+        // backstop: any path that escapes `self.root` is dropped before return.
+        // Canonicalize so a symlinked project root (`/var` → `/private/var` on
+        // macOS) or a symlinked vendor dir doesn't spuriously fail the purely
+        // textual `starts_with`. Speculative candidates that don't exist on
+        // disk can't be canonicalized, so they fall back to the textual prefix
+        // check — which keeps the in-root file guesses and still drops an
+        // absolute `/etc/passwd`-style escape. Mirrors `path_within_root` in
+        // `main.rs` (issue #55).
+        let mut paths = self.component_path_candidates(component_name);
+        let canonical_root = self.root.canonicalize();
+        paths.retain(|path| match (path.canonicalize(), &canonical_root) {
+            (Ok(real_path), Ok(real_root)) => real_path.starts_with(real_root),
+            _ => path.starts_with(&self.root),
+        });
+        paths
+    }
+
+    /// Build the raw component-file candidates for an already-Flux-normalized,
+    /// already-validated component name. Only [`resolve_component_path`] should
+    /// call this — it applies the name guard and root-containment filter that
+    /// keep the candidates from escaping the project root.
+    fn component_path_candidates(&self, component_name: &str) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
 
         // Icon-set check first: <x-heroicon-o-clock> and friends resolve to a
         // concrete SVG file path. The blade-icons Factory registers each icon

@@ -135,15 +135,19 @@ fn make_config_with_icon(tag: &str, svg_path: &str) -> LaravelConfigData {
 
 #[test]
 fn icon_tag_resolves_to_svg_path() {
+    // The svg path lives under the project root — `scan_vendor_for_icon_sets`
+    // always walks `root/vendor`, so registered icon paths are in-tree. This
+    // also satisfies the #109 root-containment backstop, which drops any
+    // candidate outside `self.root`.
     let config = make_config_with_icon(
         "heroicon-o-clock",
-        "/abs/vendor/blade-ui-kit/blade-heroicons/resources/svg/o-clock.svg",
+        "/project/vendor/blade-ui-kit/blade-heroicons/resources/svg/o-clock.svg",
     );
     let paths = config.resolve_component_path("heroicon-o-clock");
     assert_eq!(paths.len(), 1);
     assert_eq!(
         paths[0],
-        PathBuf::from("/abs/vendor/blade-ui-kit/blade-heroicons/resources/svg/o-clock.svg"),
+        PathBuf::from("/project/vendor/blade-ui-kit/blade-heroicons/resources/svg/o-clock.svg"),
     );
 }
 
@@ -429,6 +433,123 @@ fn flux_namespace_tag_resolves_same_as_single_colon() {
         "namespace form must resolve via the Flux fallback: {:?}",
         paths,
     );
+}
+
+// ─── Component-name validation & root containment (issue #109) ─────────
+
+#[test]
+fn empty_component_name_yields_no_candidates() {
+    let config = make_bare_config();
+    assert!(
+        config.resolve_component_path("").is_empty(),
+        "an empty component name must produce zero path candidates",
+    );
+}
+
+#[test]
+fn flux_empty_name_yields_no_candidates() {
+    // `<flux:>` normalizes to the bare `flux::` namespace prefix with an empty
+    // component — it must not resolve to `.blade.php` nonsense paths.
+    let config = make_bare_config();
+    assert!(
+        config.resolve_component_path("flux:").is_empty(),
+        "`<flux:>` (empty component) must produce zero candidates",
+    );
+    // The already-namespaced bare form behaves identically.
+    assert!(
+        config.resolve_component_path("flux::").is_empty(),
+        "bare `flux::` must produce zero candidates",
+    );
+}
+
+#[test]
+fn leading_dot_component_name_yields_no_candidates() {
+    // The `<flux:.etc.passwd>` attack shape: the dot→slash substitution would
+    // turn `.etc.passwd` into the absolute `/etc/passwd`, which `PathBuf::join`
+    // resolves outside the project root. Reject it at the source.
+    let config = make_bare_config();
+    assert!(
+        config.resolve_component_path("flux:.etc.passwd").is_empty(),
+        "a leading-dot component name must produce zero candidates",
+    );
+    // Same guard via an explicit namespace prefix.
+    assert!(
+        config.resolve_component_path("evil::.hidden").is_empty(),
+        "a leading-dot namespaced component must produce zero candidates",
+    );
+}
+
+#[test]
+fn absolute_component_name_yields_no_candidates() {
+    // A name that becomes an absolute path after dot→slash substitution must be
+    // rejected — here a literal leading slash in the component part.
+    let config = make_bare_config();
+    assert!(
+        config
+            .resolve_component_path("evil::/etc/passwd")
+            .is_empty(),
+        "a component that resolves to an absolute path must produce zero candidates",
+    );
+}
+
+#[test]
+fn parent_dir_traversal_name_yields_no_candidates() {
+    // A `../` traversal in the component name starts with a dot, so the source
+    // guard rejects it before any path is built — it never reaches the
+    // filesystem.
+    let config = make_bare_config();
+    assert!(
+        config
+            .resolve_component_path("flux::../../../../etc/passwd")
+            .is_empty(),
+        "a `../` traversal component name must produce zero candidates",
+    );
+}
+
+#[test]
+fn candidates_escaping_root_are_dropped() {
+    // Root-containment backstop: even when a registered directory sits outside
+    // the project root, any candidate built under it is dropped before return,
+    // while the in-root vendor-publish guesses survive.
+    let config = make_config_with_anonymous_path("evil", "/outside/root/components");
+
+    let paths = config.resolve_component_path("evil::layout");
+
+    assert!(!paths.is_empty(), "in-root candidates should still resolve");
+    assert!(
+        paths.iter().all(|p| p.starts_with("/project")),
+        "every returned candidate must stay under the project root: {:?}",
+        paths,
+    );
+    assert!(
+        paths.iter().all(|p| !p.starts_with("/outside")),
+        "candidates under an out-of-root registered directory must be dropped: {:?}",
+        paths,
+    );
+}
+
+#[test]
+fn normal_component_names_resolve_under_root() {
+    // Regression guard for the #109 changes: ordinary names still resolve, and
+    // every candidate stays in-tree.
+    let config = make_bare_config();
+    for name in [
+        "forms.input",
+        "flux::button",
+        "courier::alert",
+        "flux:button",
+    ] {
+        let paths = config.resolve_component_path(name);
+        assert!(
+            !paths.is_empty(),
+            "`{name}` should still resolve to candidates"
+        );
+        assert!(
+            paths.iter().all(|p| p.starts_with("/project")),
+            "`{name}` candidates must stay under the project root: {:?}",
+            paths,
+        );
+    }
 }
 
 #[test]
