@@ -7,6 +7,7 @@ mod code_lens_opt_in;
 mod diagnostic_severity;
 mod dynamic_where_sparseness;
 mod flux_component_context;
+mod flux_component_hover;
 mod folio_cursor_containment;
 mod generic_type_parsing;
 mod helper_identifier_hover;
