@@ -16744,7 +16744,7 @@ return [
             .as_deref()
             .and_then(laravel_lsp::blade_props::extract_props_directive);
         let trailer = if link.is_none() {
-            Some("*(file not found)*")
+            Some(hover::FILE_NOT_FOUND_TRAILER)
         } else {
             None
         };
@@ -17579,7 +17579,7 @@ return [
             .as_deref()
             .and_then(laravel_lsp::blade_props::extract_props_directive);
         let trailer = if link.is_none() {
-            Some("*(file not found)*")
+            Some(hover::FILE_NOT_FOUND_TRAILER)
         } else {
             None
         };
@@ -17636,7 +17636,7 @@ return [
             .as_deref()
             .and_then(laravel_lsp::php_class::extract_class_fqn);
         let trailer = if link.is_none() {
-            Some("*(file not found)*")
+            Some(hover::FILE_NOT_FOUND_TRAILER)
         } else {
             None
         };
@@ -17876,7 +17876,7 @@ return [
         use laravel_lsp::hover;
         let resolved = self.resolve_display_path_for_asset(asset).await;
         let trailer = if resolved.is_none() {
-            Some("*(file not found)*")
+            Some(hover::FILE_NOT_FOUND_TRAILER)
         } else {
             None
         };
@@ -17892,7 +17892,7 @@ return [
         use laravel_lsp::hover;
         let resolved = self.resolve_display_path_for_url(url_path).await;
         let trailer = if resolved.is_none() {
-            Some("*(file not found)*")
+            Some(hover::FILE_NOT_FOUND_TRAILER)
         } else {
             None
         };

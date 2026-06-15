@@ -19,7 +19,7 @@
 //!      link + props — and that the "not found" path renders the trailer instead.
 
 use laravel_lsp::blade_props::extract_props_directive;
-use laravel_lsp::hover::{self, CodeBlock, CodeLanguage, HoverContent};
+use laravel_lsp::hover::{self, CodeBlock, CodeLanguage, HoverContent, FILE_NOT_FOUND_TRAILER};
 use laravel_lsp::salsa_impl::{normalize_flux_tag_name, LaravelConfigData};
 use std::collections::HashMap;
 use std::fs;
@@ -35,15 +35,6 @@ const BUTTON_BLADE: &str =
 
 /// The `@props(...)` directive `BUTTON_BLADE` should yield verbatim.
 const BUTTON_PROPS: &str = "@props(['variant' => 'default', 'size' => null])";
-
-/// The italic trailer the anonymous-component arm of `hover_for_component`
-/// renders when no candidate file exists on disk (`main.rs`, the
-/// `if link.is_none()` branch). Kept as one constant so the not-found test
-/// drives *and* asserts against the same string instead of re-typing the
-/// literal. (Production still inlines this literal at several sites; sharing it
-/// across the module boundary would mean extracting a `pub const` there — a
-/// separate, cross-cutting refactor, out of scope for this additive test.)
-const FILE_NOT_FOUND: &str = "*(file not found)*";
 
 /// A `LaravelConfigData` rooted at `root`, optionally registering
 /// `anonymous_component_paths["flux"] -> flux_dir`. Mirrors `make_bare_config`
@@ -186,7 +177,7 @@ fn rendered_card_carries_source_link_and_props() {
         "the card carries the props text:\n{card}",
     );
     assert!(
-        !card.contains(FILE_NOT_FOUND),
+        !card.contains(FILE_NOT_FOUND_TRAILER),
         "a resolved file must not render the not-found trailer:\n{card}",
     );
 }
@@ -222,7 +213,7 @@ fn not_found_path_renders_trailer_without_link_or_props() {
     });
     let snippet = blade_path.as_deref().and_then(extract_props_directive);
     // The trailer is selected exactly as production does: `link.is_none()`.
-    let trailer = link.is_none().then_some(FILE_NOT_FOUND);
+    let trailer = link.is_none().then_some(FILE_NOT_FOUND_TRAILER);
 
     let card = hover::render(&HoverContent {
         code: snippet.as_deref().map(|s| CodeBlock {
@@ -235,7 +226,7 @@ fn not_found_path_renders_trailer_without_link_or_props() {
     });
 
     assert_eq!(
-        card, FILE_NOT_FOUND,
+        card, FILE_NOT_FOUND_TRAILER,
         "the card is the trailer alone — no other sections",
     );
     assert!(

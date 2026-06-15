@@ -37,6 +37,13 @@ use crate::livewire_resolver::extract_blade_variable_at_cursor;
 use crate::salsa_impl::{ParsedPatternsData, PatternAtPosition};
 use std::path::Path;
 
+/// The italic [`HoverContent::trailer`] rendered when a hovered reference
+/// resolves to no file on disk (view, component, asset, url, … — every
+/// `if link.is_none()` arm in `main.rs`). Single source of truth for the
+/// string so tests can assert against the production value instead of
+/// re-typing the literal.
+pub const FILE_NOT_FOUND_TRAILER: &str = "*(file not found)*";
+
 /// Anything the cursor might be hovering. Pattern variants come straight from
 /// the Salsa position index; the Blade-variable variant is extracted by line
 /// scanning, and only matters in `.blade.php` files.
