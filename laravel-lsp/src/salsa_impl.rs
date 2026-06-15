@@ -24,6 +24,12 @@ use crate::config::kebab_to_pascal_case;
 use crate::middleware_parser::middleware_base_alias;
 use crate::parser::{language_php, parse_php};
 use crate::queries::extract_all_php_patterns;
+// Single source of truth for lexical path normalization. The local copy this
+// replaced popped unconditionally on `..`, so a `..` walking past root would
+// pop the `RootDir` component and silently relativize an absolute path (#117).
+// `route_discovery::normalize_path` pops only a preceding `Normal` segment and
+// preserves root / leading `..`. Every other module already delegates here.
+use crate::route_discovery::normalize_path;
 
 // ============================================================================
 // Database Definition
@@ -2277,21 +2283,6 @@ fn extract_anonymous_component_namespaces(text: &str) -> Vec<(String, String, u3
         }
     }
     out
-}
-
-/// Normalize a path by resolving . and .. components without requiring the path to exist
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut components = Vec::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                components.pop();
-            }
-            std::path::Component::CurDir => {}
-            c => components.push(c),
-        }
-    }
-    components.iter().collect()
 }
 
 /// The namespace a fluent package-builder derives from a package name when

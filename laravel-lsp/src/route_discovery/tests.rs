@@ -1164,3 +1164,52 @@ fn external_prefixes_for_returns_cached_prefixes() {
         vec![String::new(), "admin.".to_string()]
     );
 }
+
+// ---------------------------------------------------------------------------
+// normalize_path — lexical `.`/`..` resolution (regression cover for #117,
+// where salsa_impl's divergent copy popped `RootDir` and relativized absolute
+// paths; salsa_impl now delegates to this canonical function).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn normalize_path_resolves_interior_parent_dir_and_stays_absolute() {
+    // A `..` after a `Normal` segment pops that segment; the path stays absolute.
+    let result = normalize_path(&PathBuf::from("/app/models/../views"));
+    assert_eq!(result, PathBuf::from("/app/views"));
+    assert!(result.is_absolute(), "absolute input must stay absolute");
+}
+
+#[test]
+fn normalize_path_never_pops_root_dir() {
+    // Regression for #117: a `..` walking past root must NOT pop `RootDir` and
+    // silently turn an absolute path relative. The escaping `..` is preserved
+    // and the result stays rooted (the buggy copy returned a relative `escape`).
+    let result = normalize_path(&PathBuf::from("/app/../../escape"));
+    assert!(
+        result.is_absolute(),
+        "absolute input must stay absolute, got {result:?}"
+    );
+    assert_eq!(result, PathBuf::from("/../escape"));
+}
+
+#[test]
+fn normalize_path_preserves_leading_parent_dir() {
+    // A leading `..` on a relative path can't be resolved lexically, so it's kept.
+    assert_eq!(
+        normalize_path(&PathBuf::from("../sibling/file.php")),
+        PathBuf::from("../sibling/file.php")
+    );
+}
+
+#[test]
+fn normalize_path_unchanged_without_parent_dir() {
+    // No `..` segments: behavior is unchanged (only `CurDir` collapses).
+    assert_eq!(
+        normalize_path(&PathBuf::from("/app/views/home.blade.php")),
+        PathBuf::from("/app/views/home.blade.php")
+    );
+    assert_eq!(
+        normalize_path(&PathBuf::from("/app/./views/./home.php")),
+        PathBuf::from("/app/views/home.php")
+    );
+}
