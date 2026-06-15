@@ -117,3 +117,31 @@ fn prop_names_empty_without_directive() {
 fn prop_names_empty_for_empty_props() {
     assert!(extract_prop_names("@props([])\n").is_empty());
 }
+
+// ─── string-literal decoding (issue #111: UTF-8 correctness) ─────────────
+
+#[test]
+fn first_string_literal_utf8_multibyte() {
+    // A multi-byte UTF-8 character inside the literal must be decoded whole,
+    // not split into raw Latin-1 byte casts.
+    assert_eq!(first_string_literal("'café'"), Some("café".to_string()));
+    assert_eq!(
+        first_string_literal("\"naïve façade — €\""),
+        Some("naïve façade — €".to_string())
+    );
+}
+
+#[test]
+fn first_string_literal_escapes() {
+    // Escape sequences take the next char verbatim, even when it is multi-byte.
+    assert_eq!(first_string_literal(r"'it\'s'"), Some("it's".to_string()));
+    assert_eq!(first_string_literal(r#""a\"b""#), Some("a\"b".to_string()));
+    assert_eq!(first_string_literal(r"'a\\b'"), Some("a\\b".to_string()));
+    assert_eq!(first_string_literal(r"'caf\é'"), Some("café".to_string()));
+}
+
+#[test]
+fn first_string_literal_none_cases() {
+    assert_eq!(first_string_literal("no quotes here"), None);
+    assert_eq!(first_string_literal("'unterminated"), None);
+}
