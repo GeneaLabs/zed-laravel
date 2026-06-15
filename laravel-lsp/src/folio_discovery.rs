@@ -369,18 +369,71 @@ pub fn cursor_on_page_name(content: &str, line: u32, character: u32) -> bool {
     }
 }
 
-/// Source span of a Folio page's `name('...')` argument string, including the
-/// surrounding quotes, as `(line, start_column, end_column)`. Used to decide
-/// whether a cursor is on the call. `None` when the page declares no name.
-fn page_name_span(content: &str) -> Option<(u32, u32, u32)> {
+/// A Folio page's own `name('...')` declaration: the route name it owns plus the
+/// 0-based source span of the string *content* between the quotes.
+///
+/// The span follows [`crate::route_name_locator::RouteNameDeclaration`]'s
+/// no-quotes convention — the precise range a rename `TextEdit` replaces — so it
+/// pairs with the route-name rename machinery. [`cursor_on_page_name`] widens
+/// the same span by the enclosing quotes for cursor hit-testing; this yields the
+/// edit range and the leaf name once a cursor is confirmed on the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageNameLocation {
+    /// The page's own route name (the `name('...')` argument content, trimmed,
+    /// no quotes, no mount prefix). This is the route's leaf segment — any
+    /// mount `->name('admin.')` prefix lives on the Folio mount registration.
+    pub name: String,
+    /// 0-based row of the name string. The helper call is single-line.
+    pub line: u32,
+    /// 0-based column of the first content character (after the opening quote).
+    pub start_column: u32,
+    /// 0-based column one past the last content character (before the closing
+    /// quote).
+    pub end_column: u32,
+}
+
+/// Locate a Folio page's own `name('...')` helper declaration — the route name
+/// and the quote-excluded source span of its argument. `None` when the page
+/// declares no name.
+///
+/// The rename/prepare-rename counterpart to [`cursor_on_page_name`]: that
+/// hit-tests a cursor against the (quote-widened) span; this returns the exact
+/// edit range plus the leaf name to rewrite. Pure over `content` — no
+/// filesystem access — so the caller sources the page text (editor buffer or
+/// disk).
+pub fn page_name_location(content: &str) -> Option<PageNameLocation> {
     let inner = PAGE_NAME_RE.captures(content)?.get(1)?;
-    // Widen one byte each side to cover the enclosing quotes.
-    let start = inner.start().saturating_sub(1);
-    let end = (inner.end() + 1).min(content.len());
-    let start_pos = crate::query_chain::byte_offset_to_position(content, start);
-    let end_pos = crate::query_chain::byte_offset_to_position(content, end);
-    // The `name('...')` argument is single-line; anchor to its start line.
-    Some((start_pos.line, start_pos.character, end_pos.character))
+    let name = inner.as_str().trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    // Boundary byte offsets → LSP positions (UTF-16 columns); the helper call's
+    // argument is single-line so we anchor to its start row.
+    let start_pos = crate::query_chain::byte_offset_to_position(content, inner.start());
+    let end_pos = crate::query_chain::byte_offset_to_position(content, inner.end());
+    Some(PageNameLocation {
+        name,
+        line: start_pos.line,
+        start_column: start_pos.character,
+        end_column: end_pos.character,
+    })
+}
+
+/// Source span of a Folio page's `name('...')` argument string, *including* the
+/// surrounding quotes, as `(line, start_column, end_column)`. Used by
+/// [`cursor_on_page_name`] to decide whether a cursor is on the call (clicking a
+/// quote still counts). `None` when the page declares no name. The
+/// quote-excluded span — the rename edit range — is [`page_name_location`].
+fn page_name_span(content: &str) -> Option<(u32, u32, u32)> {
+    let loc = page_name_location(content)?;
+    // Widen one column each side to cover the enclosing quotes. A PHP string
+    // quote is always a single-column ASCII byte (`'` or `"`), so a one-column
+    // step is exact under LSP's UTF-16 columns.
+    Some((
+        loc.line,
+        loc.start_column.saturating_sub(1),
+        loc.end_column + 1,
+    ))
 }
 
 /// Discover every Folio page across the project's mounts and resolve it to a

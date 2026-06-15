@@ -9,6 +9,7 @@ mod dynamic_where_sparseness;
 mod flux_component_context;
 mod flux_component_hover;
 mod folio_cursor_containment;
+mod folio_rename;
 mod generic_type_parsing;
 mod helper_identifier_hover;
 mod livewire_component_resolution;

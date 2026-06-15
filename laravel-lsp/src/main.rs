@@ -4829,6 +4829,39 @@ impl LaravelLanguageServer {
         .then_some(name)
     }
 
+    /// The prepare-rename highlight range for a Folio page's own `name('...')`
+    /// helper when the cursor sits on it (issue #100) — the page-route
+    /// counterpart to the `routes/`-file decl ranges `decl_range_at` derives
+    /// from `cached_route_decls`.
+    ///
+    /// A Folio page lives outside `routes/` and its bare `name(...)` helper is no
+    /// `->name()` chain, so the conventional decl walk never finds it; this
+    /// resolves the quote-excluded content span straight from the page source
+    /// (editor buffer or disk). Returns `None` when the cursor isn't on a Folio
+    /// page's `name(...)` call.
+    async fn folio_name_decl_range(&self, file_path: &Path, position: Position) -> Option<Range> {
+        let uri = Url::from_file_path(file_path).ok()?;
+        let content = self.document_or_disk_content(&uri, file_path).await?;
+        if !laravel_lsp::folio_discovery::cursor_on_page_name(
+            &content,
+            position.line,
+            position.character,
+        ) {
+            return None;
+        }
+        let loc = laravel_lsp::folio_discovery::page_name_location(&content)?;
+        Some(Range {
+            start: Position {
+                line: loc.line,
+                character: loc.start_column,
+            },
+            end: Position {
+                line: loc.line,
+                character: loc.end_column,
+            },
+        })
+    }
+
     /// Return the current content of `uri` — the editor buffer if the file is
     /// open (so unsaved edits are reflected), otherwise the on-disk text.
     /// Returns `None` only when neither source is readable.
@@ -18152,8 +18185,13 @@ async fn classify_with_decl_fallback(
         // page lives outside `routes/` and the bare helper isn't tagged by
         // php.scm. If the cursor sits on that call, resolve it to the page's
         // (mount-prefixed) route name — read from the already-built in-memory
-        // route index, never a fresh filesystem walk — so find-references /
-        // rename reach every `route('...')` usage of the page.
+        // route index, never a fresh filesystem walk. find-references then
+        // reaches every `route('...')` usage of the page, and rename rewrites
+        // them atomically with the page's own `name('...')` declaration: the
+        // call-site edits come from `find_references`, the declaration edit from
+        // `collect_route_declaration_targets`' Folio branch, with the matching
+        // prepare_rename highlight range from `decl_range_at`'s Folio fallback
+        // (issue #100).
         if let Some(name) = server
             .folio_route_name_for_cursor(file_path, position)
             .await
@@ -18200,34 +18238,41 @@ async fn decl_range_at(
     let laravel_lsp::references::SymbolRef::Route(name) = symbol else {
         return None;
     };
-    let decls = server.cached_route_decls(file_path).await?;
-    // `name` may carry an external-file group prefix (issue #43); match a raw
-    // in-file decl whose name equals `name` once that prefix is prepended.
-    let external = root
-        .map(|r| laravel_lsp::route_discovery::external_prefixes_for_file(r, file_path))
-        .unwrap_or_else(|| vec![String::new()]);
-    for d in decls.iter().filter(|d| {
-        external
-            .iter()
-            .any(|ext| format!("{}{}", ext, d.full_name) == *name)
-    }) {
-        if d.line == position.line
-            && position.character >= d.start_column
-            && position.character <= d.end_column
-        {
-            return Some(Range {
-                start: Position {
-                    line: d.line,
-                    character: d.start_column,
-                },
-                end: Position {
-                    line: d.line,
-                    character: d.end_column,
-                },
-            });
+    if let Some(decls) = server.cached_route_decls(file_path).await {
+        // `name` may carry an external-file group prefix (issue #43); match a raw
+        // in-file decl whose name equals `name` once that prefix is prepended.
+        let external = root
+            .map(|r| laravel_lsp::route_discovery::external_prefixes_for_file(r, file_path))
+            .unwrap_or_else(|| vec![String::new()]);
+        for d in decls.iter().filter(|d| {
+            external
+                .iter()
+                .any(|ext| format!("{}{}", ext, d.full_name) == *name)
+        }) {
+            if d.line == position.line
+                && position.character >= d.start_column
+                && position.character <= d.end_column
+            {
+                return Some(Range {
+                    start: Position {
+                        line: d.line,
+                        character: d.start_column,
+                    },
+                    end: Position {
+                        line: d.line,
+                        character: d.end_column,
+                    },
+                });
+            }
         }
     }
-    None
+
+    // Folio fallback (issue #100): a named Folio page declares its route via its
+    // own `name('...')` helper, which lives outside `routes/` and is no
+    // `->name()` chain, so the decl walk above never sees it. If the cursor sits
+    // on that call, return its quote-excluded content range so prepare_rename
+    // offers the same highlight a conventional route decl would.
+    server.folio_name_decl_range(file_path, position).await
 }
 
 /// Is this file a conventional route file — i.e. does it live directly under
@@ -18562,64 +18607,110 @@ async fn collect_route_declaration_targets(
 ) -> Vec<laravel_lsp::rename::EditTarget> {
     let mut targets = Vec::new();
     let routes_dir = root.join("routes");
-    if !routes_dir.exists() {
-        return targets;
-    }
-    // Inherited external-load prefixes for EVERY route file, computed once per
-    // request instead of re-running the project load graph per file inside the
-    // loop below (avoids O(files²)).
-    let external_prefix_map = laravel_lsp::route_discovery::external_prefixes_map(root);
-    for entry in WalkDir::new(&routes_dir)
-        .max_depth(6)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !path.is_file() || path.extension().is_none_or(|ext| ext != "php") {
-            continue;
-        }
-        // Mtime-cached: first invocation per file mtime parses the file
-        // with route_name_locator; subsequent invocations are a HashMap hit
-        // until the file changes on disk.
-        let Some(all_decls) = server.cached_route_decls(path).await else {
-            continue;
-        };
-        // External-file group prefixes (issue #43): a file loaded via
-        // `Route::as('admin.')->group(<path>)` resolves its raw `->name('x')`
-        // to `admin.x` at the project level. For each matching decl we
-        // re-anchor `full_name` to that combined prefix so `rewritten_segment`
-        // strips the WHOLE prefix (external + in-file group) and rewrites only
-        // the leaf — never doubling either prefix in source. The always-present
-        // `""` prefix preserves the plain (non-external) match.
-        let external = external_prefix_map
-            .get(&laravel_lsp::route_discovery::normalize_path(path))
-            .cloned()
-            .unwrap_or_else(|| vec![String::new()]);
-        for d in all_decls.iter() {
-            let Some(ext) = external
-                .iter()
-                .find(|ext| format!("{}{}", ext, d.full_name) == target)
-            else {
+    if routes_dir.exists() {
+        // Inherited external-load prefixes for EVERY route file, computed once
+        // per request instead of re-running the project load graph per file
+        // inside the loop below (avoids O(files²)).
+        let external_prefix_map = laravel_lsp::route_discovery::external_prefixes_map(root);
+        for entry in WalkDir::new(&routes_dir)
+            .max_depth(6)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "php") {
+                continue;
+            }
+            // Mtime-cached: first invocation per file mtime parses the file
+            // with route_name_locator; subsequent invocations are a HashMap hit
+            // until the file changes on disk.
+            let Some(all_decls) = server.cached_route_decls(path).await else {
                 continue;
             };
-            let resolved = laravel_lsp::route_name_locator::RouteNameDeclaration {
-                full_name: format!("{}{}", ext, d.full_name),
-                local_segment: d.local_segment.clone(),
-                line: d.line,
-                start_column: d.start_column,
-                end_column: d.end_column,
-            };
-            targets.push(laravel_lsp::rename::EditTarget {
-                file_path: path.to_path_buf(),
-                line: d.line,
-                start_column: d.start_column,
-                end_column: d.end_column,
-                // Decl spans only this segment; the group prefix (if any)
-                // lives elsewhere and must not be re-written here.
-                new_text: resolved.rewritten_segment(new_name).to_string(),
-            });
+            // External-file group prefixes (issue #43): a file loaded via
+            // `Route::as('admin.')->group(<path>)` resolves its raw `->name('x')`
+            // to `admin.x` at the project level. For each matching decl we
+            // re-anchor `full_name` to that combined prefix so `rewritten_segment`
+            // strips the WHOLE prefix (external + in-file group) and rewrites only
+            // the leaf — never doubling either prefix in source. The always-present
+            // `""` prefix preserves the plain (non-external) match.
+            let external = external_prefix_map
+                .get(&laravel_lsp::route_discovery::normalize_path(path))
+                .cloned()
+                .unwrap_or_else(|| vec![String::new()]);
+            for d in all_decls.iter() {
+                let Some(ext) = external
+                    .iter()
+                    .find(|ext| format!("{}{}", ext, d.full_name) == target)
+                else {
+                    continue;
+                };
+                let resolved = laravel_lsp::route_name_locator::RouteNameDeclaration {
+                    full_name: format!("{}{}", ext, d.full_name),
+                    local_segment: d.local_segment.clone(),
+                    line: d.line,
+                    start_column: d.start_column,
+                    end_column: d.end_column,
+                };
+                targets.push(laravel_lsp::rename::EditTarget {
+                    file_path: path.to_path_buf(),
+                    line: d.line,
+                    start_column: d.start_column,
+                    end_column: d.end_column,
+                    // Decl spans only this segment; the group prefix (if any)
+                    // lives elsewhere and must not be re-written here.
+                    new_text: resolved.rewritten_segment(new_name).to_string(),
+                });
+            }
         }
     }
+
+    // Folio page declaration (issue #100): a named Folio page declares its route
+    // via its own `name('...')` helper, which lives outside `routes/` (so the
+    // walk above never reaches it) and is no `->name()` chain. Without rewriting
+    // it, a rename would update every `route('...')` call site but leave the
+    // page's declaration stale — the decl/call-site desync this fixes. Resolve
+    // the page straight from the in-memory route index (the same source
+    // `collect_declaration_locations`' Folio branch reads): a `.blade.php`-backed
+    // entry for `target` is Folio-owned (a conventional route of the same name
+    // shadows it via keep-first insertion, and its file is a `routes/*.php`), so
+    // this never double-counts with the walk above.
+    let folio_page = {
+        let guard = server.route_index.read().await;
+        guard
+            .as_ref()
+            .and_then(|idx| idx.get(target))
+            .filter(|def| def.file.to_str().is_some_and(|s| s.ends_with(".blade.php")))
+            .map(|def| def.file.clone())
+    };
+    if let Some(file) = folio_page {
+        if let Ok(uri) = Url::from_file_path(&file) {
+            if let Some(content) = server.document_or_disk_content(&uri, &file).await {
+                if let Some(loc) = laravel_lsp::folio_discovery::page_name_location(&content) {
+                    // The page's `name(...)` argument is the route's LEAF; any
+                    // mount `->name('admin.')` prefix lives on the Folio mount
+                    // registration, not in the page. Strip it exactly as a
+                    // `routes/` group prefix is stripped so only the leaf is
+                    // rewritten — never doubling the mount prefix in source.
+                    let resolved = laravel_lsp::route_name_locator::RouteNameDeclaration {
+                        full_name: target.to_string(),
+                        local_segment: loc.name.clone(),
+                        line: loc.line,
+                        start_column: loc.start_column,
+                        end_column: loc.end_column,
+                    };
+                    targets.push(laravel_lsp::rename::EditTarget {
+                        file_path: file,
+                        line: loc.line,
+                        start_column: loc.start_column,
+                        end_column: loc.end_column,
+                        new_text: resolved.rewritten_segment(new_name).to_string(),
+                    });
+                }
+            }
+        }
+    }
+
     targets
 }
 

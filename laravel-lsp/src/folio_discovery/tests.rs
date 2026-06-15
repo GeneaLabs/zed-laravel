@@ -418,6 +418,56 @@ fn cursor_on_page_name_false_for_unnamed_page() {
     assert!(!cursor_on_page_name("<div>no name here</div>", 0, 0));
 }
 
+// ---------------------------------------------------------------------------
+// page_name_location — the rename edit range + leaf name (issue #100)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn page_name_location_spans_content_without_quotes() {
+    // `<?php name('about'); ?>` — `about` content occupies columns 12..=16, so
+    // the quote-excluded span is start 12, end 17 (one past the last char).
+    let loc = page_name_location("<?php name('about'); ?>").expect("named page locates");
+    assert_eq!(loc.name, "about");
+    assert_eq!(loc.line, 0);
+    assert_eq!(loc.start_column, 12);
+    assert_eq!(loc.end_column, 17);
+}
+
+#[test]
+fn page_name_location_excludes_the_cursor_quote_padding() {
+    // The quote-widened cursor span (page_name_span, via cursor_on_page_name)
+    // includes the quotes; the rename location must NOT — it sits one column
+    // inside each quote. Cross-check the two stay consistent.
+    let content = "<?php name('about'); ?>";
+    let loc = page_name_location(content).unwrap();
+    // One column left of the content start is the opening quote — still "on the
+    // call" for hit-testing, but never part of the edit range.
+    assert!(cursor_on_page_name(content, 0, loc.start_column - 1));
+    assert!(cursor_on_page_name(content, 0, loc.end_column));
+}
+
+#[test]
+fn page_name_location_handles_double_quotes_and_dotted_names() {
+    let loc = page_name_location(r#"<?php name("users.show"); ?>"#).expect("dotted name locates");
+    assert_eq!(loc.name, "users.show");
+    assert_eq!(loc.line, 0);
+    // Slice the source at the reported span; it must equal the leaf name.
+    let content = r#"<?php name("users.show"); ?>"#;
+    let slice: String = content
+        .chars()
+        .skip(loc.start_column as usize)
+        .take((loc.end_column - loc.start_column) as usize)
+        .collect();
+    assert_eq!(slice, "users.show");
+}
+
+#[test]
+fn page_name_location_none_when_no_helper() {
+    assert!(page_name_location("<div>plain page</div>").is_none());
+    // `->name(` route-chain and static `::name(` are not the Folio helper.
+    assert!(page_name_location("<?php Route::get('/x')->name('not.folio');").is_none());
+}
+
 #[test]
 fn folio_name_for_file_resolves_from_the_index() {
     // Build the in-memory index the same way the route-index build does, then
