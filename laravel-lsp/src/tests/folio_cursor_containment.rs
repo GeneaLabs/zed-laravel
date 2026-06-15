@@ -1,10 +1,11 @@
-//! Tests for the explicit root-containment guard in
-//! `LaravelLanguageServer::folio_route_name_for_cursor` (issue #104).
+//! Tests for the explicit root-containment guards in
+//! `LaravelLanguageServer::folio_route_name_for_cursor` (issue #104) and its
+//! prepare-rename sibling `folio_name_decl_range` (issue #141).
 //!
 //! The guard is defense in depth: the route index already holds only mounts
-//! that stayed under the project root, but the method re-checks containment
+//! that stayed under the project root, but the methods re-check containment
 //! against `self.root_path` before reading the cursor file from disk. These
-//! tests drive the private method directly by building the server through
+//! tests drive the private methods directly by building the server through
 //! `tower_lsp::LspService` and reaching its inner value with `inner()`.
 
 use crate::LaravelLanguageServer;
@@ -12,7 +13,7 @@ use laravel_lsp::route_discovery::{RouteDefinition, RouteIndex, PRIORITY_APP};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
-use tower_lsp::lsp_types::Position;
+use tower_lsp::lsp_types::{Position, Range};
 use tower_lsp::LspService;
 
 /// A bare Folio page that declares `name('contact')`. Cursor character 13 sits
@@ -137,5 +138,109 @@ async fn under_root_symlink_to_outside_target_returns_none() {
         "a page reached through an under-root symlink that resolves outside the \
          project root must not resolve — the canonicalize-based containment guard \
          refuses it even though the link path is lexically inside the root"
+    );
+}
+
+// --- folio_name_decl_range: prepare-rename highlight range (issue #141) ---
+//
+// `folio_name_decl_range` resolves the quote-excluded span of a Folio page's
+// own `name('...')` call straight from the page source (it does not consult the
+// route index), so these tests only need the page on disk plus `root_path` set.
+// The guard mirrors `folio_route_name_for_cursor`: refuse to read a page whose
+// canonical path falls outside the project root.
+
+/// The expected highlight range for `PAGE_SRC` — the `contact` argument content
+/// (columns 12..19 on line 0), quotes excluded.
+const DECL_RANGE: Range = Range {
+    start: Position {
+        line: 0,
+        character: 12,
+    },
+    end: Position {
+        line: 0,
+        character: 19,
+    },
+};
+
+#[tokio::test]
+async fn decl_range_out_of_root_page_returns_none() {
+    // The page lives outside the project root, yet exists on disk and has a
+    // valid `name(...)` call with the cursor on it. Without the guard the method
+    // would read it and return a range; the guard must refuse it on containment
+    // grounds alone.
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let page = outside.path().join("contact.blade.php");
+    fs::write(&page, PAGE_SRC).unwrap();
+
+    let server = test_server();
+    *server.root_path.write().await = Some(root.path().to_path_buf());
+
+    let result = server.folio_name_decl_range(&page, CURSOR).await;
+
+    assert_eq!(
+        result, None,
+        "an out-of-root page must not yield a decl range, even though it exists \
+         and the cursor is on its name() call — the containment guard refuses it"
+    );
+}
+
+#[tokio::test]
+async fn decl_range_in_tree_page_returns_range() {
+    // Positive control: a page inside the project root resolves to the correct
+    // highlight range, confirming the guard doesn't regress in-tree behavior.
+    let root = TempDir::new().unwrap();
+    let page = root.path().join("pages").join("contact.blade.php");
+    fs::create_dir_all(page.parent().unwrap()).unwrap();
+    fs::write(&page, PAGE_SRC).unwrap();
+
+    let server = test_server();
+    *server.root_path.write().await = Some(root.path().to_path_buf());
+
+    let result = server.folio_name_decl_range(&page, CURSOR).await;
+
+    assert_eq!(
+        result,
+        Some(DECL_RANGE),
+        "an in-tree page on its name() call must still yield the quote-excluded \
+         highlight range of its name argument"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn decl_range_under_root_symlink_to_outside_target_returns_none() {
+    // The discriminating case a lexical guard could not catch: the page path
+    // lives *under* the project root — a symlink at
+    // `<root>/pages/contact.blade.php` — yet it resolves to a file OUTSIDE the
+    // root. The target exists on disk (through the link) and the cursor sits on
+    // its `name(...)` call, so a missing file can't explain a `None` result. A
+    // purely lexical `starts_with` check would *admit* this path; only
+    // canonicalization — `path_within_root` resolving the symlink to its
+    // out-of-tree target — can reject it.
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+
+    // Real target file, outside the project root.
+    let target = outside.path().join("contact.blade.php");
+    fs::write(&target, PAGE_SRC).unwrap();
+
+    // Symlink under the root that points at the outside target.
+    let pages = root.path().join("pages");
+    fs::create_dir_all(&pages).unwrap();
+    let link = pages.join("contact.blade.php");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let server = test_server();
+    *server.root_path.write().await = Some(root.path().to_path_buf());
+
+    let result = server.folio_name_decl_range(&link, CURSOR).await;
+
+    assert_eq!(
+        result, None,
+        "a page reached through an under-root symlink that resolves outside the \
+         project root must not yield a decl range — the canonicalize-based \
+         containment guard refuses it even though the link path is lexically \
+         inside the root"
     );
 }

@@ -4843,6 +4843,16 @@ impl LaravelLanguageServer {
     /// (editor buffer or disk). Returns `None` when the cursor isn't on a Folio
     /// page's `name(...)` call.
     async fn folio_name_decl_range(&self, file_path: &Path, position: Position) -> Option<Range> {
+        // Defense-in-depth containment guard: refuse to read a page that sits
+        // outside the project root, even if the index were ever seeded with one.
+        // `path_within_root` canonicalizes both sides before comparing, so a
+        // symlink *under* the root that points outside it is rejected here —
+        // before any disk access — rather than slipping past a purely lexical
+        // prefix check. Mirrors the read-path sibling `folio_route_name_for_cursor`.
+        let root = self.root_path.read().await.clone()?;
+        if !path_within_root(file_path, &root) {
+            return None;
+        }
         let uri = Url::from_file_path(file_path).ok()?;
         let content = self.document_or_disk_content(&uri, file_path).await?;
         if !laravel_lsp::folio_discovery::cursor_on_page_name(
