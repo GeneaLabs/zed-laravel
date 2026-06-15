@@ -36,6 +36,15 @@ const BUTTON_BLADE: &str =
 /// The `@props(...)` directive `BUTTON_BLADE` should yield verbatim.
 const BUTTON_PROPS: &str = "@props(['variant' => 'default', 'size' => null])";
 
+/// The italic trailer the anonymous-component arm of `hover_for_component`
+/// renders when no candidate file exists on disk (`main.rs`, the
+/// `if link.is_none()` branch). Kept as one constant so the not-found test
+/// drives *and* asserts against the same string instead of re-typing the
+/// literal. (Production still inlines this literal at several sites; sharing it
+/// across the module boundary would mean extracting a `pub const` there — a
+/// separate, cross-cutting refactor, out of scope for this additive test.)
+const FILE_NOT_FOUND: &str = "*(file not found)*";
+
 /// A `LaravelConfigData` rooted at `root`, optionally registering
 /// `anonymous_component_paths["flux"] -> flux_dir`. Mirrors `make_bare_config`
 /// in `salsa_impl/tests.rs` — every other field is empty.
@@ -81,9 +90,12 @@ fn normalize_rewrites_single_colon_and_rejects_already_namespaced() {
         normalize_flux_tag_name("flux:button").as_deref(),
         Some("flux::button"),
     );
-    // …while an already-namespaced tag arrives pre-normalized (no double rewrite)…
+    // …while an already-namespaced tag arrives pre-normalized (no double rewrite):
+    // after stripping `flux:`, the remainder begins with `:`, which the
+    // `rest.starts_with(':')` guard rejects (`salsa_impl.rs`)…
     assert_eq!(normalize_flux_tag_name("flux::button"), None);
-    // …and a dotted child under the double-colon prefix is left alone too.
+    // …and any other already-`flux::` name is rejected by that same guard — the
+    // remainder still leads with `:`, so it's left untouched too.
     assert_eq!(normalize_flux_tag_name("flux::nested"), None);
 }
 
@@ -143,9 +155,17 @@ fn rendered_card_carries_source_link_and_props() {
     let props =
         extract_props_directive(path).expect("props are extractable from the resolved file");
 
-    // Source link built the same way `Backend::source_link` does (file:// URL).
+    // Source link built the same way `Backend::source_link` does: a file:// URL
+    // with a *root-relative* display label, mirroring `relative_display_path`
+    // (which strips the project root, falling back to the full path on
+    // mismatch). Here the fixture root IS the flux dir, so this reduces to
+    // `button.blade.php` — but deriving it from the root keeps the assertion
+    // faithful to production instead of coincidentally equal to `file_name()`.
     let url = Url::from_file_path(path).expect("absolute path → file URL");
-    let display = path.file_name().unwrap().to_string_lossy();
+    let display = path
+        .strip_prefix(&config.root)
+        .unwrap_or(path)
+        .to_string_lossy();
     let link = hover::source_link(&display, url.as_str(), None);
 
     let card = hover::render(&HoverContent {
@@ -166,7 +186,7 @@ fn rendered_card_carries_source_link_and_props() {
         "the card carries the props text:\n{card}",
     );
     assert!(
-        !card.contains("*(file not found)*"),
+        !card.contains(FILE_NOT_FOUND),
         "a resolved file must not render the not-found trailer:\n{card}",
     );
 }
@@ -180,21 +200,42 @@ fn not_found_path_renders_trailer_without_link_or_props() {
     let dir = TempDir::new().unwrap();
     let config = flux_config(dir.path().to_path_buf(), None);
 
-    let resolved = config.resolve_component_path("flux:button");
+    // Walk the *production* not-found decision (`main.rs`, anonymous-component
+    // arm). `resolve_component_file` keeps the first candidate that exists on
+    // disk; production derives `link`/`snippet` from it and selects the trailer
+    // with `if link.is_none()`. The resolution outcome therefore *drives* the
+    // trailer — it isn't hand-fed. With nothing on disk, `blade_path` is None,
+    // so no link, no props, and the not-found trailer is what renders.
+    let blade_path = config
+        .resolve_component_path("flux:button")
+        .into_iter()
+        .find(|p| p.exists());
     assert!(
-        resolved.iter().all(|p| !p.exists()),
+        blade_path.is_none(),
         "no candidate file exists for an unregistered, empty project",
     );
 
-    // Mirror `hover_for_component` when resolution yields no existing file: no
-    // source link, no props code, just the not-found trailer.
+    let link = blade_path.as_deref().map(|p| {
+        let url = Url::from_file_path(p).expect("absolute path → file URL");
+        let display = p.strip_prefix(&config.root).unwrap_or(p).to_string_lossy();
+        hover::source_link(&display, url.as_str(), None)
+    });
+    let snippet = blade_path.as_deref().and_then(extract_props_directive);
+    // The trailer is selected exactly as production does: `link.is_none()`.
+    let trailer = link.is_none().then_some(FILE_NOT_FOUND);
+
     let card = hover::render(&HoverContent {
-        trailer: Some("*(file not found)*"),
+        code: snippet.as_deref().map(|s| CodeBlock {
+            language: CodeLanguage::Php,
+            content: s,
+        }),
+        source_link: link.as_deref(),
+        trailer,
         ..Default::default()
     });
 
     assert_eq!(
-        card, "*(file not found)*",
+        card, FILE_NOT_FOUND,
         "the card is the trailer alone — no other sections",
     );
     assert!(
