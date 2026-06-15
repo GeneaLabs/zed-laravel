@@ -113,6 +113,47 @@ async fn out_of_root_component_view_returns_none_without_disk_read() {
 }
 
 #[tokio::test]
+async fn out_of_root_candidate_is_never_stated() {
+    // Ordering proof for issue #145: the containment guard must run *before*
+    // `file_exists_cached`, so an out-of-root candidate is rejected without any
+    // disk `stat`, closing the out-of-root existence oracle. `file_exists_cached`
+    // writes a path into `file_exists_cache` only *after* it `stat`s the path, so
+    // that cache is a faithful record of which candidates were probed on disk.
+    //
+    // We resolve an out-of-root `card` view that exists on disk, run the lookup,
+    // and assert its path never entered the existence cache — i.e. the syscall
+    // was never made. This is what guards the ordering: the result-level
+    // `out_of_root_component_view_returns_none_without_disk_read` test passes
+    // under *either* loop order (the guard rejects the path eventually), so it
+    // can't catch a regression that reverts the guard back behind
+    // `file_exists_cached`. Asserting the absence of the `stat` can.
+    let root = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+
+    let card = outside.path().join("components/card.blade.php");
+    write(&card, CARD_VIEW);
+
+    let server = test_server();
+    let source_uri =
+        Url::from_file_path(root.path().join("resources/views/page.blade.php")).unwrap();
+    let config = config_with_namespace(root.path(), outside.path());
+    seed(&server, config, &source_uri).await;
+
+    let result = server.create_slot_location(&source_uri, CURSOR).await;
+
+    assert!(
+        result.is_none(),
+        "an out-of-root component view must not resolve"
+    );
+    assert!(
+        !server.file_exists_cache.read().await.contains_key(&card),
+        "the out-of-root candidate must never be stat'ed: its path must not enter \
+         file_exists_cache. Its presence would mean file_exists_cached ran before \
+         the containment guard — the exact ordering bug #145 closes"
+    );
+}
+
+#[tokio::test]
 async fn in_root_component_view_still_resolves() {
     // Positive control: the `pkg` namespace points to a directory INSIDE the
     // project root, so the resolved `card` view passes containment and slot

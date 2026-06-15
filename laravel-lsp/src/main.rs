@@ -13687,17 +13687,18 @@ return [
         let possible_paths = config.resolve_component_path(&parent.name);
 
         for path in possible_paths {
-            if !self.file_exists_cached(&path).await {
+            // Containment guard (issues #130, #145): a `loadViewsFrom`-style
+            // namespace can resolve a component to an absolute path that escapes
+            // the project root. This runs *first* — before `file_exists_cached`
+            // — so an out-of-root candidate is never `stat`ed on disk, closing
+            // the existence-oracle on paths outside the project root. Matches the
+            // Folio cursor flow (`folio_route_name_for_cursor`) and the blade-var
+            // rename flow. `continue` rather than `return None` so a later in-root
+            // candidate can still resolve.
+            if !path_within_root(&path, &config.root) {
                 continue;
             }
-            // Containment guard (issue #130): a `loadViewsFrom`-style namespace
-            // can resolve a component to an absolute path that escapes the
-            // project root. Refuse to read anything outside the root before the
-            // `locate_slot_in_view` disk read, matching the Folio cursor flow
-            // (`folio_route_name_for_cursor`) and the blade-var rename flow.
-            // `continue` rather than `return None` so a later in-root candidate
-            // can still resolve.
-            if !path_within_root(&path, &config.root) {
+            if !self.file_exists_cached(&path).await {
                 continue;
             }
             let Ok(target_uri) = Url::from_file_path(&path) else {
