@@ -5,7 +5,7 @@
 //! NAME token, and the resolved pattern + rendered card are asserted. Mirrors
 //! the example call sites in the issue's acceptance criteria.
 
-use laravel_lsp::hover::{self, HelperCard};
+use laravel_lsp::hover;
 use laravel_lsp::pattern_indexer::parse_owned;
 use laravel_lsp::salsa_impl::PatternAtPosition;
 use std::fs;
@@ -108,75 +108,51 @@ fn helper_identifier_hover_works_in_blade_embedded_php() {
 
 // ─── source-link branch: vendored helpers.php present vs. absent (#118) ───
 //
-// `Backend::hover_for_helper` (`main.rs`) probes the workspace root for the
-// vendored framework `helpers.php`: present → a `file://` link into that file,
-// absent → the canonical `laravel.com/docs` anchor. The two arms below walk
-// that decision with a `TempDir` — the same backend-free approach
-// `flux_component_hover.rs` uses for the Flux hover chain — so a regression that
-// flipped the branch selection or broke the vendor-path probe is caught.
+// `Backend::hover_for_helper` (`main.rs`) delegates its vendored-vs-docs
+// source-link decision to `hover::resolve_helper_source_link`, which probes the
+// workspace root for the vendored framework `helpers.php`: present → a `file://`
+// link into that file, absent → the canonical `laravel.com/docs` anchor. The two
+// arms below drive that *production* function directly with a `TempDir` — the
+// same standalone-function + `TempDir` convention as `vendor_translations` and
+// `vendor_member_prover` — and assert on the link it RETURNS, so a regression
+// flipping the branch selection or breaking the vendor-path probe is caught.
 
-/// Reproduce `Backend::hover_for_helper`'s source-link decision (`main.rs`)
-/// without standing up an async LSP backend. The vendored-vs-docs branch is
-/// *driven* by the on-disk probe (`vendored.exists()`, mirroring the production
-/// `tokio::fs::try_exists`), so the fixture — vendored file present or absent —
-/// selects the arm exactly as production does; it is never hand-picked.
-fn helper_source_link(root: &Path, card: &HelperCard) -> String {
-    let vendored = root.join(card.vendor_path);
-    if vendored.exists() {
-        // Mirror `Backend::source_link`: a root-relative display label over a
-        // `file://` URL (`relative_display_path` strips the project root,
-        // falling back to the absolute path on mismatch — here the fixture root
-        // IS the workspace root, so the label reduces to `card.vendor_path`).
-        let url = Url::from_file_path(&vendored).expect("absolute path → file URL");
-        let display = vendored
-            .strip_prefix(root)
-            .unwrap_or(&vendored)
-            .to_string_lossy();
-        hover::source_link(&display, url.as_str(), None)
-    } else {
-        // Fallback arm: the curated `laravel.com/docs` anchor for this helper.
-        hover::source_link("Laravel documentation", card.docs_url, None)
-    }
-}
-
-#[test]
-fn vendored_helpers_file_present_yields_a_file_source_link() {
+#[tokio::test]
+async fn vendored_helpers_file_present_yields_a_file_source_link() {
     let card = hover::helper_card("route").expect("route is curated");
 
     // A workspace root with the framework vendored: materialize the exact file
-    // `hover_for_helper` probes for.
+    // `resolve_helper_source_link` probes for.
     let dir = TempDir::new().unwrap();
     let vendored = dir.path().join(card.vendor_path);
     fs::create_dir_all(vendored.parent().unwrap()).unwrap();
     fs::write(&vendored, "<?php\n// Illuminate\\Foundation helpers\n").unwrap();
 
-    let link = helper_source_link(dir.path(), card);
-    let render = hover::helper_identifier_card("route", Some(&link))
-        .expect("route is curated, so a card renders");
+    // Drive the real production decision off the on-disk probe.
+    let link = hover::resolve_helper_source_link(Some(dir.path()), card).await;
 
-    // The card carries the resolved source link verbatim…
+    // The probe hit → a `file://` link into the vendored helpers.php, labelled
+    // with the root-relative vendored path. The `file://` URL is computed
+    // independently here and must match what production returned (output, not
+    // an echo of an input we built).
+    let expected_url = Url::from_file_path(&vendored).expect("absolute path → file URL");
     assert!(
-        render.contains(&link),
-        "card carries the source link string:\n{render}",
+        link.contains(expected_url.as_str()),
+        "present framework yields a file:// link into the vendored helpers.php:\n{link}",
     );
-    // …a `file://` link resolving into the vendored path…
     assert!(
-        render.contains("file://"),
-        "vendored framework yields a file:// source link:\n{render}",
-    );
-    assert!(
-        render.contains(card.vendor_path),
-        "the link resolves into the vendored helpers.php path:\n{render}",
+        link.contains(card.vendor_path),
+        "the link is labelled with the root-relative vendored path:\n{link}",
     );
     // …and the docs-URL fallback is NOT used.
     assert!(
-        !render.contains("laravel.com/docs"),
-        "the docs fallback must not appear when the framework is vendored:\n{render}",
+        !link.contains("laravel.com/docs"),
+        "the docs fallback must not appear when the framework is vendored:\n{link}",
     );
 }
 
-#[test]
-fn vendored_helpers_file_absent_falls_back_to_the_docs_url() {
+#[tokio::test]
+async fn vendored_helpers_file_absent_falls_back_to_the_docs_url() {
     let card = hover::helper_card("route").expect("route is curated");
 
     // An empty workspace root — the framework is not vendored, so the probe
@@ -187,22 +163,23 @@ fn vendored_helpers_file_absent_falls_back_to_the_docs_url() {
         "fixture root must not contain the vendored helpers.php",
     );
 
-    let link = helper_source_link(dir.path(), card);
-    let render = hover::helper_identifier_card("route", Some(&link))
-        .expect("route is curated, so a card renders");
+    // Drive the real production decision off the on-disk probe.
+    let link = hover::resolve_helper_source_link(Some(dir.path()), card).await;
 
-    // The card carries the docs anchor (with its `#method-route` fragment)…
-    assert!(
-        render.contains(card.docs_url),
-        "absent framework falls back to the docs URL:\n{render}",
+    // The probe missed → exactly the curated docs source link (anchor and all),
+    // and no `file://` link. Asserting equality against the docs link the helper
+    // would build distinguishes the branch's output from the vendored arm.
+    assert_eq!(
+        link,
+        hover::source_link("Laravel documentation", card.docs_url, None),
+        "absent framework falls back to the exact docs source link",
     );
     assert!(
-        render.contains("#method-route"),
-        "the docs anchor fragment is preserved:\n{render}",
+        link.contains(card.docs_url),
+        "the docs URL (with its #method-route anchor) is the link target:\n{link}",
     );
-    // …and no `file://` link is rendered.
     assert!(
-        !render.contains("file://"),
-        "no file:// link when the framework isn't vendored:\n{render}",
+        !link.contains("file://"),
+        "no file:// link when the framework isn't vendored:\n{link}",
     );
 }

@@ -17644,22 +17644,10 @@ return [
         let Some(card) = hover::helper_card(name) else {
             return String::new();
         };
-        // Prefer a file:// link into the vendored framework source; fall back to
-        // the docs URL when the framework isn't vendored under the workspace.
-        let vendored = match root {
-            Some(r) => {
-                let p = r.join(card.vendor_path);
-                tokio::fs::try_exists(&p)
-                    .await
-                    .unwrap_or(false)
-                    .then_some(p)
-            }
-            None => None,
-        };
-        let link = match vendored {
-            Some(p) => self.source_link(&p, None).await,
-            None => hover::source_link("Laravel documentation", card.docs_url, None),
-        };
+        // The vendored-vs-docs source-link decision lives in `hover` so it can be
+        // tested directly against a real `TempDir` (the `root` passed here IS
+        // `self.root_path`, so the relative-display label matches `source_link`).
+        let link = hover::resolve_helper_source_link(root, card).await;
         hover::helper_identifier_card(name, Some(&link)).unwrap_or_default()
     }
 
