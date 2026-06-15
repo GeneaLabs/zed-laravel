@@ -13705,7 +13705,7 @@ return [
             };
 
             let (target_line, target_col) =
-                locate_slot_in_view(&path, &slot.name).unwrap_or((0, 0));
+                locate_slot_in_view(&path, &slot.name, &config.root).unwrap_or((0, 0));
 
             let target_range = Range {
                 start: Position {

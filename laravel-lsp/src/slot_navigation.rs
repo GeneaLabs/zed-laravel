@@ -261,9 +261,34 @@ pub fn find_slot_variable_line(view_source: &str, slot_name: &str) -> Option<(u3
 ///
 /// Convenience wrapper that combines file reading with the line search. Returns
 /// None when the file can't be read or no `{{ $slot_name }}` reference exists.
-pub fn locate_slot_in_view(view_path: &Path, slot_name: &str) -> Option<(u32, u32)> {
+///
+/// Before touching the disk it enforces the project-root containment invariant
+/// (`path_within_root`): a `view_path` that resolves outside `root` returns
+/// `None` immediately, with no `read_to_string`. A `loadViewsFrom`-style
+/// namespace can resolve a component to an absolute path that escapes the
+/// project root (issue #130), so internalizing the check here makes the
+/// invariant un-violable regardless of how many call sites exist — a future
+/// caller that forgets to pre-check can't reopen the out-of-root read
+/// (issue #149).
+pub fn locate_slot_in_view(view_path: &Path, slot_name: &str, root: &Path) -> Option<(u32, u32)> {
+    if !path_within_root(view_path, root) {
+        return None;
+    }
     let source = std::fs::read_to_string(view_path).ok()?;
     find_slot_variable_line(&source, slot_name)
+}
+
+/// True if `view_path` resolves to a location inside `root`. Both sides are
+/// canonicalized first so a symlink under the project can't resolve outside the
+/// root and slip past a purely textual `starts_with`. When either side can't be
+/// canonicalized (e.g. the file vanished mid-edit) we fall back to the textual
+/// prefix check rather than admitting an unverified path. Mirrors
+/// `path_within_root` in `main.rs` (issues #55, #130).
+fn path_within_root(view_path: &Path, root: &Path) -> bool {
+    match (view_path.canonicalize(), root.canonicalize()) {
+        (Ok(real_path), Ok(real_root)) => real_path.starts_with(&real_root),
+        _ => view_path.starts_with(root),
+    }
 }
 
 // ============================================================================

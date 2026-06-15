@@ -154,3 +154,47 @@ fn find_enclosing_parent_component_skips_slot_ancestors() {
     // Inner <x-slot:icon> bubbles past <x-slot:header> to the real component.
     assert_eq!(parent.unwrap().name, "modal");
 }
+
+/// A parent view body that references `{{ $title }}` so `locate_slot_in_view`
+/// has a slot variable to pin navigation to. `$title` sits on line 1 (0-based)
+/// at character 7 — four spaces plus `{{ ` precede it.
+const VIEW_WITH_SLOT: &str = "<div>\n    {{ $title }}\n</div>\n";
+
+#[test]
+fn locate_slot_in_view_returns_none_for_out_of_root_path() {
+    // AC #4: a view file that exists on disk and references the slot variable,
+    // but resolves OUTSIDE the project root, must return None — the internal
+    // containment guard refuses it before any `read_to_string`. A missing file
+    // can't explain the None here: the file is written and present.
+    let root = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+
+    let view = outside.path().join("components/card.blade.php");
+    std::fs::create_dir_all(view.parent().unwrap()).unwrap();
+    std::fs::write(&view, VIEW_WITH_SLOT).unwrap();
+
+    assert!(
+        locate_slot_in_view(&view, "title", root.path()).is_none(),
+        "an out-of-root view must not resolve, even though it exists on disk \
+         and references the slot variable — the containment guard refuses it"
+    );
+}
+
+#[test]
+fn locate_slot_in_view_resolves_in_root_path() {
+    // AC #5: a valid in-root view containing the named slot variable resolves
+    // to the exact (line, col) of the `{{ $title }}` usage.
+    let root = tempfile::TempDir::new().unwrap();
+
+    let view = root
+        .path()
+        .join("resources/views/components/card.blade.php");
+    std::fs::create_dir_all(view.parent().unwrap()).unwrap();
+    std::fs::write(&view, VIEW_WITH_SLOT).unwrap();
+
+    assert_eq!(
+        locate_slot_in_view(&view, "title", root.path()),
+        Some((1, 7)),
+        "an in-root view must resolve to the slot-variable line and column"
+    );
+}
