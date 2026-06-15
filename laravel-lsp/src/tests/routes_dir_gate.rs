@@ -35,6 +35,18 @@ fn rejects_folio_style_nested_routes_component() {
 }
 
 #[test]
+fn rejects_false_prefix_sibling() {
+    // A sibling directory whose name merely *starts with* `routes` (e.g.
+    // `routesX/`) is not the routes dir. The gate matches path components,
+    // not string prefixes — a future "optimization" to a raw prefix check
+    // would silently reintroduce the bug (issue #98).
+    assert!(!is_in_routes_dir(
+        Some(Path::new("/project")),
+        Path::new("/project/routesX/web.php")
+    ));
+}
+
+#[test]
 fn rejects_when_root_unknown() {
     // No project root to anchor against → never trigger the fallback walk.
     assert!(!is_in_routes_dir(None, Path::new("/any/routes/file.php")));
