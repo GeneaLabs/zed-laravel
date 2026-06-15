@@ -13647,6 +13647,16 @@ return [
             if !self.file_exists_cached(&path).await {
                 continue;
             }
+            // Containment guard (issue #130): a `loadViewsFrom`-style namespace
+            // can resolve a component to an absolute path that escapes the
+            // project root. Refuse to read anything outside the root before the
+            // `locate_slot_in_view` disk read, matching the Folio cursor flow
+            // (`folio_route_name_for_cursor`) and the blade-var rename flow.
+            // `continue` rather than `return None` so a later in-root candidate
+            // can still resolve.
+            if !path_within_root(&path, &config.root) {
+                continue;
+            }
             let Ok(target_uri) = Url::from_file_path(&path) else {
                 continue;
             };
