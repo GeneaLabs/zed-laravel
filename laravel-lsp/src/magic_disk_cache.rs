@@ -25,6 +25,13 @@
 //! sites). An earlier revision used an all-or-nothing guard instead,
 //! re-resolving the whole project after any edit-then-restart.
 //!
+//! Files **deleted** between sessions are pruned on restore ([`prune_deleted`],
+//! #67): they're absent from the project file list, so the changed-file
+//! re-resolve never touches them — without the prune their stale resolved
+//! entries would be resurrected from disk and outlive the file (inflating
+//! reference counts, pointing hovers at a missing path). This mirrors the
+//! live-delete path's `remove_file` eviction, applied at restore time.
+//!
 //! The cache is also re-saved (debounced) after live incremental refreshes,
 //! so it tracks the in-memory index across a working session instead of
 //! going stale at the first edit.
@@ -112,6 +119,25 @@ pub fn load(project_root: &Path) -> Option<MagicCacheData> {
         return None;
     }
     Some(cache.data)
+}
+
+/// Drop entries (and controller view-renders) for files that no longer exist
+/// on disk, returning the number of resolved-entry files evicted.
+///
+/// The warm restore imports the cache wholesale, then re-resolves only the
+/// files the pattern cache flagged as changed or new. A file *deleted* between
+/// sessions is in neither set — it's gone from the project file list, so it's
+/// never a changed path and never re-resolved — which without this prune would
+/// resurrect its stale resolved entries from `magic_cache.bin` and let them
+/// outlive the file (inflating reference counts, pointing hovers at a missing
+/// path). The `path.exists()` stats run inline on the caller's thread — call
+/// it from the blocking pool, alongside [`load`].
+pub fn prune_deleted(data: &mut MagicCacheData) -> usize {
+    let before = data.entries.len();
+    data.entries.retain(|(path, _, _)| path.exists());
+    let evicted = before - data.entries.len();
+    data.view_renders.retain(|(path, _)| path.exists());
+    evicted
 }
 
 /// Persist the resolved magic-member `data` for `project_root`. Written via
@@ -207,5 +233,53 @@ mod tests {
         assert!(b.2.contains("App\\Models\\Invoice"));
         assert_eq!(loaded.view_renders.len(), 1);
         assert_eq!(loaded.view_renders[0].1[0].view_name, "users.show");
+    }
+
+    /// A file deleted between sessions is pruned from a restored cache — both
+    /// its resolved entries and its controller view-renders — while files that
+    /// still exist on disk survive. Guards the deleted-file eviction AC (#67):
+    /// without the prune, the wholesale restore would resurrect the deleted
+    /// file's stale entries and inflate reference counts.
+    #[test]
+    fn prune_deleted_evicts_missing_files_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let present = dir.path().join("Present.php");
+        std::fs::write(&present, b"<?php").unwrap();
+        // `deleted` is never written to disk — it stands in for a file removed
+        // between sessions whose entry still lives in the persisted cache.
+        let deleted = dir.path().join("Deleted.php");
+
+        let entry = MagicMemberEntry {
+            fqcn: "App\\Models\\User".to_string(),
+            member: "email".to_string(),
+            line: 1,
+            column: 0,
+            end_column: 5,
+        };
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("user".to_string(), "App\\Models\\User".to_string());
+        let render = |name: &str| ViewRender {
+            view_name: name.to_string(),
+            vars: vars.clone(),
+        };
+
+        let mut data = MagicCacheData {
+            entries: vec![
+                (present.clone(), vec![entry.clone()], HashSet::new()),
+                (deleted.clone(), vec![entry.clone()], HashSet::new()),
+            ],
+            view_renders: vec![
+                (present.clone(), vec![render("present.view")]),
+                (deleted.clone(), vec![render("deleted.view")]),
+            ],
+        };
+
+        let evicted = prune_deleted(&mut data);
+
+        assert_eq!(evicted, 1, "exactly the deleted entry file is evicted");
+        assert_eq!(data.entries.len(), 1);
+        assert_eq!(data.entries[0].0, present);
+        assert_eq!(data.view_renders.len(), 1);
+        assert_eq!(data.view_renders[0].0, present);
     }
 }

@@ -4578,13 +4578,27 @@ impl LaravelLanguageServer {
             let restored = {
                 let root_for_load = root_for_save.clone();
                 tokio::task::spawn_blocking(move || {
-                    laravel_lsp::magic_disk_cache::load(&root_for_load)
+                    laravel_lsp::magic_disk_cache::load(&root_for_load).map(|mut data| {
+                        // Evict files deleted between sessions before import:
+                        // they're gone from the project file list, so the
+                        // granular re-resolve below never touches them and
+                        // their stale entries would otherwise be resurrected
+                        // (#67). Stats stay on the blocking pool with the read.
+                        let evicted = laravel_lsp::magic_disk_cache::prune_deleted(&mut data);
+                        (data, evicted)
+                    })
                 })
                 .await
                 .ok()
                 .flatten()
             };
-            if let Some(data) = restored {
+            if let Some((data, evicted)) = restored {
+                if evicted > 0 {
+                    info!(
+                        "🪄 Magic-member restore: evicted {} deleted file(s) from cache",
+                        evicted
+                    );
+                }
                 let laravel_lsp::magic_disk_cache::MagicCacheData {
                     entries,
                     view_renders,
@@ -4669,6 +4683,12 @@ impl LaravelLanguageServer {
                         );
                         server_for_warm.refresh_files_magic(work).await;
                     }
+                }
+                // Deleted files were pruned from the live index above; the
+                // refresh only schedules a save when it had work, so persist
+                // the cleaned set here to converge the on-disk cache (#67).
+                if evicted > 0 {
+                    server_for_warm.schedule_magic_cache_save().await;
                 }
             } else {
                 // Resolve fresh, drive progress (the file-parse loop had nothing
