@@ -108,6 +108,65 @@ fn view_rename_refuses_vendor_view() {
     assert!(is_under_vendor(&vendor_view, root));
 }
 
+// View rename — live-symlink containment (issue #158).
+//
+// `locate_view_file` only checks `is_file()`, so a live symlink *under*
+// `resources/views` whose target resolves OUTSIDE the project root is admitted —
+// it's a real file on disk. The vendor guard does not catch it (it isn't under
+// `vendor/`), so the `path_within_root` guard added to the `SymbolRef::View`
+// rename arm is what refuses it, mirroring the binding-rename arm's
+// `.filter(|p| path_within_root(p, &config.root))`. Without that guard the
+// handler would feed the out-of-tree path into `compute_target_path` and move a
+// file outside the project. This is the live-symlink leg; the dangling-symlink
+// (canonicalize-fails) leg is covered by
+// `folio_cursor_containment::path_within_root_refuses_dangling_under_root_symlink`.
+#[cfg(unix)]
+#[test]
+fn view_rename_refuses_under_root_symlink_resolving_outside() {
+    use crate::path_within_root;
+    use laravel_lsp::view_declaration_locator::{is_under_vendor, locate_view_file};
+
+    // A real target file living entirely OUTSIDE the project root.
+    let outside = TempDir::new().unwrap();
+    let outside_target = outside.path().join("secret.blade.php");
+    write(&outside_target, "<h1>out of tree</h1>");
+
+    // The project root, with a `resources/views/escape.blade.php` symlink whose
+    // target is the out-of-tree file above. Canonicalizing the link escapes root.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let views = root.join("resources/views");
+    fs::create_dir_all(&views).unwrap();
+    let link = views.join("escape.blade.php");
+    std::os::unix::fs::symlink(&outside_target, &link).unwrap();
+
+    let config = fake_config(root);
+
+    // `locate_view_file` admits the symlink — it passes the `is_file()` check
+    // because the link resolves to a real file.
+    let current = locate_view_file("escape", &config).expect("symlinked view resolves on disk");
+    assert_eq!(current, link);
+
+    // The vendor guard does NOT catch it — the link lives under resources/views,
+    // not vendor/. So `path_within_root`, not `is_under_vendor`, is the guard
+    // that must refuse this rename.
+    assert!(!is_under_vendor(&current, root));
+
+    // Discriminating precondition: the link path is lexically inside the root, so
+    // a textual `starts_with(root)` check would have admitted it. Only the
+    // canonicalize-based `path_within_root` refuses it.
+    assert!(current.starts_with(root));
+
+    // The guard the rename arm now applies, BEFORE `compute_target_path`:
+    // canonicalizing the link escapes the root, so containment fails and the
+    // rename is refused — no `compute_target_path`, no file-system mutation.
+    assert!(
+        !path_within_root(&current, root),
+        "a live under-root symlink whose canonicalized target leaves the project \
+         root must be refused — path_within_root canonicalizes both sides"
+    );
+}
+
 // ============================================================================
 // Blade component rename — class-backed flavour (file moves + class decl)
 // ============================================================================

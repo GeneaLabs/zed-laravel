@@ -21484,8 +21484,9 @@ impl LanguageServer for LaravelLanguageServer {
                 // declaration. Rename = move the .blade.php + rewrite every
                 // `view('old')` call site (call sites already collected
                 // above into `targets`). New name validation, vendor-path
-                // refusal, and target-path computation surface as toasts
-                // via short-circuit errors rather than silent no-ops.
+                // refusal, root-containment refusal, and target-path
+                // computation surface as toasts via short-circuit errors
+                // rather than silent no-ops.
                 let trimmed_new = new_name.trim();
                 if let Err(e) =
                     laravel_lsp::view_declaration_locator::validate_view_name(trimmed_new)
@@ -21517,6 +21518,18 @@ impl LanguageServer for LaravelLanguageServer {
                     if laravel_lsp::view_declaration_locator::is_under_vendor(&current_path, root) {
                         return Err(laravel_lsp::rename::rename_error(
                             "cannot rename views located under vendor/.",
+                        ));
+                    }
+                    // Containment guard, mirroring the binding-rename arm's
+                    // `.filter(|p| path_within_root(p, &config.root))`. `locate_view_file`
+                    // only checks `is_file()`, so a live under-root symlink whose target
+                    // resolves OUTSIDE the project root is admitted (it's a real file on
+                    // disk). `path_within_root` canonicalizes both sides, so it refuses
+                    // such a path before `compute_target_path` could move an out-of-tree
+                    // file. Fail-closed: a path that can't be canonicalized is also refused.
+                    if !path_within_root(&current_path, root) {
+                        return Err(laravel_lsp::rename::rename_error(
+                            "cannot rename view: file resolves outside the project root.",
                         ));
                     }
                 }
