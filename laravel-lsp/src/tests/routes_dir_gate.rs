@@ -96,12 +96,23 @@ fn rejects_real_path_outside_routes_dir() {
 #[test]
 fn falls_back_to_textual_when_path_missing() {
     // A path that doesn't exist can't be canonicalized; the gate must fall back
-    // to the textual component check rather than panic (issue #122). Use a real
-    // tempdir root so only `path` fails canonicalization.
+    // to the textual component check rather than panic (issue #122). Create a
+    // real `routes/` dir on disk so `routes_dir` canonicalizes but the missing
+    // `path` does not — genuinely driving the `(Err, Ok)` arm. This is the
+    // realistic case the production doc comment calls out: a brand-new route
+    // file still in the editor buffer, not yet saved to disk, sitting inside a
+    // real `routes/` directory.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join("routes")).unwrap();
     let missing = root.join("routes").join("does_not_exist.php");
 
     // No panic, and the textual prefix still matches the project routes/ dir.
     assert!(is_in_routes_dir(Some(&root), &missing));
+
+    // False-negative side: a missing path *outside* routes/ must still return
+    // false through the same textual fallback (routes_dir canonicalizes, the
+    // path does not — again the `(Err, Ok)` arm).
+    let missing_outside = root.join("app").join("does_not_exist.php");
+    assert!(!is_in_routes_dir(Some(&root), &missing_outside));
 }
