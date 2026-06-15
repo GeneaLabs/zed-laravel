@@ -553,6 +553,60 @@ fn normal_component_names_resolve_under_root() {
 }
 
 #[test]
+fn slash_bearing_name_yields_no_candidates() {
+    // Holmes's PR #150 review: a mid-path `..` traversal smuggled behind a
+    // literal slash — `flux::foo/../../../../etc/passwd` — is NOT caught by the
+    // leading-dot guard (no leading dot) nor by an absolute-after-substitution
+    // check (`replace('.', "/")` leaves a non-`/`-leading string). No real
+    // Blade/Flux component name contains a forward slash (nesting uses dots,
+    // namespaces use `::`), so the source guard now rejects the whole
+    // slash-bearing class — closing both the mid-path-traversal and the
+    // `evil::/etc/passwd` absolute shapes before any path is built.
+    let config = make_bare_config();
+    for name in [
+        "flux::foo/../../../../etc/passwd",
+        "flux:foo/../../../../etc/passwd",
+        "evil::foo/../bar",
+        "components/../../etc/passwd",
+        "evil::/etc/passwd",
+    ] {
+        assert!(
+            config.resolve_component_path(name).is_empty(),
+            "slash-bearing name `{name}` must produce zero candidates",
+        );
+    }
+}
+
+#[test]
+fn candidates_with_interior_parent_dir_escape_are_dropped() {
+    // Defense-in-depth backstop, independent of the source guard: a slash-free,
+    // dot-free component name (`evil::layout`) sails past the front guard, but
+    // the *registered* directory itself carries an interior `..`. A
+    // misregistered `anonymousComponentPath` of `/project/sub/../../escape`
+    // lexically resolves to `/escape`, outside the root. A plain component-wise
+    // `starts_with("/project")` is fooled — the path's leading components are
+    // still `/`, `project` — so the backstop must lexically normalize first.
+    let config = make_config_with_anonymous_path("evil", "/project/sub/../../escape/components");
+
+    let paths = config.resolve_component_path("evil::layout");
+
+    assert!(
+        paths
+            .iter()
+            .all(|p| !crate::route_discovery::normalize_path(p).starts_with("/escape")),
+        "candidates that lexically escape the project root must be dropped: {:?}",
+        paths,
+    );
+    // The in-root vendor-publish guesses still survive, so the filter isn't
+    // just dropping everything.
+    assert!(
+        paths.iter().any(|p| p.starts_with("/project")),
+        "in-root candidates should still resolve: {:?}",
+        paths,
+    );
+}
+
+#[test]
 fn unregistered_anonymous_prefix_does_not_borrow_registered_directory() {
     let config = make_config_with_anonymous_path(
         "backstage",
