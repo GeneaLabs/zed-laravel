@@ -18140,7 +18140,9 @@ async fn classify_with_decl_fallback(
     // subsequent invocations don't re-parse the file.
     if !is_in_routes_dir(root, file_path) {
         // A Folio page's `name('...')` helper declares its route name, but the
-        // page lives outside `routes/` and the bare helper isn't tagged by
+        // page isn't a conventional route file — it lives outside the
+        // project-root `routes/`, or nested deeper inside it (a mount under
+        // `routes/pages/`, issue #105) — and the bare helper isn't tagged by
         // php.scm. If the cursor sits on that call, resolve it to the page's
         // (mount-prefixed) route name — read from the already-built in-memory
         // route index, never a fresh filesystem walk — so find-references /
@@ -18221,36 +18223,46 @@ async fn decl_range_at(
     None
 }
 
-/// Is this file a conventional route file — i.e. does it live directly under
-/// the project root's `routes/` directory? Used to gate the declaration-fallback
+/// Is this file a conventional route file — i.e. is its immediate parent the
+/// project root's `routes/` directory? Used to gate the declaration-fallback
 /// walk so we don't pay the parse cost on every PHP file.
 ///
-/// Only the project-root `routes/` qualifies. A `routes` component nested
-/// deeper — a package's `vendor/.../routes/`, or a Folio mount that happens to
-/// carry a `routes` segment (issue #98) — must NOT be treated as the
-/// conventional routes dir, or find-references from such a file would be routed
-/// into the decl walk and never reach its real resolver. When the project root
-/// is unknown (`None`), default to `false` so the walk never triggers without a
-/// root to anchor against.
+/// Only files sitting *directly* in the project-root `routes/` qualify
+/// (`routes/web.php`, `routes/api.php`). Two kinds of `routes` path component
+/// must NOT trigger the gate:
+///   - a `routes` segment nested elsewhere — a package's `vendor/.../routes/`,
+///     or a sibling dir that merely shares the name (issue #98);
+///   - a file nested *deeper* inside `routes/` — e.g. a Folio mount under
+///     `routes/pages/about.php` (issue #105). Such a page has its own resolver
+///     (the Folio branch in `classify_with_decl_fallback`); routing it into the
+///     decl walk would bypass that branch and yield no references. Matching the
+///     immediate parent — not a `starts_with` prefix — is what keeps the Folio
+///     page out of the gate.
 ///
-/// Both `path` and the joined `routes/` dir are canonicalized before the
-/// component-wise prefix check (issue #122), mirroring the sibling helper
+/// When the project root is unknown (`None`), default to `false` so the walk
+/// never triggers without a root to anchor against.
+///
+/// Both the file's parent and the joined `routes/` dir are canonicalized before
+/// the equality check (issue #122), mirroring the sibling helper
 /// `path_within_root`. `root` is stored once (from an earlier `did_open`) while
 /// `path` arrives per-request, so the two can resolve through different symlink
-/// states — e.g. macOS `/tmp` → `/private/tmp`. A raw textual `starts_with`
-/// would then return a false negative and silently skip the decl-fallback walk
-/// for a real conventional route file. When either side can't be canonicalized
-/// (the file doesn't exist yet, a permission error) we fall back to the textual
-/// prefix check rather than guess — no panic, and the same behaviour as before
+/// states — e.g. macOS `/tmp` → `/private/tmp`. A raw textual comparison would
+/// then return a false negative and silently skip the decl-fallback walk for a
+/// real conventional route file. When either side can't be canonicalized (the
+/// file doesn't exist yet, a permission error) we fall back to comparing the
+/// uncanonicalized paths rather than guess — no panic, and the same behaviour
 /// for in-memory paths that aren't on disk.
 fn is_in_routes_dir(root: Option<&Path>, path: &Path) -> bool {
     let Some(r) = root else {
         return false;
     };
     let routes_dir = r.join("routes");
-    match (path.canonicalize(), routes_dir.canonicalize()) {
-        (Ok(real_path), Ok(real_routes)) => real_path.starts_with(&real_routes),
-        _ => path.starts_with(&routes_dir),
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    match (parent.canonicalize(), routes_dir.canonicalize()) {
+        (Ok(real_parent), Ok(real_routes)) => real_parent == real_routes,
+        _ => parent == routes_dir,
     }
 }
 

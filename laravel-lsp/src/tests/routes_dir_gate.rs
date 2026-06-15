@@ -1,17 +1,39 @@
 //! Unit tests for `is_in_routes_dir` — the gate deciding whether the
-//! declaration-fallback route walk runs for a given file. Only the project
-//! root's own `routes/` directory qualifies; a `routes` component nested
-//! deeper (a package's `vendor/.../routes/`, or a Folio mount) must not be
-//! mistaken for it (issue #98).
+//! declaration-fallback route walk runs for a given file. Only a file whose
+//! immediate parent is the project root's own `routes/` directory qualifies.
+//! A `routes` component nested elsewhere (a package's `vendor/.../routes/`, a
+//! sibling that shares the name) must not be mistaken for it (issue #98), and
+//! neither must a file nested *deeper* inside `routes/` — e.g. a Folio mount
+//! under `routes/pages/` (issue #105), which has its own resolver.
 
 use crate::is_in_routes_dir;
 use std::path::Path;
 
 #[test]
 fn matches_project_root_routes_dir() {
+    // Direct children of the project-root `routes/` are conventional route
+    // files (AC: both web.php and api.php resolve correctly).
     assert!(is_in_routes_dir(
         Some(Path::new("/project")),
         Path::new("/project/routes/web.php")
+    ));
+    assert!(is_in_routes_dir(
+        Some(Path::new("/project")),
+        Path::new("/project/routes/api.php")
+    ));
+}
+
+#[test]
+fn rejects_folio_page_nested_under_routes() {
+    // A Folio mount under `routes/pages/` lives *inside* routes/, but deeper
+    // than its immediate child level (issue #105). It must NOT be gated as a
+    // conventional route file — its `name('...')` is resolved by the Folio
+    // branch in `classify_with_decl_fallback`, and routing it into the decl
+    // walk would bypass that branch and yield no references. The immediate-
+    // parent check (not a `starts_with` prefix) is what excludes it.
+    assert!(!is_in_routes_dir(
+        Some(Path::new("/project")),
+        Path::new("/project/routes/pages/about.php")
     ));
 }
 
@@ -43,6 +65,16 @@ fn rejects_false_prefix_sibling() {
     assert!(!is_in_routes_dir(
         Some(Path::new("/project")),
         Path::new("/project/routesX/web.php")
+    ));
+}
+
+#[test]
+fn rejects_routes_dir_outside_project_root() {
+    // A `routes/` directory that belongs to some *other* tree, not the
+    // configured project root, must not qualify (AC: root-known case).
+    assert!(!is_in_routes_dir(
+        Some(Path::new("/project")),
+        Path::new("/elsewhere/routes/web.php")
     ));
 }
 
@@ -95,24 +127,31 @@ fn rejects_real_path_outside_routes_dir() {
 
 #[test]
 fn falls_back_to_textual_when_path_missing() {
-    // A path that doesn't exist can't be canonicalized; the gate must fall back
-    // to the textual component check rather than panic (issue #122). Create a
-    // real `routes/` dir on disk so `routes_dir` canonicalizes but the missing
-    // `path` does not — genuinely driving the `(Err, Ok)` arm. This is the
-    // realistic case the production doc comment calls out: a brand-new route
-    // file still in the editor buffer, not yet saved to disk, sitting inside a
-    // real `routes/` directory.
+    // The gate compares the file's *parent* dir against `<root>/routes`. When a
+    // path can't be canonicalized it must fall back to a direct (uncanonical)
+    // comparison rather than panic (issue #122). This is the realistic case the
+    // production doc comment calls out: a brand-new route file still in the
+    // editor buffer, not yet saved to disk, sitting inside a real `routes/` dir.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     std::fs::create_dir_all(root.join("routes")).unwrap();
     let missing = root.join("routes").join("does_not_exist.php");
 
-    // No panic, and the textual prefix still matches the project routes/ dir.
+    // The parent `<root>/routes` exists, so this resolves via the canonical arm
+    // — no panic on the unsaved file, and the parent matches the routes/ dir.
     assert!(is_in_routes_dir(Some(&root), &missing));
 
-    // False-negative side: a missing path *outside* routes/ must still return
-    // false through the same textual fallback (routes_dir canonicalizes, the
-    // path does not — again the `(Err, Ok)` arm).
+    // False-negative side: a missing path *outside* routes/ has a parent
+    // (`<root>/app`) that doesn't exist either, so its parent can't be
+    // canonicalized — driving the `(Err, Ok)` textual-fallback arm. It must
+    // still return false.
     let missing_outside = root.join("app").join("does_not_exist.php");
     assert!(!is_in_routes_dir(Some(&root), &missing_outside));
+
+    // And a route file *and* its parent both missing from disk (neither
+    // canonicalizes) must still match through the textual fallback — the parent
+    // `<root>/routes` equals the joined routes dir by direct comparison.
+    let unsaved_root = tmp.path().join("never_created");
+    let unsaved_file = unsaved_root.join("routes").join("web.php");
+    assert!(is_in_routes_dir(Some(&unsaved_root), &unsaved_file));
 }
