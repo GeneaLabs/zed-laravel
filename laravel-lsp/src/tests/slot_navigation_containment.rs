@@ -17,7 +17,7 @@ use laravel_lsp::salsa_impl::LaravelConfigData;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tower_lsp::lsp_types::Position;
+use tower_lsp::lsp_types::{GotoDefinitionResponse, Position};
 use tower_lsp::{lsp_types::Url, LspService};
 
 /// A `<x-pkg::card>` parent component wrapping a named slot. The cursor sits on
@@ -117,6 +117,13 @@ async fn in_root_component_view_still_resolves() {
     // Positive control: the `pkg` namespace points to a directory INSIDE the
     // project root, so the resolved `card` view passes containment and slot
     // navigation resolves exactly as before — no regression.
+    //
+    // Assert the exact file, line, AND column (AC #4), matching the folio
+    // precedent (`folio_cursor_containment.rs` asserts the exact route name).
+    // "Something resolved" (`is_some()`) is too weak: it also passes when
+    // `locate_slot_in_view` finds nothing and `create_slot_location` falls back
+    // to `(0, 0)`. Pinning file + line + column proves the jump lands on the
+    // real `{{ $title }}` usage, closing that degenerate-`Some` gap.
     let root = tempfile::TempDir::new().unwrap();
     let namespace_dir = root.path().join("packages/pkg/resources/views");
 
@@ -131,9 +138,28 @@ async fn in_root_component_view_still_resolves() {
 
     let result = server.create_slot_location(&source_uri, CURSOR).await;
 
-    assert!(
-        result.is_some(),
-        "an in-root component view on a slot must still resolve to its definition"
+    let Some(GotoDefinitionResponse::Link(links)) = result else {
+        panic!("an in-root component view on a slot must resolve to a Link definition response");
+    };
+    assert_eq!(links.len(), 1, "exactly one definition link is expected");
+    let link = &links[0];
+
+    // Correct file: the link must target the seeded card view itself.
+    assert_eq!(
+        link.target_uri,
+        Url::from_file_path(&card).unwrap(),
+        "the definition must point at the in-root card view that backs the component"
+    );
+    // Correct line + column: `CARD_VIEW` references the slot variable on its
+    // second line (0-based line 1), at character 7 — four spaces plus `{{ `
+    // precede `$title`. The `(0, 0)` fallback would put it on the file top.
+    assert_eq!(
+        link.target_range.start.line, 1,
+        "the jump must land on the slot-variable line, not the file top"
+    );
+    assert_eq!(
+        link.target_range.start.character, 7,
+        "the jump must land on the slot variable's column"
     );
 }
 
