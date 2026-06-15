@@ -49,7 +49,14 @@ fn hovering_config_identifier_resolves_a_helper_card() {
         panic!("expected HelperIdentifier, got {pattern:?}");
     };
     assert_eq!(helper.name, "config");
-    assert!(hover::helper_identifier_card(&helper.name, None).is_some());
+
+    let card = hover::helper_identifier_card(&helper.name, None)
+        .expect("config is curated, so a card renders");
+    assert!(card.contains("**config**"), "card headers the helper name");
+    assert!(
+        card.contains("configuration variable"),
+        "card carries the Laravel-aware synopsis"
+    );
 }
 
 #[test]
@@ -101,4 +108,35 @@ fn helper_identifier_hover_works_in_blade_embedded_php() {
         .expect("route helper identifier captured in Blade-embedded PHP");
     // The card renders the same regardless of host file type.
     assert!(hover::helper_identifier_card(&route.name, None).is_some());
+}
+
+#[test]
+fn every_curated_helper_renders_its_own_card() {
+    // Lock in that each of the seven curated helpers renders ITS OWN card — the
+    // right header AND the right Laravel-aware synopsis — rather than a bare
+    // `is_some()` that would pass even if the wrong (or an empty) card rendered.
+    // Each keyword is distinctive to that one synopsis (and absent from the
+    // `**name**` header), so a swapped or blank card fails the assertion.
+    let cases = [
+        ("route", "named route"),
+        ("view", "evaluated view"),
+        ("config", "configuration variable"),
+        ("auth", "auth guard"),
+        ("app", "container"),
+        ("session", "session store"),
+        ("cache", "cache store"),
+    ];
+
+    for (name, synopsis_keyword) in cases {
+        let card = hover::helper_identifier_card(name, None)
+            .unwrap_or_else(|| panic!("`{name}` is curated, so a card renders"));
+        assert!(
+            card.contains(&format!("**{name}**")),
+            "`{name}` card headers its own name, got: {card}"
+        );
+        assert!(
+            card.contains(synopsis_keyword),
+            "`{name}` card carries its distinctive synopsis keyword `{synopsis_keyword}`, got: {card}"
+        );
+    }
 }
