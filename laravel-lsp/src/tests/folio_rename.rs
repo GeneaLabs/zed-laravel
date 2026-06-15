@@ -135,6 +135,96 @@ async fn decl_range_at_returns_none_when_cursor_off_the_name_call() {
     assert_eq!(range, None);
 }
 
+/// Seed the route index with `route_name` → `file` and set the project root,
+/// without writing `file` itself — the caller controls where it lives (inside
+/// or outside `root`) so the containment guard, not a missing index entry,
+/// decides the outcome. Mirrors `seed_folio_page` in `folio_cursor_containment`.
+async fn seed_index_for(
+    server: &LaravelLanguageServer,
+    root: &Path,
+    route_name: &str,
+    file: &Path,
+) {
+    let mut index = RouteIndex::new();
+    index.insert(
+        route_name.to_string(),
+        RouteDefinition {
+            file: file.to_path_buf(),
+            line: 0,
+            column: 0,
+            end_column: 0,
+            priority: PRIORITY_APP,
+            method: Some("get".to_string()),
+            uri: Some("/contact".to_string()),
+            action: None,
+        },
+    );
+    *server.route_index.write().await = Some(index);
+    *server.root_path.write().await = Some(root.to_path_buf());
+}
+
+#[tokio::test]
+async fn collect_targets_skips_an_out_of_root_folio_page() {
+    // Containment guard (issue #139): a Folio page that exists on disk and is
+    // indexed, but lives OUTSIDE the project root, must produce no decl
+    // `EditTarget`. Without the guard `collect_route_declaration_targets` would
+    // read it and emit a rename edit against an out-of-project file.
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let page = outside.path().join("contact.blade.php");
+    fs::write(&page, PAGE_SRC).unwrap();
+
+    let server = test_server();
+    seed_index_for(&server, root.path(), "contact", &page).await;
+
+    let targets =
+        collect_route_declaration_targets(&server, root.path(), "contact", "support").await;
+
+    assert!(
+        targets.is_empty(),
+        "an out-of-root Folio page must not produce a decl edit, even though it \
+         exists and is indexed — the containment guard refuses it"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn collect_targets_skips_an_under_root_symlink_resolving_outside() {
+    // The discriminating case a lexical guard could not catch: the page path
+    // lives *under* the project root — a symlink at
+    // `<root>/pages/contact.blade.php` — yet resolves to a file OUTSIDE the
+    // root. The target exists on disk (through the link) and is indexed under
+    // its in-root link path, so a missing entry can't explain an empty result. A
+    // purely lexical `starts_with` check would *admit* this path; only
+    // canonicalization — `path_within_root` resolving the symlink to its
+    // out-of-tree target — rejects it, so no decl edit is emitted.
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+
+    // Real target file, outside the project root.
+    let target = outside.path().join("contact.blade.php");
+    fs::write(&target, PAGE_SRC).unwrap();
+
+    // Symlink under the root that points at the outside target.
+    let pages = root.path().join("pages");
+    fs::create_dir_all(&pages).unwrap();
+    let link = pages.join("contact.blade.php");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let server = test_server();
+    seed_index_for(&server, root.path(), "contact", &link).await;
+
+    let targets =
+        collect_route_declaration_targets(&server, root.path(), "contact", "support").await;
+
+    assert!(
+        targets.is_empty(),
+        "a page reached through an under-root symlink that resolves outside the \
+         project root must produce no decl edit — the canonicalize-based guard \
+         refuses it even though the link path is lexically inside the root"
+    );
+}
+
 #[tokio::test]
 async fn collect_targets_rewrites_the_page_name_declaration() {
     // rename AC: the page's own `name('...')` declaration is rewritten so it

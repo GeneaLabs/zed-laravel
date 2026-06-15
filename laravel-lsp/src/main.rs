@@ -18719,6 +18719,16 @@ async fn collect_route_declaration_targets(
             .as_ref()
             .and_then(|idx| idx.get(target))
             .filter(|def| def.file.to_str().is_some_and(|s| s.ends_with(".blade.php")))
+            // Defense-in-depth containment guard (issue #139): refuse to read or
+            // rewrite a page whose canonical path falls outside the project root,
+            // even if the index were ever seeded with one. `path_within_root`
+            // canonicalizes both sides before comparing, so a symlink *under* the
+            // root that resolves outside it — or a `..` escape — is rejected here,
+            // before any disk access and before any `EditTarget` is emitted,
+            // rather than slipping past a purely lexical prefix check. Mirrors the
+            // read-path sibling `folio_route_name_for_cursor` (#151 covers the
+            // prepare-rename highlight read path).
+            .filter(|def| path_within_root(&def.file, root))
             .map(|def| def.file.clone())
     };
     if let Some(file) = folio_page {
