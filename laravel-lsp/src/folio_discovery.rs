@@ -196,14 +196,27 @@ fn parse_folio_mounts(content: &str, root: &Path) -> Vec<FolioMount> {
 
 /// Find the index of the `)` that closes the `(` at byte `open`, balancing
 /// nested parens and skipping over single/double-quoted string contents (so a
-/// `)` inside a path literal never ends the scan early).
+/// `)` inside a path literal never ends the scan early). Backslash escapes
+/// inside a quoted string are honored: a `\` skips the byte that follows it, so
+/// a PHP `\'` or `\"` cannot close the quote state prematurely (which would
+/// otherwise reopen the quote on the trailing delimiter and swallow the real
+/// closing `)`, silently dropping the mount).
 fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut quote: Option<u8> = None;
+    let mut escaped = false;
     for (i, &b) in bytes.iter().enumerate().skip(open) {
         match quote {
             Some(q) => {
-                if b == q {
+                if escaped {
+                    // Previous byte was a backslash: this byte is escaped (the
+                    // `'` in `\'`, the `"` in `\"`, etc.) and is consumed
+                    // unconditionally, so it can't close the string.
+                    escaped = false;
+                } else if b == b'\\' {
+                    // Start of a PHP escape sequence — skip the next byte.
+                    escaped = true;
+                } else if b == q {
                     quote = None;
                 }
             }
@@ -226,6 +239,16 @@ fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
 /// Parse a single- or double-quoted PHP string literal, returning its inner
 /// content. `None` for anything that isn't a bare quoted literal (e.g. a
 /// variable or a concatenation we can't resolve statically).
+///
+/// The inner content is returned **raw** — PHP escape sequences (`\'`, `\\`, …)
+/// are deliberately not unescaped. Decision (issue #103): a correct unescape
+/// would have to be quote-type aware (single quotes recognize only `\'` and
+/// `\\`; double quotes carry a far larger table — `\n`, `\t`, `\$`, `\xNN`, …),
+/// which is out of scope and disproportionate risk for the reported bug. That
+/// bug was an escaped quote causing the mount to be *silently dropped* — a
+/// `matching_paren` scan bug, now fixed. A directory whose name literally
+/// contains a quote is pathological; with the scan fixed it now resolves (with
+/// the backslash retained in the path) instead of disappearing.
 fn parse_literal(expr: &str) -> Option<String> {
     let expr = expr.trim();
     let bytes = expr.as_bytes();

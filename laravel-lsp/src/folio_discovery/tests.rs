@@ -188,6 +188,37 @@ fn discover_folio_mounts_falls_back_when_only_mount_escapes() {
 }
 
 #[test]
+fn matching_paren_honors_escaped_quote() {
+    // A PHP-escaped quote inside a single-quoted argument must NOT close the
+    // string early. Without escape tracking the scan closes on the `'` of `\'`,
+    // reopens on the trailing `'`, and then swallows the real closing `)` —
+    // returning `None` (or, with an even number of escapes, the wrong index).
+    // The returned index must point at the true `)` (the final byte here).
+    let src = b"Folio::path('pages\\'special')";
+    let open = src.iter().position(|&b| b == b'(').unwrap();
+    let close = matching_paren(src, open).expect("the true closing paren is found");
+    assert_eq!(close, src.len() - 1);
+    assert_eq!(src[close], b')');
+
+    // Same guarantee for a double-quoted argument with an escaped `\"`.
+    let dq = b"Folio::path(\"pages\\\"special\")";
+    let dq_open = dq.iter().position(|&b| b == b'(').unwrap();
+    let dq_close = matching_paren(dq, dq_open).expect("the true closing paren is found");
+    assert_eq!(dq_close, dq.len() - 1);
+}
+
+#[test]
+fn parse_folio_mounts_keeps_mount_with_escaped_quote_in_path() {
+    // A path containing a PHP-escaped quote (`pages\'special`) must not cause
+    // the mount to be silently dropped: `matching_paren` honors the escape and
+    // delimits the `Folio::path(...)` argument correctly, so exactly one mount
+    // is returned rather than zero.
+    let src = "<?php Folio::path('pages\\'special');";
+    let mounts = parse_folio_mounts(src, Path::new("/app"));
+    assert_eq!(mounts.len(), 1);
+}
+
+#[test]
 fn parse_folio_mounts_with_uri_and_name_prefixes() {
     let src = "<?php Folio::path('resources/views/admin')->uri('/admin')->name('admin.');";
     let mounts = parse_folio_mounts(src, Path::new("/app"));
