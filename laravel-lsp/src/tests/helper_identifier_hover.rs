@@ -8,7 +8,10 @@
 use laravel_lsp::hover;
 use laravel_lsp::pattern_indexer::parse_owned;
 use laravel_lsp::salsa_impl::PatternAtPosition;
+use std::fs;
 use std::path::Path;
+use tempfile::TempDir;
+use tower_lsp::lsp_types::Url;
 
 /// Parse a `.php` snippet the way the warming path does.
 fn parse(src: &str) -> std::sync::Arc<laravel_lsp::salsa_impl::ParsedPatternsData> {
@@ -139,4 +142,82 @@ fn every_curated_helper_renders_its_own_card() {
             "`{name}` card carries its distinctive synopsis keyword `{synopsis_keyword}`, got: {card}"
         );
     }
+}
+
+// ─── source-link branch: vendored helpers.php present vs. absent (#118) ───
+//
+// `Backend::hover_for_helper` (`main.rs`) delegates its vendored-vs-docs
+// source-link decision to `hover::resolve_helper_source_link`, which probes the
+// workspace root for the vendored framework `helpers.php`: present → a `file://`
+// link into that file, absent → the canonical `laravel.com/docs` anchor. The two
+// arms below drive that *production* function directly with a `TempDir` — the
+// same standalone-function + `TempDir` convention as `vendor_translations` and
+// `vendor_member_prover` — and assert on the link it RETURNS, so a regression
+// flipping the branch selection or breaking the vendor-path probe is caught.
+
+#[tokio::test]
+async fn vendored_helpers_file_present_yields_a_file_source_link() {
+    let card = hover::helper_card("route").expect("route is curated");
+
+    // A workspace root with the framework vendored: materialize the exact file
+    // `resolve_helper_source_link` probes for.
+    let dir = TempDir::new().unwrap();
+    let vendored = dir.path().join(card.vendor_path);
+    fs::create_dir_all(vendored.parent().unwrap()).unwrap();
+    fs::write(&vendored, "<?php\n// Illuminate\\Foundation helpers\n").unwrap();
+
+    // Drive the real production decision off the on-disk probe.
+    let link = hover::resolve_helper_source_link(Some(dir.path()), card).await;
+
+    // The probe hit → a `file://` link into the vendored helpers.php, labelled
+    // with the root-relative vendored path. The `file://` URL is computed
+    // independently here and must match what production returned (output, not
+    // an echo of an input we built).
+    let expected_url = Url::from_file_path(&vendored).expect("absolute path → file URL");
+    assert!(
+        link.contains(expected_url.as_str()),
+        "present framework yields a file:// link into the vendored helpers.php:\n{link}",
+    );
+    assert!(
+        link.contains(card.vendor_path),
+        "the link is labelled with the root-relative vendored path:\n{link}",
+    );
+    // …and the docs-URL fallback is NOT used.
+    assert!(
+        !link.contains("laravel.com/docs"),
+        "the docs fallback must not appear when the framework is vendored:\n{link}",
+    );
+}
+
+#[tokio::test]
+async fn vendored_helpers_file_absent_falls_back_to_the_docs_url() {
+    let card = hover::helper_card("route").expect("route is curated");
+
+    // An empty workspace root — the framework is not vendored, so the probe
+    // misses and the docs anchor is the source link.
+    let dir = TempDir::new().unwrap();
+    assert!(
+        !dir.path().join(card.vendor_path).exists(),
+        "fixture root must not contain the vendored helpers.php",
+    );
+
+    // Drive the real production decision off the on-disk probe.
+    let link = hover::resolve_helper_source_link(Some(dir.path()), card).await;
+
+    // The probe missed → exactly the curated docs source link (anchor and all),
+    // and no `file://` link. Asserting equality against the docs link the helper
+    // would build distinguishes the branch's output from the vendored arm.
+    assert_eq!(
+        link,
+        hover::source_link("Laravel documentation", card.docs_url, None),
+        "absent framework falls back to the exact docs source link",
+    );
+    assert!(
+        link.contains(card.docs_url),
+        "the docs URL (with its #method-route anchor) is the link target:\n{link}",
+    );
+    assert!(
+        !link.contains("file://"),
+        "no file:// link when the framework isn't vendored:\n{link}",
+    );
 }

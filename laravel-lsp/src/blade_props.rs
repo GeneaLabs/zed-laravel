@@ -197,32 +197,34 @@ fn split_top_level_commas(body: &str) -> Vec<&str> {
 /// or `None` when there isn't one. Used to pull the prop name (the key, or the
 /// bare value) from a `@props` array entry.
 fn first_string_literal(entry: &str) -> Option<String> {
-    let bytes = entry.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'\'' || b == b'"' {
-            let quote = b;
-            let mut j = i + 1;
-            let mut s = String::new();
-            while j < bytes.len() {
-                let c = bytes[j];
-                if c == b'\\' && j + 1 < bytes.len() {
-                    s.push(bytes[j + 1] as char);
-                    j += 2;
-                    continue;
-                }
-                if c == quote {
-                    return Some(s);
-                }
-                s.push(c as char);
-                j += 1;
-            }
-            return None; // unterminated literal
+    // Iterate over `char`s (not raw `u8` bytes) so a multi-byte UTF-8 codepoint
+    // inside the literal (e.g. `é` in `'café'`) stays whole instead of being
+    // split into individual Latin-1 byte casts.
+    let mut chars = entry.chars();
+    // Find the opening quote (single or double); no quote → no literal.
+    let quote = loop {
+        let c = chars.next()?;
+        if c == '\'' || c == '"' {
+            break c;
         }
-        i += 1;
+    };
+    let mut s = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            // Escape sequence (`\'`, `\"`, `\\`, …): take the next char
+            // verbatim. Stepping by `char` means we never index into the middle
+            // of a multi-byte codepoint. A trailing backslash with no following
+            // char falls through to the unterminated-literal `None` below.
+            '\\' => {
+                if let Some(escaped) = chars.next() {
+                    s.push(escaped);
+                }
+            }
+            _ if c == quote => return Some(s),
+            _ => s.push(c),
+        }
     }
-    None
+    None // unterminated literal
 }
 
 /// Whether `s` is a valid PHP identifier (the shape a prop name must have to

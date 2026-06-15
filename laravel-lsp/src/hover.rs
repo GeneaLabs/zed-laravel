@@ -35,6 +35,7 @@
 
 use crate::livewire_resolver::extract_blade_variable_at_cursor;
 use crate::salsa_impl::{ParsedPatternsData, PatternAtPosition};
+use std::path::Path;
 
 /// Anything the cursor might be hovering. Pattern variants come straight from
 /// the Salsa position index; the Blade-variable variant is extracted by line
@@ -326,6 +327,54 @@ pub fn helper_identifier_card(name: &str, source_link: Option<&str>) -> Option<S
         source_link,
         ..Default::default()
     }))
+}
+
+/// Resolve the bottom-of-hover source link for a curated helper card, driving
+/// the vendored-vs-docs decision off a real on-disk probe under `root`.
+///
+/// When the framework's `helpers.php` (`card.vendor_path`) is vendored under
+/// `root`, returns a `file://` link into it, labelled with the path relative to
+/// `root`. Otherwise — no root, or the file isn't present — falls back to the
+/// canonical `laravel.com/docs` anchor (`card.docs_url`).
+///
+/// This is the single source of truth for the branch: the binary's
+/// `Backend::hover_for_helper` delegates to it, and the behavior tests drive it
+/// directly with a real `TempDir`, so the test and the production decision can
+/// never diverge.
+pub async fn resolve_helper_source_link(root: Option<&Path>, card: &HelperCard) -> String {
+    use tower_lsp::lsp_types::Url;
+
+    // Probe the workspace for the vendored framework helpers file — a single
+    // existence stat, no vendor scan. `try_exists` treats a probe error
+    // (permission denied, broken symlink) as "absent".
+    let vendored = match root {
+        Some(r) => {
+            let path = r.join(card.vendor_path);
+            tokio::fs::try_exists(&path)
+                .await
+                .unwrap_or(false)
+                .then_some((r, path))
+        }
+        None => None,
+    };
+
+    let Some((root, path)) = vendored else {
+        // No root, or the framework isn't vendored: the curated docs anchor.
+        return source_link("Laravel documentation", card.docs_url, None);
+    };
+
+    // A `file://` link into the vendored helpers.php, labelled relative to the
+    // workspace root — mirrors `Backend::source_link` (the `root` here IS the
+    // workspace root, so the label reduces to `card.vendor_path`). Falls back to
+    // an unlinked monospace path when the URL can't be built (non-absolute path).
+    let display = path
+        .strip_prefix(root)
+        .map(|rel| rel.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+    match Url::from_file_path(&path) {
+        Ok(url) => source_link(&display, url.as_str(), None),
+        Err(_) => format!("`{}`", display),
+    }
 }
 
 /// The declaring method names a magic-member usage name could map to, by kind.

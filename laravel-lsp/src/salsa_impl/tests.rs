@@ -817,6 +817,59 @@ fn collect_route_matches() {
 }
 
 #[test]
+fn collect_route_matches_dotted_name_exact() {
+    // Folio-style dotted route names (e.g. `route('users.show')`) must match by
+    // full-string equality, never by prefix. Two entries whose names overlap as
+    // prefixes — "users.show" and the shorter "users" — let us prove neither
+    // bleeds into the other. The `collect_route_matches` fixture above uses
+    // distinct names ("home" / "admin.users"), so a `starts_with`-style
+    // regression in the route arm would slip past it; this test guards that gap.
+    let mut p = ParsedPatternsData::default();
+    p.route_refs.push(Arc::new(RouteReferenceData {
+        name: "users.show".into(),
+        line: 0,
+        column: 6,
+        end_column: 16,
+    }));
+    p.route_refs.push(Arc::new(RouteReferenceData {
+        name: "users".into(),
+        line: 1,
+        column: 6,
+        end_column: 11,
+    }));
+    p.build_position_index();
+
+    // Querying the full dotted name returns only its own entry (line 0); the
+    // shorter "users" prefix must not be swept in.
+    let mut out = Vec::new();
+    collect_matches_for_symbol(
+        &dummy_path(),
+        &p,
+        &SymbolRefData::Route("users.show".into()),
+        &mut out,
+    );
+    assert_eq!(
+        out.len(),
+        1,
+        "dotted name should match exactly its own entry"
+    );
+    assert_eq!(out[0].line, 0);
+
+    // Querying the shorter prefix returns only its own entry (line 1); the
+    // longer "users.show" must not be matched — catching a `starts_with`
+    // regression that the distinct-name fixture above cannot.
+    let mut out = Vec::new();
+    collect_matches_for_symbol(
+        &dummy_path(),
+        &p,
+        &SymbolRefData::Route("users".into()),
+        &mut out,
+    );
+    assert_eq!(out.len(), 1, "prefix must not match the longer dotted name");
+    assert_eq!(out[0].line, 1);
+}
+
+#[test]
 fn collect_config_matches_by_key() {
     let mut p = ParsedPatternsData::default();
     p.config_refs.push(Arc::new(ConfigReferenceData {
