@@ -638,6 +638,36 @@ function f() {
     );
 }
 
+/// Over-refusal guard for the `${'x'}` shape: a *function-local* `$x` whose only
+/// `${'x'}` reference lives in a *nested closure* binds to that closure, not the
+/// outer function. `scope_references_dynamic_string_var` is resolution-aware
+/// (it fires only when the `${'x'}` resolves to *this* scope), so an unrelated
+/// dynamic-string access in an inner scope must NOT block renaming the local.
+/// This is the FALSE arm of `dynamic_string_variable_reference_is_refused` — the
+/// companion to `function_local_is_renamable_despite_unrelated_globals_access`.
+#[test]
+fn function_local_is_renamable_despite_dynamic_string_in_inner_scope() {
+    let src = "\
+<?php
+function f() {
+    $x = 1;
+    $g = function () { return ${'x'}; };
+    return $x;
+}
+";
+    // `f`'s `$x` (assignment + return) renames; the `${'x'}` inside the closure
+    // resolves to the closure scope, a separate binding, so it is neither a
+    // blocker nor rewritten.
+    let targets = rename(src, "$x", 0, "$y");
+    assert_eq!(targets.len(), 2, "only the two function-local sites");
+    assert!(targets.iter().all(|t| t.new_text == "$y"));
+    let edited = edited_offsets(src, &targets);
+    assert!(
+        !edited.contains(&abs_byte_of_match(src, "${'x'}", 0)),
+        "the ${{'x'}} in the inner closure stays put"
+    );
+}
+
 /// Shape: `$GLOBALS['x']` (superglobal array access). CLASSIFICATION: REFUSE.
 /// `$GLOBALS['x']` aliases the program-scope global `$x` through a string key the
 /// rename can't rewrite. Before #96 the `scope_aliases_global` guard only saw
