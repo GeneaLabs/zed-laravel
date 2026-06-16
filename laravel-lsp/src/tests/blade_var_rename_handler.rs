@@ -110,15 +110,16 @@ async fn prepare_accepts_file_scoped_variable_and_excludes_the_sigil() {
 
 #[tokio::test]
 async fn prepare_rejects_cursor_in_unresolved_loop() {
-    // An opaque `@foreach`: the inline comment inside the header desyncs the
-    // paren scan, so the loop's binding can't be resolved. Even though `$user`
-    // *does* surface in markup (so the `is_template_variable` gate passes), a
-    // cursor inside the loop must be refused by the `cursor_in_unresolved_loop`
-    // gate — a scope-local rename there risks a file-wide clobber.
+    // An opaque `@foreach`: the header has no resolvable ` as $var` binding, so
+    // the loop's scope can't be determined. Even though `$user` *does* surface
+    // in markup (so the `is_template_variable` gate passes), a cursor inside the
+    // loop must be refused by the `cursor_in_unresolved_loop` gate — a
+    // scope-local rename there risks a file-wide clobber. (Issue #166 reworked
+    // this fixture off a comment-embedded `)`, which now parses correctly.)
     let dir = TempDir::new().unwrap();
     let backend = minimal_backend();
     let src = "{{ $user }}\n\
-               @foreach ($users /* :) */ as $user)\n\
+               @foreach ($users)\n\
                \x20   {{ $user }}\n\
                @endforeach\n\
                {{ $user }}\n";

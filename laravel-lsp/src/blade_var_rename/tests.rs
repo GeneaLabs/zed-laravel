@@ -246,15 +246,54 @@ fn commented_out_loop_does_not_create_a_phantom_binding_block() {
 }
 
 #[test]
-fn opaque_loop_refuses_rename_rather_than_clobbering() {
-    // A PHP block comment inside the header desyncs the paren scan, so the
-    // binding can't be resolved — an opaque loop. A rename whose cursor sits
-    // inside it is refused (no spans) rather than falling through to the
-    // file-scope arm and clobbering every `$user`. `cursor_in_unresolved_loop`
-    // gates prepare_rename identically.
+fn commented_foreach_header_is_resolved_and_renameable() {
+    // issue #166: a `)` inside a PHP comment in the header no longer desyncs the
+    // paren scan. The loop binding (`$user`) is recovered, so the block is NOT
+    // opaque, the cursor is NOT in an unresolved region, and a rename is offered
+    // (scoped to the loop) instead of being refused.
     let src = "\
 {{ $user }}
 @foreach ($users /* :) */ as $user)
+    {{ $user->name }}
+@endforeach
+{{ $user }}";
+
+    // The header parses into a foreach block that binds `$user` — not opaque.
+    let block = find_loop_blocks(src)
+        .into_iter()
+        .find(|b| b.loop_type == BladeLoopType::Foreach)
+        .expect("the commented header still forms a foreach block");
+    assert!(
+        block.variables.iter().any(|(v, _)| v == "user"),
+        "the bound `$user` is recovered from the commented header"
+    );
+    assert!(!is_opaque_loop(&block), "a resolved binding is not opaque");
+
+    // A cursor inside the loop body is not in an unresolved region…
+    assert!(
+        !cursor_in_unresolved_loop(src, 2),
+        "the loop scope is resolved, so the cursor is not unresolved"
+    );
+    // …and the rename is offered, scoped to the loop (directive + body).
+    let spans = in_scope_spans(src, "user", 2);
+    let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+    assert_eq!(
+        lines,
+        vec![1, 2],
+        "rename offered and scoped to the loop, not refused"
+    );
+}
+
+#[test]
+fn opaque_loop_refuses_rename_rather_than_clobbering() {
+    // A `@foreach` with no resolvable ` as $var` binding is an opaque loop — the
+    // parser recovers no loop variable, so its scope is unknown. A rename whose
+    // cursor sits inside it is refused (no spans) rather than falling through to
+    // the file-scope arm and clobbering every `$user`. `cursor_in_unresolved_loop`
+    // gates prepare_rename identically.
+    let src = "\
+{{ $user }}
+@foreach ($users)
     {{ $user }}
 @endforeach
 {{ $user }}";
@@ -316,10 +355,12 @@ fn blade_comment_inside_a_multiline_header_still_scopes() {
 #[test]
 fn file_scoped_rename_skips_an_opaque_loop() {
     // A file-scoped rename (cursor outside any loop) must not clobber INTO an
-    // opaque loop whose scope is unknown — those occurrences are left alone.
+    // opaque loop whose scope is unknown — those occurrences are left alone. The
+    // opaque loop here has no resolvable ` as $var` binding (issue #166 reworked
+    // this away from a comment-embedded `)`, which now parses correctly).
     let src = "\
 {{ $user }}
-@foreach ($users /* :) */ as $user)
+@foreach ($users)
     {{ $user }}
 @endforeach
 {{ $user }}";
