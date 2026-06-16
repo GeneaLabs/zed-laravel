@@ -625,6 +625,104 @@ fn unregistered_anonymous_prefix_does_not_borrow_registered_directory() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn symlink_escaping_candidate_is_dropped_by_canonicalize_backstop() {
+    // Issue #152: the canonicalize *drop*-leg of the root-containment backstop.
+    //
+    // The backstop in `resolve_component_path` has two arms (PR #150):
+    //
+    //     paths.retain(|path| match (path.canonicalize(), &canonical_root) {
+    //         (Ok(real_path), Ok(real_root)) => real_path.starts_with(real_root), // canonicalize
+    //         _ => normalize_path(path).starts_with(&self.root),                  // textual fallback
+    //     });
+    //
+    // Every #109 test runs against a fictional `/project` root, so its candidates
+    // never exist on disk and only the *textual-fallback* `_` arm ever fires. The
+    // canonicalize *keep*-leg (an in-root path that exists) is covered by the
+    // `TempDir` tests, but the *drop*-leg is not: a candidate that EXISTS on disk
+    // yet, once `canonicalize()` resolves its symlinks, points OUTSIDE the project
+    // root — a symlink escape (`{root}/vendor/evil` → an out-of-root directory).
+    // This pins that drop-leg. The registered directory is lexically in-root, so
+    // it sails past the textual guard; only canonicalization reveals the escape.
+    use std::os::unix::fs::symlink;
+
+    // A real project root, plus a second tempdir OUTSIDE it standing in for the
+    // attacker-controlled target (the moral equivalent of `/etc`).
+    let (_dir, root) = project_with_files(&[]);
+    let outside = TempDir::new().unwrap();
+
+    // A real component file inside the out-of-root target, so the candidate built
+    // through the symlink EXISTS on disk and `path.canonicalize()` returns
+    // `Ok(real_path)` — exercising the canonicalize arm, not the `_` fallback.
+    std::fs::write(
+        outside.path().join("widget.blade.php"),
+        "<div>escaped</div>\n",
+    )
+    .unwrap();
+
+    // Symlink an in-root path (`{root}/vendor/evil`) at the out-of-root target,
+    // then register THAT in-root directory as the `evil` anonymousComponentPath.
+    std::fs::create_dir_all(root.join("vendor")).unwrap();
+    let symlinked = root.join("vendor/evil");
+    symlink(outside.path(), &symlinked).unwrap();
+
+    let mut anon = HashMap::new();
+    anon.insert("evil".to_string(), symlinked.clone());
+    let config = LaravelConfigData {
+        root: root.clone(),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: anon,
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
+    };
+
+    // Precondition: the escaping candidate really does exist on disk (via the
+    // symlink), so `canonicalize()` returns Ok and the canonicalize arm — not the
+    // textual fallback — is what must drop it. Guards against a vacuous pass.
+    let escaping = symlinked.join("widget.blade.php");
+    assert!(
+        escaping.exists(),
+        "precondition: the symlink-escaping candidate must exist on disk so \
+         `canonicalize()` returns Ok and the canonicalize arm runs: {:?}",
+        escaping,
+    );
+
+    let paths = config.resolve_component_path("evil::widget");
+
+    // The canonicalize drop-leg must remove every candidate whose canonicalized
+    // form escapes the project root. Non-existent speculative candidates can't be
+    // canonicalized and are treated as in-root (the textual fallback keeps them).
+    let canonical_root = root.canonicalize().unwrap();
+    assert!(
+        paths.iter().all(|p| match p.canonicalize() {
+            Ok(real) => real.starts_with(&canonical_root),
+            Err(_) => true,
+        }),
+        "every on-disk candidate must canonicalize inside the project root; a \
+         symlink-escaping candidate leaked: {:?}",
+        paths,
+    );
+
+    // Specifically, the candidate that escapes via the symlink must be gone —
+    // this is the drop-leg firing, not merely the absence of any candidate. We do
+    // NOT assert the result is empty: in-root vendor-publish guesses survive via
+    // the textual fallback.
+    assert!(
+        !paths.contains(&escaping),
+        "the symlink-escaping candidate must be dropped by the canonicalize \
+         backstop: {:?}",
+        paths,
+    );
+}
+
 // ─── PHP path-expression resolution ─────────────────────────────────────
 
 #[test]
