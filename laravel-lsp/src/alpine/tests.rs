@@ -224,6 +224,46 @@ fn not_attribute_position_inside_quoted_value() {
     assert!(!at_attribute_position(line, at));
 }
 
+#[test]
+fn attribute_position_after_apostrophe_in_double_quoted_value() {
+    // Regression: an apostrophe inside an already-closed double-quoted value
+    // must not throw off attribute-position detection. Independent `'`/`"`
+    // parity counts saw an odd `'` here and wrongly returned false, silently
+    // killing Alpine directive completion + hover on the rest of the element.
+    let line = "<input placeholder=\"Don't\" x-data>";
+    let at = line.find("x-data").unwrap();
+    assert!(at_attribute_position(line, at));
+}
+
+#[test]
+fn attribute_position_after_double_quote_in_single_quoted_value() {
+    // Symmetric case: a `"` sitting inside an already-closed single-quoted
+    // value must not flip parity either.
+    let line = "<input data-label='say \"hi\"' x-data>";
+    let at = line.find("x-data").unwrap();
+    assert!(at_attribute_position(line, at));
+}
+
+#[test]
+fn not_attribute_position_with_unbalanced_quote_after_apostrophe() {
+    // The apostrophe is decoration inside the value; the cursor is genuinely
+    // inside the open `class="…"` string, so it is *not* an attribute position.
+    let line = "<input placeholder=\"Don't\" class=\"x-data";
+    let at = line.rfind("x-data").unwrap();
+    assert!(!at_attribute_position(line, at));
+}
+
+#[test]
+fn at_attribute_position_rejects_non_char_boundary() {
+    // Hardening: a byte offset landing inside a multibyte char must return
+    // false rather than panicking on the `&line[..byte_pos]` slice.
+    let line = "<div café x-data>";
+    let cafe = line.find("caf").unwrap();
+    let mid_e = cafe + "caf".len() + 1; // inside the 2-byte 'é'
+    assert!(!line.is_char_boundary(mid_e));
+    assert!(!at_attribute_position(line, mid_e));
+}
+
 // ─── directive completion context ────────────────────────────────────────
 
 #[test]

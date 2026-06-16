@@ -330,15 +330,22 @@ fn is_attr_name_char(c: char) -> bool {
 /// quoted attribute value. This is what tells an Alpine `@click` attribute apart
 /// from a Blade `@directive` written in text or a PHP block.
 pub fn at_attribute_position(line: &str, byte_pos: usize) -> bool {
-    if byte_pos > line.len() {
+    if byte_pos > line.len() || !line.is_char_boundary(byte_pos) {
         return false;
     }
     let before = &line[..byte_pos];
     match before.rfind('<') {
         Some(lt) if before.rfind('>').is_none_or(|gt| gt < lt) => {
+            // The cursor is at an attribute position only when it sits outside
+            // any open quoted value. Reuse the `open_quote` state machine (the
+            // same one the magic path relies on) instead of counting `"` and
+            // `'` independently: independent parity counts misfire whenever a
+            // quote of one kind sits inside an already-closed value of the other
+            // — e.g. the apostrophe in `<input placeholder="Don't" x-da│>` makes
+            // the `'` count odd even though the cursor is plainly outside any
+            // string, which would silently kill directive completion and hover.
             let region = &before[lt..];
-            region.matches('"').count().is_multiple_of(2)
-                && region.matches('\'').count().is_multiple_of(2)
+            open_quote(region).is_none()
         }
         _ => false,
     }
