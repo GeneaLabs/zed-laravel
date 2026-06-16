@@ -64,6 +64,38 @@
 //! Constructor-promoted parameters (`__construct(private $name)`) are treated
 //! as ordinary locals within the constructor — the property side of promotion
 //! belongs to the deferred class-property rename pass, not here.
+//!
+//! ## Engine default: fail-open with a complete denylist
+//!
+//! The engine is **fail-open**: a rename proceeds by default — rewriting every
+//! `variable_name` bound to the scope — and refuses only for an explicit set of
+//! shapes that reach a local through something a scope-local edit can't follow
+//! (a string key, or a cross-scope alias). Issue #96 mapped the whole boundary
+//! of string-keyed and cross-scope references so the denylist is now complete for
+//! every shape detectable in a single file:
+//!
+//! - **Refused** — a string/alias reference the rename can't rewrite, so leaving
+//!   it behind would strand it: `global $x;`, `compact('x')` / `extract('x')`,
+//!   `${'x'}` (dynamic variable over a string literal), `$GLOBALS['x']`.
+//! - **Rewritten** — the reference *is* a real `variable_name` the engine
+//!   collects: `use ($x)` / `use (&$x)` captures, arrow-function captures,
+//!   `$$name` (the inner `$name` is a `variable_name`), string interpolation and
+//!   heredoc (`"$x"`, `"{$x}"`, `<<<EOT $x EOT`), and by-reference positions
+//!   (`&$x` — the `&` is a separate token). Nowdoc (`<<<'EOT'`) does *not*
+//!   interpolate, so its `$x` is literal text and is correctly left untouched.
+//! - **Deferred** — no literal name in the source, so undetectable in one file:
+//!   `extract($runtimeArray)`, `get_defined_vars()`, and fully dynamic
+//!   variable-variable indirection. These are the residual fail-open risk,
+//!   documented at their sites as `KNOWN LIMITATION`s.
+//!
+//! Fail-closed (refuse unless a variable's *entire* reference set is provably
+//! plain `variable_name` tokens) was considered and rejected. It would over-refuse
+//! the ordinary, safe renames that are the feature's whole point — any variable
+//! merely *near* a construct the analyzer doesn't fully model would become
+//! unrenameable — to buy protection against the three deferred dynamic forms
+//! above, which are rare and undetectable from source either way. The denylist
+//! delivers the same corruption safety for every *detectable* shape without that
+//! over-refusal tax, so fail-open stays.
 
 use std::path::Path;
 use tree_sitter::Node;
@@ -303,6 +335,14 @@ fn scope_references_compact_extract(scope: Node, name: &str, bytes: &[u8]) -> bo
             if let Some(args) = n.child_by_field_name("arguments") {
                 let mut ac = args.walk();
                 for arg in args.named_children(&mut ac) {
+                    // KNOWN LIMITATION (#96): only the string-literal argument form
+                    // is matched here. The dynamic `extract($runtimeArray)` form
+                    // names its variables from a runtime array with no literal in
+                    // the source, so it is undetectable in a single file and the
+                    // rename is deliberately not refused for it — a deferred,
+                    // documented fail-open case, not a partial-edit corruption (no
+                    // source reference is stranded by the rename's own edits).
+                    //
                     // tree-sitter wraps each call argument in an `argument` node;
                     // the string literal is its last named child.
                     let expr = if arg.kind() == "argument" {
@@ -318,6 +358,81 @@ fn scope_references_compact_extract(scope: Node, name: &str, bytes: &[u8]) -> bo
                     {
                         return true;
                     }
+                }
+            }
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
+/// Whether the variable `name`, as bound in `scope`, is referenced by a
+/// `${'name'}` dynamic-variable expression over a **string literal** within that
+/// same scope. `${'name'}` evaluates to `$name`, but the name lives in a `string`
+/// node (the `dynamic_variable_name`'s child), not a `variable_name`, so a
+/// scope-local rename can't rewrite it — renaming `$name` while leaving
+/// `${'name'}` behind silently strands the reference. Refuse, mirroring
+/// [`scope_references_compact_extract`].
+///
+/// Only the string-literal form is caught. `$$name` is *also* a
+/// `dynamic_variable_name`, but its child is a real `variable_name`, not a string,
+/// so it is collected and renamed normally and must not be refused here — the
+/// `string_literal_content` check is what distinguishes the two.
+///
+/// Resolution-aware, exactly like the other guards: in a function/closure scope
+/// the reference counts iff a plain `$name` at that site would bind to the same
+/// scope (by node id); at the top-level `program` scope any matching reference in
+/// the file counts.
+fn scope_references_dynamic_string_var(scope: Node, name: &str, bytes: &[u8]) -> bool {
+    let program_scope = scope.kind() == "program";
+    let mut stack = vec![scope];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "dynamic_variable_name" {
+            if let Some(inner) = n.named_child(0) {
+                if string_literal_content(inner, bytes) == Some(name)
+                    && (program_scope || resolve_binding_scope(n, name, bytes).id() == scope.id())
+                {
+                    return true;
+                }
+            }
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
+/// Whether the variable `name`, bound at the top-level **program** scope, is also
+/// reached through the `$GLOBALS['name']` superglobal. `$GLOBALS` indexes the
+/// global symbol table by string key, so `$GLOBALS['name']` is an alias of the
+/// program-scope `$name` — the `global $name;` situation in different dress,
+/// except the key lives in a `string` node a scope-local rename can't rewrite.
+/// Renaming the program global while leaving `$GLOBALS['name']` behind strands the
+/// reference, so the engine refuses, mirroring [`scope_aliases_global`].
+///
+/// Only the program scope is affected: a function-local `$name` (with no `global`
+/// import) is a *different* binding from `$GLOBALS['name']`, so an unrelated
+/// superglobal access never over-refuses a genuine local. A `$GLOBALS['name']`
+/// access is itself spelled as a `subscript_expression` whose base is the
+/// `variable_name` `GLOBALS` and whose index is a string literal.
+fn scope_references_globals_array(scope: Node, name: &str, bytes: &[u8]) -> bool {
+    if scope.kind() != "program" {
+        return false;
+    }
+    let mut stack = vec![scope];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "subscript_expression" {
+            if let (Some(base), Some(index)) = (n.named_child(0), n.named_child(1)) {
+                if base.kind() == "variable_name"
+                    && var_ident(base, bytes) == Some("GLOBALS")
+                    && string_literal_content(index, bytes) == Some(name)
+                {
+                    return true;
                 }
             }
         }
@@ -369,16 +484,28 @@ fn renameable_variable_at<'t>(
     }
     // Refuse a variable whose binding scope references it in a way the rename
     // can't follow, where a scope-local edit would leave a dangling reference:
-    //  - `global $x;` aliases it to the top-level global, and
-    //  - `compact('x')` / `extract('x')` name it by string.
-    // Both are checked here (not in `is_collectible`) so the *whole* rename is
+    //  - `global $x;` aliases it to the top-level global,
+    //  - `compact('x')` / `extract('x')` name it by string,
+    //  - `${'x'}` names it via a dynamic-variable over a string literal, and
+    //  - `$GLOBALS['x']` aliases the top-level global via the superglobal array.
+    // All are checked here (not in `is_collectible`) so the *whole* rename is
     // refused regardless of where the cursor lands — collecting only the
     // in-scope `variable_name` occurrences while leaving the alias or the string
     // behind is the exact partial-rename corruption this guards against.
+    //
+    // KNOWN LIMITATION (#96): the *dynamic* sibling forms cannot be guarded
+    // because they carry no literal name in the source — `extract($runtimeArray)`
+    // (runtime keys), `get_defined_vars()` (exposes every in-scope local by its
+    // runtime name), and fully variable-variable indirection. These are deferred,
+    // documented fail-open cases: the rename proceeds and strands no *source*
+    // reference of its own; only a runtime relationship the engine cannot see
+    // from one file is affected.
     let name = var_ident(var_node, bytes)?;
     let scope = resolve_binding_scope(var_node, name, bytes);
     if scope_aliases_global(scope, name, bytes)
         || scope_references_compact_extract(scope, name, bytes)
+        || scope_references_dynamic_string_var(scope, name, bytes)
+        || scope_references_globals_array(scope, name, bytes)
     {
         return None;
     }

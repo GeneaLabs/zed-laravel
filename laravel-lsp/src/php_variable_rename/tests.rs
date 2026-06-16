@@ -601,3 +601,259 @@ fn abs_byte_of_match(source: &str, needle: &str, nth: usize) -> usize {
         .unwrap_or_else(|| panic!("occurrence {nth} of {needle:?} not found"))
         .0
 }
+
+// ── #96: full boundary of string-keyed & cross-scope reference shapes ──────
+//
+// One fixture per reference shape enumerated in issue #96, each tagged with its
+// classification:
+//   • REWRITE — the reference is a real `variable_name`; the rename rewrites it.
+//   • REFUSE  — the rename is rejected rather than emit a partial (corrupting) edit.
+//   • DEFER   — undetectable in source (no literal name); documented fail-open.
+// See the module-level "Engine default: fail-open with a complete denylist".
+
+/// Shape: `${'x'}` (dynamic variable over a string literal). CLASSIFICATION:
+/// REFUSE. `${'x'}` evaluates to `$x`, but the name sits in a `string` node, not
+/// a `variable_name`, so a scope-local rename can't rewrite it. Before #96 this
+/// silently corrupted (renamed `$x`, stranded `${'x'}`); it is now guarded by
+/// `scope_references_dynamic_string_var`.
+#[test]
+fn dynamic_string_variable_reference_is_refused() {
+    let src = "\
+<?php
+function f() {
+    $x = 1;
+    return ${'x'};
+}
+";
+    let byte = cursor_byte(src, "$x", 0);
+    assert!(
+        variable_at_cursor(src, byte).is_none(),
+        "prepare must refuse: ${{'x'}} reference can't be rewritten"
+    );
+    assert!(
+        variable_rename_targets(src, &PathBuf::from("t.php"), byte, "$y")
+            .unwrap()
+            .is_empty(),
+        "rename must be a no-op, not a partial edit"
+    );
+}
+
+/// Shape: `$GLOBALS['x']` (superglobal array access). CLASSIFICATION: REFUSE.
+/// `$GLOBALS['x']` aliases the program-scope global `$x` through a string key the
+/// rename can't rewrite. Before #96 the `scope_aliases_global` guard only saw
+/// `global $x;` declarations, so this silently corrupted; it is now guarded by
+/// `scope_references_globals_array`.
+#[test]
+fn globals_array_referenced_variable_is_refused() {
+    let src = "\
+<?php
+$x = 1;
+echo $GLOBALS['x'];
+";
+    let byte = cursor_byte(src, "$x", 0); // top-level `$x = 1`
+    assert!(
+        variable_at_cursor(src, byte).is_none(),
+        "prepare must refuse: $GLOBALS['x'] aliases the program global"
+    );
+    assert!(
+        variable_rename_targets(src, &PathBuf::from("t.php"), byte, "$y")
+            .unwrap()
+            .is_empty(),
+        "rename must be a no-op, not a partial edit"
+    );
+}
+
+/// Over-refusal guard for the `$GLOBALS` shape: a *function-local* `$x` is a
+/// different binding from `$GLOBALS['x']` (which always names the program
+/// global), so an unrelated superglobal access must NOT block renaming the local.
+#[test]
+fn function_local_is_renamable_despite_unrelated_globals_access() {
+    let src = "\
+<?php
+function f() {
+    $x = 1;
+    $GLOBALS['x'] = 2;
+    return $x;
+}
+";
+    // The local `$x` (assignment + return) renames; `$GLOBALS['x']` names the
+    // *global* `$x`, a separate binding, and is neither collected nor a blocker.
+    let targets = rename(src, "$x", 0, "$y");
+    assert_eq!(targets.len(), 2, "only the two function-local sites");
+    assert!(targets.iter().all(|t| t.new_text == "$y"));
+    let edited = edited_offsets(src, &targets);
+    assert!(
+        !edited.contains(&abs_byte_of_match(src, "$GLOBALS", 0)),
+        "the $GLOBALS superglobal token stays put"
+    );
+}
+
+/// Shape: `extract($runtimeArray)` (runtime keys, no string literal).
+/// CLASSIFICATION: DEFER. The variable names come from a runtime array with no
+/// literal in the source, so the reference is undetectable in one file. The
+/// rename proceeds — it strands no *source* reference of its own — and the
+/// deferral is recorded as a KNOWN LIMITATION in `php_variable_rename.rs`.
+#[test]
+fn extract_runtime_array_does_not_refuse_rename() {
+    let src = "\
+<?php
+function f($data) {
+    $x = 1;
+    extract($data);
+    return $x;
+}
+";
+    // Contrast with `extract('x')` (string literal → REFUSE): the dynamic form
+    // carries no detectable name, so the rename is allowed to proceed.
+    let targets = rename(src, "$x", 0, "$y");
+    assert_eq!(
+        targets.len(),
+        2,
+        "assignment + return — rename proceeds (deferred)"
+    );
+    assert!(targets.iter().all(|t| t.new_text == "$y"));
+}
+
+/// Shape: `get_defined_vars()`. CLASSIFICATION: DEFER. The call returns an array
+/// keyed by every in-scope variable's runtime name; there is no source reference
+/// to `$x` to detect or rewrite, so the rename proceeds. Recorded as a KNOWN
+/// LIMITATION in `php_variable_rename.rs`.
+#[test]
+fn get_defined_vars_does_not_refuse_rename() {
+    let src = "\
+<?php
+function f() {
+    $x = 1;
+    return get_defined_vars();
+}
+";
+    let targets = rename(src, "$x", 0, "$y");
+    assert_eq!(
+        targets.len(),
+        1,
+        "the single assignment — rename proceeds (deferred)"
+    );
+    assert!(targets.iter().all(|t| t.new_text == "$y"));
+}
+
+/// Shape: `$$name` (variable-variables). CLASSIFICATION: REWRITE. The inner
+/// `$name` is a real `variable_name` (wrapped in a `dynamic_variable_name`), so
+/// renaming `$name` rewrites every occurrence — the binding, the `$$name` use,
+/// and the return — leaving the outer `$$` wrapper syntactically valid (`$$key`).
+/// The value `$$name` dereferences at runtime is a separate, truly-dynamic
+/// concern, out of scope here. (Also proves the dynamic-string guard does not
+/// over-refuse `$$name`: its inner child is a `variable_name`, not a string.)
+#[test]
+fn variable_variables_inner_name_renames_safely() {
+    let src = "\
+<?php
+function f() {
+    $name = 'a';
+    $$name = 1;
+    return $name;
+}
+";
+    let targets = rename(src, "$name", 0, "$key");
+    assert_eq!(targets.len(), 3, "binding + inner $name of $$name + return");
+    for t in &targets {
+        assert_eq!(target_text(src, t), "$name");
+        assert_eq!(t.new_text, "$key");
+    }
+    // The `$$name` use is rewritten on its inner `$name` (one byte past the outer
+    // `$`), so `$$name` becomes `$$key` with the leading `$` wrapper untouched.
+    let edited = edited_offsets(src, &targets);
+    let inner_of_dollar_dollar = src.match_indices("$$name").next().unwrap().0 + 1;
+    assert!(
+        edited.contains(&inner_of_dollar_dollar),
+        "inner $name of $$name is rewritten"
+    );
+}
+
+/// Shape: string interpolation + heredoc (`"$x"`, `"{$x}"`, `<<<EOT $x EOT`).
+/// CLASSIFICATION: REWRITE. Interpolated variables parse as `variable_name` nodes
+/// inside the `encapsed_string` / `heredoc_body`, so the rename rewrites them; the
+/// heredoc delimiter (`EOT`) is a separate token, left untouched. A nowdoc
+/// (`<<<'EOT'`) does NOT interpolate — its `$x` is literal text (`nowdoc_string`)
+/// and must NOT be rewritten.
+#[test]
+fn interpolation_and_heredoc_are_rewritten_nowdoc_is_not() {
+    let src = "\
+<?php
+function f() {
+    $x = 1;
+    $a = \"Hello $x\";
+    $b = \"V {$x}\";
+    $h = <<<EOT
+val $x
+EOT;
+    $n = <<<'EOT'
+raw $x
+EOT;
+    return $a . $b . $h . $n;
+}
+";
+    let targets = rename(src, "$x", 0, "$y");
+    // assignment + "Hello $x" + "{$x}" + heredoc $x = 4 sites. The nowdoc `$x` is
+    // literal text and is NOT among them.
+    assert_eq!(targets.len(), 4, "assignment + 2 interpolations + heredoc");
+    for t in &targets {
+        assert_eq!(target_text(src, t), "$x");
+        assert_eq!(t.new_text, "$y");
+    }
+    // The nowdoc occurrence (5th `$x`, 0-based index 4) stays literal.
+    let edited = edited_offsets(src, &targets);
+    assert!(
+        !edited.contains(&abs_byte_of_match(src, "$x", 4)),
+        "nowdoc $x is literal, not rewritten"
+    );
+}
+
+/// Shape: by-reference positions (`&$x`). CLASSIFICATION: REWRITE. Whether `$x`
+/// is bound by a by-reference parameter (`function f(&$x)`) or passed by reference
+/// at a call site, the `$x` is a plain `variable_name` and the `&` is a separate
+/// `reference_modifier` token. The rename rewrites the `$x` occurrences and leaves
+/// every `&` intact.
+#[test]
+fn by_reference_positions_rename_and_keep_the_ampersand() {
+    // (a) by-reference PARAMETER — the idiomatic modern form.
+    let param_src = "\
+<?php
+function bump(&$counter) {
+    $counter = $counter + 1;
+    return $counter;
+}
+";
+    let targets = rename(param_src, "$counter", 0, "$total");
+    assert_eq!(targets.len(), 4, "by-ref param + three body uses");
+    for t in &targets {
+        assert_eq!(target_text(param_src, t), "$counter");
+        assert_eq!(t.new_text, "$total");
+    }
+    assert!(
+        !edited_offsets(param_src, &targets)
+            .contains(&param_src.match_indices('&').next().unwrap().0),
+        "the & reference marker is a separate token, never edited"
+    );
+
+    // (b) call-site `f(&$x)` (legacy call-time pass-by-reference). tree-sitter
+    // still parses it as `argument` → `reference_modifier` + `variable_name`, so
+    // the `$x` is collected and the `&` left intact, identical to (a).
+    let call_src = "\
+<?php
+function f() {
+    $x = 1;
+    process(&$x);
+    return $x;
+}
+";
+    let call_targets = rename(call_src, "$x", 0, "$y");
+    assert_eq!(call_targets.len(), 3, "assignment + &-arg + return");
+    for t in &call_targets {
+        assert_eq!(target_text(call_src, t), "$x");
+    }
+    assert!(
+        !edited_offsets(call_src, &call_targets)
+            .contains(&call_src.match_indices('&').next().unwrap().0),
+        "the & at the call site is untouched"
+    );
+}
