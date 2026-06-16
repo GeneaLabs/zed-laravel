@@ -1213,3 +1213,53 @@ fn normalize_path_unchanged_without_parent_dir() {
         PathBuf::from("/app/views/home.php")
     );
 }
+
+// ============================================================================
+// Folio pages surface through the handler-level index (issue #101)
+// ============================================================================
+//
+// `folio_discovery::inject_folio_routes` is unit-tested in
+// `folio_discovery/tests.rs`, but nothing exercised the layer the completion
+// handler actually reads: `build_route_index` over `discover_route_files`, the
+// same pair `rebuild_route_index` calls at runtime. `build_route_index`
+// injects Folio routes as its final step, so a named Folio page must surface in
+// the resulting `RouteIndex` — name, URI, and method — without any `Route::`
+// call. This guards the wiring above the unit test: a regression that dropped
+// the `inject_folio_routes` call (or mangled the entry) would fail here.
+
+#[test]
+fn folio_named_page_surfaces_in_handler_route_index() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // A project that uses Folio, with one named page at the default mount.
+    std::fs::write(
+        root.join("composer.json"),
+        r#"{"require": {"laravel/folio": "^1.0"}}"#,
+    )
+    .unwrap();
+    let page = root.join("resources/views/pages/users/[id].blade.php");
+    std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+    std::fs::write(&page, "<?php name('users.show'); ?>").unwrap();
+
+    // Exactly what `rebuild_route_index` runs at runtime — discover the route
+    // files, then build the index over them. Folio injection happens inside
+    // `build_route_index`, so the page surfaces even though no `routes/` file
+    // (and thus no discovered route file) exists.
+    let index = build_route_index(root, &discover_route_files(root));
+
+    let route = index
+        .get("users.show")
+        .expect("named Folio route must surface via build_route_index");
+    // The name would be offered by `get_all_route_names()`, and goto resolves
+    // to the page file.
+    assert!(
+        route.file.ends_with("users/[id].blade.php"),
+        "Folio route must point at the page file, got {:?}",
+        route.file
+    );
+    // URI and method must be carried so a future regression that omits either
+    // is caught at this layer.
+    assert_eq!(route.uri.as_deref(), Some("/users/{id}"));
+    assert_eq!(route.method.as_deref(), Some("get"));
+}
