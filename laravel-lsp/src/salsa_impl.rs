@@ -2940,14 +2940,17 @@ impl LaravelConfigData {
         // Build the raw candidates, then enforce a project-root containment
         // backstop: any path that escapes `self.root` is dropped before return.
         // This uses the *lexical* entry point of the shared containment guard
-        // (`path_containment::path_within_root_lexical`): when both sides
-        // canonicalize it compares the symlink-resolved real paths, but
-        // speculative candidates that don't exist on disk yet can't be
-        // canonicalized, so it falls back to a `normalize_path` lexical check
-        // (collapsing any interior `..`/`.` before the prefix test) rather than
-        // fail-closing — admitting the not-yet-created candidate while still
-        // refusing a `root/sub/../../escape`. The fail-closed `path_within_root`
-        // would wrongly drop every speculative candidate here.
+        // (`path_containment::path_within_root_lexical`), which rejects an
+        // out-of-root candidate lexically *without canonicalizing the candidate* —
+        // so an out-of-root candidate is never `stat`-probed on disk here, the
+        // existence oracle issue #145 closes. A lexically-in-root candidate is
+        // then canonicalized to reject symlink escapes; a speculative candidate
+        // that doesn't exist on disk yet can't be canonicalized, so it falls back
+        // to the proven lexical result (collapsing any interior `..`/`.` before
+        // the prefix test) rather than fail-closing — admitting the
+        // not-yet-created candidate while still refusing a `root/sub/../../escape`.
+        // The fail-closed `path_within_root` would wrongly drop every speculative
+        // candidate here.
         let mut paths = self.component_path_candidates(component_name);
         paths.retain(|path| path_within_root_lexical(path, &self.root));
         paths
