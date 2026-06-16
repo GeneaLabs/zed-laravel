@@ -21,6 +21,15 @@
 //! `get_cached_config` short-circuits the (inert) Salsa actor and the chain runs
 //! purely against a tempdir: `file_exists_cached` reads real files off disk
 //! (the document cache is empty), exactly as it does for the live server.
+//!
+//! A follow-up (#183) extends the same handler-level coverage to the other
+//! resolution paths the chain walks for a `flux:*` tag:
+//!   - the **anonymous-component-path** registration form
+//!     (`Blade::anonymousComponentPath`), where the registered directory IS the
+//!     components directory — contrast the namespace form the first tests use; and
+//!   - the **directory-self** candidate `{base}/{last}.blade.php` — the third
+//!     file shape `push_component_file_candidates` emits (`salsa_impl.rs`), which
+//!     no handler-level test exercised until now.
 
 use crate::LaravelLanguageServer;
 use laravel_lsp::salsa_impl::{ComponentReferenceData, LaravelConfigData};
@@ -60,19 +69,52 @@ fn flux_config(root: PathBuf) -> LaravelConfigData {
     }
 }
 
-/// Build a backend for handler-level goto-def tests: `LspService::new` wires up a
-/// real `Client`, `inner().clone()` hands back the `LaravelLanguageServer`, and
-/// we prime the two pieces of state `resolve_component_existing_file` reads — the
-/// cached config and the project root. With `cached_config` primed,
-/// `get_cached_config` never touches the Salsa actor the harness spawns, so it
-/// stays inert. The document cache is left empty, so `file_exists_cached` falls
-/// through to a real `metadata` check against the tempdir.
-async fn flux_backend(root: &Path) -> LaravelLanguageServer {
+/// A `LaravelConfigData` rooted at `root` that registers the `flux` prefix as an
+/// *anonymous component path* (`Blade::anonymousComponentPath`) pointing at
+/// `flux_dir`. Unlike the namespace form `flux_config` builds, the registered
+/// directory IS the components directory, so `<flux:button>` resolves to
+/// `{flux_dir}/button.blade.php` directly — no `components/` segment. Mirrors the
+/// `anonymous_component_paths` arm of `flux_config` in `flux_component_hover.rs`;
+/// every other field is empty.
+fn flux_paths_config(root: PathBuf, flux_dir: PathBuf) -> LaravelConfigData {
+    let mut anonymous_component_paths = HashMap::new();
+    anonymous_component_paths.insert("flux".to_string(), flux_dir);
+    LaravelConfigData {
+        root,
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths,
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
+    }
+}
+
+/// Build a backend for handler-level goto-def tests from an explicit `config`:
+/// `LspService::new` wires up a real `Client`, `inner().clone()` hands back the
+/// `LaravelLanguageServer`, and we prime the two pieces of state
+/// `resolve_component_existing_file` reads — the cached config and the project
+/// root. With `cached_config` primed, `get_cached_config` never touches the Salsa
+/// actor the harness spawns, so it stays inert. The document cache is left empty,
+/// so `file_exists_cached` falls through to a real `metadata` check against the
+/// tempdir.
+async fn backend_with_config(root: &Path, config: LaravelConfigData) -> LaravelLanguageServer {
     let (service, _socket) = LspService::new(LaravelLanguageServer::new);
     let backend = service.inner().clone();
     *backend.root_path.write().await = Some(root.to_path_buf());
-    *backend.cached_config.write().await = Some(flux_config(root.to_path_buf()));
+    *backend.cached_config.write().await = Some(config);
     backend
+}
+
+/// Build a backend primed with the namespace-form `flux_config` — the
+/// registration the first tests in this module exercise.
+async fn flux_backend(root: &Path) -> LaravelLanguageServer {
+    backend_with_config(root, flux_config(root.to_path_buf())).await
 }
 
 /// Write `body` to `relpath` under `dir`, creating parent directories, and
@@ -211,5 +253,71 @@ async fn unresolvable_flux_tag_returns_none() {
     assert!(
         resp.is_none(),
         "an unresolvable Flux tag yields no LocationLink, got {resp:?}"
+    );
+}
+
+#[tokio::test]
+async fn flux_tag_resolves_via_anonymous_component_path() {
+    // The *other* registration form: `Blade::anonymousComponentPath` registers
+    // the `flux` prefix against a directory that IS the components dir, so
+    // `<flux:button>` resolves to `{flux_dir}/button.blade.php` directly — no
+    // `components/` segment (contrast `flux_tag_resolves_to_location_link`, which
+    // drives the namespace form). The registered directory sits *outside* Flux's
+    // conventional fallback locations (`resources/views/flux`,
+    // `vendor/livewire/flux…`), so only the anonymous-component-path branch can
+    // produce this candidate — the assertion can't pass by coincidence.
+    let dir = TempDir::new().unwrap();
+    let expected = write_file(
+        dir.path(),
+        "packages/flux/resources/views/button.blade.php",
+        FLUX_BLADE,
+    );
+    let flux_dir = dir.path().join("packages/flux/resources/views");
+
+    let backend = backend_with_config(
+        dir.path(),
+        flux_paths_config(dir.path().to_path_buf(), flux_dir),
+    )
+    .await;
+    let resp = backend
+        .create_component_location_from_salsa(&flux_ref("flux:button"))
+        .await
+        .expect("a Flux tag backed by an anonymous-component-path registration resolves");
+
+    assert_eq!(
+        single_link_target(resp),
+        expected,
+        "goto-def lands on the file under the registered anonymous-component path"
+    );
+}
+
+#[tokio::test]
+async fn flux_tag_resolves_via_self_named_candidate() {
+    // The third file shape `push_component_file_candidates` emits is the
+    // directory-self convention `{base}/{last}.blade.php` (`salsa_impl.rs`):
+    // `<flux:button>` → `…/components/flux/button/button.blade.php`. With neither
+    // the direct file (`…/flux/button.blade.php`) nor the directory index
+    // (`…/flux/button/index.blade.php`) present, the handler must fall through to
+    // this self-named file. Uses the namespace registration form
+    // (`flux_config`/`flux_backend`), same as the first three tests.
+    let dir = TempDir::new().unwrap();
+    let expected = write_file(
+        dir.path(),
+        "resources/views/components/flux/button/button.blade.php",
+        FLUX_BLADE,
+    );
+
+    let backend = flux_backend(dir.path()).await;
+    let resp = backend
+        .create_component_location_from_salsa(&flux_ref("flux:button"))
+        .await
+        .expect(
+            "the directory-self convention backs a Flux tag when no direct or index file exists",
+        );
+
+    assert_eq!(
+        single_link_target(resp),
+        expected,
+        "the self-named {{base}}/{{last}}.blade.php candidate resolves when the direct and index files are absent"
     );
 }
