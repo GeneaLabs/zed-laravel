@@ -248,6 +248,49 @@ async fn decl_range_at_returns_the_page_name_span_for_a_folio_cursor() {
 }
 
 #[tokio::test]
+async fn decl_range_at_returns_the_page_name_span_for_a_non_contact_length_leaf() {
+    // Span-length regression guard (issue #191). Every other decl/rename test
+    // seeds a `contact` leaf (7 chars), so they all re-read a span that happens
+    // to coincide with the `NAME_START`/`NAME_END` constants — a span-computation
+    // bug for a different name length would still pass green. This drives
+    // `decl_range_at` against a 9-char leaf (`dashboard`) and asserts the
+    // *literal* columns the page body dictates, NOT the `contact`-sized constants.
+    //
+    // `<?php name('dashboard'); ?>` — the `dashboard` content occupies columns
+    // 12..=20, so its quote-excluded span is start 12, end 21. The `CURSOR` at
+    // column 13 sits inside it, just as it does for the shorter `contact`.
+    let root = TempDir::new().unwrap();
+    let server = test_server();
+    let page = seed_page(&server, root.path(), "dashboard").await;
+
+    let range = decl_range_at(
+        &server,
+        Some(root.path()),
+        &page,
+        CURSOR,
+        &SymbolRef::Route("dashboard".to_string()),
+    )
+    .await;
+
+    assert_eq!(
+        range,
+        Some(Range {
+            start: Position {
+                line: 0,
+                character: 12,
+            },
+            end: Position {
+                line: 0,
+                character: 21,
+            },
+        }),
+        "the prepare_rename range must cover the 9-char `dashboard` content \
+         (columns 12..21), proving the span is re-read from the page body rather \
+         than fixed to the 7-char `contact` constants (NAME_START 12, NAME_END 19)"
+    );
+}
+
+#[tokio::test]
 async fn decl_range_at_returns_none_when_cursor_off_the_name_call() {
     // Off the `name(...)` call (column 0), there is nothing to rename here.
     let root = TempDir::new().unwrap();
@@ -432,6 +475,49 @@ async fn collect_targets_rewrites_the_page_name_declaration() {
     assert_eq!(t.end_column, NAME_END);
     assert_eq!(
         t.new_text, "support",
+        "the full new name is written at the decl"
+    );
+}
+
+#[tokio::test]
+async fn collect_targets_rewrites_a_non_contact_length_leaf_declaration() {
+    // Span-length regression guard (issue #191), the rename-apply counterpart to
+    // `decl_range_at_returns_the_page_name_span_for_a_non_contact_length_leaf`.
+    // The sibling rewrite tests all seed a `contact` leaf (7 chars), so their
+    // `start_column`/`end_column` assertions reuse the `NAME_START`/`NAME_END`
+    // constants — a span miscomputation for another name length would pass green.
+    // This drives `collect_route_declaration_targets` against a 9-char leaf
+    // (`dashboard`) and asserts the *literal* edit columns, NOT the constants.
+    //
+    // `<?php name('dashboard'); ?>` — the `dashboard` content occupies columns
+    // 12..=20, so the edit span is start 12, end 21.
+    let root = TempDir::new().unwrap();
+    let server = test_server();
+    let page = seed_page(&server, root.path(), "dashboard").await;
+
+    let targets =
+        collect_route_declaration_targets(&server, root.path(), "dashboard", "home").await;
+
+    assert_eq!(
+        targets.len(),
+        1,
+        "exactly one declaration target — the page itself"
+    );
+    let t = &targets[0];
+    assert_eq!(t.file_path, page);
+    assert_eq!(t.line, 0);
+    assert_eq!(
+        t.start_column, 12,
+        "the edit starts at the `dashboard` content's first column, re-read from \
+         the body — matching the 7-char case's NAME_START only by coincidence"
+    );
+    assert_eq!(
+        t.end_column, 21,
+        "the edit ends at the 9-char `dashboard` content's end column (21), not \
+         the 7-char `contact` NAME_END (19) — proving the span tracks name length"
+    );
+    assert_eq!(
+        t.new_text, "home",
         "the full new name is written at the decl"
     );
 }
