@@ -14,10 +14,15 @@
 //!
 //! Both are driven directly on a server built through `tower_lsp::LspService`,
 //! with the route index seeded the way the route-index build seeds it — the
-//! same harness `folio_cursor_containment.rs` uses. The async `rename` handler
-//! itself isn't fixtured (it depends on the Salsa actor for call-site
-//! `find_references`, covered by the symbol-index tests); these exercise the
-//! Folio decl logic the handler composes.
+//! same harness `folio_cursor_containment.rs` uses. `prepare_rename` is now also
+//! pinned end-to-end at the handler level by
+//! `prepare_rename_handler_dispatches_a_folio_name_cursor_to_a_valid_range`
+//! (added in PR #171), which drives the whole handler and proves a Folio
+//! `name('...')` cursor falls through its `.blade.php` early-return to this decl
+//! path. The full `rename` *apply* handler still isn't fixtured — it depends on
+//! the Salsa actor for call-site `find_references`, covered by the symbol-index
+//! tests — so the remaining tests here exercise the Folio decl logic that
+//! handler composes.
 
 use crate::{collect_route_declaration_targets, decl_range_at, LaravelLanguageServer};
 use laravel_lsp::references::SymbolRef;
