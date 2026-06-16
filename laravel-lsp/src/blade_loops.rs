@@ -136,16 +136,21 @@ fn balanced_directive_arguments(lines: &[&str], start_line: usize, open: usize) 
         return Some(lines[start_line][open..=close].to_string());
     }
 
-    // Slow path: the header wraps. Accumulate continuation lines (joined by a
-    // single space, so a binding split as `… as` ⏎ `$user` still parses) until
-    // the parens balance.
+    // Slow path: the header wraps. Accumulate continuation lines until the
+    // parens balance. Lines are joined with `\n` (not a space) so `matching_paren`
+    // can see the physical line boundaries — a `//`/`#` comment on one line must
+    // end at its own line break, not swallow the closing `)` further down
+    // (issue #166). The `\n` join is internal: the returned argument string
+    // collapses each `\n` back to a single space, preserving the documented
+    // format (and the ` as ` split that recovers a binding wrapped as
+    // `… as` ⏎ `$user`).
     let mut buf = lines[start_line][open..].to_string();
     for line in &lines[start_line + 1..] {
-        buf.push(' ');
+        buf.push('\n');
         buf.push_str(line.trim_start());
         if let Some(close) = matching_paren(&buf, 0) {
             buf.truncate(close + 1);
-            return Some(buf);
+            return Some(buf.replace('\n', " "));
         }
     }
     None
@@ -153,16 +158,54 @@ fn balanced_directive_arguments(lines: &[&str], start_line: usize, open: usize) 
 
 /// Given the byte index of an opening `(` in `s`, return the byte index of its
 /// matching `)`, balancing nested parens and ignoring any parens that sit
-/// inside single- or double-quoted string literals. Returns `None` when the
-/// parens are unbalanced on this line. `(`, `)`, `'`, `"`, `\` are ASCII, so
-/// the returned indices always land on char boundaries.
+/// inside string literals **or PHP comments**. Returns `None` when the parens
+/// are unbalanced on this input.
+///
+/// Skipped spans (a `)` inside any of these never counts toward depth):
+/// - single- or double-quoted string literals (`'…'`, `"…"`), honouring `\`
+///   escapes;
+/// - `/* … */` block comments;
+/// - `//` and `#` line comments — from the marker to the end of the physical
+///   line (the next `\n`), or to the end of `s` when it has no newline. The
+///   multi-line slow path in [`balanced_directive_arguments`] joins lines with
+///   `\n` precisely so a line comment on a wrapped header ends at its own line
+///   break instead of swallowing the closing `)` further down.
+///
+/// Without comment-awareness a `)` inside a header comment — e.g.
+/// `@foreach ($users /* :) */ as $user)` — would close the depth counter early,
+/// truncating the arguments before ` as $user`. The binding would then be lost,
+/// the loop treated as opaque, and a legitimate rename refused (issue #166).
+///
+/// `(`, `)`, `'`, `"`, `\`, `/`, `*`, `#` are all ASCII, so the returned index
+/// always lands on a char boundary.
 fn matching_paren(s: &str, open: usize) -> Option<usize> {
     let bytes = s.as_bytes();
+    // The no-underflow of `depth` (a `usize`, decremented on every `)`) and the
+    // char-boundary safety of the caller's `buf.truncate(close + 1)` both rely on
+    // `open` indexing a literal `(`. Every caller passes the `(` of a loop head;
+    // assert it so a future caller that violates the contract fails loudly here.
+    debug_assert!(
+        bytes.get(open) == Some(&b'('),
+        "matching_paren expects `open` to index a literal '('"
+    );
     let mut depth = 0usize;
     let mut quote: Option<u8> = None;
+    let mut in_block_comment = false;
     let mut i = open;
     while i < bytes.len() {
         let c = bytes[i];
+
+        if in_block_comment {
+            // Inside `/* … */`: every byte (including `)`) is skipped until the
+            // closing `*/`.
+            if c == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                in_block_comment = false;
+                i += 1; // also consume the closing '/'
+            }
+            i += 1;
+            continue;
+        }
+
         match quote {
             Some(q) => {
                 if c == b'\\' {
@@ -173,6 +216,25 @@ fn matching_paren(s: &str, open: usize) -> Option<usize> {
             }
             None => match c {
                 b'\'' | b'"' => quote = Some(c),
+                // `/*` opens a block comment; its bytes are skipped above. Also
+                // consume the `*` so a lone `/*/` isn't read as open-then-close.
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    in_block_comment = true;
+                    i += 1;
+                }
+                // `//` or `#` begins a line comment. In PHP it runs to the end
+                // of the *physical* line, so on the `\n`-joined multi-line buffer
+                // (the slow path) it ends at the next `\n` and scanning resumes
+                // on the following line — the real closing `)` further down is
+                // still counted. On a single-line input there is no `\n`, so the
+                // rest is commentary and the parens can't balance: stop.
+                b'#' | b'/' if c == b'#' || bytes.get(i + 1) == Some(&b'/') => {
+                    match s[i..].find('\n') {
+                        // Jump to the `\n`; the `i += 1` below steps past it.
+                        Some(rel_nl) => i += rel_nl,
+                        None => return None,
+                    }
+                }
                 b'(' => depth += 1,
                 b')' => {
                     depth -= 1;
@@ -322,4 +384,113 @@ pub fn get_enclosing_loops(content: &str, cursor_line: usize) -> Vec<BladeLoopBl
 
     enclosing.sort_by_key(|b| std::cmp::Reverse(b.start_line));
     enclosing
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── matching_paren: comment-awareness (issue #166) ──────────────────────
+
+    #[test]
+    fn matching_paren_ignores_parens_in_a_block_comment() {
+        // The `)` inside `/* :) */` must NOT close the depth counter early; the
+        // match is the final `)`, not the one inside the comment.
+        let s = "@foreach ($users /* :) */ as $user)";
+        let open = s.find('(').unwrap();
+        let close = matching_paren(s, open).unwrap();
+        assert_eq!(
+            close,
+            s.len() - 1,
+            "match is the trailing `)`, not the one in the comment"
+        );
+    }
+
+    #[test]
+    fn matching_paren_still_ignores_parens_in_strings() {
+        // Pre-existing quote-awareness is preserved by the comment changes.
+        let s = "($users->where('a)b', true) as $user)";
+        let close = matching_paren(s, 0).unwrap();
+        assert_eq!(close, s.len() - 1);
+    }
+
+    #[test]
+    fn matching_paren_treats_line_comments_as_skipping_the_rest() {
+        // `//` and `#` start a line comment: everything past the marker — the
+        // closing `)` included — is skipped, so the parens never balance.
+        assert_eq!(matching_paren("($users // ) comment", 0), None);
+        assert_eq!(matching_paren("($users # ) comment", 0), None);
+    }
+
+    #[test]
+    fn matching_paren_ends_a_line_comment_at_the_newline() {
+        // On the `\n`-joined multi-line buffer that the slow path of
+        // `balanced_directive_arguments` builds, a `//` / `#` comment ends at the
+        // next newline — the real closing `)` on a later line is still found,
+        // instead of being swallowed as if the comment ran to end of input
+        // (the issue #166 review regression).
+        let slashes = "($users // active only\nas $user)";
+        let close = matching_paren(slashes, 0).expect("the `)` on the next line is found");
+        assert_eq!(close, slashes.len() - 1);
+
+        let hash = "($users # active only\nas $user)";
+        let close = matching_paren(hash, 0).expect("the `)` on the next line is found");
+        assert_eq!(close, hash.len() - 1);
+    }
+
+    #[test]
+    fn matching_paren_lone_slash_star_is_unterminated() {
+        // `/*/` is an open block comment, not open-then-close; it never ends, so
+        // the surrounding paren never balances.
+        assert_eq!(matching_paren("($x /*/ as $y)", 0), None);
+    }
+
+    // ── balanced_directive_arguments + parse_foreach_variables (issue #166) ──
+
+    #[test]
+    fn commented_header_yields_full_arguments_and_the_bound_variable() {
+        // The header `@foreach ($users /* :) */ as $user)` parses end-to-end:
+        // the full argument list survives the comment, and `$user` is recovered.
+        let line = "@foreach ($users /* :) */ as $user)";
+        let lines = vec![line];
+        let open = line.find('(').unwrap();
+        let args = balanced_directive_arguments(&lines, 0, open).unwrap();
+        assert_eq!(args, "($users /* :) */ as $user)");
+
+        let vars = parse_foreach_variables(&args);
+        assert_eq!(
+            vars,
+            vec![("user".to_string(), "mixed".to_string())],
+            "the bound variable survives the comment in the header"
+        );
+    }
+
+    #[test]
+    fn wrapped_header_with_a_first_line_comment_resolves_the_binding() {
+        // A `//` (or `#`) line comment on the FIRST physical line of a wrapped
+        // header ends at the line break, so the binding on the next line is still
+        // parsed — the comment doesn't swallow the rest of the joined buffer
+        // (issue #166 review fix). The returned argument string keeps the comment
+        // text (like the block-comment case) but collapses the line join to a
+        // single space.
+        let lines = vec!["@foreach ($users // active only", "    as $user)"];
+        let open = lines[0].find('(').unwrap();
+        let args = balanced_directive_arguments(&lines, 0, open).unwrap();
+        assert_eq!(args, "($users // active only as $user)");
+        assert_eq!(
+            parse_foreach_variables(&args),
+            vec![("user".to_string(), "mixed".to_string())],
+            "the `// …`-commented first line doesn't lose the binding"
+        );
+
+        let lines = vec!["@foreach ($users # active only", "    as $user)"];
+        let open = lines[0].find('(').unwrap();
+        let args = balanced_directive_arguments(&lines, 0, open).unwrap();
+        assert_eq!(args, "($users # active only as $user)");
+        assert_eq!(
+            parse_foreach_variables(&args),
+            vec![("user".to_string(), "mixed".to_string())],
+            "the `# …`-commented first line doesn't lose the binding"
+        );
+    }
 }

@@ -143,14 +143,12 @@ fn route_index_keeps_lower_when_higher_does_not_redefine() {
 
 #[test]
 fn file_registers_named_routes_detects_macro_file() {
-    let dir = std::env::temp_dir().join("laravel-lsp-route-test");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("AuthRouteMethods.php");
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("AuthRouteMethods.php");
     let src = "<?php\nclass X {\n  public function auth() {\n    return function () {\n      $this->get('login')->name('login');\n    };\n  }\n}\n";
     std::fs::write(&path, src).unwrap();
 
     assert!(file_registers_named_routes(&path));
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -187,13 +185,11 @@ fn content_registers_named_routes_rejects_only_name_calls() {
 
 #[test]
 fn file_registers_named_routes_rejects_unrelated_php() {
-    let dir = std::env::temp_dir().join("laravel-lsp-route-test-2");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("Plain.php");
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("Plain.php");
     std::fs::write(&path, "<?php\nclass Plain { public $name = 'x'; }\n").unwrap();
 
     assert!(!file_registers_named_routes(&path));
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]

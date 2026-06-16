@@ -10,6 +10,7 @@ mod dynamic_where_sparseness;
 mod flux_component_context;
 mod flux_component_hover;
 mod flux_goto_def_handler;
+mod flux_slot_name_context;
 mod folio_cursor_containment;
 mod folio_rename;
 mod generic_type_parsing;

@@ -8140,6 +8140,14 @@ impl LaravelLanguageServer {
             // Get the text after <x-
             let after_prefix = &before_cursor[start_pos..];
 
+            // `<x-slot:name>` / `<x-slot …>` is Laravel slot syntax, not a
+            // component — don't offer component-name completions there. The
+            // downstream Flux slot-name context (issue #106) handles the
+            // colon form instead.
+            if after_prefix == "slot" || after_prefix.starts_with("slot:") {
+                return None;
+            }
+
             // Check that we haven't closed the tag or hit a space (which would mean attributes)
             // Component names can contain: letters, numbers, dots, and hyphens
             // If we hit a space, >, or /, we're past the component name
@@ -8289,6 +8297,204 @@ impl LaravelLanguageServer {
                 quote_char: ' ',
             },
         ))
+    }
+
+    /// Detect when the cursor sits inside a slot *name* being typed — the
+    /// trigger for Flux slot-name completion (issue #106). Two syntaxes:
+    ///
+    /// - the `name="…"` attribute value of a `<flux:slot …>` tag
+    ///   (`<flux:slot name="ti│">`), and
+    /// - the colon form `<x-slot:ti│>` (the name portion after the `:`).
+    ///
+    /// Returns the partial name typed so far (filters the offered slots) plus
+    /// the replacement column range. Returns `None` for the positions slot
+    /// completion must *not* fire in: the cursor in the `name` attribute *key*
+    /// (`<flux:slot name│="…">`), in tag content (between `>` and
+    /// `</flux:slot>`), or not inside a slot tag at all.
+    fn get_flux_slot_name_context(line_text: &str, character: u32) -> Option<StringContext> {
+        use lazy_static::lazy_static;
+        use regex::Regex;
+        lazy_static! {
+            // The `name="` / `name='` opener of a slot tag's name attribute.
+            // The trailing capture is the opening quote so we know which quote
+            // closes the value.
+            static ref SLOT_NAME_ATTR_RE: Regex = Regex::new(r#"\bname\s*=\s*("|')"#).unwrap();
+        }
+
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+        let before_cursor = &line_text[..cursor];
+
+        // ── `<flux:slot name="│">` value form ──────────────────────────────
+        if let Some(tag_pos) = before_cursor.rfind("<flux:slot") {
+            let after_tag = &before_cursor[tag_pos + "<flux:slot".len()..];
+            // A real tag boundary (`<flux:slot ` / `<flux:slot\t`), not a
+            // longer name like `<flux:slotx`; and the tag must still be open
+            // (no `>` before the cursor → otherwise we're in tag content).
+            let boundary_ok =
+                after_tag.is_empty() || after_tag.starts_with(|c: char| c.is_whitespace());
+            if boundary_ok && !after_tag.contains('>') {
+                // The last `name=` opener before the cursor is the active value.
+                if let Some(m) = SLOT_NAME_ATTR_RE.find_iter(after_tag).last() {
+                    // The capture is the opening quote (`"` or `'`) — the one
+                    // that closes the value.
+                    let quote = m.as_str().chars().last().unwrap();
+                    // Byte index (in the whole line) of the content right after
+                    // the opening quote.
+                    let content_start = tag_pos + "<flux:slot".len() + m.end();
+                    let typed = &line_text[content_start..cursor];
+                    // A closing quote between the opener and the cursor means
+                    // the value already closed — the cursor isn't inside it.
+                    if !typed.contains(quote) {
+                        let end_col = Self::find_string_end(line_text, content_start, quote);
+                        return Some(StringContext {
+                            prefix: typed.to_string(),
+                            start_col: content_start as u32,
+                            end_col,
+                            quote_char: quote,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── `<x-slot:│>` colon form ────────────────────────────────────────
+        if let Some(tag_pos) = before_cursor.rfind("<x-slot:") {
+            let start_pos = tag_pos + "<x-slot:".len();
+            let after_colon = &before_cursor[start_pos..];
+            // The name runs until whitespace / `>` / `/`. An `=` or quote means
+            // we're past the bare name (into an attribute or value).
+            let past_name = after_colon.contains(char::is_whitespace)
+                || after_colon.contains('>')
+                || after_colon.contains('/')
+                || after_colon.contains('=')
+                || after_colon.contains('"')
+                || after_colon.contains('\'');
+            if !past_name
+                && after_colon
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            {
+                return Some(StringContext {
+                    prefix: after_colon.to_string(),
+                    start_col: start_pos as u32,
+                    end_col: cursor as u32,
+                    quote_char: ' ',
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Convert a 0-based `(line, character)` LSP position into a byte offset
+    /// into `content`. Columns are treated as byte offsets within the line —
+    /// the convention used throughout this file's line-local context helpers.
+    /// `\r` (in `\r\n` line endings) stays part of its line segment, so the
+    /// offset math holds for both `\n` and `\r\n` files.
+    fn line_char_to_offset(content: &str, line: u32, character: u32) -> Option<usize> {
+        let mut offset = 0usize;
+        for (current_line, segment) in content.split('\n').enumerate() {
+            if current_line as u32 == line {
+                return Some(offset + (character as usize).min(segment.len()));
+            }
+            offset += segment.len() + 1; // + the '\n' that `split` consumed
+        }
+        None
+    }
+
+    /// Walk the document's component open/close tags up to `position` and
+    /// return the name (e.g. `flux:modal`) of the nearest still-open
+    /// `<flux:…>` component that *owns* a slot tag being typed at the cursor.
+    ///
+    /// The walk replays every fully-formed tag before the cursor onto an
+    /// open-tag stack: opening tags push, matching closing tags pop (dropping
+    /// any unclosed inner tags with them), self-closing tags are leaves. The
+    /// owner is then the innermost stack entry that is a `flux:…` component but
+    /// not itself a slot tag — `flux:slot` / `x-slot` entries and intervening
+    /// non-Flux tags are skipped. Returns `None` when no Flux component wraps
+    /// the cursor (e.g. a bare `<x-slot:…>` outside any Flux component — see
+    /// issue #106 AC).
+    fn enclosing_flux_component(content: &str, position: Position) -> Option<String> {
+        use lazy_static::lazy_static;
+        use regex::Regex;
+        lazy_static! {
+            // Opening / self-closing component tags. Capture 1 = tag name,
+            // capture 2 = trailing `/` for self-closing. Mirrors the proven
+            // patterns in `document_symbols::extract_blade_symbols`.
+            static ref OPEN_TAG_RE: Regex = Regex::new(
+                r#"<((?:x-[a-z][a-z0-9._:-]*)|(?:livewire:[a-z][a-z0-9._-]*)|(?:flux:[a-z][a-z0-9._-]*))\b[^>]*?(/?)>"#,
+            )
+            .unwrap();
+            static ref CLOSE_TAG_RE: Regex = Regex::new(
+                r#"</((?:x-[a-z][a-z0-9._:-]*)|(?:livewire:[a-z][a-z0-9._-]*)|(?:flux:[a-z][a-z0-9._-]*))>"#,
+            )
+            .unwrap();
+        }
+
+        let cursor = Self::line_char_to_offset(content, position.line, position.character)?;
+
+        // Tag events that fully precede the cursor, in source order.
+        enum Tag<'a> {
+            Open(&'a str),
+            SelfClose,
+            Close(&'a str),
+        }
+        let mut events: Vec<(usize, Tag)> = Vec::new();
+        for cap in OPEN_TAG_RE.captures_iter(content) {
+            let m = cap.get(0).expect("regex match always has group 0");
+            if m.end() > cursor {
+                continue; // includes the slot tag the cursor sits inside
+            }
+            let name = cap.get(1).map(|x| x.as_str()).unwrap_or_default();
+            let self_close = cap.get(2).map(|x| x.as_str() == "/").unwrap_or(false);
+            events.push((
+                m.start(),
+                if self_close {
+                    Tag::SelfClose
+                } else {
+                    Tag::Open(name)
+                },
+            ));
+        }
+        for cap in CLOSE_TAG_RE.captures_iter(content) {
+            let m = cap.get(0).expect("regex match always has group 0");
+            if m.end() > cursor {
+                continue;
+            }
+            let name = cap.get(1).map(|x| x.as_str()).unwrap_or_default();
+            events.push((m.start(), Tag::Close(name)));
+        }
+        events.sort_by_key(|(start, _)| *start);
+
+        // Replay onto an open-tag stack.
+        let mut stack: Vec<&str> = Vec::new();
+        for (_, tag) in &events {
+            match tag {
+                Tag::Open(name) => stack.push(name),
+                Tag::SelfClose => {}
+                Tag::Close(name) => {
+                    // Pop the nearest matching open tag, discarding any unclosed
+                    // inner tags opened after it (forgiving of malformed nesting).
+                    if let Some(pos) = stack.iter().rposition(|t| t == name) {
+                        stack.truncate(pos);
+                    }
+                }
+            }
+        }
+
+        // Innermost-first: the owner is the nearest `flux:…` component that
+        // isn't itself a slot tag.
+        stack.iter().rev().find_map(|t| {
+            let is_slot = *t == "flux:slot" || *t == "x-slot" || t.starts_with("x-slot:");
+            if !is_slot && t.starts_with("flux:") {
+                Some((*t).to_string())
+            } else {
+                None
+            }
+        })
     }
 
     /// Check if cursor is inside a Livewire component tag like `<livewire:...` or `@livewire('...')`
@@ -22586,6 +22792,81 @@ impl LanguageServer for LaravelLanguageServer {
                     .collect();
 
                 debug!("   Returning {} Flux prop completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Flux slot-name context (`<flux:slot name="│">` or `<x-slot:│>`):
+            // offer the *enclosing* Flux component's named slots — the slots
+            // half of issue #60's props/slots criterion. Ordered after the Flux
+            // attribute (props) block and before Livewire, per issue #106.
+            if let Some(slot_ctx) = Self::get_flux_slot_name_context(line_text, position.character)
+            {
+                debug!(
+                    "   Flux slot-name context, filter prefix: '{}'",
+                    slot_ctx.prefix
+                );
+
+                // Resolve the wrapping `<flux:…>` component and enumerate its
+                // named slots from the backing Blade. No Flux parent (e.g. a
+                // bare `<x-slot:…>`) → no completions.
+                let slot_names: Vec<(String, String)> =
+                    match Self::enclosing_flux_component(&content, position) {
+                        Some(component_name) => {
+                            match self.resolve_component_file(&component_name).await {
+                                Some(path) => {
+                                    let file_content =
+                                        std::fs::read_to_string(&path).unwrap_or_default();
+                                    Self::extract_slot_variable_usages(&file_content)
+                                        .into_iter()
+                                        .map(|(name, _ty)| (name, component_name.clone()))
+                                        .collect()
+                                }
+                                None => Vec::new(),
+                            }
+                        }
+                        None => Vec::new(),
+                    };
+
+                let prefix_lower = slot_ctx.prefix.to_lowercase();
+                let items: Vec<CompletionItem> = slot_names
+                    .into_iter()
+                    .filter(|(name, _)| name.to_lowercase().starts_with(&prefix_lower))
+                    .map(|(name, component_name)| CompletionItem {
+                        label: name.clone(),
+                        kind: Some(CompletionItemKind::FIELD),
+                        detail: Some(format!("<{}> slot", component_name)),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(format!("{} (slot)", name))
+                                .summary("Flux component slot.")
+                                .into_documentation(),
+                        ),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: slot_ctx.start_col,
+                                },
+                                end: Position {
+                                    line: position.line,
+                                    character: slot_ctx.end_col,
+                                },
+                            },
+                            new_text: name.clone(),
+                        })),
+                        ..Default::default()
+                    })
+                    .collect();
+
+                debug!("   Returning {} Flux slot completion items", items.len());
 
                 return if items.is_empty() {
                     Ok(None)

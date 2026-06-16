@@ -72,6 +72,16 @@ fn rejects_empty_segment() {
     );
 }
 
+#[test]
+fn rejects_double_dot_segment_break() {
+    // "users..profile" splits to ["users", "", "profile"] — empty middle
+    // segment, caught before we ever look at the chars.
+    assert_eq!(
+        validate_livewire_name("users..profile"),
+        Err(LivewireNameError::EmptySegment)
+    );
+}
+
 // ---------- locate (V4 SFC) ----------
 
 #[test]
