@@ -29,8 +29,10 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
-use tower_lsp::lsp_types::{Position, Range, Url};
-use tower_lsp::LspService;
+use tower_lsp::lsp_types::{
+    Position, PrepareRenameResponse, Range, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+};
+use tower_lsp::{LanguageServer, LspService};
 
 /// `<?php name('contact'); ?>` — the `contact` argument content occupies columns
 /// 12..=18, so its quote-excluded span is start 12, end 19. A cursor at column
@@ -133,6 +135,54 @@ async fn decl_range_at_returns_none_when_cursor_off_the_name_call() {
     .await;
 
     assert_eq!(range, None);
+}
+
+#[tokio::test]
+async fn prepare_rename_handler_dispatches_a_folio_name_cursor_to_a_valid_range() {
+    // Handler-level dispatch guard (issue #142, follow-up to #100 / PR #138).
+    //
+    // The tests above drive `decl_range_at` directly — the unit that computes the
+    // range. This one drives the whole `prepare_rename` HANDLER, pinning the
+    // dispatch glue that wires that range to a Folio cursor. The seam: a Folio
+    // page is a `.blade.php` file, so the handler's `.blade.php` early-return runs
+    // `prepare_blade_var_rename` FIRST (main.rs). The Folio rename only works
+    // because that helper returns `None` for a `name('...')` cursor — there is no
+    // `$variable` under the cursor — letting execution fall through to
+    // `classify_with_decl_fallback` → `decl_range_at`'s Folio fallback. A future
+    // change to the Blade var/scope rename path that began intercepting a Folio
+    // cursor would silently break rename with no red test; this is that test.
+    let root = TempDir::new().unwrap();
+    let server = test_server();
+    let page = seed_page(&server, root.path(), "contact").await;
+
+    let params = TextDocumentPositionParams {
+        text_document: TextDocumentIdentifier {
+            uri: Url::from_file_path(&page).unwrap(),
+        },
+        position: CURSOR,
+    };
+
+    let response = server
+        .prepare_rename(params)
+        .await
+        .expect("prepare_rename must not error for a Folio name('...') cursor")
+        .expect("the handler must offer a rename range, not fall through to None");
+
+    assert_eq!(
+        response,
+        PrepareRenameResponse::Range(Range {
+            start: Position {
+                line: 0,
+                character: NAME_START,
+            },
+            end: Position {
+                line: 0,
+                character: NAME_END,
+            },
+        }),
+        "the handler must return the quote-excluded `contact` span (start 12, end 19), \
+         proving the .blade.php early-return fell through to the Folio decl path"
+    );
 }
 
 #[tokio::test]
