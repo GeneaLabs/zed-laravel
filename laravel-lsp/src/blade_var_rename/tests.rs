@@ -285,6 +285,50 @@ fn commented_foreach_header_is_resolved_and_renameable() {
 }
 
 #[test]
+fn wrapped_header_with_a_php_line_comment_is_resolved_and_renameable() {
+    // issue #166 review fix: a `//` / `#` PHP comment on the first physical line
+    // of a WRAPPED `@foreach` header must end at the line break, not swallow the
+    // closing `)` on the next line. Before the fix the joined buffer treated the
+    // comment as running to end of input, the binding (`$user`) was lost, the
+    // loop was treated as unresolved, and a legitimate rename was refused. (A
+    // Blade `{{-- --}}` comment is masked upstream; a PHP `//`/`#` is not, so it
+    // reaches the paren scan — hence this dedicated case.)
+    for header in [
+        "@foreach ($users // active only\n    as $user)",
+        "@foreach ($users # active only\n    as $user)",
+    ] {
+        let src = String::from("{{ $user }}\n")
+            + header
+            + "\n    {{ $user->name }}\n@endforeach\n{{ $user }}";
+
+        // The header parses into a foreach block that binds `$user` — not opaque.
+        let block = find_loop_blocks(&src)
+            .into_iter()
+            .find(|b| b.loop_type == BladeLoopType::Foreach)
+            .expect("the line-commented wrapped header still forms a foreach block");
+        assert!(
+            block.variables.iter().any(|(v, _)| v == "user"),
+            "the bound `$user` is recovered despite the first-line comment: {header:?}"
+        );
+        assert!(!is_opaque_loop(&block), "a resolved binding is not opaque");
+
+        // A cursor in the loop body (line 3) is not unresolved, and the rename is
+        // offered, scoped to the binding line + body (lines 2 and 3) — not refused.
+        assert!(
+            !cursor_in_unresolved_loop(&src, 3),
+            "the loop scope is resolved, so the cursor is not unresolved: {header:?}"
+        );
+        let spans = in_scope_spans(&src, "user", 3);
+        let lines: Vec<u32> = spans.iter().map(|s| s.line).collect();
+        assert_eq!(
+            lines,
+            vec![2, 3],
+            "rename offered and scoped to the loop, not refused: {header:?}"
+        );
+    }
+}
+
+#[test]
 fn opaque_loop_refuses_rename_rather_than_clobbering() {
     // A `@foreach` with no resolvable ` as $var` binding is an opaque loop — the
     // parser recovers no loop variable, so its scope is unknown. A rename whose
