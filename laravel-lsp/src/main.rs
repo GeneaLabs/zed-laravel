@@ -22161,15 +22161,24 @@ impl LanguageServer for LaravelLanguageServer {
 
                     // Merge in Alpine `@event` bindings when the `@` sits at an
                     // HTML attribute position — `@click`, `@submit`, etc. are
-                    // Alpine, not Blade directives (issue #61). Event names and
-                    // Blade directive names are disjoint, so the merged list never
-                    // double-suggests the same entry.
+                    // Alpine, not Blade directives (issue #61). A handful of
+                    // names (`error` → Blade's `@error … @enderror`) are *both* a
+                    // Blade directive and an Alpine event, so the merge dedups by
+                    // name (`mergeable_events`): the Blade directive wins and its
+                    // event twin is dropped, leaving exactly one entry (AC5).
                     if let Some(at_byte) =
                         (position.character as usize).checked_sub(directive_prefix.len() + 1)
                     {
                         if laravel_lsp::alpine::at_attribute_position(line_text, at_byte) {
+                            // Names already offered as Blade directives (those that
+                            // matched the typed prefix, i.e. the items built above).
+                            let blade_names: Vec<&str> = directives
+                                .iter()
+                                .filter(|d| d.name.to_lowercase().starts_with(&prefix_lower))
+                                .map(|d| d.name.as_str())
+                                .collect();
                             items.extend(
-                                laravel_lsp::alpine::matching_events(&prefix_lower)
+                                laravel_lsp::alpine::mergeable_events(&prefix_lower, &blade_names)
                                     .into_iter()
                                     .map(|ev| CompletionItem {
                                         label: format!("@{ev}"),

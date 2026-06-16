@@ -266,6 +266,27 @@ pub fn matching_events(prefix: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// Alpine events matching `prefix` that are safe to *add* to a Blade
+/// `@`-directive completion list, given the Blade directive names already
+/// offered (`blade_names`, matched case-insensitively).
+///
+/// A name can be **both** a Blade directive and an Alpine event — `error` is
+/// the live example: Laravel's compiler exposes `@error … @enderror`, and
+/// `error` is also a DOM event. Without deduping, `@err` would surface two
+/// `@error` entries (issue #61, AC5). The Blade directive wins — it reflects a
+/// directive that is actually registered in the project — so its event twin is
+/// dropped here, leaving exactly one `@error` in the merged list.
+pub fn mergeable_events(prefix: &str, blade_names: &[&str]) -> Vec<&'static str> {
+    let taken: std::collections::HashSet<String> =
+        blade_names.iter().map(|n| n.to_lowercase()).collect();
+    // `ALPINE_EVENTS` are already lowercase, so comparing against the lowercased
+    // Blade names is a straight set membership test.
+    matching_events(prefix)
+        .into_iter()
+        .filter(|ev| !taken.contains(*ev))
+        .collect()
+}
+
 /// Render a hover card for a directive by bare name, or `None` if unknown.
 pub fn directive_card(name: &str) -> Option<String> {
     entry_card(directive(name)?)

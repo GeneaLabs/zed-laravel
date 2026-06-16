@@ -69,6 +69,48 @@ fn directive_and_event_names_are_disjoint() {
     }
 }
 
+#[test]
+fn mergeable_events_drops_blade_directive_collisions() {
+    // The *real* merge path is Blade directives × Alpine events, and they are
+    // NOT disjoint: `error` is both Laravel's `@error … @enderror` directive and
+    // a DOM event. `mergeable_events` must drop the Alpine `error` so the merged
+    // `@`-completion list shows it once, not twice (issue #61, AC5).
+    let blade_names = ["error", "if", "foreach"]; // names already offered by Blade
+    let events = mergeable_events("err", &blade_names);
+
+    assert!(
+        !events.contains(&"error"),
+        "the Alpine `error` event must be dropped — Blade already offers @error: {events:?}",
+    );
+
+    // Assemble the merged `@`-name set exactly as the handler does (Blade items
+    // that matched the prefix, then the deduped Alpine events) and prove there
+    // is exactly one `@error`.
+    let mut at_names: Vec<String> = blade_names
+        .iter()
+        .filter(|n| n.starts_with("err"))
+        .map(|n| format!("@{n}"))
+        .collect();
+    at_names.extend(events.iter().map(|e| format!("@{e}")));
+    assert_eq!(
+        at_names.iter().filter(|n| *n == "@error").count(),
+        1,
+        "exactly one @error entry in the merged list, got {at_names:?}",
+    );
+}
+
+#[test]
+fn mergeable_events_keeps_non_colliding_events() {
+    // A name that is only an Alpine event (no same-named Blade directive) is
+    // still offered. `@cli` → `click`, with no Blade `@click` to shadow it.
+    let blade_names = ["if", "foreach"];
+    let events = mergeable_events("cli", &blade_names);
+    assert!(
+        events.contains(&"click"),
+        "non-colliding Alpine events must survive the dedup: {events:?}",
+    );
+}
+
 // ─── is_alpine_event ─────────────────────────────────────────────────────
 
 #[test]
