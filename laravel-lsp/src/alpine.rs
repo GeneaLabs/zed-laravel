@@ -371,7 +371,7 @@ fn attr_word_before(before: &str, cursor: usize) -> (usize, &str) {
 /// attribute position.
 pub fn directive_completion_context(line: &str, cursor_col: u32) -> Option<AlpineContext> {
     let cursor = cursor_col as usize;
-    if cursor == 0 || cursor > line.len() {
+    if cursor == 0 || cursor > line.len() || !line.is_char_boundary(cursor) {
         return None;
     }
     let before = &line[..cursor];
@@ -437,7 +437,7 @@ fn in_alpine_expression(before: &str) -> bool {
 /// expression, so ordinary Blade/PHP `$variables` are never hijacked.
 pub fn magic_completion_context(line: &str, cursor_col: u32) -> Option<AlpineContext> {
     let cursor = cursor_col as usize;
-    if cursor == 0 || cursor > line.len() {
+    if cursor == 0 || cursor > line.len() || !line.is_char_boundary(cursor) {
         return None;
     }
     let before = &line[..cursor];
@@ -495,7 +495,7 @@ fn token_at(line: &str, cursor: usize, pred: impl Fn(char) -> bool) -> (usize, &
 /// `@event` / `:bind` shorthands) and `$`-magics inside Alpine expressions.
 pub fn hover_at(line: &str, character: u32) -> Option<String> {
     let cursor = character as usize;
-    if cursor > line.len() {
+    if cursor > line.len() || !line.is_char_boundary(cursor) {
         return None;
     }
     directive_hover_at(line, cursor).or_else(|| magic_hover_at(line, cursor))

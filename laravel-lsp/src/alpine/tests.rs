@@ -323,6 +323,20 @@ fn directive_context_none_inside_attribute_value() {
     assert!(directive_completion_context(line, line.len() as u32).is_none());
 }
 
+#[test]
+fn directive_context_rejects_non_char_boundary() {
+    // Regression (issue #61): the cursor column arrives as a UTF-16-derived
+    // offset (the server advertises no positionEncoding, so LSP defaults to
+    // UTF-16). On a line with a non-ASCII char before the cursor that offset
+    // can land mid-codepoint; `&line[..cursor]` must not panic and crash the
+    // language server — it returns None instead.
+    let line = "<div café x-data>";
+    let cafe = line.find("caf").unwrap();
+    let mid_e = cafe + "caf".len() + 1; // inside the 2-byte 'é'
+    assert!(!line.is_char_boundary(mid_e));
+    assert!(directive_completion_context(line, mid_e as u32).is_none());
+}
+
 // ─── magic completion context ────────────────────────────────────────────
 
 #[test]
@@ -366,6 +380,17 @@ fn magic_context_none_in_non_alpine_attribute() {
     // A `$` inside a plain HTML attribute value isn't an Alpine expression.
     let line = "<input value=\"$st";
     assert!(magic_completion_context(line, line.len() as u32).is_none());
+}
+
+#[test]
+fn magic_context_rejects_non_char_boundary() {
+    // Regression (issue #61): a UTF-16-derived cursor offset that lands inside a
+    // multibyte char must return None, not panic on `&line[..cursor]`.
+    let line = "<button @click=\"café $st\">";
+    let cafe = line.find("caf").unwrap();
+    let mid_e = cafe + "caf".len() + 1; // inside the 2-byte 'é'
+    assert!(!line.is_char_boundary(mid_e));
+    assert!(magic_completion_context(line, mid_e as u32).is_none());
 }
 
 // ─── hover ───────────────────────────────────────────────────────────────
@@ -434,4 +459,16 @@ fn hover_none_on_unknown_attribute() {
     let line = "<div data-foo=\"x\">";
     let at = line.find("data-foo").unwrap() as u32;
     assert!(hover_at(line, at).is_none());
+}
+
+#[test]
+fn hover_rejects_non_char_boundary() {
+    // Regression (issue #61): a hover request whose UTF-16-derived character
+    // offset lands inside a multibyte char must return None rather than panic in
+    // `token_at`'s `&line[..cursor]` / `&line[start..end]` slices.
+    let line = "<div café x-data=\"{}\">";
+    let cafe = line.find("caf").unwrap();
+    let mid_e = cafe + "caf".len() + 1; // inside the 2-byte 'é'
+    assert!(!line.is_char_boundary(mid_e));
+    assert!(hover_at(line, mid_e as u32).is_none());
 }
