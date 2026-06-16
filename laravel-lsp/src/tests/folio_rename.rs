@@ -58,25 +58,43 @@ fn test_server() -> LaravelLanguageServer {
 /// Write a Folio page under `root/pages/<leaf>.blade.php`, where `<leaf>` is the
 /// last dot-segment of `route_name` (the whole name when it has no dot), seed the
 /// route index with `route_name` pointing at that file, set the project root, and
-/// return the page path. Deriving the filename from `route_name` keeps the on-disk
-/// file leaf and the route-index key consistent: a caller passing `"admin.contact"`
-/// gets `pages/contact.blade.php`, and one passing `"dashboard"` gets
-/// `pages/dashboard.blade.php` — never a hardcoded `contact.blade.php` that
-/// silently disagrees with its index key (issue #175). Mirrors how
-/// `inject_folio_routes` seeds named pages (top-of-file anchor) so the decl logic
-/// must re-read the page to find the `name(...)` span.
+/// return the page path. The filename, the body's `name('...')` argument, and the
+/// index entry's `uri` all track `route_name`, so nothing the helper produces is
+/// hardcoded to `contact`:
+///
+///   * **filename** — the leaf: `"admin.contact"` → `pages/contact.blade.php`,
+///     `"dashboard"` → `pages/dashboard.blade.php`, never a hardcoded
+///     `contact.blade.php` that disagrees with its index key (issue #175).
+///   * **body** — `<?php name('<leaf>'); ?>`, so the declaration the decl logic
+///     re-reads agrees with the route-index key for every caller (issue #188).
+///   * **uri** — dot separators become path segments: `"contact"` → `"/contact"`,
+///     `"admin.contact"` → `"/admin/contact"` (issue #188).
+///
+/// Deriving all three keeps the fixture internally consistent rather than passing
+/// for the wrong reason on a non-`contact` name. Mirrors how `inject_folio_routes`
+/// seeds named pages (top-of-file anchor) so the decl logic must re-read the page
+/// to find the `name(...)` span.
 async fn seed_page(
     server: &LaravelLanguageServer,
     root: &Path,
     route_name: &str,
 ) -> std::path::PathBuf {
-    // The page's own `name('...')` helper owns only the leaf segment, so the
-    // on-disk file is named for that leaf — `admin.contact` → `contact.blade.php`.
+    // The page's own `name('...')` helper owns only the leaf segment, so both the
+    // on-disk file and the body's `name('...')` argument are named for that leaf —
+    // `admin.contact` → `contact.blade.php` carrying `name('contact')`. Generating
+    // the body from the leaf (rather than a hardcoded `name('contact')`) keeps the
+    // declaration the decl logic re-reads in sync with the route-index key for
+    // every caller, not just `contact`-leaf ones (issue #188).
     let leaf = route_name.rsplit('.').next().unwrap_or(route_name);
     let page = root.join("pages").join(format!("{leaf}.blade.php"));
     fs::create_dir_all(page.parent().unwrap()).unwrap();
-    fs::write(&page, PAGE_SRC).unwrap();
+    fs::write(&page, format!("<?php name('{leaf}'); ?>")).unwrap();
 
+    // The seeded `uri` tracks `route_name` too — each dot separator becomes a path
+    // segment, prefixed with `/` — so `"contact"` → `"/contact"` and
+    // `"admin.contact"` → `"/admin/contact"`, never a hardcoded `/contact` that
+    // disagrees with a non-`contact` key (issue #188).
+    let uri = format!("/{}", route_name.replace('.', "/"));
     let mut index = RouteIndex::new();
     index.insert(
         route_name.to_string(),
@@ -87,7 +105,7 @@ async fn seed_page(
             end_column: 0,
             priority: PRIORITY_APP,
             method: Some("get".to_string()),
-            uri: Some("/contact".to_string()),
+            uri: Some(uri),
             action: None,
         },
     );
@@ -138,6 +156,61 @@ async fn seed_page_filename_tracks_the_route_name_leaf() {
     assert_eq!(
         def.file, page,
         "RouteDefinition.file must point at the derived leaf-based path"
+    );
+}
+
+#[tokio::test]
+async fn seed_page_body_and_uri_track_the_route_name() {
+    // Guards the helper invariant (issue #188) — the same latent-trap class #175
+    // fixed for the filename, one level deeper. `seed_page` must derive the body's
+    // `name('...')` argument (leaf-only) and the index entry's `uri` from
+    // `route_name`, not hardcode `contact`/`/contact`. With the old hardcodes a
+    // caller seeding a non-`contact` name got a body and uri that silently
+    // disagreed with the route-index key — a fixture that could pass for the wrong
+    // reason once a test re-read the page's `name('…')` span or its `uri`.
+    let root = TempDir::new().unwrap();
+    let server = test_server();
+
+    // AC4: a dotless non-`contact` name — the whole name is the leaf in the body,
+    // and the uri is a single segment.
+    let page = seed_page(&server, root.path(), "dashboard").await;
+    assert_eq!(
+        fs::read_to_string(&page).unwrap(),
+        "<?php name('dashboard'); ?>",
+        "the body's name('...') argument tracks the route name leaf, not `contact`"
+    );
+    {
+        let index = server.route_index.read().await;
+        let def = index
+            .as_ref()
+            .unwrap()
+            .get("dashboard")
+            .expect("the route index must carry the seeded name");
+        assert_eq!(
+            def.uri.as_deref(),
+            Some("/dashboard"),
+            "a dotless route name yields a single-segment uri, not hardcoded `/contact`"
+        );
+    } // drop the read guard before seed_page below re-acquires the write lock
+
+    // AC5: a dotted non-`contact` name — the body carries only the leaf, while the
+    // uri expands every dot segment into a path segment.
+    let page = seed_page(&server, root.path(), "admin.dashboard").await;
+    assert_eq!(
+        fs::read_to_string(&page).unwrap(),
+        "<?php name('dashboard'); ?>",
+        "a dotted route name puts only the leaf in the page's name('...') call"
+    );
+    let index = server.route_index.read().await;
+    let def = index
+        .as_ref()
+        .unwrap()
+        .get("admin.dashboard")
+        .expect("the route index must carry the seeded name");
+    assert_eq!(
+        def.uri.as_deref(),
+        Some("/admin/dashboard"),
+        "a dotted route name expands each segment into the uri path"
     );
 }
 
