@@ -50,16 +50,25 @@ fn test_server() -> LaravelLanguageServer {
     service.inner().clone()
 }
 
-/// Write a Folio page under `root/pages/contact.blade.php`, seed the route index
-/// with `route_name` pointing at it, set the project root, and return the page
-/// path. Mirrors how `inject_folio_routes` seeds named pages (top-of-file
-/// anchor) so the decl logic must re-read the page to find the `name(...)` span.
+/// Write a Folio page under `root/pages/<leaf>.blade.php`, where `<leaf>` is the
+/// last dot-segment of `route_name` (the whole name when it has no dot), seed the
+/// route index with `route_name` pointing at that file, set the project root, and
+/// return the page path. Deriving the filename from `route_name` keeps the on-disk
+/// file leaf and the route-index key consistent: a caller passing `"admin.contact"`
+/// gets `pages/contact.blade.php`, and one passing `"dashboard"` gets
+/// `pages/dashboard.blade.php` — never a hardcoded `contact.blade.php` that
+/// silently disagrees with its index key (issue #175). Mirrors how
+/// `inject_folio_routes` seeds named pages (top-of-file anchor) so the decl logic
+/// must re-read the page to find the `name(...)` span.
 async fn seed_page(
     server: &LaravelLanguageServer,
     root: &Path,
     route_name: &str,
 ) -> std::path::PathBuf {
-    let page = root.join("pages").join("contact.blade.php");
+    // The page's own `name('...')` helper owns only the leaf segment, so the
+    // on-disk file is named for that leaf — `admin.contact` → `contact.blade.php`.
+    let leaf = route_name.rsplit('.').next().unwrap_or(route_name);
+    let page = root.join("pages").join(format!("{leaf}.blade.php"));
     fs::create_dir_all(page.parent().unwrap()).unwrap();
     fs::write(&page, PAGE_SRC).unwrap();
 
@@ -80,6 +89,51 @@ async fn seed_page(
     *server.route_index.write().await = Some(index);
     *server.root_path.write().await = Some(root.to_path_buf());
     page
+}
+
+#[tokio::test]
+async fn seed_page_filename_tracks_the_route_name_leaf() {
+    // Guards the helper invariant (issue #175): `seed_page` derives the on-disk
+    // filename from the leaf segment of `route_name` rather than hardcoding
+    // `contact.blade.php`. With the old hardcode, a caller passing a name whose
+    // leaf differs from `contact` would write a file whose leaf disagrees with the
+    // route-index key — a logically-inconsistent fixture that could pass for the
+    // wrong reason. This pins the derivation so the trap can't return.
+    let root = TempDir::new().unwrap();
+    let server = test_server();
+
+    // No dot — the whole name is the leaf.
+    let page = seed_page(&server, root.path(), "dashboard").await;
+    assert_eq!(
+        page.file_name().unwrap().to_str().unwrap(),
+        "dashboard.blade.php",
+        "a dotless route name uses the whole name as the file stem"
+    );
+    assert!(
+        page.exists(),
+        "the derived page file must be written to disk"
+    );
+
+    // Dotted — only the leaf segment names the file.
+    let page = seed_page(&server, root.path(), "admin.dashboard").await;
+    assert_eq!(
+        page.file_name().unwrap().to_str().unwrap(),
+        "dashboard.blade.php",
+        "a dotted route name uses only its leaf segment as the file stem"
+    );
+
+    // AC2: the index entry's `file` points at the same derived path, so the index
+    // key and the on-disk file stay consistent.
+    let index = server.route_index.read().await;
+    let def = index
+        .as_ref()
+        .unwrap()
+        .get("admin.dashboard")
+        .expect("the route index must carry the seeded name");
+    assert_eq!(
+        def.file, page,
+        "RouteDefinition.file must point at the derived leaf-based path"
+    );
 }
 
 #[tokio::test]
