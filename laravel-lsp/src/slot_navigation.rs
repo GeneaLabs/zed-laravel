@@ -16,6 +16,10 @@ use std::path::Path;
 use tree_sitter::{Node, Tree};
 
 use crate::parser::parse_blade;
+// Project-root containment guard — now the shared, fail-closed
+// `path_containment::path_within_root` (was a local copy mirroring `main.rs`).
+// This upgrades the old raw-textual fallback to fail-closed (issue #156).
+use crate::path_containment::path_within_root;
 
 /// Information about a slot tag found at the cursor position.
 #[derive(Debug, Clone, PartialEq)]
@@ -276,19 +280,6 @@ pub fn locate_slot_in_view(view_path: &Path, slot_name: &str, root: &Path) -> Op
     }
     let source = std::fs::read_to_string(view_path).ok()?;
     find_slot_variable_line(&source, slot_name)
-}
-
-/// True if `view_path` resolves to a location inside `root`. Both sides are
-/// canonicalized first so a symlink under the project can't resolve outside the
-/// root and slip past a purely textual `starts_with`. When either side can't be
-/// canonicalized (e.g. the file vanished mid-edit) we fall back to the textual
-/// prefix check rather than admitting an unverified path. Mirrors
-/// `path_within_root` in `main.rs` (issues #55, #130).
-fn path_within_root(view_path: &Path, root: &Path) -> bool {
-    match (view_path.canonicalize(), root.canonicalize()) {
-        (Ok(real_path), Ok(real_root)) => real_path.starts_with(&real_root),
-        _ => view_path.starts_with(root),
-    }
 }
 
 // ============================================================================

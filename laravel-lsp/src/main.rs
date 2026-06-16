@@ -27,6 +27,7 @@ use laravel_lsp::completion_format::CompletionDoc;
 use laravel_lsp::config::find_project_root;
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
 use laravel_lsp::migration_index::{build_migration_index, MigrationIndex};
+use laravel_lsp::path_containment::path_within_root;
 use laravel_lsp::route_discovery::{
     build_route_index, discover_route_files, normalize_path, RouteIndex,
 };
@@ -19070,31 +19071,6 @@ fn zero_anchor() -> Range {
             line: 0,
             character: 0,
         },
-    }
-}
-
-/// True if `path` resolves to a location inside `root`. Both sides are
-/// canonicalized first — `locate_view_file` builds the path by joining and
-/// `Path::starts_with` is purely textual, so a symlink under the project could
-/// otherwise resolve outside the root and leak an absolute, out-of-project path
-/// into a `WorkspaceEdit` (issue #55 cross-file binding rename).
-///
-/// **Fail-closed.** When either side can't be canonicalized this returns
-/// `false` rather than falling back to a textual prefix check (issue #134).
-/// The motivating case is a *dangling* under-root symlink — a symlink at
-/// `<root>/…` whose target no longer exists, so `canonicalize` returns
-/// `Err(ENOENT)`. A lexical `path.starts_with(root)` fallback would *admit*
-/// it (its link path is textually inside the root) even though its real
-/// target is unverifiable, a surprising fail-open default for a containment
-/// guard. Every caller uses this as a security guard, so an unprovable path is
-/// refused, not admitted.
-fn path_within_root(path: &std::path::Path, root: &std::path::Path) -> bool {
-    match (path.canonicalize(), root.canonicalize()) {
-        (Ok(real_path), Ok(real_root)) => real_path.starts_with(&real_root),
-        // Fail-closed: a path we can't canonicalize (missing, or a dangling
-        // symlink) is unverifiable, so refuse it rather than admit it via a
-        // textual prefix check that a dangling under-root symlink would pass.
-        _ => false,
     }
 }
 

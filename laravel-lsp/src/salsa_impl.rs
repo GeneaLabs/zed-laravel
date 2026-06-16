@@ -30,6 +30,9 @@ use crate::queries::extract_all_php_patterns;
 // `route_discovery::normalize_path` pops only a preceding `Normal` segment and
 // preserves root / leading `..`. Every other module already delegates here.
 use crate::route_discovery::normalize_path;
+// The lexical (non-fail-closed) entry point of the shared containment guard —
+// admits speculative candidates that don't exist on disk yet (issue #156).
+use crate::path_containment::path_within_root_lexical;
 
 // ============================================================================
 // Database Definition
@@ -2936,22 +2939,17 @@ impl LaravelConfigData {
 
         // Build the raw candidates, then enforce a project-root containment
         // backstop: any path that escapes `self.root` is dropped before return.
-        // Canonicalize so a symlinked project root (`/var` → `/private/var` on
-        // macOS) or a symlinked vendor dir doesn't spuriously fail the purely
-        // textual `starts_with`. Speculative candidates that don't exist on
-        // disk can't be canonicalized, so they fall back to a *lexical*
-        // containment check: `normalize_path` collapses any interior `..`/`.`
-        // first, because `Path::starts_with` is component-wise and does NOT
-        // resolve `..` — without normalization a `root/sub/../../escape`
-        // candidate (e.g. from a misregistered component directory) keeps its
-        // `/`, `root` prefix and slips through. Mirrors `path_within_root` in
-        // `main.rs` (issue #55).
+        // This uses the *lexical* entry point of the shared containment guard
+        // (`path_containment::path_within_root_lexical`): when both sides
+        // canonicalize it compares the symlink-resolved real paths, but
+        // speculative candidates that don't exist on disk yet can't be
+        // canonicalized, so it falls back to a `normalize_path` lexical check
+        // (collapsing any interior `..`/`.` before the prefix test) rather than
+        // fail-closing — admitting the not-yet-created candidate while still
+        // refusing a `root/sub/../../escape`. The fail-closed `path_within_root`
+        // would wrongly drop every speculative candidate here.
         let mut paths = self.component_path_candidates(component_name);
-        let canonical_root = self.root.canonicalize();
-        paths.retain(|path| match (path.canonicalize(), &canonical_root) {
-            (Ok(real_path), Ok(real_root)) => real_path.starts_with(real_root),
-            _ => normalize_path(path).starts_with(&self.root),
-        });
+        paths.retain(|path| path_within_root_lexical(path, &self.root));
         paths
     }
 
