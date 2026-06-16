@@ -99,3 +99,21 @@ fn empty_when_no_known_directives_present() {
     assert!(directive_token_positions("plain text with no directives", &set).is_empty());
     assert!(extract_blade_directive_tokens("plain text", &set).is_empty());
 }
+
+#[test]
+fn skips_alpine_event_bindings(/* issue #61 */) {
+    // `@click="…"` is an Alpine event binding, not a Blade directive — even if a
+    // same-named custom directive were registered, the `@word=` shape excludes it.
+    let set = known(&["click", "submit", "if"]);
+    // Plain binding.
+    assert!(directive_token_positions("<button @click=\"go()\">", &set).is_empty());
+    // Binding with modifiers.
+    assert!(directive_token_positions("<form @submit.prevent=\"save()\">", &set).is_empty());
+    // A real Blade directive is untouched on the same line.
+    let positions = directive_token_positions("<button @click=\"go()\">@if($x)", &set);
+    assert_eq!(
+        positions,
+        vec![(0, 22, 3)],
+        "only the @if directive survives"
+    );
+}

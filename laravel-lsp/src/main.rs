@@ -20520,6 +20520,23 @@ impl LanguageServer for LaravelLanguageServer {
             .unwrap_or("")
             .to_string();
 
+        // Alpine.js directive/magic hover (issue #61). Checked before the Salsa
+        // pattern lookup: Alpine tokens (`x-data`, `x-on:click`, `$store`) live
+        // in HTML attributes the Laravel pattern index doesn't cover, and a hit
+        // here means the cursor is unambiguously on an Alpine token. Blade-only
+        // since Alpine markup lives in `.blade.php` views.
+        if is_blade {
+            if let Some(card) = laravel_lsp::alpine::hover_at(&line_text, position.character) {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: card,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
         // Salsa pattern lookup. The target dispatch in `find_hover_target`
         // tries patterns first and only falls back to Blade variables when
         // nothing matched at the cursor.
@@ -21950,6 +21967,84 @@ impl LanguageServer for LaravelLanguageServer {
             // Check for variable name context in Blade files (typing $user, $u, etc.)
             // This must come BEFORE model property context to avoid conflicts
             if uri.path().ends_with(".blade.php") {
+                // Alpine.js magic completion (`@click="$dis|"`, `x-data="{… $st|"`).
+                // Must precede the Blade `$variable` context below so a magic
+                // inside an Alpine expression wins over plain variable suggestions
+                // (issue #61). Gated to Alpine attribute expressions, so ordinary
+                // `$variables` fall straight through.
+                if let Some(ctx) =
+                    laravel_lsp::alpine::magic_completion_context(line_text, position.character)
+                {
+                    let items: Vec<CompletionItem> =
+                        laravel_lsp::alpine::matching_magics(&ctx.prefix)
+                            .into_iter()
+                            .map(|m| CompletionItem {
+                                label: m.name.to_string(),
+                                kind: Some(CompletionItemKind::VARIABLE),
+                                detail: Some("Alpine magic".to_string()),
+                                // The `$` is already typed — insert only the rest.
+                                insert_text: Some(m.name[1..].to_string()),
+                                documentation: Some(
+                                    CompletionDoc::new()
+                                        .header(m.name)
+                                        .summary(m.summary)
+                                        .section(format!("[Alpine.js docs]({})", m.url))
+                                        .into_documentation(),
+                                ),
+                                ..Default::default()
+                            })
+                            .collect();
+                    if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::List(CompletionList {
+                            is_incomplete: false,
+                            items,
+                        })));
+                    }
+                }
+
+                // Alpine.js directive completion (`<div x-da|`, `<x-card x-|>`).
+                // Offers the core `x-…` directive names as attributes (issue #61).
+                if let Some(ctx) =
+                    laravel_lsp::alpine::directive_completion_context(line_text, position.character)
+                {
+                    let items: Vec<CompletionItem> =
+                        laravel_lsp::alpine::matching_directives(&ctx.prefix)
+                            .into_iter()
+                            .map(|d| CompletionItem {
+                                label: d.name.to_string(),
+                                kind: Some(CompletionItemKind::KEYWORD),
+                                detail: Some("Alpine directive".to_string()),
+                                documentation: Some(
+                                    CompletionDoc::new()
+                                        .header(d.name)
+                                        .summary(d.summary)
+                                        .section(format!("[Alpine.js docs]({})", d.url))
+                                        .into_documentation(),
+                                ),
+                                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                    range: Range {
+                                        start: Position {
+                                            line: position.line,
+                                            character: ctx.start_col,
+                                        },
+                                        end: Position {
+                                            line: position.line,
+                                            character: ctx.end_col,
+                                        },
+                                    },
+                                    new_text: d.name.to_string(),
+                                })),
+                                ..Default::default()
+                            })
+                            .collect();
+                    if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::List(CompletionList {
+                            is_incomplete: false,
+                            items,
+                        })));
+                    }
+                }
+
                 if let Some(var_prefix) =
                     Self::get_variable_name_context(line_text, position.character)
                 {
@@ -22021,7 +22116,7 @@ impl LanguageServer for LaravelLanguageServer {
                     };
 
                     let prefix_lower = directive_prefix.to_lowercase();
-                    let items: Vec<CompletionItem> = directives
+                    let mut items: Vec<CompletionItem> = directives
                         .iter()
                         .filter(|d| d.name.to_lowercase().starts_with(&prefix_lower))
                         .map(|d| {
@@ -22063,6 +22158,41 @@ impl LanguageServer for LaravelLanguageServer {
                             }
                         })
                         .collect();
+
+                    // Merge in Alpine `@event` bindings when the `@` sits at an
+                    // HTML attribute position — `@click`, `@submit`, etc. are
+                    // Alpine, not Blade directives (issue #61). Event names and
+                    // Blade directive names are disjoint, so the merged list never
+                    // double-suggests the same entry.
+                    if let Some(at_byte) =
+                        (position.character as usize).checked_sub(directive_prefix.len() + 1)
+                    {
+                        if laravel_lsp::alpine::at_attribute_position(line_text, at_byte) {
+                            items.extend(
+                                laravel_lsp::alpine::matching_events(&prefix_lower)
+                                    .into_iter()
+                                    .map(|ev| CompletionItem {
+                                        label: format!("@{ev}"),
+                                        kind: Some(CompletionItemKind::EVENT),
+                                        detail: Some("Alpine event (x-on shorthand)".to_string()),
+                                        // The `@` is already typed — insert the rest.
+                                        insert_text: Some(ev.to_string()),
+                                        documentation: Some(
+                                            CompletionDoc::new()
+                                                .header(format!("@{ev}"))
+                                                .summary(
+                                                    "Alpine event binding (shorthand for x-on).",
+                                                )
+                                                .section(
+                                                    "[Alpine.js docs](https://alpinejs.dev/directives/on)",
+                                                )
+                                                .into_documentation(),
+                                        ),
+                                        ..Default::default()
+                                    }),
+                            );
+                        }
+                    }
 
                     debug!("   Returning {} directive completion items", items.len());
 

@@ -56,6 +56,32 @@ fn in_comment(pos: usize, spans: &[(usize, usize)]) -> bool {
     spans.iter().any(|&(start, end)| pos >= start && pos < end)
 }
 
+/// Whether the `@word` ending at `word_end` is an attribute *binding* —
+/// `@word`, optionally followed by `.modifier` segments, then `=`. That is the
+/// Alpine event-binding shape (`@click="…"`, `@submit.prevent="…"`), which
+/// collides syntactically with Blade's `@directive`. No Blade directive is ever
+/// written as `@word=`, so this guard keeps Alpine bindings from lighting up as
+/// directives without risking a real directive (issue #61).
+fn is_attribute_binding(content: &str, word_end: usize) -> bool {
+    let bytes = &content.as_bytes()[word_end..];
+    let mut i = 0;
+    // Consume zero or more `.modifier` segments (`.prevent`, `.enter`, …).
+    while i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        let mod_start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+        {
+            i += 1;
+        }
+        // A lone `.` with no modifier name isn't a binding suffix.
+        if i == mod_start {
+            return false;
+        }
+    }
+    i < bytes.len() && bytes[i] == b'='
+}
+
 /// Find the directives to highlight as 0-based `(line, start_column, length)`
 /// triples. A `@word` is included only when it is not inside a comment and its
 /// name is present in `known` (which must already be lowercased).
@@ -77,6 +103,12 @@ pub fn directive_token_positions(content: &str, known: &HashSet<String>) -> Vec<
 
         // Skip directives sitting inside a Blade/HTML comment.
         if in_comment(start_byte, &comment_spans) {
+            continue;
+        }
+
+        // Skip Alpine-style attribute bindings (`@click="…"`): a `@word(.mod)*=`
+        // is an event binding, not a Blade directive (issue #61).
+        if is_attribute_binding(content, mat.end()) {
             continue;
         }
 
