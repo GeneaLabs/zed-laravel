@@ -9504,7 +9504,13 @@ impl LaravelLanguageServer {
         // Make sure we're not inside a string or already completed directive
         // Check if @ is at start of line or preceded by whitespace/bracket
         if at_pos > 0 {
-            let char_before_at = before_cursor.chars().nth(at_pos - 1);
+            // `at_pos` is a *byte* offset (it comes from `char_indices()`), so we
+            // must read the char immediately before `@` via a byte-bounded slice.
+            // `chars().nth(at_pos - 1)` treated the byte offset as a char count,
+            // which misreads any line containing a multibyte char before `@`
+            // (e.g. `🎉 @if`) — see issue #180. Slicing at the byte boundary is
+            // always valid because `char_indices()` only yields char boundaries.
+            let char_before_at = before_cursor[..at_pos].chars().next_back();
             if let Some(c) = char_before_at {
                 // @ should be preceded by whitespace, start of tag, or at start of PHP block
                 if !c.is_whitespace() && c != '>' && c != '(' && c != '{' && c != ';' && c != '\t' {
