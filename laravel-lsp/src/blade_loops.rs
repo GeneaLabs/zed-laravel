@@ -136,24 +136,142 @@ fn balanced_directive_arguments(lines: &[&str], start_line: usize, open: usize) 
         return Some(lines[start_line][open..=close].to_string());
     }
 
-    // Slow path: the header wraps. Accumulate continuation lines until the
-    // parens balance. Lines are joined with `\n` (not a space) so `matching_paren`
-    // can see the physical line boundaries — a `//`/`#` comment on one line must
-    // end at its own line break, not swallow the closing `)` further down
-    // (issue #166). The `\n` join is internal: the returned argument string
-    // collapses each `\n` back to a single space, preserving the documented
-    // format (and the ` as ` split that recovers a binding wrapped as
-    // `… as` ⏎ `$user`).
+    // Slow path: the header wraps across physical lines. Walk the continuation
+    // lines a single time, carrying the scanner state (paren depth, the active
+    // string quote, and any open block comment) forward from one line to the
+    // next via [`scan_line_parens`]. Each line's bytes are therefore visited
+    // exactly once — total work is O(total bytes across the continuation lines),
+    // not the O(N²) of re-scanning the whole accumulated buffer from index 0
+    // after every appended line (issue #185).
+    //
+    // `buf` still accumulates the joined header — lines joined with `\n`, each
+    // continuation `trim_start`ed — so the returned argument string is byte-for-
+    // byte what the old re-scan produced: the closing `)` truncates it and every
+    // `\n` collapses back to a single space, preserving the documented format
+    // (and the ` as ` split that recovers a binding wrapped as `… as` ⏎ `$user`).
     let mut buf = lines[start_line][open..].to_string();
+    // Seed the running state from the opening line. The fast path above already
+    // proved it doesn't balance on its own, so this can only yield `Open(state)`;
+    // the `Closed` arm is defensive and resolves correctly rather than panicking.
+    let mut state = match scan_line_parens(lines[start_line], open, ParenScanState::default()) {
+        LineScan::Closed(close) => return Some(lines[start_line][open..=close].to_string()),
+        LineScan::Open(state) => state,
+    };
     for line in &lines[start_line + 1..] {
         buf.push('\n');
+        // Scan only the bytes just appended (one physical continuation line),
+        // resuming from `state`; `scan_line_parens` returns indices absolute in
+        // `buf`, so the close index truncates `buf` directly.
+        let segment_start = buf.len();
         buf.push_str(line.trim_start());
-        if let Some(close) = matching_paren(&buf, 0) {
-            buf.truncate(close + 1);
-            return Some(buf.replace('\n', " "));
+        match scan_line_parens(&buf, segment_start, state) {
+            LineScan::Closed(close) => {
+                buf.truncate(close + 1);
+                return Some(buf.replace('\n', " "));
+            }
+            LineScan::Open(next) => state = next,
         }
     }
     None
+}
+
+/// Running state of the parenthesis scanner as it walks a loop directive's
+/// argument list. [`balanced_directive_arguments`]'s slow path carries this from
+/// one continuation line to the next so a wrapped header is scanned in a single
+/// linear pass instead of re-scanning the whole accumulated buffer per appended
+/// line (issue #185).
+///
+/// The acceptance criteria name `depth` + `quote` as the resumable state; the
+/// open-block-comment flag is carried too because a `/* … */` comment can span a
+/// wrapped header. Dropping it across the line break would let a `)` inside a
+/// multi-line block comment close the arguments early — re-introducing exactly
+/// the truncation that issue #166's comment-awareness fixed. All three must
+/// survive a line boundary; a `//`/`#` line comment does *not* (it ends at its
+/// own physical line), so it is deliberately absent from the carried state.
+#[derive(Debug, Clone, Copy, Default)]
+struct ParenScanState {
+    /// Open-paren depth. The argument list balances when this returns to 0.
+    depth: usize,
+    /// The active string-literal quote byte (`b'\''` or `b'"'`), or `None`
+    /// outside a string. A string literal spans line boundaries.
+    quote: Option<u8>,
+    /// Whether we are inside an unterminated `/* … */` block comment. A block
+    /// comment spans line boundaries.
+    in_block_comment: bool,
+}
+
+/// Result of scanning one physical line with [`scan_line_parens`].
+enum LineScan {
+    /// The arguments balanced: the matching `)` is at this byte index, absolute
+    /// within the slice that was scanned.
+    Closed(usize),
+    /// The line ended without balancing; carry this state to the next line.
+    Open(ParenScanState),
+}
+
+/// Scan one physical line of a directive's argument list, beginning at byte
+/// `start` and resuming from the carried `state`. Returns [`LineScan::Closed`]
+/// the instant the open-paren depth returns to 0 (the matching `)` index), or
+/// [`LineScan::Open`] with the updated state when the line ends still unbalanced.
+///
+/// `line` is exactly one physical line (the slice up to the next `\n`, exclusive).
+/// That single-line framing is what makes a `//`/`#` comment end at the line
+/// boundary: anything after the marker on this line is commentary, but a `)` on a
+/// *later* line is still counted when the next line resumes. String literals
+/// (honouring `\` escapes) and `/* … */` block comments instead carry across
+/// lines through `state`. See [`matching_paren`] for the full rationale on the
+/// comment- and string-awareness (issue #166).
+fn scan_line_parens(line: &str, start: usize, mut state: ParenScanState) -> LineScan {
+    let bytes = line.as_bytes();
+    let mut i = start;
+    while i < bytes.len() {
+        let c = bytes[i];
+
+        if state.in_block_comment {
+            // Inside `/* … */`: every byte (including `)`) is skipped until `*/`.
+            if c == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                state.in_block_comment = false;
+                i += 1; // also consume the closing '/'
+            }
+            i += 1;
+            continue;
+        }
+
+        match state.quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 1; // skip the escaped byte
+                } else if c == q {
+                    state.quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' => state.quote = Some(c),
+                // `/*` opens a block comment; consume the `*` too so a lone `/*/`
+                // isn't read as open-then-close.
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    state.in_block_comment = true;
+                    i += 1;
+                }
+                // `//` or `#` begins a line comment: in PHP it runs to the end of
+                // this physical line. Nothing past the marker on this line can
+                // affect the parens, so stop — the next line resumes the scan, so
+                // a real closing `)` further down is still found.
+                b'#' => return LineScan::Open(state),
+                b'/' if bytes.get(i + 1) == Some(&b'/') => return LineScan::Open(state),
+                b'(' => state.depth += 1,
+                b')' => {
+                    state.depth -= 1;
+                    if state.depth == 0 {
+                        return LineScan::Closed(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    LineScan::Open(state)
 }
 
 /// Given the byte index of an opening `(` in `s`, return the byte index of its
@@ -188,66 +306,30 @@ fn matching_paren(s: &str, open: usize) -> Option<usize> {
         bytes.get(open) == Some(&b'('),
         "matching_paren expects `open` to index a literal '('"
     );
-    let mut depth = 0usize;
-    let mut quote: Option<u8> = None;
-    let mut in_block_comment = false;
-    let mut i = open;
-    while i < bytes.len() {
-        let c = bytes[i];
-
-        if in_block_comment {
-            // Inside `/* … */`: every byte (including `)`) is skipped until the
-            // closing `*/`.
-            if c == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                in_block_comment = false;
-                i += 1; // also consume the closing '/'
-            }
-            i += 1;
-            continue;
+    // Walk `s` one physical line at a time from `open`, carrying the scanner
+    // state across each `\n` via [`scan_line_parens`] — the same single-line-aware
+    // logic the multi-line slow path of [`balanced_directive_arguments`] uses, so
+    // the two can never drift. Within a line a `//`/`#` comment ends at the line
+    // break (a real `)` on a later line is still counted); a `/* … */` block
+    // comment and a string literal both span line breaks. On a single-line input
+    // ending in a line comment there is no further line, so the parens can't
+    // balance and the function yields `None`.
+    let mut state = ParenScanState::default();
+    let mut line_start = open;
+    loop {
+        let line_end = match s[line_start..].find('\n') {
+            Some(rel_nl) => line_start + rel_nl,
+            None => s.len(),
+        };
+        match scan_line_parens(&s[..line_end], line_start, state) {
+            LineScan::Closed(close) => return Some(close),
+            LineScan::Open(next) => state = next,
         }
-
-        match quote {
-            Some(q) => {
-                if c == b'\\' {
-                    i += 1; // skip the escaped byte
-                } else if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                b'\'' | b'"' => quote = Some(c),
-                // `/*` opens a block comment; its bytes are skipped above. Also
-                // consume the `*` so a lone `/*/` isn't read as open-then-close.
-                b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                    in_block_comment = true;
-                    i += 1;
-                }
-                // `//` or `#` begins a line comment. In PHP it runs to the end
-                // of the *physical* line, so on the `\n`-joined multi-line buffer
-                // (the slow path) it ends at the next `\n` and scanning resumes
-                // on the following line — the real closing `)` further down is
-                // still counted. On a single-line input there is no `\n`, so the
-                // rest is commentary and the parens can't balance: stop.
-                b'#' | b'/' if c == b'#' || bytes.get(i + 1) == Some(&b'/') => {
-                    match s[i..].find('\n') {
-                        // Jump to the `\n`; the `i += 1` below steps past it.
-                        Some(rel_nl) => i += rel_nl,
-                        None => return None,
-                    }
-                }
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            },
+        if line_end == s.len() {
+            return None;
         }
-        i += 1;
+        line_start = line_end + 1; // step past the `\n`
     }
-    None
 }
 
 lazy_static! {
@@ -491,6 +573,66 @@ mod tests {
             parse_foreach_variables(&args),
             vec![("user".to_string(), "mixed".to_string())],
             "the `# …`-commented first line doesn't lose the binding"
+        );
+    }
+
+    // ── balanced_directive_arguments: linear-time slow path (issue #185) ─────
+
+    #[test]
+    fn header_wrapped_across_many_continuation_lines_resolves_the_binding() {
+        // A `@foreach` header split across K = 6 continuation lines, with the
+        // closing `)` only on the final one. This drives the slow path — the
+        // path that previously re-scanned the whole accumulated buffer from
+        // index 0 after every appended line (O(n²)) and now carries the scanner
+        // state forward so each line's bytes are visited exactly once. The point
+        // of the test is end-to-end correctness after that refactor: the binding
+        // on the last continuation line must still be recovered. Each
+        // `->where(...)`/`->get()` call opens and closes its own parens on a
+        // single line, so depth stays at 1 across the wrap until the final `)`.
+        let lines = vec![
+            "@foreach ($users",
+            "    ->where('active', true)",
+            "    ->where('verified', true)",
+            "    ->orderBy('name')",
+            "    ->get()",
+            "    ->filter()",
+            "    as $user)",
+        ];
+        let open = lines[0].find('(').unwrap();
+        let args = balanced_directive_arguments(&lines, 0, open)
+            .expect("the wrapped header balances on the final continuation line");
+        assert_eq!(
+            args,
+            "($users ->where('active', true) ->where('verified', true) \
+             ->orderBy('name') ->get() ->filter() as $user)"
+        );
+        assert_eq!(
+            parse_foreach_variables(&args),
+            vec![("user".to_string(), "mixed".to_string())],
+            "the binding on the final continuation line is recovered"
+        );
+    }
+
+    #[test]
+    fn wrapped_header_with_a_multi_line_block_comment_still_balances() {
+        // A `/* … */` block comment that spans the wrap and contains a `)` must
+        // not close the arguments early: the block-comment state has to carry
+        // across the line break (issue #166's comment-awareness, preserved by
+        // the issue #185 linear-time refactor). Without carrying it, the `)`
+        // inside the comment on the second line would truncate before ` as $user`.
+        let lines = vec![
+            "@foreach ($users /* keep only",
+            "    the :) active ones */",
+            "    as $user)",
+        ];
+        let open = lines[0].find('(').unwrap();
+        let args = balanced_directive_arguments(&lines, 0, open)
+            .expect("the trailing `)` closes the header, not the one in the comment");
+        assert_eq!(args, "($users /* keep only the :) active ones */ as $user)");
+        assert_eq!(
+            parse_foreach_variables(&args),
+            vec![("user".to_string(), "mixed".to_string())],
+            "the binding survives a `)` buried in a multi-line block comment"
         );
     }
 }
