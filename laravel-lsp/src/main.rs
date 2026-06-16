@@ -13809,25 +13809,35 @@ return [
         let possible_paths = config.resolve_view_path(&view.name);
 
         for path in possible_paths {
-            if self.file_exists_cached(&path).await {
-                if let Ok(target_uri) = Url::from_file_path(&path) {
-                    let origin_selection_range = Range {
-                        start: Position {
-                            line: view.line,
-                            character: view.column,
-                        },
-                        end: Position {
-                            line: view.line,
-                            character: view.end_column,
-                        },
-                    };
-                    return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                        origin_selection_range: Some(origin_selection_range),
-                        target_uri,
-                        target_range: Range::default(),
-                        target_selection_range: Range::default(),
-                    }]));
-                }
+            if !self.file_exists_cached(&path).await {
+                continue;
+            }
+            // Containment guard (issue #148, extending #130): a
+            // `loadViewsFrom(__DIR__ . '/../../etc', 'ns')`-style namespace can
+            // resolve a view to an absolute path that escapes the project root.
+            // Refuse to hand the client a navigation target outside the root,
+            // matching the slot-navigation guard. `continue` rather than
+            // `return None` so a later in-root candidate can still resolve.
+            if !path_within_root(&path, &config.root) {
+                continue;
+            }
+            if let Ok(target_uri) = Url::from_file_path(&path) {
+                let origin_selection_range = Range {
+                    start: Position {
+                        line: view.line,
+                        character: view.column,
+                    },
+                    end: Position {
+                        line: view.line,
+                        character: view.end_column,
+                    },
+                };
+                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                    origin_selection_range: Some(origin_selection_range),
+                    target_uri,
+                    target_range: Range::default(),
+                    target_selection_range: Range::default(),
+                }]));
             }
         }
         None
@@ -13847,9 +13857,21 @@ return [
         let autoload = laravel_lsp::composer_autoload::ComposerAutoload::for_project(&root);
 
         for path in laravel_lsp::salsa_impl::component_candidate_paths(name, &config, autoload) {
-            if self.file_exists_cached(&path).await {
-                return Some(path);
+            if !self.file_exists_cached(&path).await {
+                continue;
             }
+            // Containment guard (issue #148, extending #130). `resolve_component_path`
+            // already filters its own candidates against the root, but
+            // `component_candidate_paths` appends class-backed
+            // (`Blade::component('tag', Class::class)`) and PSR-4 `componentNamespace`
+            // candidates *after* that filter — those can resolve to a class file
+            // outside the project root. Refuse any out-of-root target here, using
+            // the same `config.root` the slot-navigation guard does. `continue` so a
+            // later in-root candidate can still resolve.
+            if !path_within_root(&path, &config.root) {
+                continue;
+            }
+            return Some(path);
         }
         None
     }
@@ -13996,6 +14018,15 @@ return [
         let arguments = dir.arguments.as_ref()?;
         let config = self.get_cached_config().await?;
 
+        // Containment guard (issue #148, extending #130): every candidate loop
+        // below resolves a directive argument to a view/component path through
+        // `resolve_view_path`, which honours `loadViewsFrom`-style namespaces that
+        // can point an absolute path outside the project root. Each loop re-checks
+        // `path_within_root(&path, &config.root)` after the existence check and
+        // `continue`s past any out-of-root candidate, so no directive flow hands
+        // the client a navigation target that escapes the root. The `@feature`
+        // branch builds its path from `root.join(..)` and so is already contained.
+
         // Directives where first argument is a view name
         let view_directives_first_arg =
             ["extends", "include", "includeIf", "includeUnless", "each"];
@@ -14011,17 +14042,25 @@ return [
                 let possible_paths = config.resolve_view_path(&component_path);
 
                 for path in possible_paths {
-                    if self.file_exists_cached(&path).await {
-                        return self.create_location_link(dir, &path);
+                    if !self.file_exists_cached(&path).await {
+                        continue;
                     }
+                    if !path_within_root(&path, &config.root) {
+                        continue;
+                    }
+                    return self.create_location_link(dir, &path);
                 }
 
                 // Also try direct view path
                 let possible_paths = config.resolve_view_path(&component_name);
                 for path in possible_paths {
-                    if self.file_exists_cached(&path).await {
-                        return self.create_location_link(dir, &path);
+                    if !self.file_exists_cached(&path).await {
+                        continue;
                     }
+                    if !path_within_root(&path, &config.root) {
+                        continue;
+                    }
+                    return self.create_location_link(dir, &path);
                 }
             }
         }
@@ -14032,9 +14071,13 @@ return [
                 let possible_paths = config.resolve_view_path(&view_name);
 
                 for path in possible_paths {
-                    if self.file_exists_cached(&path).await {
-                        return self.create_location_link(dir, &path);
+                    if !self.file_exists_cached(&path).await {
+                        continue;
                     }
+                    if !path_within_root(&path, &config.root) {
+                        continue;
+                    }
+                    return self.create_location_link(dir, &path);
                 }
             }
         }
@@ -14045,9 +14088,13 @@ return [
                 let possible_paths = config.resolve_view_path(&view_name);
 
                 for path in possible_paths {
-                    if self.file_exists_cached(&path).await {
-                        return self.create_location_link(dir, &path);
+                    if !self.file_exists_cached(&path).await {
+                        continue;
                     }
+                    if !path_within_root(&path, &config.root) {
+                        continue;
+                    }
+                    return self.create_location_link(dir, &path);
                 }
             }
         }
@@ -14058,9 +14105,13 @@ return [
             for view_name in view_names {
                 let possible_paths = config.resolve_view_path(&view_name);
                 for path in possible_paths {
-                    if self.file_exists_cached(&path).await {
-                        return self.create_location_link(dir, &path);
+                    if !self.file_exists_cached(&path).await {
+                        continue;
                     }
+                    if !path_within_root(&path, &config.root) {
+                        continue;
+                    }
+                    return self.create_location_link(dir, &path);
                 }
             }
         }
@@ -14077,10 +14128,14 @@ return [
                 let possible_paths = config.resolve_view_path(&component_name);
 
                 for path in possible_paths {
-                    if self.file_exists_cached(&path).await {
-                        // Use string_column/string_end_column for the clickable range (just the component name)
-                        return self.create_location_link_with_string_range(dir, &path);
+                    if !self.file_exists_cached(&path).await {
+                        continue;
                     }
+                    if !path_within_root(&path, &config.root) {
+                        continue;
+                    }
+                    // Use string_column/string_end_column for the clickable range (just the component name)
+                    return self.create_location_link_with_string_range(dir, &path);
                 }
             }
         }
