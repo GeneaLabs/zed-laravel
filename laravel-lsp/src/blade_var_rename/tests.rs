@@ -945,6 +945,41 @@ fn endphp_inside_nowdoc_does_not_close_block() {
 }
 
 #[test]
+fn endphp_inside_double_quoted_heredoc_does_not_close_block() {
+    // A *double-quoted*-label heredoc (`<<<"SQL"`) is a valid opener — its body
+    // runs until the closing label, so an `@endphp` inside it is literal text
+    // and the block closes only at the real `@endphp` after the label. Companion
+    // to the bare-label and nowdoc cases above: this exercises the quoted-label
+    // leg of `skip_heredoc`, which those don't reach.
+    let src = "\
+@php
+    $marker = <<<\"SQL\"
+    @endphp is just text in here
+    SQL;
+    $ghost = 5;
+@endphp
+{{ $user }}";
+    assert!(!is_template_variable(src, "ghost"));
+    assert!(is_template_variable(src, "user"));
+}
+
+#[test]
+fn endphp_inside_block_comment_does_not_close_block() {
+    // A literal `@endphp` inside a `/* … */` block comment does not close the
+    // block — the scanner skips to the comment's `*/` (companion to the `//`
+    // line-comment case above, which the existing apostrophe test exercises but
+    // the block-comment leg of `find_block_terminator` does not).
+    let src = "\
+@php
+    /* a stray @endphp lives in this block comment */
+    $ghost = 5;
+@endphp
+{{ $user }}";
+    assert!(!is_template_variable(src, "ghost"));
+    assert!(is_template_variable(src, "user"));
+}
+
+#[test]
 fn endphp_word_prefix_does_not_close_block() {
     // `@endphpunit` shares the `@endphp` prefix but is not the terminator — a
     // symmetric word boundary (mirroring the `@php` opener guard) keeps the
