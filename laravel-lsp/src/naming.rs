@@ -144,5 +144,77 @@ pub fn with_emoji(s: &str, enabled: bool) -> String {
     }
 }
 
+/// Reasons a dotted name (a view, Blade-component, or Livewire-component name)
+/// was rejected by [`validate_dotted_name`].
+///
+/// This is the single shared error vocabulary behind the three locators'
+/// `validate_*` functions. Each locator maps these back to its own
+/// noun-specific error type ([`crate::view_declaration_locator::ViewNameError`],
+/// [`crate::component_declaration_locator::ComponentNameError`],
+/// [`crate::livewire_declaration_locator::LivewireNameError`]) so user-facing
+/// message wording ("view name" / "component name" / "Livewire component name")
+/// stays per-noun. The variants here mirror that shared set; `Namespaced` is
+/// produced only when the caller opts in via `reject_namespaced`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DottedNameError {
+    /// The name was empty (or whitespace-only after trimming).
+    Empty,
+    /// The name carried a `::` namespace prefix (e.g. `package::view`). Only
+    /// produced when the caller passes `reject_namespaced = true`; otherwise
+    /// the `:` falls through to [`DottedNameError::InvalidCharacter`].
+    Namespaced,
+    /// The name used `/` or `\` where it should use `.` segment separators.
+    ContainsSlash,
+    /// The name carried a `.blade.php`, `.blade`, or `.php` file extension.
+    HasExtension,
+    /// A dotted segment was empty — a leading, trailing, or double dot.
+    EmptySegment,
+    /// A segment contained a character outside `[A-Za-z0-9_-]`.
+    InvalidCharacter(char),
+}
+
+/// Validate a user-typed dotted name (view / Blade-component / Livewire-component).
+///
+/// Returns `Ok(())` only when `name` is a well-formed dotted segment list — the
+/// shape Laravel's `view()` / Blade-component / Livewire resolution actually
+/// accepts at runtime. The check order is fixed so each rejection reports the
+/// most specific reason first: empty, then namespaced (opt-in), then slash,
+/// then extension, then a per-segment scan for empty segments and invalid
+/// characters.
+///
+/// `reject_namespaced` selects the one behavioural difference between the
+/// callers. The view locator passes `false` — it has no namespaced-rename
+/// support to refuse, so a `:` is reported as an invalid character. The Blade-
+/// and Livewire-component locators pass `true` — they refuse `package::name`
+/// up front with [`DottedNameError::Namespaced`] (their own
+/// `NamespacedNotSupported` variant) rather than letting it read as a stray
+/// invalid character.
+pub fn validate_dotted_name(name: &str, reject_namespaced: bool) -> Result<(), DottedNameError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(DottedNameError::Empty);
+    }
+    if reject_namespaced && trimmed.contains("::") {
+        return Err(DottedNameError::Namespaced);
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(DottedNameError::ContainsSlash);
+    }
+    if trimmed.ends_with(".blade.php") || trimmed.ends_with(".blade") || trimmed.ends_with(".php") {
+        return Err(DottedNameError::HasExtension);
+    }
+    for segment in trimmed.split('.') {
+        if segment.is_empty() {
+            return Err(DottedNameError::EmptySegment);
+        }
+        for c in segment.chars() {
+            if !c.is_alphanumeric() && c != '-' && c != '_' {
+                return Err(DottedNameError::InvalidCharacter(c));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

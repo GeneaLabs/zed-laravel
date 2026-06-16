@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::naming::{self, DottedNameError};
 use crate::salsa_impl::LaravelConfigData;
 
 /// Reasons a new view name was rejected. Each variant carries the data
@@ -51,6 +52,23 @@ impl ViewNameError {
     }
 }
 
+impl From<DottedNameError> for ViewNameError {
+    fn from(error: DottedNameError) -> Self {
+        match error {
+            DottedNameError::Empty => Self::Empty,
+            DottedNameError::ContainsSlash => Self::ContainsSlash,
+            DottedNameError::EmptySegment => Self::EmptySegment,
+            DottedNameError::HasExtension => Self::HasExtension,
+            DottedNameError::InvalidCharacter(c) => Self::InvalidCharacter(c),
+            // View names don't support namespaced renames, so `validate_view_name`
+            // never opts into the `::` check (it passes `reject_namespaced = false`)
+            // and this arm is unreachable in practice. Map it defensively to the
+            // invalid-character reason a bare `:` would otherwise produce.
+            DottedNameError::Namespaced => Self::InvalidCharacter(':'),
+        }
+    }
+}
+
 /// Validate a user-typed new view name. Returns `Ok(())` only when the name
 /// is a well-formed dotted segment list — what Laravel's `view()` helper
 /// actually resolves at runtime.
@@ -62,27 +80,10 @@ impl ViewNameError {
 /// rather than mis-resolving it. Supporting `package::view` would mean parsing
 /// the namespace segment against the registered view hints — a separate change.
 pub fn validate_view_name(name: &str) -> Result<(), ViewNameError> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(ViewNameError::Empty);
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') {
-        return Err(ViewNameError::ContainsSlash);
-    }
-    if trimmed.ends_with(".blade.php") || trimmed.ends_with(".blade") || trimmed.ends_with(".php") {
-        return Err(ViewNameError::HasExtension);
-    }
-    for segment in trimmed.split('.') {
-        if segment.is_empty() {
-            return Err(ViewNameError::EmptySegment);
-        }
-        for c in segment.chars() {
-            if !c.is_alphanumeric() && c != '-' && c != '_' {
-                return Err(ViewNameError::InvalidCharacter(c));
-            }
-        }
-    }
-    Ok(())
+    // View renames don't support namespaced (`package::view`) targets, so the
+    // shared validator runs without the `::` check — a `:` reads as an invalid
+    // character, matching this locator's historical behaviour.
+    naming::validate_dotted_name(name, false).map_err(ViewNameError::from)
 }
 
 /// Find the on-disk `.blade.php` file backing a dotted view name. Walks

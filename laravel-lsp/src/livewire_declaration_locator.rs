@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::livewire_config::LivewireConfig;
 use crate::livewire_resolver::{resolve_component, LivewireComponent, LivewireComponentKind};
 use crate::livewire_version::LivewireVersion;
-use crate::naming;
+use crate::naming::{self, DottedNameError};
 
 /// Reasons a new Livewire-component name was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,32 +54,24 @@ impl LivewireNameError {
     }
 }
 
+impl From<DottedNameError> for LivewireNameError {
+    fn from(error: DottedNameError) -> Self {
+        match error {
+            DottedNameError::Empty => Self::Empty,
+            DottedNameError::Namespaced => Self::NamespacedNotSupported,
+            DottedNameError::ContainsSlash => Self::ContainsSlash,
+            DottedNameError::EmptySegment => Self::EmptySegment,
+            DottedNameError::HasExtension => Self::HasExtension,
+            DottedNameError::InvalidCharacter(c) => Self::InvalidCharacter(c),
+        }
+    }
+}
+
 /// Validate a user-typed new Livewire-component name.
 pub fn validate_livewire_name(name: &str) -> Result<(), LivewireNameError> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(LivewireNameError::Empty);
-    }
-    if trimmed.contains("::") {
-        return Err(LivewireNameError::NamespacedNotSupported);
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') {
-        return Err(LivewireNameError::ContainsSlash);
-    }
-    if trimmed.ends_with(".blade.php") || trimmed.ends_with(".blade") || trimmed.ends_with(".php") {
-        return Err(LivewireNameError::HasExtension);
-    }
-    for segment in trimmed.split('.') {
-        if segment.is_empty() {
-            return Err(LivewireNameError::EmptySegment);
-        }
-        for c in segment.chars() {
-            if !c.is_alphanumeric() && c != '-' && c != '_' {
-                return Err(LivewireNameError::InvalidCharacter(c));
-            }
-        }
-    }
-    Ok(())
+    // Livewire renames refuse namespaced (`package::name`) targets up front, so
+    // the shared validator runs with the `::` check enabled.
+    naming::validate_dotted_name(name, true).map_err(LivewireNameError::from)
 }
 
 /// All the artifacts participating in a discovered Livewire component,

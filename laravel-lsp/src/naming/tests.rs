@@ -164,3 +164,93 @@ fn with_emoji_no_double_prefix() {
 fn with_emoji_disabled_on_plain_is_noop() {
     assert_eq!(with_emoji("create", false), "create");
 }
+
+// ---------- validate_dotted_name (shared validator) ----------
+
+#[test]
+fn validate_dotted_accepts_simple_and_nested_names() {
+    assert_eq!(validate_dotted_name("welcome", false), Ok(()));
+    assert_eq!(validate_dotted_name("admin.user-list", true), Ok(()));
+    assert_eq!(validate_dotted_name("admin.user_list", false), Ok(()));
+}
+
+#[test]
+fn validate_dotted_trims_before_checking() {
+    assert_eq!(validate_dotted_name("  users.profile  ", false), Ok(()));
+}
+
+#[test]
+fn validate_dotted_rejects_empty() {
+    assert_eq!(validate_dotted_name("", false), Err(DottedNameError::Empty));
+    assert_eq!(
+        validate_dotted_name("   ", true),
+        Err(DottedNameError::Empty)
+    );
+}
+
+#[test]
+fn validate_dotted_rejects_namespaced_only_when_opted_in() {
+    // reject_namespaced = true → the `::` is caught before the segment scan.
+    assert_eq!(
+        validate_dotted_name("billing::invoice", true),
+        Err(DottedNameError::Namespaced)
+    );
+    // reject_namespaced = false → the `:` falls through as an invalid character
+    // (the view locator relies on this).
+    assert_eq!(
+        validate_dotted_name("billing::invoice", false),
+        Err(DottedNameError::InvalidCharacter(':'))
+    );
+}
+
+#[test]
+fn validate_dotted_rejects_slashes() {
+    assert_eq!(
+        validate_dotted_name("users/profile", false),
+        Err(DottedNameError::ContainsSlash)
+    );
+    assert_eq!(
+        validate_dotted_name("users\\profile", true),
+        Err(DottedNameError::ContainsSlash)
+    );
+}
+
+#[test]
+fn validate_dotted_rejects_extensions() {
+    for name in ["a.blade.php", "a.blade", "a.php"] {
+        assert_eq!(
+            validate_dotted_name(name, false),
+            Err(DottedNameError::HasExtension),
+            "expected HasExtension for {name:?}"
+        );
+    }
+}
+
+#[test]
+fn validate_dotted_rejects_empty_segments() {
+    // Leading, trailing, and double-dot all collapse to EmptySegment.
+    assert_eq!(
+        validate_dotted_name(".users", false),
+        Err(DottedNameError::EmptySegment)
+    );
+    assert_eq!(
+        validate_dotted_name("users.", false),
+        Err(DottedNameError::EmptySegment)
+    );
+    assert_eq!(
+        validate_dotted_name("users..profile", true),
+        Err(DottedNameError::EmptySegment)
+    );
+}
+
+#[test]
+fn validate_dotted_rejects_invalid_characters() {
+    assert_eq!(
+        validate_dotted_name("users profile", false),
+        Err(DottedNameError::InvalidCharacter(' '))
+    );
+    assert_eq!(
+        validate_dotted_name("users@profile", true),
+        Err(DottedNameError::InvalidCharacter('@'))
+    );
+}

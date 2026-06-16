@@ -22,7 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::naming;
+use crate::naming::{self, DottedNameError};
 use crate::salsa_impl::LaravelConfigData;
 
 /// Reasons a new component name was rejected.
@@ -63,33 +63,25 @@ impl ComponentNameError {
     }
 }
 
+impl From<DottedNameError> for ComponentNameError {
+    fn from(error: DottedNameError) -> Self {
+        match error {
+            DottedNameError::Empty => Self::Empty,
+            DottedNameError::Namespaced => Self::NamespacedNotSupported,
+            DottedNameError::ContainsSlash => Self::ContainsSlash,
+            DottedNameError::EmptySegment => Self::EmptySegment,
+            DottedNameError::HasExtension => Self::HasExtension,
+            DottedNameError::InvalidCharacter(c) => Self::InvalidCharacter(c),
+        }
+    }
+}
+
 /// Validate a user-typed new component name. Mirrors view-name rules plus an
 /// explicit refusal for `::` namespace prefixes.
 pub fn validate_component_name(name: &str) -> Result<(), ComponentNameError> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(ComponentNameError::Empty);
-    }
-    if trimmed.contains("::") {
-        return Err(ComponentNameError::NamespacedNotSupported);
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') {
-        return Err(ComponentNameError::ContainsSlash);
-    }
-    if trimmed.ends_with(".blade.php") || trimmed.ends_with(".blade") || trimmed.ends_with(".php") {
-        return Err(ComponentNameError::HasExtension);
-    }
-    for segment in trimmed.split('.') {
-        if segment.is_empty() {
-            return Err(ComponentNameError::EmptySegment);
-        }
-        for c in segment.chars() {
-            if !c.is_alphanumeric() && c != '-' && c != '_' {
-                return Err(ComponentNameError::InvalidCharacter(c));
-            }
-        }
-    }
-    Ok(())
+    // Blade-component renames refuse namespaced (`package::name`) targets up
+    // front, so the shared validator runs with the `::` check enabled.
+    naming::validate_dotted_name(name, true).map_err(ComponentNameError::from)
 }
 
 /// All the files participating in a discovered Blade-component definition,
