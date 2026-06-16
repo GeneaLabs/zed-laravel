@@ -798,6 +798,113 @@ fn php_word_prefix_does_not_anchor_a_mask_block() {
     assert!(is_template_variable(src, "total"));
 }
 
+// ── is_template_variable: string-literal-safe @php/@endphp masking (#93) ─────
+
+#[test]
+fn endphp_inside_single_quoted_php_string_does_not_close_block() {
+    // A literal `@endphp` inside a single-quoted PHP string must not close the
+    // masked region early. `$ghost` lives only in real PHP *after* that fake
+    // terminator, so it is a block-local, not a renameable template variable.
+    let src = "\
+@php
+    $marker = '@endphp';
+    $ghost = 5;
+@endphp
+{{ $user }}";
+    assert!(!is_template_variable(src, "ghost"));
+    // The real markup after the block is still recognized — the block masks
+    // only itself, not what follows.
+    assert!(is_template_variable(src, "user"));
+}
+
+#[test]
+fn endphp_inside_double_quoted_php_string_does_not_close_block() {
+    let src = "\
+@php
+    $marker = \"@endphp\";
+    $ghost = 5;
+@endphp
+{{ $user }}";
+    assert!(!is_template_variable(src, "ghost"));
+    assert!(is_template_variable(src, "user"));
+}
+
+#[test]
+fn endphp_inside_heredoc_does_not_close_block() {
+    // The `@endphp` inside the heredoc body is literal text; the block closes
+    // only at the real `@endphp` after the heredoc's closing label.
+    let src = "\
+@php
+    $marker = <<<SQL
+    @endphp is just text in here
+    SQL;
+    $ghost = 5;
+@endphp
+{{ $user }}";
+    assert!(!is_template_variable(src, "ghost"));
+    assert!(is_template_variable(src, "user"));
+}
+
+#[test]
+fn endphp_inside_nowdoc_does_not_close_block() {
+    let src = "\
+@php
+    $marker = <<<'TXT'
+    @endphp stays literal here
+    TXT;
+    $ghost = 5;
+@endphp
+{{ $user }}";
+    assert!(!is_template_variable(src, "ghost"));
+    assert!(is_template_variable(src, "user"));
+}
+
+#[test]
+fn endphp_word_prefix_does_not_close_block() {
+    // `@endphpunit` shares the `@endphp` prefix but is not the terminator — a
+    // symmetric word boundary (mirroring the `@php` opener guard) keeps the
+    // block open until the real `@endphp`.
+    let src = "\
+@php
+    $a = 1; @endphpunit
+    $ghost = 5;
+@endphp
+{{ $user }}";
+    assert!(!is_template_variable(src, "ghost"));
+    assert!(is_template_variable(src, "user"));
+}
+
+#[test]
+fn apostrophe_in_php_comment_does_not_break_block_masking() {
+    // A `//` comment containing an apostrophe must not be read as a string
+    // opener — otherwise the scanner would never find the real `@endphp` and
+    // would wrongly leave the block (and its locals) unmasked.
+    let src = "\
+@php
+    // don't treat this apostrophe as a string opener
+    $ghost = 5;
+@endphp
+{{ $user }}";
+    assert!(!is_template_variable(src, "ghost"));
+    assert!(is_template_variable(src, "user"));
+}
+
+#[test]
+fn escaped_quote_before_endphp_keeps_block_masked() {
+    // An escaped quote does not terminate its string, so a following `@endphp`
+    // stays inside the string and does not close the block — and the escapes
+    // resolve in a single forward pass (no quadratic backtracking).
+    let src = "\
+@php
+    $d = \"escaped \\\" quote then @endphp\";
+    $s = 'escaped \\' quote then @endphp';
+    $ghost = 5;
+@endphp
+{{ $user }}";
+    assert!(!is_template_variable(src, "ghost"));
+    assert!(is_template_variable(src, "user"));
+}
+
 // ── view_binding_key_at: ->with chains ──────────────────────────────────────
 
 #[test]

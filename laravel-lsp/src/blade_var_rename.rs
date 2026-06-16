@@ -229,7 +229,11 @@ fn mask_php_blocks(source: &str, out: &mut [u8]) {
             search_from = after_open;
             continue;
         }
-        let Some(rel_end) = source[after_open..].find("@endphp") else {
+        // Locate the closing `@endphp` with PHP-string awareness: a literal
+        // `@endphp` inside a string or comment in the block body does not close
+        // the block (a plain substring search would close it early, leaving the
+        // real PHP tail wrongly treated as renameable markup).
+        let Some(rel_end) = find_block_terminator(&source[after_open..]) else {
             break; // unclosed `@php` (inline `@php(...)`) — not a block.
         };
         let end = after_open + rel_end + "@endphp".len();
@@ -239,6 +243,156 @@ fn mask_php_blocks(source: &str, out: &mut [u8]) {
             }
         }
         search_from = end;
+    }
+}
+
+/// Within a `@php` block body, return the byte offset of the real `@endphp`
+/// terminator — the first `@endphp` token that lies in PHP *code*, not inside a
+/// string literal or comment. A literal `@endphp` inside a single-/double-quoted
+/// string, a heredoc/nowdoc body, or a `//`, `#`, or `/* … */` comment does not
+/// close the block. A symmetric word boundary (mirroring the `@php` opener guard)
+/// keeps `@endphpunit` from matching. Returns `None` when the block is unclosed.
+/// Single forward pass over the body — O(n), no backtracking.
+fn find_block_terminator(body: &str) -> Option<usize> {
+    let b = body.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        match b[i] {
+            b'\'' => i = skip_php_quoted(b, i, b'\''),
+            b'"' => i = skip_php_quoted(b, i, b'"'),
+            b'/' if b[i..].starts_with(b"//") => i = skip_to_line_end(b, i),
+            b'/' if b[i..].starts_with(b"/*") => i = skip_block_comment(b, i),
+            b'#' if !b[i..].starts_with(b"#[") => i = skip_to_line_end(b, i),
+            b'<' if b[i..].starts_with(b"<<<") => i = skip_heredoc(b, i).unwrap_or(i + 1),
+            b'@' if b[i..].starts_with(b"@endphp") => {
+                let after = i + "@endphp".len();
+                let at_boundary =
+                    after >= n || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
+                if at_boundary {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Index just past the closing `quote` of a PHP string opening at `start`
+/// (`b[start] == quote`). A backslash escapes the next byte — covering `\'`/`\\`
+/// in single-quoted and `\"`/`\\`/… in double-quoted strings — so an escaped
+/// quote does not terminate the string. The ASCII delimiters never collide with
+/// UTF-8 continuation bytes, so byte scanning is multi-byte safe. Unterminated →
+/// end of input.
+fn skip_php_quoted(b: &[u8], start: usize, quote: u8) -> usize {
+    let n = b.len();
+    let mut i = start + 1;
+    while i < n {
+        if b[i] == b'\\' {
+            i += 2; // skip the escaped byte
+        } else if b[i] == quote {
+            return i + 1;
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+/// Index of the next line feed at or after `i` (or end of input) — skips a `//`
+/// or `#` line comment so an `@endphp` inside it isn't mistaken for a string
+/// opener's apostrophe (`// don't …`) or treated as the terminator.
+fn skip_to_line_end(b: &[u8], i: usize) -> usize {
+    match b[i..].iter().position(|&c| c == b'\n') {
+        Some(off) => i + off,
+        None => b.len(),
+    }
+}
+
+/// Index just past the closing `*/` of a block comment opening at `i`
+/// (`b[i..]` begins with `/*`). Unterminated → end of input.
+fn skip_block_comment(b: &[u8], i: usize) -> usize {
+    let n = b.len();
+    let mut j = i + 2;
+    while j + 1 < n {
+        if b[j] == b'*' && b[j + 1] == b'/' {
+            return j + 2;
+        }
+        j += 1;
+    }
+    n
+}
+
+/// If a heredoc/nowdoc opens at `start` (`b[start..]` begins with `<<<`), return
+/// the index just past its closing label, skipping the whole body — any
+/// `@endphp` inside it is literal text. Mirrors PHP: optional spaces/tabs, an
+/// optional `"`/`'` wrapping the label (nowdoc uses `'`), then the label; the
+/// body runs until a line whose first non-whitespace content is the label
+/// followed by a non-identifier byte (PHP 7.3+ allows the closer to be
+/// indented). Returns `None` when `<<<` is not a valid opener, so the caller
+/// treats it as ordinary code.
+fn skip_heredoc(b: &[u8], start: usize) -> Option<usize> {
+    let n = b.len();
+    let mut i = start + 3; // past "<<<"
+    while i < n && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    let quote = match b.get(i) {
+        Some(&q) if q == b'"' || q == b'\'' => {
+            i += 1;
+            Some(q)
+        }
+        _ => None,
+    };
+    let label_start = i;
+    if b.get(i)
+        .is_some_and(|&c| c.is_ascii_alphabetic() || c == b'_')
+    {
+        i += 1;
+        while b
+            .get(i)
+            .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            i += 1;
+        }
+    } else {
+        return None; // no valid label → not a heredoc opener
+    }
+    let label = &b[label_start..i];
+    if let Some(q) = quote {
+        if b.get(i) == Some(&q) {
+            i += 1;
+        } else {
+            return None; // mismatched opening quote → not a heredoc opener
+        }
+    }
+    if b.get(i) == Some(&b'\r') {
+        i += 1;
+    }
+    if b.get(i) == Some(&b'\n') {
+        i += 1;
+    } else {
+        return None; // label not terminated by a newline → not a heredoc opener
+    }
+    // Scan body lines for the closing label.
+    loop {
+        let mut j = i;
+        while j < n && (b[j] == b' ' || b[j] == b'\t') {
+            j += 1;
+        }
+        if b[j..].starts_with(label) {
+            let after = j + label.len();
+            let at_boundary = after >= n || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
+            if at_boundary {
+                return Some(after);
+            }
+        }
+        match b[i..].iter().position(|&c| c == b'\n') {
+            Some(off) => i += off + 1,
+            None => return Some(n), // unterminated heredoc → consume to EOF
+        }
     }
 }
 
