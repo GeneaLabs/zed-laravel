@@ -65,6 +65,7 @@ fn two_arg_context_helpers_never_panic_on_any_byte_index() {
         LaravelLanguageServer::get_feature_call_context,
         LaravelLanguageServer::get_variable_name_context,
         LaravelLanguageServer::get_blade_directive_context,
+        LaravelLanguageServer::get_inertia_call_context,
     );
 }
 
@@ -105,6 +106,19 @@ fn config_call_context_keeps_accented_prefix() {
     let ctx = LaravelLanguageServer::get_config_call_context(line, col)
         .expect("inside a config('…') string");
     assert_eq!(ctx.prefix, "app.café");
+}
+
+#[test]
+fn inertia_call_context_keeps_accented_prefix() {
+    // `inertia('Café` with the cursor at end-of-line: the page-name prefix must
+    // include the accented char intact. The old `character as usize` slice
+    // panicked at this column on a multibyte line (issue #10 regression); the
+    // boundary-correct conversion reads the full "Café".
+    let line = "inertia('Café";
+    let col = line.chars().count() as u32;
+    let ctx = LaravelLanguageServer::get_inertia_call_context(line, col)
+        .expect("inside an inertia('…') page string");
+    assert_eq!(ctx.prefix, "Café");
 }
 
 #[test]

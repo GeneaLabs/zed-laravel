@@ -8179,10 +8179,13 @@ impl LaravelLanguageServer {
     /// - `Route::inertia('/path', 'Page')` — the page name is the *second*
     ///   argument (after the URI), handled specially like `Route::view`.
     fn get_inertia_call_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        // `character` is an LSP code-point column, not a byte offset. Route it
+        // through `char_col_to_byte_offset` (like every sibling `*_context`
+        // helper) so the slice below always lands on a char boundary — a raw
+        // `&line_text[..character]` panics on any line with a multibyte char
+        // before the cursor. The helper clamps a past-end column to
+        // `line_text.len()`, so the old out-of-bounds guard is unneeded.
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
