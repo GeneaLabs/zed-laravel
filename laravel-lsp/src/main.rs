@@ -27,7 +27,7 @@ use laravel_lsp::completion_format::CompletionDoc;
 use laravel_lsp::config::find_project_root;
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
 use laravel_lsp::migration_index::{build_migration_index, MigrationIndex};
-use laravel_lsp::path_containment::path_within_root;
+use laravel_lsp::path_containment::{path_within_root, path_within_root_lexical};
 use laravel_lsp::route_discovery::{
     build_route_index, discover_route_files, normalize_path, RouteIndex,
 };
@@ -13995,6 +13995,21 @@ return [
         let path = self.resolve_livewire_primary_path(&lw.name).await?;
 
         if self.file_exists_cached(&path).await {
+            // Containment guard (issue #194, extending #130/#143/#148): the
+            // `<livewire:ns::component>` Blade-tag flow resolves through
+            // `resolve_livewire_primary_path`, and `component_namespaces`
+            // (parsed by `livewire_config.rs`) explicitly accepts bare absolute
+            // paths — so a `'component_namespaces' => ['x' => '/etc']`
+            // registration plus a `<livewire:x::passwd>` tag could resolve to a
+            // path outside the project root. Refuse to hand the client a
+            // navigation target that escapes the root, matching the
+            // view/component/directive and slot-navigation guards. A single
+            // resolved candidate here (not a loop), so a failed check returns
+            // `None`. Fetched after the existence check, before the link build.
+            let config = self.get_cached_config().await?;
+            if !path_within_root(&path, &config.root) {
+                return None;
+            }
             if let Ok(target_uri) = Url::from_file_path(&path) {
                 let origin_selection_range = Range {
                     start: Position {
@@ -15929,7 +15944,18 @@ return [
             // Check view() calls using Salsa patterns
             for view_ref in &patterns.views {
                 let possible_paths = config.resolve_view_path(&view_ref.name);
-                let exists = possible_paths.iter().any(|p| p.exists());
+                // Containment guard (issue #194, secondary): skip `.exists()`
+                // filesystem probes on candidates that resolve outside the
+                // project root, so an out-of-root `loadViewsFrom`/namespace
+                // registration can't make diagnostics stat-probe files outside
+                // the project tree. Lexical containment (the speculative-candidate
+                // helper) keeps not-yet-created in-root candidates — a genuinely
+                // missing in-root view still reports "not found" — while refusing
+                // out-of-root paths without probing them.
+                let exists = possible_paths
+                    .iter()
+                    .filter(|p| path_within_root_lexical(p, &config.root))
+                    .any(|p| p.exists());
 
                 if !exists {
                     let expected_path = possible_paths
@@ -16606,8 +16632,19 @@ return [
                     if let Some(view_name) = Self::extract_view_from_directive_args(args) {
                         let possible_paths = config.resolve_view_path(&view_name);
 
-                        // Check if ANY of the possible paths exist
-                        let exists = possible_paths.iter().any(|p| p.exists());
+                        // Check if ANY of the possible paths exist. Containment
+                        // guard (issue #194, secondary): skip `.exists()`
+                        // filesystem probes on candidates that resolve outside
+                        // the project root, so an out-of-root namespace can't make
+                        // `@extends`/`@include` diagnostics stat-probe files
+                        // outside the project tree. Lexical containment keeps
+                        // not-yet-created in-root candidates — a genuinely missing
+                        // in-root view still reports "not found" — while refusing
+                        // out-of-root paths without probing them.
+                        let exists = possible_paths
+                            .iter()
+                            .filter(|p| path_within_root_lexical(p, &config.root))
+                            .any(|p| p.exists());
 
                         if !exists {
                             // Use the first path for the diagnostic message

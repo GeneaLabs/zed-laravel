@@ -19,6 +19,7 @@ mod folio_rename;
 mod generic_type_parsing;
 mod helper_identifier_hover;
 mod livewire_component_resolution;
+mod livewire_tag_navigation_containment;
 mod loop_variable_resolution;
 mod rename_integration;
 mod route_binding_resolution;
