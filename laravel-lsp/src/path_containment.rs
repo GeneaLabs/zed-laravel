@@ -251,4 +251,93 @@ mod tests {
             "a dangling under-root symlink must be refused — the guard is fail-closed"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_admits_in_root_candidate_under_symlinked_root() {
+        // The macOS `/var`→`/private/var` symlinked-root tolerance (AC #2). When
+        // the root is given as a symlink but the candidate carries the *resolved*
+        // prefix, the only thing that admits it is the gate's `root.canonicalize()`
+        // leg (`:91-95`) — canonicalizing the *trusted root* is not an oracle. If
+        // that leg is ever dropped or inverted, in-root component goto-definition
+        // silently breaks on macOS while the rest of the suite stays green.
+        let tmp = TempDir::new().unwrap();
+        let real_root = tmp.path().join("real-project");
+        std::fs::create_dir_all(&real_root).unwrap();
+
+        // Build the candidate under the root's *canonical* (symlink-resolved) form,
+        // mirroring how macOS hands the LSP a `/private/var/...` candidate while the
+        // workspace root is the `/var/...` symlink.
+        let real_canonical = real_root.canonicalize().unwrap();
+        let views = real_canonical.join("resources").join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        let candidate = views.join("card.blade.php");
+        std::fs::write(&candidate, "{{ $x }}").unwrap();
+
+        // Root passed as a *symlink* pointing at the real root.
+        let symlink_root = tmp.path().join("link-project");
+        std::os::unix::fs::symlink(&real_root, &symlink_root).unwrap();
+
+        // Preconditions: the candidate is NOT lexically under the root as given —
+        // so the first `starts_with(root)` leg fails — yet the symlink root
+        // canonicalizes to the candidate's prefix, so only the
+        // `root.canonicalize()` leg can admit it.
+        assert!(
+            !candidate.starts_with(&symlink_root),
+            "candidate must not be lexically under the symlink root as given"
+        );
+        assert_eq!(
+            symlink_root.canonicalize().unwrap(),
+            real_canonical,
+            "the symlink root must canonicalize to the real root"
+        );
+
+        assert!(
+            path_within_root_lexical(&candidate, &symlink_root),
+            "an in-root candidate under a symlinked root must be admitted via the root-canonicalize leg"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_refuses_in_root_symlink_escaping_the_root() {
+        // AC #2's "no containment downgrade" (#55/#134): a symlink whose *link
+        // path* is lexically inside the root but whose target resolves OUTSIDE it
+        // must still be refused by the lexical guard. The lexical gate admits the
+        // link path, but the candidate-canonicalize step
+        // (`canonical_containment`, `:103`) catches the escape — this asserts that
+        // directly on `path_within_root_lexical`, not just on the fail-closed
+        // `path_within_root`.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A real file OUTSIDE the root.
+        let outside_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let secret = outside_dir.join("secret.blade.php");
+        std::fs::write(&secret, "{{ $x }}").unwrap();
+
+        // An under-root symlink whose target escapes the root.
+        let escaping_link = root.join("escape.blade.php");
+        std::os::unix::fs::symlink(&secret, &escaping_link).unwrap();
+
+        // Preconditions: the link path is lexically inside the root (it passes the
+        // lexical gate), but it canonicalizes to a path outside the root.
+        assert!(
+            escaping_link.starts_with(&root),
+            "the link path is lexically inside the root"
+        );
+        let link_target = escaping_link.canonicalize().unwrap();
+        let real_root = root.canonicalize().unwrap();
+        assert!(
+            !link_target.starts_with(&real_root),
+            "the link's real target escapes the root"
+        );
+
+        assert!(
+            !path_within_root_lexical(&escaping_link, &root),
+            "an in-root symlink whose target escapes the root must be refused — no containment downgrade"
+        );
+    }
 }
