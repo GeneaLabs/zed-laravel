@@ -6,6 +6,7 @@ mod blade_var_rename_handler;
 mod cast_type_context;
 mod class_locator_and_properties;
 mod code_lens_opt_in;
+mod component_file_navigation_containment;
 mod component_navigation_containment;
 mod diagnostic_severity;
 mod directive_navigation_containment;

@@ -18402,9 +18402,23 @@ return [
     async fn resolve_component_file(&self, name: &str) -> Option<PathBuf> {
         let config = self.get_cached_config().await?;
         for path in config.resolve_component_path(name) {
-            if self.file_exists_cached(&path).await {
-                return Some(path);
+            if !self.file_exists_cached(&path).await {
+                continue;
             }
+            // Containment guard (issue #199) — the next sibling in the
+            // #130 → #143 → #148 → #194 containment-guard chain, whose invariant
+            // is that the fail-closed `path_within_root` check holds *uniformly*
+            // on every FS-touching resolution path. `resolve_component_path`
+            // already drops out-of-root candidates with the *lexical*
+            // `path_within_root_lexical` filter, so this is defense-in-depth: it
+            // re-checks containment with the same fail-closed guard the sibling
+            // `resolve_component_existing_file` (`:13878`) applies, against the
+            // same `config.root`. `continue` so a later in-root candidate can
+            // still resolve.
+            if !path_within_root(&path, &config.root) {
+                continue;
+            }
+            return Some(path);
         }
         None
     }
