@@ -3,6 +3,7 @@ mod asset_path_resolution;
 mod blade_component_context;
 mod blade_directive_context;
 mod blade_var_rename_handler;
+mod byte_offset_panic_hardening;
 mod cast_type_context;
 mod class_locator_and_properties;
 mod code_lens_opt_in;

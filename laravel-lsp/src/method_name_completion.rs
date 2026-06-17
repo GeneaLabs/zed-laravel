@@ -85,7 +85,11 @@ pub enum MethodNameContext {
 /// support both bare names (`User`), namespaced names (`App\Models\User`),
 /// and leading-backslash FQCNs (`\App\Models\User`).
 pub fn detect_method_name_position(line: &str, cursor_col: usize) -> Option<MethodNameContext> {
-    if cursor_col > line.len() {
+    // `cursor_col` arrives as a raw `position.character` byte index from the
+    // handler. Reject an out-of-range or mid-codepoint index so the slice
+    // below can't `panic!` on a line containing a multibyte char (issue #182),
+    // mirroring the `is_char_boundary` guard the alpine context helpers use.
+    if cursor_col > line.len() || !line.is_char_boundary(cursor_col) {
         return None;
     }
     let before = &line[..cursor_col];

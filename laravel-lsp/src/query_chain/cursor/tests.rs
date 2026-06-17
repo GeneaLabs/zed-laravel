@@ -303,6 +303,48 @@ fn position_beyond_eof_returns_none() {
     assert!(position_to_byte_offset(content, 5, 0).is_none());
 }
 
+// ---- char_col_to_byte_offset ------------------------------------------
+
+#[test]
+fn char_col_ascii_is_identity() {
+    // On a pure-ASCII line the byte offset equals the column.
+    let line = "config('app')";
+    assert_eq!(char_col_to_byte_offset(line, 0), 0);
+    assert_eq!(char_col_to_byte_offset(line, 8), 8);
+    assert_eq!(char_col_to_byte_offset(line, line.len()), line.len());
+}
+
+#[test]
+fn char_col_accent_maps_past_two_byte_char() {
+    // `é` is two UTF-8 bytes, so columns after it map to a larger byte offset.
+    // Line: c a f é ' )  → columns 0..6, bytes: é occupies bytes 3..5.
+    let line = "café')";
+    assert_eq!(char_col_to_byte_offset(line, 3), 3); // start of `é`
+    assert_eq!(char_col_to_byte_offset(line, 4), 5); // after `é` (the `'`)
+    assert_eq!(char_col_to_byte_offset(line, 5), 6); // the `)`
+                                                     // Every result is a valid char boundary — slicing must not panic.
+    assert!(line.is_char_boundary(char_col_to_byte_offset(line, 4)));
+}
+
+#[test]
+fn char_col_emoji_maps_past_four_byte_char() {
+    // `🎉` is four UTF-8 bytes. A column landing right after it must resolve to
+    // a boundary, not the mid-codepoint byte that `character as usize` produced.
+    let line = "@if 🎉 x";
+    let after_emoji = char_col_to_byte_offset(line, 5); // `@if ` (4) + `🎉` (1) = col 5
+    assert_eq!(after_emoji, "@if 🎉".len());
+    assert!(line.is_char_boundary(after_emoji));
+    // Slicing at the returned offset is panic-safe.
+    assert_eq!(&line[..after_emoji], "@if 🎉");
+}
+
+#[test]
+fn char_col_beyond_line_end_clamps_to_len() {
+    let line = "café"; // 4 chars, 5 bytes
+    assert_eq!(char_col_to_byte_offset(line, 99), line.len());
+    assert!(line.is_char_boundary(char_col_to_byte_offset(line, 99)));
+}
+
 // ---- detect_chain_context_at: DB::table ----------------------------------
 
 #[test]

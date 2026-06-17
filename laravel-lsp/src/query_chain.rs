@@ -30,9 +30,10 @@ pub mod var_type;
 
 pub use chain::*;
 pub use cursor::{
-    byte_offset_to_position, chain_context_for_link, detect_chain_context_at,
-    detect_chain_context_at_diagnostic, detect_chain_target_at, fixup_for_completion,
-    position_to_byte_offset, ChainResolveFailure, ChainTarget, CompletionPrep,
+    byte_offset_to_position, chain_context_for_link, char_col_to_byte_offset,
+    detect_chain_context_at, detect_chain_context_at_diagnostic, detect_chain_target_at,
+    fixup_for_completion, position_to_byte_offset, ChainResolveFailure, ChainTarget,
+    CompletionPrep,
 };
 pub use diagnostics::chain_diagnostics;
 pub use extractor::extract_chains;

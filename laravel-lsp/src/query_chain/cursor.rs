@@ -220,6 +220,25 @@ pub fn position_to_byte_offset(content: &str, line: u32, character: u32) -> Opti
     Some(line_start + byte_in_line)
 }
 
+/// Translate a line-local **code-point column** into a byte offset within
+/// `line`, by summing the UTF-8 length of each leading character. The returned
+/// offset is always a valid char boundary — so slicing `&line[..offset]` can
+/// never panic — and clamps to `line.len()` when `char_col` runs past the end
+/// of the line (`take` simply yields fewer characters).
+///
+/// This is the line-scoped companion to [`position_to_byte_offset`]: the
+/// `*_context` cursor helpers in `main.rs` already hold a single extracted line
+/// plus a column, so they route the column→offset conversion through here
+/// rather than re-deriving the line. Like `position_to_byte_offset`, `char_col`
+/// is treated as a Unicode code-point index (not a UTF-16 code unit or a raw
+/// byte). That's exact for ASCII Laravel source — the overwhelming common case
+/// — and, crucially, stays panic-safe on the rare line that does contain a
+/// multibyte character, where the old `character as usize` byte-slice could
+/// land mid-codepoint and `panic!`.
+pub fn char_col_to_byte_offset(line: &str, char_col: usize) -> usize {
+    line.chars().take(char_col).map(char::len_utf8).sum()
+}
+
 /// Inverse of [`position_to_byte_offset`]: translate a byte offset inside
 /// `content` into an LSP `Position` (0-based line + character). Characters are
 /// counted as Unicode code points, matching `position_to_byte_offset` — so a
