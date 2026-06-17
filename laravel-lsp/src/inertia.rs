@@ -37,13 +37,13 @@ pub fn pages_dir(root: &Path) -> PathBuf {
 /// Defense-in-depth mirroring [`crate::salsa_impl::LaravelConfigData::resolve_component_path`]:
 /// the name comes straight from a string literal in source, and the
 /// page→path mapping below would otherwise let a crafted name escape the
-/// pages directory. We reject a name that is:
-///   - empty                       → `inertia('')`
-///   - starts with `/`             → absolute path (`PathBuf::join` would
-///                                    discard the receiver)
-///   - starts with `.`             → leading-dot / `../` traversal
-///   - contains a path component   → any segment that is `.`/`..` or an
-///     that traverses                 absolute Windows-style drive prefix
+/// pages directory. We reject a name that:
+///   - is empty (`inertia('')`);
+///   - starts with `/` — an absolute path, where `PathBuf::join` would
+///     discard the receiver;
+///   - starts with `.` — a leading-dot / `../` traversal;
+///   - contains a traversing `/`-segment — any segment that is `.`, `..`,
+///     empty, or an absolute Windows-style drive prefix.
 ///
 /// A backstop root-containment filter still runs on the built candidates, but
 /// rejecting up front keeps us from ever constructing an out-of-root path.
@@ -82,11 +82,7 @@ pub fn resolve_page_candidates(root: &Path, page: &str) -> Vec<PathBuf> {
 /// [`PAGE_EXTENSIONS`] priority order, except that — when `dominant` is set and
 /// that file exists — the dominant project extension is preferred (AC: "if
 /// multiple extensions match the same page, prefer the dominant one").
-pub fn resolve_existing_page(
-    root: &Path,
-    page: &str,
-    dominant: Option<&str>,
-) -> Option<PathBuf> {
+pub fn resolve_existing_page(root: &Path, page: &str, dominant: Option<&str>) -> Option<PathBuf> {
     let candidates = resolve_page_candidates(root, page);
     if candidates.is_empty() {
         return None;
@@ -134,8 +130,8 @@ pub fn detect_dominant_extension(root: &Path) -> Option<String> {
         .max_by_key(|(ext, n)| {
             // Higher count wins; on a tie, the earlier priority extension wins
             // (lower index → higher rank).
-            let rank = PAGE_EXTENSIONS.len()
-                - PAGE_EXTENSIONS.iter().position(|e| e == ext).unwrap();
+            let rank =
+                PAGE_EXTENSIONS.len() - PAGE_EXTENSIONS.iter().position(|e| e == ext).unwrap();
             (*n, rank)
         })
         .map(|(ext, _)| ext.to_string())

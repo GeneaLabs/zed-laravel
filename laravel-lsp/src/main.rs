@@ -8170,6 +8170,108 @@ impl LaravelLanguageServer {
         })
     }
 
+    /// Check if the cursor sits inside the page-name string of an Inertia call
+    /// (issue #10) and, if so, return the partial page name plus the text range
+    /// to replace. Mirrors [`Self::get_view_call_context`] but for Inertia's
+    /// three call sites:
+    ///
+    /// - `inertia('Page')` — the helper function.
+    /// - `Inertia::render('Page', $props)` — the facade. The `rfind` also
+    ///   catches the fully-qualified `\Inertia\Inertia::render('Page')` form,
+    ///   since that string ends with `Inertia::render(`.
+    /// - `Route::inertia('/path', 'Page')` — the page name is the *second*
+    ///   argument (after the URI), handled specially like `Route::view`.
+    fn get_inertia_call_context(line_text: &str, character: u32) -> Option<StringContext> {
+        let cursor = character as usize;
+        if cursor > line_text.len() {
+            return None;
+        }
+
+        let before_cursor = &line_text[..cursor];
+
+        let mut matches: Vec<(usize, char, usize)> = Vec::new();
+
+        // Facade: Inertia::render('Page' | "Page" — the page is the first
+        // argument and the class name is explicit, so a plain rfind suffices.
+        // (pattern_string, quote_char, pattern_length-including-quote)
+        for (pattern, quote, len) in [
+            ("Inertia::render('", '\'', 17),
+            ("Inertia::render(\"", '"', 17),
+        ] {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                matches.push((pos, quote, len));
+            }
+        }
+
+        // Helper: inertia('Page' | "Page". The literal `inertia(` is also a
+        // substring of `Route::inertia(` — whose page name is the *second*
+        // argument, handled separately below — so guard against matching that
+        // method call (and any `…inertia(` identifier) by requiring the char
+        // before `inertia` not to be part of a `::`/identifier. A real global
+        // helper call sits at line start or after a non-identifier delimiter.
+        for (pattern, quote, len) in [("inertia('", '\'', 9), ("inertia(\"", '"', 9)] {
+            if let Some(pos) = before_cursor.rfind(pattern) {
+                let is_global_helper = match pos.checked_sub(1) {
+                    None => true,
+                    Some(i) => {
+                        let prev = before_cursor.as_bytes()[i];
+                        prev != b':' && prev != b'_' && !prev.is_ascii_alphanumeric()
+                    }
+                };
+                if is_global_helper {
+                    matches.push((pos, quote, len));
+                }
+            }
+        }
+
+        // Route::inertia('/path', 'Page') — the page name is the second
+        // argument. Same shape as the Route::view handling above.
+        if let Some(route_pos) = before_cursor.rfind("Route::inertia(") {
+            let after_route = &before_cursor[route_pos + 15..];
+            if let Some(comma_pos) = after_route.find(',') {
+                let after_comma = &after_route[comma_pos + 1..];
+                let trimmed = after_comma.trim_start();
+                if let Some(first_char) = trimmed.chars().next() {
+                    if first_char == '\'' || first_char == '"' {
+                        let quote_char = first_char;
+                        let quote_pos_in_after_comma = after_comma.find(quote_char).unwrap();
+                        let start = route_pos + 15 + comma_pos + 1 + quote_pos_in_after_comma + 1;
+                        if start <= cursor {
+                            let content = &before_cursor[start..];
+                            if !content.contains(quote_char) {
+                                matches.push((start - 1, quote_char, 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return None;
+        }
+
+        // Closest match to the cursor wins.
+        let (pos, quote_char, pattern_len) = matches.into_iter().max_by_key(|(p, _, _)| *p)?;
+
+        let start_pos = pos + pattern_len;
+
+        // Bail if the string already closed before the cursor.
+        let after_pattern = &before_cursor[start_pos..];
+        if after_pattern.contains(quote_char) {
+            return None;
+        }
+
+        let end_col = Self::find_string_end(line_text, start_pos, quote_char);
+
+        Some(StringContext {
+            prefix: after_pattern.to_string(),
+            start_col: start_pos as u32,
+            end_col,
+            quote_char,
+        })
+    }
+
     /// Check if cursor is inside a Blade component tag like `<x-...`
     /// Returns context with the partial component name and position info for text replacement
     ///
@@ -12373,6 +12475,18 @@ impl LaravelLanguageServer {
         // Sort by name for consistent ordering
         completions.sort_by(|a, b| a.name.cmp(&b.name));
         completions
+    }
+
+    /// Every Inertia page under `resources/js/Pages/`, as `/`-nested page names
+    /// without extension (issue #10). Drives completion inside the three Inertia
+    /// call sites. Already sorted and de-duplicated by [`inertia::list_pages`].
+    async fn get_all_inertia_pages(&self) -> Vec<String> {
+        use laravel_lsp::inertia;
+        let root = match self.root_path.read().await.clone() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        inertia::list_pages(&root)
     }
 
     /// Get all Blade component names from component directories for autocomplete
@@ -20902,12 +21016,16 @@ impl LanguageServer for LaravelLanguageServer {
             }
             PatternAtPosition::Inertia(page) => {
                 debug!("Laravel: Found Inertia page: {}", page.name);
-                let path = self.resolve_inertia_file(&page.name).await?;
-                let uri = Url::from_file_path(&path).ok()?;
-                Some(GotoDefinitionResponse::Scalar(Location {
-                    uri,
-                    range: Range::default(),
-                }))
+                self.resolve_inertia_file(&page.name)
+                    .await
+                    .and_then(|path| {
+                        Url::from_file_path(&path).ok().map(|uri| {
+                            GotoDefinitionResponse::Scalar(Location {
+                                uri,
+                                range: Range::default(),
+                            })
+                        })
+                    })
             }
             PatternAtPosition::Component(comp) => {
                 debug!("Laravel: Found component: {}", comp.name);
@@ -23049,6 +23167,62 @@ impl LanguageServer for LaravelLanguageServer {
                     .collect();
 
                 debug!("   Returning {} view completion items", items.len());
+
+                return if items.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })))
+                };
+            }
+
+            // Check for Inertia page context: inertia('…'), Inertia::render('…'),
+            // or Route::inertia('/path', '…') (issue #10). Lists every page under
+            // resources/js/Pages/ without extension, filtered by the partial.
+            if let Some(inertia_ctx) = Self::get_inertia_call_context(line_text, position.character)
+            {
+                debug!(
+                    "   Inertia context, filter prefix: '{}'",
+                    inertia_ctx.prefix
+                );
+
+                let pages = self.get_all_inertia_pages().await;
+
+                let prefix_lower = inertia_ctx.prefix.to_lowercase();
+                let items: Vec<CompletionItem> = pages
+                    .into_iter()
+                    .filter(|p| p.to_lowercase().starts_with(&prefix_lower))
+                    .map(|page| CompletionItem {
+                        label: page.clone(),
+                        kind: Some(CompletionItemKind::FILE),
+                        detail: Some(format!("{}/{}", laravel_lsp::inertia::PAGES_DIR, page)),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(&page)
+                                .summary("Inertia.js page.")
+                                .section(format!("Under: {}/", laravel_lsp::inertia::PAGES_DIR))
+                                .into_documentation(),
+                        ),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: inertia_ctx.start_col,
+                                },
+                                end: Position {
+                                    line: position.line,
+                                    character: inertia_ctx.end_col,
+                                },
+                            },
+                            new_text: page.clone(),
+                        })),
+                        ..Default::default()
+                    })
+                    .collect();
+
+                debug!("   Returning {} Inertia completion items", items.len());
 
                 return if items.is_empty() {
                     Ok(None)

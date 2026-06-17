@@ -8,6 +8,7 @@ mod call_site_variants;
 mod column_positions;
 mod extraction_performance;
 mod feature_pattern_extraction;
+mod inertia_extraction;
 mod interpolated_strings;
 mod member_access_extraction;
 mod middleware_extraction;
