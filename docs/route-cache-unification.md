@@ -161,7 +161,9 @@ error in the bulk-index cost but are the *only* files that need rename/outline.
 The two strategies **both surface resources** — the original issue's "outline
 omits resources" premise was wrong (confirmed in code: `route_chain.rs`
 `ROUTE_VERBS` includes `"resource"`/`"apiResource"`, and `route_outline.rs`
-folds them into a `RESOURCE` leaf). The real difference is **granularity**:
+folds each into a resource-type leaf (`RESOURCE` / `APIRESOURCE`) — the verb is
+upper-cased verbatim, so `apiResource` surfaces as `APIRESOURCE`, not `RESOURCE`).
+The real difference is **granularity**:
 
 ```
 == Route::resource granularity (AC#4) ==
