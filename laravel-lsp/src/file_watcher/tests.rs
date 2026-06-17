@@ -132,11 +132,38 @@ fn registration_options_round_trip_through_serde() {
         "must have at least one watcher"
     );
 
-    // We constructed exactly 1 (controllers) + 1 (routes) + 2 (view
-    // blade + php) + 1 (livewire) + 2 (vendor php + blade) + 1 (migrations)
-    // = 8 watchers. If the construction changes, this assertion will
-    // flag it for review.
-    assert_eq!(parsed.watchers.len(), 8);
+    // We constructed exactly 1 (controllers) + 1 (routes) + 1 (migrations)
+    // + 2 (view blade + php) + 1 (livewire) + 2 (vendor php + blade)
+    // + 4 (Inertia page extensions: vue/tsx/jsx/svelte) = 12 watchers. If the
+    // construction changes, this assertion will flag it for review.
+    assert_eq!(parsed.watchers.len(), 12);
+}
+
+#[test]
+fn watchers_include_inertia_page_globs() {
+    // Inertia "views" live under resources/js/Pages/ as JS/TS files (issue
+    // #10) — one watcher glob per supported extension so external page
+    // create/delete invalidates the existence cache.
+    let root = PathBuf::from("/projects/laravel-app");
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None);
+
+    let globs: Vec<String> = watchers
+        .iter()
+        .map(|w| match &w.glob_pattern {
+            GlobPattern::String(s) => s.clone(),
+            GlobPattern::Relative(_) => unreachable!(),
+        })
+        .collect();
+
+    for ext in ["vue", "tsx", "jsx", "svelte"] {
+        let suffix = format!("*.{ext}");
+        assert!(
+            globs
+                .iter()
+                .any(|g| g.contains("resources/js/Pages") && g.ends_with(&suffix)),
+            "missing inertia {ext} glob: {globs:?}"
+        );
+    }
 }
 
 #[test]

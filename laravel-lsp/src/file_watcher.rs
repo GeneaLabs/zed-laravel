@@ -79,7 +79,9 @@ pub fn build_watchers(
     // could leave it None; we pass it explicitly for clarity.
     let kind = Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete);
 
-    let mut watchers = Vec::with_capacity(4 + view_paths.len());
+    // 5 fixed (controllers, routes, migrations, vendor php + blade) + 4 Inertia
+    // page-extension globs + 1 optional livewire + 2 per view path.
+    let mut watchers = Vec::with_capacity(10 + 2 * view_paths.len());
 
     // Controllers — current default path. If a project moves them, we
     // miss those changes until a future improvement makes this glob
@@ -146,6 +148,21 @@ pub fn build_watchers(
         glob_pattern: GlobPattern::String(format!("{}/vendor/**/*.blade.php", root.display())),
         kind,
     });
+
+    // Inertia page files (issue #10). Inertia "views" are JS/TS files under
+    // `resources/js/Pages/`, not Blade — so a page created/deleted outside the
+    // editor (a `git pull`, another tool) must invalidate the file-existence
+    // cache event-driven, not just when the 5-second TTL lapses. One glob per
+    // supported extension: Zed's matcher doesn't reliably expand brace
+    // alternation (`{vue,tsx,...}`), and per-extension mirrors the explicit
+    // blade/php pairing above.
+    let pages_dir = crate::inertia::pages_dir(root);
+    for ext in crate::inertia::PAGE_EXTENSIONS {
+        watchers.push(FileSystemWatcher {
+            glob_pattern: GlobPattern::String(format!("{}/**/*.{}", pages_dir.display(), ext)),
+            kind,
+        });
+    }
 
     watchers
 }

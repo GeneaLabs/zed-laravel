@@ -32,6 +32,19 @@ pub fn pages_dir(root: &Path) -> PathBuf {
     root.join(PAGES_DIR)
 }
 
+/// Whether a path is an Inertia page file: it sits under a `resources/js/Pages/`
+/// segment and carries a supported page extension ([`PAGE_EXTENSIONS`]). A
+/// lightweight, root-agnostic heuristic — mirroring the migration/command
+/// substring checks in the file-watcher — used to recognise page
+/// create/change/delete events so the file-existence cache can be invalidated
+/// eagerly instead of waiting out its TTL (issue #10).
+pub fn is_page_file(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    PAGE_EXTENSIONS.contains(&ext) && path.to_string_lossy().contains(&format!("{PAGES_DIR}/"))
+}
+
 /// Whether a captured page name is safe to turn into a filesystem path.
 ///
 /// Defense-in-depth mirroring [`crate::salsa_impl::LaravelConfigData::resolve_component_path`]:
@@ -298,6 +311,27 @@ mod tests {
         assert!(page_create_path(root, "New/Page", None)
             .unwrap()
             .ends_with("resources/js/Pages/New/Page.vue"));
+    }
+
+    #[test]
+    fn recognises_page_files_by_dir_and_extension() {
+        // Under the pages dir with a supported extension → a page file.
+        for ext in PAGE_EXTENSIONS {
+            let p = PathBuf::from(format!("/app/resources/js/Pages/Auth/Login.{ext}"));
+            assert!(is_page_file(&p), "should recognise .{ext} page");
+        }
+        // Wrong directory, or unsupported extension → not a page file.
+        assert!(!is_page_file(Path::new(
+            "/app/resources/js/Pages/readme.md"
+        )));
+        assert!(!is_page_file(Path::new(
+            "/app/resources/views/home.blade.php"
+        )));
+        assert!(!is_page_file(Path::new(
+            "/app/resources/js/components/Btn.vue"
+        )));
+        // No extension at all.
+        assert!(!is_page_file(Path::new("/app/resources/js/Pages/Login")));
     }
 
     #[test]
