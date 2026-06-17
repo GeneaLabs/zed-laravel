@@ -3755,6 +3755,17 @@ impl LaravelLanguageServer {
         use laravel_lsp::query_chain::{extract_use_aliases, resolve_class_name};
 
         // 1. Cursor at a static-receiver position?
+        //
+        // `cursor_col` is the LSP `position.character` — a Unicode code-point
+        // column, not a byte offset. Convert it to a byte offset (always a
+        // valid char boundary, clamped at line length) before handing it to
+        // `detect_method_name_position`, which slices `&line[..cursor_col]`. On
+        // a line with a multibyte char before the cursor the column and the
+        // byte offset diverge, so passing the raw column would slice the wrong
+        // receiver or mis-fire the boundary guard (issue #182) — the same bug
+        // the `*_context` helpers route through `char_col_to_byte_offset` to
+        // avoid.
+        let cursor_col = char_col_to_byte_offset(line_text, cursor_col);
         let receiver = match detect_method_name_position(line_text, cursor_col)? {
             MethodNameContext::Static { receiver } => receiver,
             // Instance position — Eloquent\Builder's @mixin makes the
