@@ -28,6 +28,7 @@ use laravel_lsp::config::find_project_root;
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
 use laravel_lsp::migration_index::{build_migration_index, MigrationIndex};
 use laravel_lsp::path_containment::{path_within_root, path_within_root_lexical};
+use laravel_lsp::query_chain::cursor::char_col_to_byte_offset;
 use laravel_lsp::route_discovery::{
     build_route_index, discover_route_files, normalize_path, RouteIndex,
 };
@@ -3794,6 +3795,17 @@ impl LaravelLanguageServer {
         use laravel_lsp::query_chain::{extract_use_aliases, resolve_class_name};
 
         // 1. Cursor at a static-receiver position?
+        //
+        // `cursor_col` is the LSP `position.character` — a Unicode code-point
+        // column, not a byte offset. Convert it to a byte offset (always a
+        // valid char boundary, clamped at line length) before handing it to
+        // `detect_method_name_position`, which slices `&line[..cursor_col]`. On
+        // a line with a multibyte char before the cursor the column and the
+        // byte offset diverge, so passing the raw column would slice the wrong
+        // receiver or mis-fire the boundary guard (issue #182) — the same bug
+        // the `*_context` helpers route through `char_col_to_byte_offset` to
+        // avoid.
+        let cursor_col = char_col_to_byte_offset(line_text, cursor_col);
         let receiver = match detect_method_name_position(line_text, cursor_col)? {
             MethodNameContext::Static { receiver } => receiver,
             // Instance position — Eloquent\Builder's @mixin makes the
@@ -7581,10 +7593,7 @@ impl LaravelLanguageServer {
     ///
     /// Example: `env('APP_` with cursor at end returns Some(StringContext{prefix: "APP_", ...})
     fn get_env_call_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -7628,10 +7637,7 @@ impl LaravelLanguageServer {
     ///
     /// Example: `NEW_VAR=${APP` with cursor at end returns context with prefix="APP"
     fn get_env_interpolation_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -7664,10 +7670,7 @@ impl LaravelLanguageServer {
     ///
     /// Example: `<env name="APP_` with cursor at end returns context with prefix="APP_"
     fn get_phpunit_env_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -7714,10 +7717,7 @@ impl LaravelLanguageServer {
     /// - `Config::get('db.` returns Some("db.")
     /// - `Config::string('app.` returns Some("app.")
     fn get_config_call_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -7820,10 +7820,7 @@ impl LaravelLanguageServer {
     /// - `to_route('admin.` returns Some("admin.")
     /// - `redirect()->route('` returns Some("")
     fn get_route_call_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -7913,10 +7910,7 @@ impl LaravelLanguageServer {
         character: u32,
         previous_lines: Option<&[&str]>,
     ) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -8070,10 +8064,7 @@ impl LaravelLanguageServer {
     /// - `view('users.` returns Some(StringContext{prefix: "users.", ...})
     /// - `View::make('admin.` returns Some(StringContext{prefix: "admin.", ...})
     fn get_view_call_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -8289,10 +8280,7 @@ impl LaravelLanguageServer {
     ///   components (anonymous or class-based) are completed too, so `:` is a
     ///   valid character in the partial name.
     fn get_blade_component_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -8346,10 +8334,7 @@ impl LaravelLanguageServer {
     /// (for filtering completions), or `None` when the cursor is past the name
     /// (hit a space, `>`, or `/`).
     fn get_flux_component_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -8397,10 +8382,7 @@ impl LaravelLanguageServer {
         line_text: &str,
         character: u32,
     ) -> Option<(String, StringContext)> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
         let before_cursor = &line_text[..cursor];
 
         let pos = before_cursor.rfind("<flux:")?;
@@ -8485,10 +8467,7 @@ impl LaravelLanguageServer {
             static ref SLOT_NAME_ATTR_RE: Regex = Regex::new(r#"\bname\s*=\s*("|')"#).unwrap();
         }
 
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
         let before_cursor = &line_text[..cursor];
 
         // ── `<flux:slot name="│">` value form ──────────────────────────────
@@ -8669,10 +8648,7 @@ impl LaravelLanguageServer {
     /// - `<livewire:user-` returns Some("user-")
     /// - `@livewire('user-` returns Some("user-")
     fn get_livewire_component_context(line_text: &str, character: u32) -> Option<String> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -8736,10 +8712,7 @@ impl LaravelLanguageServer {
     /// - `asset('css/` returns Some(StringContext{prefix: "css/", ...})
     /// - `asset('images/logo` returns Some(StringContext{prefix: "images/logo", ...})
     fn get_asset_call_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -8773,10 +8746,7 @@ impl LaravelLanguageServer {
     /// - `@vite('` returns Some(StringContext{prefix: "", ...})
     /// - `@vite('resources/js/` returns Some(StringContext{prefix: "resources/js/", ...})
     fn get_vite_call_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -8861,10 +8831,7 @@ impl LaravelLanguageServer {
     /// - `storage_path('logs/` returns Some(("storage_path", "logs/"))
     /// - `base_path('config/` returns Some(("base_path", "config/"))
     fn get_path_helper_context(line_text: &str, character: u32) -> Option<(&'static str, String)> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -8911,10 +8878,7 @@ impl LaravelLanguageServer {
     /// - `app('cache` returns Some(StringContext{prefix: "cache", ...})
     /// - `resolve('log` returns Some(StringContext{prefix: "log", ...})
     fn get_binding_call_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -8956,10 +8920,7 @@ impl LaravelLanguageServer {
     /// - `Feature::active('new` returns Some(StringContext{prefix: "new", ...})
     /// - `Feature::for($user)->active('beta` returns Some(StringContext{prefix: "beta", ...})
     fn get_feature_call_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -9092,10 +9053,7 @@ impl LaravelLanguageServer {
         character: u32,
         file_content: &str,
     ) -> Option<(String, String)> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -9560,8 +9518,8 @@ impl LaravelLanguageServer {
     /// Returns the prefix they've typed (without $) if in variable name context
     /// Returns None if they're in `$var->` context (property access)
     fn get_variable_name_context(line_text: &str, cursor_col: u32) -> Option<String> {
-        let cursor = cursor_col as usize;
-        if cursor == 0 || cursor > line_text.len() {
+        let cursor = char_col_to_byte_offset(line_text, cursor_col as usize);
+        if cursor == 0 {
             return None;
         }
 
@@ -9615,8 +9573,8 @@ impl LaravelLanguageServer {
     /// Detect if user is typing a Blade directive (e.g., `@if`, `@foreach`)
     /// Returns the partial directive name typed so far (e.g., "fo" for "@fo|")
     fn get_blade_directive_context(line_text: &str, cursor_col: u32) -> Option<String> {
-        let cursor = cursor_col as usize;
-        if cursor == 0 || cursor > line_text.len() {
+        let cursor = char_col_to_byte_offset(line_text, cursor_col as usize);
+        if cursor == 0 {
             return None;
         }
 
@@ -11122,10 +11080,7 @@ impl LaravelLanguageServer {
     /// - `trans('auth.` returns Some(StringContext{prefix: "auth.", ...})
     /// - `Lang::get('` returns Some(StringContext{prefix: "", ...})
     fn get_translation_call_context(line_text: &str, character: u32) -> Option<StringContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -11205,15 +11160,7 @@ impl LaravelLanguageServer {
         surrounding_lines: &[&str],
         cached_rules: &[String],
     ) -> Option<ValidationParamContext> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            info!(
-                "      ⚠️  Cursor {} > line length {}",
-                cursor,
-                line_text.len()
-            );
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
         info!("      📍 before_cursor: '{}'", before_cursor);
@@ -12026,10 +11973,7 @@ impl LaravelLanguageServer {
         surrounding_lines: &[&str],
         cached_rules: &[String],
     ) -> Option<String> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -12171,10 +12115,7 @@ impl LaravelLanguageServer {
         character: u32,
         surrounding_lines: &[&str],
     ) -> Option<String> {
-        let cursor = character as usize;
-        if cursor > line_text.len() {
-            return None;
-        }
+        let cursor = char_col_to_byte_offset(line_text, character as usize);
 
         let before_cursor = &line_text[..cursor];
 
@@ -22889,8 +22830,16 @@ impl LanguageServer for LaravelLanguageServer {
                     // Blade directive and an Alpine event, so the merge dedups by
                     // name (`mergeable_events`): the Blade directive wins and its
                     // event twin is dropped, leaving exactly one entry (AC5).
+                    // Derive the `@` byte offset from a char-boundary-correct
+                    // cursor: convert the code-point column to a byte offset
+                    // first, then step back over the typed prefix + the `@`
+                    // itself. Treating `position.character` as a raw byte offset
+                    // (the old math) lands mid-codepoint on a line with any
+                    // multibyte char and makes `at_attribute_position`'s slicing
+                    // panic-prone (issue #182).
                     if let Some(at_byte) =
-                        (position.character as usize).checked_sub(directive_prefix.len() + 1)
+                        char_col_to_byte_offset(line_text, position.character as usize)
+                            .checked_sub(directive_prefix.len() + 1)
                     {
                         if laravel_lsp::alpine::at_attribute_position(line_text, at_byte) {
                             // Names already offered as Blade directives (those that
@@ -22937,12 +22886,12 @@ impl LanguageServer for LaravelLanguageServer {
                 }
 
                 // Check for Blade bracket context - show all options after first {
-                let cursor_col = position.character as usize;
-                let text_before = if cursor_col <= line_text.len() {
-                    &line_text[..cursor_col]
-                } else {
-                    line_text
-                };
+                // `char_col_to_byte_offset` lands on a char boundary and clamps
+                // to the line length, so the slice is panic-safe even when the
+                // line holds a multibyte char (issue #182) — no separate
+                // bounds branch needed.
+                let cursor_col = char_col_to_byte_offset(line_text, position.character as usize);
+                let text_before = &line_text[..cursor_col];
 
                 // Check if we're in a Blade bracket context (starts with {)
                 // Find what the user has typed so far
