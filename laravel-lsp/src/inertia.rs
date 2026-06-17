@@ -66,10 +66,12 @@ pub fn is_valid_page_name(page: &str) -> bool {
     }
     // Reject any traversal or absolute segment. Inertia page names are simple
     // `/`-nested identifiers; a `..` or empty segment never appears in a real
-    // one and is how a literal smuggles a traversal past the join.
+    // one and is how a literal smuggles a traversal past the join. A `:` in a
+    // segment is a Windows drive prefix (`C:`), likewise absent from a real
+    // page name — reject it so the code matches the documented invariant.
     !page
         .split('/')
-        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        .any(|seg| seg.is_empty() || seg == "." || seg == ".." || seg.contains(':'))
 }
 
 /// Build the candidate file paths for an Inertia page name, in resolution
@@ -338,7 +340,17 @@ mod tests {
     fn rejects_traversing_page_names() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        for bad in ["", "/etc/passwd", "../secret", "..", "a/../../b", "./x"] {
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../secret",
+            "..",
+            "a/../../b",
+            "./x",
+            "C:",
+            "C:/Windows",
+            "Auth/C:",
+        ] {
             assert!(!is_valid_page_name(bad), "should reject {bad:?}");
             assert!(
                 resolve_page_candidates(root, bad).is_empty(),
