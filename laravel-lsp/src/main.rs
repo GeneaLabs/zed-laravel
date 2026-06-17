@@ -18651,12 +18651,22 @@ fn is_in_routes_dir(root: Option<&Path>, path: &Path) -> bool {
 /// secondary) runs *before* the `.exists()` probe, so an out-of-root
 /// `loadViewsFrom`/namespace registration can never make the view-diagnostic
 /// loops stat-probe files outside the project tree — even one whose file
-/// happens to exist on disk is treated as absent. Lexical containment
-/// (`path_within_root_lexical`) is deliberate over the fail-closed
-/// `path_within_root`: it keeps not-yet-created **in-root** candidates so a
-/// genuinely missing in-root view still reports "View file not found", while
-/// still refusing interior-`..` escapes. Both the `view()` and
-/// `@extends`/`@include` diagnostic loops share this identical decision.
+/// happens to exist on disk is treated as absent.
+///
+/// Lexical containment (`path_within_root_lexical`) is used rather than the
+/// fail-closed `path_within_root` for **consistency** with the sibling
+/// candidate-path filter in `salsa_impl.rs` (issue #156), which must stay
+/// lexical because it returns the retained paths *for navigation* — there a
+/// fail-closed guard would wrongly drop speculative, not-yet-created in-root
+/// targets. For *this* helper's boolean result the two policies are
+/// **equivalent**: a missing in-root candidate yields `false` either way —
+/// lexical keeps it and `.exists()` returns `false`; fail-closed drops it from
+/// the filter and `.any()` runs over an empty set — so a genuinely missing
+/// in-root view still reports "View file not found" under both. The only
+/// practical difference is that lexical avoids a wasted `.exists()` stat on a
+/// missing in-root path (a side-effect, never the returned boolean). Both the
+/// `view()` and `@extends`/`@include` diagnostic loops share this identical
+/// decision.
 fn any_in_root_candidate_exists(candidates: &[PathBuf], root: &Path) -> bool {
     candidates
         .iter()

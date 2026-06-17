@@ -18,10 +18,18 @@
 //!
 //! These tests drive the shared helper directly (mirroring the
 //! `crate::is_in_routes_dir` style in `routes_dir_gate.rs` and the disk-backed
-//! containment cases in `view_navigation_containment.rs`), pinning the exact
-//! fork: out-of-root-but-exists is treated as missing, while a speculative
-//! in-root candidate is still probed so a genuinely missing in-root view keeps
-//! reporting "not found".
+//! containment cases in `view_navigation_containment.rs`), confirming the
+//! helper's behavior: an out-of-root candidate that exists on disk is treated
+//! as absent, while a speculative in-root candidate still reports "not found"
+//! (no false suppression of a genuinely missing view).
+//!
+//! Note the helper's boolean output is *equivalent* under lexical and
+//! fail-closed containment — a missing in-root candidate yields `false` either
+//! way (lexical keeps it and `.exists()` is `false`; fail-closed drops it so
+//! `.any()` runs over an empty set). The lexical choice is for consistency with
+//! the navigation-side filter (`salsa_impl.rs`, issue #156) and to avoid a
+//! wasted stat, *not* because it changes any of these outcomes — so these tests
+//! assert the helper's contract, not a distinction between the two policies.
 
 use crate::any_in_root_candidate_exists;
 use std::fs;
@@ -86,9 +94,11 @@ fn speculative_in_root_candidate_reports_missing() {
     // A not-yet-created in-root candidate (the everyday case: the developer
     // referenced a view they haven't built). Lexical containment keeps it — it
     // is *not* filtered out as an escape — so it is probed, found absent, and
-    // "View file not found" correctly fires. This proves the filter uses lexical
-    // (not fail-closed) containment: a fail-closed guard would drop every
-    // not-yet-created candidate and break the missing-view diagnostic entirely.
+    // "View file not found" correctly fires. (The fail-closed `path_within_root`
+    // would reach the same boolean: it drops the missing candidate so `.any()`
+    // runs over an empty set → also `false`. The two policies are equivalent
+    // here.) This case guards against a future filter that wrongly suppressed
+    // the diagnostic for a genuinely missing in-root view.
     let root = tempfile::TempDir::new().unwrap();
     let ghost = root.path().join("resources/views/ghost.blade.php");
 
@@ -98,8 +108,8 @@ fn speculative_in_root_candidate_reports_missing() {
     );
     assert!(
         !any_in_root_candidate_exists(&[ghost], root.path()),
-        "a missing in-root view must still report absent — lexical containment \
-         keeps speculative in-root candidates so the diagnostic still fires"
+        "a missing in-root view must still report absent — the containment \
+         filter must not suppress the diagnostic for a speculative in-root view"
     );
 }
 
