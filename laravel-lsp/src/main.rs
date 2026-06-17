@@ -2002,6 +2002,12 @@ struct LaravelLanguageServer {
     /// schedule call cancels the previous timer, so a burst of saves
     /// produces one disk write after the burst settles.
     magic_cache_save_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Dominant Inertia page extension (`vue` / `tsx` / `jsx` / `svelte`),
+    /// detected once at startup by counting files under `resources/js/Pages/`.
+    /// Used as the default for the "create page" code action and to break
+    /// ambiguous goto-definition resolution. `None` until detected (or when the
+    /// project has no Inertia pages). Issue #10.
+    inertia_default_ext: Arc<RwLock<Option<String>>>,
 }
 
 /// Default Salsa debounce delay in milliseconds
@@ -2119,6 +2125,9 @@ enum FileActionType {
     EnvVar,
     /// Laravel Pennant feature class
     Feature,
+    /// Inertia.js page file under resources/js/Pages/ (issue #10). The target
+    /// extension (`.vue`/`.tsx`/`.jsx`/`.svelte`) is carried on `target_path`.
+    InertiaPage,
 }
 
 /// Represents a file creation action parsed from a diagnostic
@@ -2143,7 +2152,21 @@ impl FileAction {
             None => return Vec::new(),
         };
 
-        if message.starts_with("View file not found") {
+        if message.starts_with("Inertia page not found") {
+            vec![FileAction {
+                action_type: FileActionType::InertiaPage,
+                name: LaravelLanguageServer::extract_name_from_diagnostic(
+                    message,
+                    "Inertia page not found: '",
+                    "'",
+                )
+                .unwrap_or("Page")
+                .to_string(),
+                target_path: PathBuf::from(target_path),
+                file_exists: false,
+                copy_from: None,
+            }]
+        } else if message.starts_with("View file not found") {
             vec![FileAction {
                 action_type: FileActionType::View,
                 name: LaravelLanguageServer::extract_name_from_diagnostic(
@@ -2359,6 +2382,17 @@ impl FileAction {
                 // Convert the feature key to PascalCase for the class name
                 let class_name = feature_key_to_class_name(&self.name);
                 format!("Create feature class: {}", class_name)
+            }
+            FileActionType::InertiaPage => {
+                // Name the framework after the target extension so the action
+                // reads "Create page (Vue / React / Svelte): <name>".
+                let framework = match self.target_path.extension().and_then(|e| e.to_str()) {
+                    Some("vue") => "Vue",
+                    Some("tsx") | Some("jsx") => "React",
+                    Some("svelte") => "Svelte",
+                    _ => "page",
+                };
+                format!("Create page ({}): {}", framework, self.name)
             }
         }
     }
@@ -3970,6 +4004,7 @@ impl LaravelLanguageServer {
                 laravel_lsp::view_var_index::ViewVarIndex::new(),
             )),
             magic_cache_save_handle: Arc::new(RwLock::new(None)),
+            inertia_default_ext: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -13262,6 +13297,7 @@ impl LaravelLanguageServer {
                 | FileActionType::ConfigPhp
                 | FileActionType::EnvVar
                 | FileActionType::BladeComponentWithClass
+                | FileActionType::InertiaPage
         ) {
             return Self::fallback_template(action);
         }
@@ -13297,7 +13333,8 @@ impl LaravelLanguageServer {
             | FileActionType::TranslationJson
             | FileActionType::ConfigPhp
             | FileActionType::EnvVar
-            | FileActionType::BladeComponentWithClass => {
+            | FileActionType::BladeComponentWithClass
+            | FileActionType::InertiaPage => {
                 return Self::fallback_template(action);
             }
         };
@@ -13447,6 +13484,23 @@ class {}
 "#,
                     class_name
                 )
+            }
+            FileActionType::InertiaPage => {
+                // Stub matches the target extension: a Single-File Component for
+                // Vue/Svelte, a minimal default-export component for React
+                // (.tsx/.jsx). The last path segment becomes the component name.
+                let component = action.name.rsplit('/').next().unwrap_or(&action.name);
+                match action.target_path.extension().and_then(|e| e.to_str()) {
+                    Some("vue") => {
+                        "<script setup lang=\"ts\">\n</script>\n\n<template>\n    <div></div>\n</template>\n".to_string()
+                    }
+                    Some("svelte") => "<script lang=\"ts\">\n</script>\n\n<div></div>\n".to_string(),
+                    // React (.tsx / .jsx) and any other extension.
+                    _ => format!(
+                        "export default function {}() {{\n    return <div></div>;\n}}\n",
+                        Self::kebab_to_pascal_case(component)
+                    ),
+                }
             }
             FileActionType::TranslationPhp => {
                 // For PHP files, the key is the nested key (e.g., "welcome" from "messages.welcome")
@@ -15640,6 +15694,7 @@ return [
             magic_deps: self.magic_deps.clone(),
             view_vars: self.view_vars.clone(),
             magic_cache_save_handle: self.magic_cache_save_handle.clone(),
+            inertia_default_ext: self.inertia_default_ext.clone(),
         }
     }
 
@@ -15985,6 +16040,53 @@ return [
                         data: None,
                     };
                     diagnostics.push(diagnostic);
+                }
+            }
+
+            // Check Inertia page references (issue #10). A page resolves to a
+            // JS/TS file under resources/js/Pages/; a missing one is always an
+            // ERROR. The "Expected at" path uses the dominant project extension
+            // so the create-page code action lands a file of the right type.
+            if !patterns.inertia_refs.is_empty() {
+                let dominant = self.inertia_dominant_extension().await;
+                for page_ref in &patterns.inertia_refs {
+                    if self.resolve_inertia_file(&page_ref.name).await.is_some() {
+                        continue;
+                    }
+                    let expected_path = laravel_lsp::inertia::page_create_path(
+                        &config.root,
+                        &page_ref.name,
+                        dominant.as_deref(),
+                    );
+                    // An invalid (traversing) page name yields no expected path;
+                    // skip it rather than emit an unactionable diagnostic.
+                    let Some(expected_path) = expected_path else {
+                        continue;
+                    };
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position {
+                                line: page_ref.line,
+                                character: page_ref.column,
+                            },
+                            end: Position {
+                                line: page_ref.line,
+                                character: page_ref.end_column,
+                            },
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        code: None,
+                        source: Some("laravel".to_string()),
+                        message: format!(
+                            "Inertia page not found: '{}'\nExpected at: {}",
+                            page_ref.name,
+                            expected_path.to_string_lossy()
+                        ),
+                        related_information: None,
+                        tags: None,
+                        code_description: None,
+                        data: None,
+                    });
                 }
             }
 
@@ -16992,6 +17094,7 @@ return [
         // all patterns and lives in `hover::render`.
         let rendered = match pattern {
             PatternAtPosition::View(view) => self.hover_for_view(&view.name).await,
+            PatternAtPosition::Inertia(page) => self.hover_for_inertia(&page.name).await,
             // Pass `comp.name` (bare, without `x-` prefix) — `tag_name`
             // includes the prefix which would break path resolution.
             PatternAtPosition::Component(comp) => self.hover_for_component(&comp.name).await,
@@ -17068,6 +17171,27 @@ return [
                 language: hover::CodeLanguage::Php,
                 content: s,
             }),
+            source_link: link.as_deref(),
+            trailer,
+            ..Default::default()
+        })
+    }
+
+    /// Inertia page — link to the resolved JS/TS page file under
+    /// `resources/js/Pages/`, or a not-found trailer (issue #10).
+    async fn hover_for_inertia(&self, name: &str) -> String {
+        use laravel_lsp::hover;
+        let path = self.resolve_inertia_file(name).await;
+        let link = match &path {
+            Some(p) => Some(self.source_link(p, None).await),
+            None => None,
+        };
+        let trailer = if link.is_none() {
+            Some(hover::FILE_NOT_FOUND_TRAILER)
+        } else {
+            None
+        };
+        hover::render(&hover::HoverContent {
             source_link: link.as_deref(),
             trailer,
             ..Default::default()
@@ -18398,6 +18522,51 @@ return [
         None
     }
 
+    /// Resolve an Inertia page name to an existing file under
+    /// `resources/js/Pages/` (issue #10). Candidates are probed in
+    /// [`laravel_lsp::inertia::PAGE_EXTENSIONS`] priority order, but the
+    /// project's dominant extension is tried first so an ambiguous page (one
+    /// that exists as both `.vue` and `.tsx`) prefers the dominant one. Uses
+    /// the shared 5-minute file-existence cache.
+    async fn resolve_inertia_file(&self, name: &str) -> Option<PathBuf> {
+        use laravel_lsp::inertia;
+        let config = self.get_cached_config().await?;
+        let root = &config.root;
+
+        let mut candidates = inertia::resolve_page_candidates(root, name);
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Float the dominant-extension candidate to the front so it wins an
+        // ambiguous match (AC: "prefer the dominant one").
+        if let Some(dom) = self.inertia_dominant_extension().await {
+            candidates.sort_by_key(|p| {
+                let is_dom = p.extension().and_then(|e| e.to_str()) == Some(dom.as_str());
+                // false (0) sorts before true (1), so negate: dominant first.
+                !is_dom as u8
+            });
+        }
+
+        for path in candidates {
+            if self.file_exists_cached(&path).await {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// The project's dominant Inertia page extension, detected at startup and
+    /// cached. Falls back to on-demand detection if the startup pass hasn't run
+    /// (e.g. a request arriving before background init completes).
+    async fn inertia_dominant_extension(&self) -> Option<String> {
+        if let Some(ext) = self.inertia_default_ext.read().await.clone() {
+            return Some(ext);
+        }
+        let root = self.root_path.read().await.clone()?;
+        laravel_lsp::inertia::detect_dominant_extension(&root)
+    }
+
     /// Same shape as [`Self::resolve_view_file`] but for Blade components.
     async fn resolve_component_file(&self, name: &str) -> Option<PathBuf> {
         let config = self.get_cached_config().await?;
@@ -18684,6 +18853,7 @@ fn pattern_range_at(
     let pat = patterns.find_at_position(line, column)?;
     let (l, start, end) = match pat {
         laravel_lsp::salsa_impl::PatternAtPosition::View(v) => (v.line, v.column, v.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Inertia(i) => (i.line, i.column, i.end_column),
         laravel_lsp::salsa_impl::PatternAtPosition::Route(r) => (r.line, r.column, r.end_column),
         laravel_lsp::salsa_impl::PatternAtPosition::HelperIdentifier(h) => {
             (h.line, h.column, h.end_column)
@@ -19934,6 +20104,19 @@ impl LanguageServer for LaravelLanguageServer {
                 server.register_config_with_salsa(&root).await;
             }
 
+            // Detect the dominant Inertia page extension once, at startup, by
+            // counting files under resources/js/Pages/ (issue #10). Cached for
+            // the create-page code action and ambiguous goto resolution; stays
+            // None on non-Inertia projects. The walk is cheap relative to the
+            // file-indexing that follows, and runs off the request path.
+            {
+                let dom = laravel_lsp::inertia::detect_dominant_extension(&root);
+                if let Some(ext) = &dom {
+                    info!("🅸 Inertia detected — dominant page extension: .{}", ext);
+                }
+                *server.inertia_default_ext.write().await = dom;
+            }
+
             // Register project files with Salsa for reference finding (if config available).
             // The progress handle is MOVED into register_project_files_with_salsa,
             // which forwards it into the spawned warming task — that task is
@@ -20716,6 +20899,15 @@ impl LanguageServer for LaravelLanguageServer {
             PatternAtPosition::View(view) => {
                 debug!("Laravel: Found view: {}", view.name);
                 self.create_view_location_from_salsa(&view).await
+            }
+            PatternAtPosition::Inertia(page) => {
+                debug!("Laravel: Found Inertia page: {}", page.name);
+                let path = self.resolve_inertia_file(&page.name).await?;
+                let uri = Url::from_file_path(&path).ok()?;
+                Some(GotoDefinitionResponse::Scalar(Location {
+                    uri,
+                    range: Range::default(),
+                }))
             }
             PatternAtPosition::Component(comp) => {
                 debug!("Laravel: Found component: {}", comp.name);

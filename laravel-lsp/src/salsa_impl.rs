@@ -2416,6 +2416,18 @@ pub struct ViewReferenceData {
     pub is_route_view: bool,
 }
 
+/// Inertia page reference data for transfer across async boundaries (issue
+/// #10). `name` is the page name (`/`-nested, no extension); the span covers
+/// the page-name string inside the quotes. Drives goto-definition, the
+/// missing-page diagnostic, hover, and the create-page code action.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InertiaReferenceData {
+    pub name: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
 /// Component reference data for transfer across async boundaries
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ComponentReferenceData {
@@ -3521,6 +3533,16 @@ struct PositionEntry {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ParsedPatternsData {
     pub views: Vec<Arc<ViewReferenceData>>,
+    /// Inertia page references (`inertia()`, `Inertia::render()`,
+    /// `Route::inertia()`) — issue #10. Like `feature_refs`/`route_refs`, these
+    /// are extracted in `handle_get_patterns` rather than as a `ParsedPatterns`
+    /// Salsa field (that struct is at the 12-element tuple-Hash cap).
+    ///
+    /// `#[serde(default)]` so disk-cache entries written by older builds (which
+    /// lacked this field) deserialize with an empty list rather than failing
+    /// the whole entry; the next edit re-runs extraction and repopulates.
+    #[serde(default)]
+    pub inertia_refs: Vec<Arc<InertiaReferenceData>>,
     pub components: Vec<Arc<ComponentReferenceData>>,
     pub directives: Vec<Arc<DirectiveReferenceData>>,
     pub env_refs: Vec<Arc<EnvReferenceData>>,
@@ -3597,6 +3619,9 @@ pub struct ParsedPatternsData {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PatternAtPosition {
     View(Arc<ViewReferenceData>),
+    /// An Inertia page reference (`inertia()`, `Inertia::render()`,
+    /// `Route::inertia()`) under the cursor — issue #10.
+    Inertia(Arc<InertiaReferenceData>),
     Component(Arc<ComponentReferenceData>),
     Directive(Arc<DirectiveReferenceData>),
     EnvRef(Arc<EnvReferenceData>),
@@ -3659,6 +3684,15 @@ impl ParsedPatternsData {
                 column: view.column,
                 end_column: view.end_column,
                 pattern: PatternAtPosition::View(view.clone()),
+            });
+        }
+
+        for inertia in &self.inertia_refs {
+            entries.push(PositionEntry {
+                line: inertia.line,
+                column: inertia.column,
+                end_column: inertia.end_column,
+                pattern: PatternAtPosition::Inertia(inertia.clone()),
             });
         }
 
@@ -6386,6 +6420,7 @@ impl SalsaActor {
         let mut url_refs = Vec::new();
         let mut action_refs = Vec::new();
         let mut feature_refs = Vec::new();
+        let mut inertia_refs: Vec<Arc<InertiaReferenceData>> = Vec::new();
         let mut member_access_refs: Vec<Arc<MemberAccessReferenceData>> = Vec::new();
         let mut chains: Vec<Arc<crate::query_chain::BuilderChain>> = Vec::new();
 
@@ -6445,6 +6480,15 @@ impl SalsaActor {
                             line: f.row as u32,
                             column: f.column as u32,
                             end_column: f.end_column as u32,
+                        }));
+                    }
+
+                    for p in php_patterns.inertia_pages {
+                        inertia_refs.push(Arc::new(InertiaReferenceData {
+                            name: p.page_name.to_string(),
+                            line: p.row as u32,
+                            column: p.column as u32,
+                            end_column: p.end_column as u32,
                         }));
                     }
 
@@ -6619,6 +6663,26 @@ impl SalsaActor {
                         end_column: end_col,
                     }));
                 }
+                for p in snippet_patterns.inertia_pages {
+                    let (line, col) = adjust_inner_position(
+                        p.row as u32,
+                        p.column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    let (_, end_col) = adjust_inner_position(
+                        p.row as u32,
+                        p.end_column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    inertia_refs.push(Arc::new(InertiaReferenceData {
+                        name: p.page_name.to_string(),
+                        line,
+                        column: col,
+                        end_column: end_col,
+                    }));
+                }
 
                 // Property-form member accesses inside this Blade region
                 // (`{{ $user->email }}`). Positions are mapped to outer-file
@@ -6681,6 +6745,7 @@ impl SalsaActor {
 
         let mut data = ParsedPatternsData {
             views,
+            inertia_refs,
             components,
             directives,
             env_refs,

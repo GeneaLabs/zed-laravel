@@ -167,6 +167,104 @@
   (#eq? @method_name "route"))
 
 ; ============================================================================
+; Pattern 4b: Inertia.js page references (issue #10)
+; ============================================================================
+; Inertia "views" resolve to JS/TS files under resources/js/Pages/, not Blade
+; templates. We recognise three call-site shapes:
+;   inertia('Page/Name')                  - helper function (first argument)
+;   Inertia::render('Page/Name', $props)  - facade (first argument)
+;   Route::inertia('/path', 'Page/Name')  - route registration (SECOND argument)
+;
+; The page name uses '/' for nesting (e.g. 'Auth/Login'). Resolution to a file
+; lives in `crate::inertia`; here we only capture the page-name string.
+
+; --- inertia('Page/Name') helper - single-quoted
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @inertia_page)))
+  (#eq? @function_name "inertia"))
+
+; --- inertia("Page/Name") helper - double-quoted
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    (argument
+      (encapsed_string
+        (string_content) @inertia_page)))
+  (#eq? @function_name "inertia"))
+
+; --- Inertia::render('Page/Name', $props) facade - single-quoted (first arg)
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @inertia_page)))
+  (#eq? @class_name "Inertia")
+  (#eq? @method_name "render"))
+
+; --- Inertia::render("Page/Name", $props) facade - double-quoted (first arg)
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (encapsed_string
+        (string_content) @inertia_page)))
+  (#eq? @class_name "Inertia")
+  (#eq? @method_name "render"))
+
+; --- \Inertia\Inertia::render(...) fully-qualified facade - single-quoted
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @inertia_page)))
+  (#match? @class_name ".*Inertia$")
+  (#eq? @method_name "render"))
+
+; --- \Inertia\Inertia::render(...) fully-qualified facade - double-quoted
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (encapsed_string
+        (string_content) @inertia_page)))
+  (#match? @class_name ".*Inertia$")
+  (#eq? @method_name "render"))
+
+; --- Route::inertia('/path', 'Page/Name') - single-quoted (SECOND argument)
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument)
+    (argument
+      (string
+        (string_content) @route_inertia_page)))
+  (#eq? @class_name "Route")
+  (#eq? @method_name "inertia"))
+
+; --- Route::inertia('/path', "Page/Name") - double-quoted (SECOND argument)
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument)
+    (argument
+      (encapsed_string
+        (string_content) @route_inertia_page)))
+  (#eq? @class_name "Route")
+  (#eq? @method_name "inertia"))
+
+; ============================================================================
 ; Pattern 5: env('VAR_NAME') or env('VAR_NAME', 'default') function calls
 ; ============================================================================
 ; Matches: env('APP_NAME', 'Laravel')

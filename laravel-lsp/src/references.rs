@@ -104,10 +104,14 @@ pub fn classify_pattern_at_cursor(
         // it gets armed for find-references in M4.
         // `HelperIdentifier` is a hover-only feature (#58) — no cross-file
         // rename / find-references participation.
+        // `Inertia` pages resolve to JS/TS files outside the PHP/Blade world,
+        // so they don't participate in PHP-side cross-file rename / references
+        // (issue #10 scopes them to goto / completion / diagnostics / hover).
         PatternAtPosition::Asset(_)
         | PatternAtPosition::Url(_)
         | PatternAtPosition::Action(_)
         | PatternAtPosition::Feature(_)
+        | PatternAtPosition::Inertia(_)
         | PatternAtPosition::HelperIdentifier(_)
         | PatternAtPosition::MemberAccess(_) => None,
     }

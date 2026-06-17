@@ -97,6 +97,24 @@ pub struct ViewMatch<'a> {
     pub is_route_view: bool,
 }
 
+/// Represents a matched Inertia page reference in PHP code (issue #10).
+///
+/// Captures the page-name string from `inertia('Page/Name')`,
+/// `Inertia::render('Page/Name', $props)`, or
+/// `Route::inertia('/path', 'Page/Name')`. The page name uses `/` for nesting
+/// and resolves to a JS/TS file under `resources/js/Pages/` (see
+/// [`crate::inertia`]) — unlike a Blade view, a missing Inertia page is always
+/// an ERROR.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InertiaMatch<'a> {
+    pub page_name: &'a str,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub row: usize,
+    pub column: usize,
+    pub end_column: usize,
+}
+
 /// Represents a matched Blade component (<x-*>)
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComponentMatch<'a> {
@@ -398,6 +416,9 @@ pub struct MemberAccessMatch<'a> {
 #[derive(Debug, Default)]
 pub struct ExtractedPhpPatterns<'a> {
     pub views: Vec<ViewMatch<'a>>,
+    /// Inertia page references (`inertia()`, `Inertia::render()`,
+    /// `Route::inertia()`) — issue #10.
+    pub inertia_pages: Vec<InertiaMatch<'a>>,
     pub env_calls: Vec<EnvMatch<'a>>,
     pub config_calls: Vec<ConfigMatch<'a>>,
     pub middleware_calls: Vec<MiddlewareMatch<'a>>,
@@ -515,6 +536,22 @@ pub fn extract_all_php_patterns<'a>(
                     column: start_pos.column,
                     end_column: end_pos.column,
                     is_route_view: true,
+                });
+            }
+
+            // Inertia page patterns (issue #10). `inertia_page` covers the
+            // helper (`inertia('Page')`) and facade (`Inertia::render('Page')`)
+            // first-argument forms; `route_inertia_page` covers the
+            // `Route::inertia('/path', 'Page')` second-argument form. Both land
+            // in the same collection — resolution treats them identically.
+            "inertia_page" | "route_inertia_page" => {
+                result.inertia_pages.push(InertiaMatch {
+                    page_name: text,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
                 });
             }
 
@@ -1002,6 +1039,7 @@ pub fn extract_all_php_patterns<'a>(
 
     let total_time = start.elapsed();
     let pattern_count = result.views.len()
+        + result.inertia_pages.len()
         + result.env_calls.len()
         + result.config_calls.len()
         + result.middleware_calls.len()

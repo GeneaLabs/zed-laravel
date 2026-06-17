@@ -40,6 +40,7 @@ pub mod file_watcher;
 pub mod folio_discovery;
 pub mod hover;
 pub mod indexing_progress;
+pub mod inertia;
 pub mod laravel_introspector;
 pub mod livewire_config;
 pub mod livewire_declaration_locator;
