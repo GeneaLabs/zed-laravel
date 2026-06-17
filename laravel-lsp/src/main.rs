@@ -8389,22 +8389,6 @@ impl LaravelLanguageServer {
         None
     }
 
-    /// Convert a 0-based `(line, character)` LSP position into a byte offset
-    /// into `content`. Columns are treated as byte offsets within the line —
-    /// the convention used throughout this file's line-local context helpers.
-    /// `\r` (in `\r\n` line endings) stays part of its line segment, so the
-    /// offset math holds for both `\n` and `\r\n` files.
-    fn line_char_to_offset(content: &str, line: u32, character: u32) -> Option<usize> {
-        let mut offset = 0usize;
-        for (current_line, segment) in content.split('\n').enumerate() {
-            if current_line as u32 == line {
-                return Some(offset + (character as usize).min(segment.len()));
-            }
-            offset += segment.len() + 1; // + the '\n' that `split` consumed
-        }
-        None
-    }
-
     /// Walk the document's component open/close tags up to `position` and
     /// return the name (e.g. `flux:modal`) of the nearest still-open
     /// `<flux:…>` component that *owns* a slot tag being typed at the cursor.
@@ -8434,7 +8418,11 @@ impl LaravelLanguageServer {
             .unwrap();
         }
 
-        let cursor = Self::line_char_to_offset(content, position.line, position.character)?;
+        let cursor = laravel_lsp::query_chain::position_to_byte_offset(
+            content,
+            position.line,
+            position.character,
+        )?;
 
         // Tag events that fully precede the cursor, in source order.
         enum Tag<'a> {
