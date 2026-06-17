@@ -1,5 +1,9 @@
 //! Tests for the root-containment guard in the **diagnostic-validation** view
-//! loops (issue #194, the secondary surface — extending #130/#143/#148).
+//! loops (issue #194, the secondary surface — extending #130/#143/#148), and
+//! the remaining diagnostic surfaces in the same family (issue #201): the
+//! Livewire "component not found" fallback (which now shares the
+//! `any_in_root_candidate_exists` decision) and the "Expected at:" message-hint
+//! selection (`in_root_expected_path_hint`).
 //!
 //! `validate_and_publish_diagnostics` walks both the PHP `view()` references and
 //! the Blade `@extends`/`@include` directives, resolving each to candidate paths
@@ -31,7 +35,7 @@
 //! wasted stat, *not* because it changes any of these outcomes — so these tests
 //! assert the helper's contract, not a distinction between the two policies.
 
-use crate::any_in_root_candidate_exists;
+use crate::{any_in_root_candidate_exists, in_root_expected_path_hint};
 use std::fs;
 use std::path::Path;
 
@@ -131,5 +135,111 @@ fn out_of_root_existing_does_not_mask_missing_in_root() {
         !any_in_root_candidate_exists(&[in_root_missing, out_of_root_present], root.path()),
         "an existing out-of-root candidate must not mask a missing in-root one — \
          it is filtered out before probing, so the diagnostic fires"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Livewire diagnostic fallback (issue #201)
+// ---------------------------------------------------------------------------
+//
+// The Livewire "component not found" diagnostic falls back to view-path
+// resolution when no Livewire kind resolves. That fallback now shares the same
+// `any_in_root_candidate_exists` decision as the `view()` and
+// `@extends`/`@include` loops, so an out-of-root `loadViewsFrom`/
+// `component_namespaces`-registered view can't make it stat-probe outside the
+// project tree, and an out-of-root view that exists on disk can't silently
+// satisfy the check.
+
+#[test]
+fn livewire_fallback_out_of_root_view_still_reports_not_found() {
+    // The Livewire component's fallback view resolves OUTSIDE the project root
+    // (the shape a `component_namespaces`/`loadViewsFrom` registration pointing
+    // at an absolute out-of-tree directory produces). The file exists on disk,
+    // so without the containment filter the fallback would see `exists = true`
+    // and suppress the diagnostic — having stat-probed a file outside the
+    // project. The filter refuses it on root grounds, so the helper reports the
+    // candidate absent and a "Livewire component not found" diagnostic fires.
+    let root = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+
+    let escapee = outside.path().join("counter.blade.php");
+    write(&escapee, VIEW_BODY);
+
+    assert!(
+        escapee.exists(),
+        "precondition: the out-of-root Livewire view candidate exists on disk"
+    );
+    assert!(
+        !any_in_root_candidate_exists(&[escapee], root.path()),
+        "an out-of-root Livewire-fallback view candidate must be treated as \
+         absent even though it exists on disk — the containment filter refuses \
+         it before probing, so the \"component not found\" diagnostic fires"
+    );
+}
+
+#[test]
+fn livewire_fallback_in_root_view_suppresses_diagnostic() {
+    // Positive control: a Livewire component whose fallback view exists in-root
+    // passes containment and is found, so no false "Livewire component not
+    // found" diagnostic fires (e.g. a vendor-registered component view at a
+    // non-conventional in-root path like Jetstream's `resources/views/api/`).
+    let root = tempfile::TempDir::new().unwrap();
+    let view = root.path().join("resources/views/api/counter.blade.php");
+    write(&view, VIEW_BODY);
+
+    assert!(
+        any_in_root_candidate_exists(&[view], root.path()),
+        "an in-root Livewire-fallback view that exists must be found — the \
+         diagnostic must not fire for a real in-root component view"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// "Expected at:" message-hint containment (issue #201)
+// ---------------------------------------------------------------------------
+//
+// The "not found" diagnostics echo an "Expected at:" path back to the client.
+// `in_root_expected_path_hint` sources it from the first *in-root* candidate so
+// a maliciously-registered out-of-root namespace path is never leaked into the
+// message text — it considers only lexical containment, never disk existence.
+
+#[test]
+fn expected_path_hint_is_unknown_when_all_candidates_out_of_root() {
+    // Every resolved candidate is outside the project root (the shape an
+    // out-of-root `loadViewsFrom`/namespace registration produces with no
+    // in-root fallback). The hint must NOT leak an out-of-root absolute path —
+    // it falls back to "unknown".
+    let root = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+
+    let escapee_a = outside.path().join("pkg/card.blade.php");
+    let escapee_b = outside.path().join("other/card.blade.php");
+
+    assert_eq!(
+        in_root_expected_path_hint(&[escapee_a, escapee_b], root.path()),
+        "unknown",
+        "when every candidate is out-of-root the hint must be \"unknown\", never \
+         a leaked out-of-root absolute path"
+    );
+}
+
+#[test]
+fn expected_path_hint_picks_first_in_root_candidate() {
+    // Positive control: with a mix of out-of-root and in-root candidates, the
+    // hint is the first *in-root* one — the out-of-root candidate ordered ahead
+    // of it is skipped, so a real, safe expected path is still surfaced. The
+    // in-root candidate need not exist on disk (the hint is for a *missing*
+    // view); only lexical containment is checked.
+    let root = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+
+    let out_of_root = outside.path().join("pkg/card.blade.php");
+    let in_root = root.path().join("resources/views/card.blade.php");
+
+    assert_eq!(
+        in_root_expected_path_hint(&[out_of_root, in_root.clone()], root.path()),
+        in_root.to_string_lossy().to_string(),
+        "the hint must be the first in-root candidate, skipping the out-of-root \
+         one ordered ahead of it"
     );
 }

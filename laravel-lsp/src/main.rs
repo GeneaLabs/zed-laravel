@@ -15953,10 +15953,11 @@ return [
                 let exists = any_in_root_candidate_exists(&possible_paths, &config.root);
 
                 if !exists {
-                    let expected_path = possible_paths
-                        .first()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
+                    // Source the hint from the first *in-root* candidate (issue
+                    // #201): never echo an out-of-root candidate (e.g. from a
+                    // maliciously-registered namespace) back to the client in
+                    // the message text. Falls back to "unknown" when none qualifies.
+                    let expected_path = in_root_expected_path_hint(&possible_paths, &config.root);
 
                     // All view() calls with missing files should be ERROR
                     let severity = DiagnosticSeverity::ERROR;
@@ -16637,11 +16638,12 @@ return [
                         let exists = any_in_root_candidate_exists(&possible_paths, &config.root);
 
                         if !exists {
-                            // Use the first path for the diagnostic message
-                            let expected_path = possible_paths
-                                .first()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "unknown".to_string());
+                            // Source the hint from the first *in-root* candidate
+                            // (issue #201): the in-root filter keeps an
+                            // out-of-root namespace path out of the message text.
+                            // Shares the `view()` loop's decision above.
+                            let expected_path =
+                                in_root_expected_path_hint(&possible_paths, &config.root);
 
                             let diagnostic = Diagnostic {
                                 range: Range {
@@ -16750,10 +16752,16 @@ return [
             let view_exists = if has_livewire_kind {
                 true
             } else {
-                config
-                    .resolve_view_path(&lw_ref.name)
-                    .iter()
-                    .any(|p| p.exists())
+                // Containment guard (issue #201): out-of-root candidates are
+                // filtered out before the `.exists()` probe, so an out-of-root
+                // `loadViewsFrom`/`component_namespaces` registration can't make
+                // the Livewire diagnostic fallback stat-probe files outside the
+                // project tree — and an out-of-root view that exists on disk
+                // can't silently satisfy the check. Shares the identical
+                // decision with the `view()` and `@extends`/`@include` loops
+                // above — see `any_in_root_candidate_exists`.
+                let possible_paths = config.resolve_view_path(&lw_ref.name);
+                any_in_root_candidate_exists(&possible_paths, &config.root)
             };
             if !view_exists {
                 let diagnostic = Diagnostic {
@@ -18664,14 +18672,33 @@ fn is_in_routes_dir(root: Option<&Path>, path: &Path) -> bool {
 /// the filter and `.any()` runs over an empty set — so a genuinely missing
 /// in-root view still reports "View file not found" under both. The only
 /// practical difference is that lexical avoids a wasted `.exists()` stat on a
-/// missing in-root path (a side-effect, never the returned boolean). Both the
-/// `view()` and `@extends`/`@include` diagnostic loops share this identical
-/// decision.
+/// missing in-root path (a side-effect, never the returned boolean). The
+/// `view()`, `@extends`/`@include`, and Livewire-fallback diagnostic loops all
+/// share this identical decision.
 fn any_in_root_candidate_exists(candidates: &[PathBuf], root: &Path) -> bool {
     candidates
         .iter()
         .filter(|p| path_within_root_lexical(p, root))
         .any(|p| p.exists())
+}
+
+/// The "Expected at:" hint for a "not found" diagnostic, sourced from the first
+/// candidate that lexically resolves within `root` (issue #201). Falls back to
+/// `"unknown"` when no candidate qualifies.
+///
+/// `config.resolve_view_path` can return out-of-root candidates (an out-of-root
+/// `loadViewsFrom`/`component_namespaces` registration), and the diagnostic
+/// message text is echoed back to the client. Selecting the first *in-root*
+/// candidate keeps a maliciously-registered out-of-root absolute path out of the
+/// message — the same containment invariant `any_in_root_candidate_exists` holds
+/// for the `.exists()` probe, applied here to the message text. The `view()` and
+/// `@extends`/`@include` diagnostic loops share this identical decision.
+fn in_root_expected_path_hint(candidates: &[PathBuf], root: &Path) -> String {
+    candidates
+        .iter()
+        .find(|p| path_within_root_lexical(p, root))
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Return the column range of the classified pattern under the cursor.
