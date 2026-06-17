@@ -2005,9 +2005,15 @@ struct LaravelLanguageServer {
     /// Dominant Inertia page extension (`vue` / `tsx` / `jsx` / `svelte`),
     /// detected once at startup by counting files under `resources/js/Pages/`.
     /// Used as the default for the "create page" code action and to break
-    /// ambiguous goto-definition resolution. `None` until detected (or when the
-    /// project has no Inertia pages). Issue #10.
-    inertia_default_ext: Arc<RwLock<Option<String>>>,
+    /// ambiguous goto-definition resolution. Issue #10.
+    ///
+    /// Two-level option so "detected, no Inertia" is distinct from "not yet
+    /// detected" — without it, a non-Inertia project's `None` would trigger a
+    /// full directory walk on *every* goto/hover/diagnostic:
+    ///   - `None`          → startup detection hasn't run yet
+    ///   - `Some(None)`    → detection ran; project has no Inertia pages
+    ///   - `Some(Some(e))` → detected dominant extension `e`
+    inertia_default_ext: Arc<RwLock<Option<Option<String>>>>,
 }
 
 /// Default Salsa debounce delay in milliseconds
@@ -15856,6 +15862,56 @@ return [
         out
     }
 
+    /// Build an "Inertia page not found" ERROR diagnostic for a single page
+    /// reference, or `None` when the page already resolves (`resolved == true`)
+    /// or its name is invalid (traversing) and so has no actionable create path
+    /// (issue #10).
+    ///
+    /// The filesystem probe lives in the caller (`resolve_inertia_file`); this is
+    /// the pure decision + message builder, mirroring
+    /// [`Self::route_not_found_diagnostics`] and [`Self::asset_diagnostic`] so the
+    /// ERROR-severity and "Expected at" contract is testable without a live
+    /// server. The "Expected at" path is built with the project's `dominant`
+    /// extension so the downstream create-page code action lands a file of the
+    /// right type.
+    fn inertia_not_found_diagnostic(
+        page_ref: &laravel_lsp::salsa_impl::InertiaReferenceData,
+        resolved: bool,
+        root: &Path,
+        dominant: Option<&str>,
+    ) -> Option<Diagnostic> {
+        if resolved {
+            return None;
+        }
+        // An invalid (traversing) page name yields no expected path; skip it
+        // rather than emit an unactionable diagnostic.
+        let expected_path = laravel_lsp::inertia::page_create_path(root, &page_ref.name, dominant)?;
+        Some(Diagnostic {
+            range: Range {
+                start: Position {
+                    line: page_ref.line,
+                    character: page_ref.column,
+                },
+                end: Position {
+                    line: page_ref.line,
+                    character: page_ref.end_column,
+                },
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: None,
+            source: Some("laravel".to_string()),
+            message: format!(
+                "Inertia page not found: '{}'\nExpected at: {}",
+                page_ref.name,
+                expected_path.to_string_lossy()
+            ),
+            related_information: None,
+            tags: None,
+            code_description: None,
+            data: None,
+        })
+    }
+
     /// Resolve an asset-helper reference to the absolute path the helper points
     /// at, plus the helper's display name. Each helper's base directory follows
     /// its Laravel convention.
@@ -16164,43 +16220,15 @@ return [
             if !patterns.inertia_refs.is_empty() {
                 let dominant = self.inertia_dominant_extension().await;
                 for page_ref in &patterns.inertia_refs {
-                    if self.resolve_inertia_file(&page_ref.name).await.is_some() {
-                        continue;
-                    }
-                    let expected_path = laravel_lsp::inertia::page_create_path(
+                    let resolved = self.resolve_inertia_file(&page_ref.name).await.is_some();
+                    if let Some(diag) = Self::inertia_not_found_diagnostic(
+                        page_ref,
+                        resolved,
                         &config.root,
-                        &page_ref.name,
                         dominant.as_deref(),
-                    );
-                    // An invalid (traversing) page name yields no expected path;
-                    // skip it rather than emit an unactionable diagnostic.
-                    let Some(expected_path) = expected_path else {
-                        continue;
-                    };
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line: page_ref.line,
-                                character: page_ref.column,
-                            },
-                            end: Position {
-                                line: page_ref.line,
-                                character: page_ref.end_column,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        code: None,
-                        source: Some("laravel".to_string()),
-                        message: format!(
-                            "Inertia page not found: '{}'\nExpected at: {}",
-                            page_ref.name,
-                            expected_path.to_string_lossy()
-                        ),
-                        related_information: None,
-                        tags: None,
-                        code_description: None,
-                        data: None,
-                    });
+                    ) {
+                        diagnostics.push(diag);
+                    }
                 }
             }
 
@@ -18640,8 +18668,18 @@ return [
     /// `resources/js/Pages/` (issue #10). Candidates are probed in
     /// [`laravel_lsp::inertia::PAGE_EXTENSIONS`] priority order, but the
     /// project's dominant extension is tried first so an ambiguous page (one
-    /// that exists as both `.vue` and `.tsx`) prefers the dominant one. Uses
-    /// the shared 5-minute file-existence cache.
+    /// that exists as both `.vue` and `.tsx`) prefers the dominant one — and
+    /// emits a `warn!` (AC: "warn if ambiguous"). Uses the shared file-existence
+    /// cache (a 5-second TTL — see [`Self::file_exists_cached`]).
+    ///
+    /// This is the single shared resolution entry point for goto-definition,
+    /// hover, and the missing-page diagnostic, so the fail-closed containment
+    /// guard below covers all three at once: like
+    /// [`Self::create_view_location_from_salsa`] (issues #148/#130), a resolved
+    /// page must lie inside the project root before it can become a navigation
+    /// target. `resolve_page_candidates` only gates on the lexical
+    /// `path_within_root_lexical`; the security guard is the fail-closed
+    /// `path_within_root` applied here, after the existence probe.
     async fn resolve_inertia_file(&self, name: &str) -> Option<PathBuf> {
         use laravel_lsp::inertia;
         let config = self.get_cached_config().await?;
@@ -18662,20 +18700,49 @@ return [
             });
         }
 
+        // Probe every candidate, collecting the ones that both exist and lie
+        // inside the project root. The first (dominant-floated) survivor is the
+        // resolved file; more than one means the page is ambiguous (resolves to
+        // several extensions on disk) and we warn (AC: "warn if ambiguous").
+        let mut existing = Vec::new();
         for path in candidates {
-            if self.file_exists_cached(&path).await {
-                return Some(path);
+            if !self.file_exists_cached(&path).await {
+                continue;
             }
+            // Containment guard (issues #148/#130), fail-closed: refuse to hand
+            // the client a navigation target outside the project root. `continue`
+            // so a later in-root candidate can still resolve.
+            if !path_within_root(&path, root) {
+                continue;
+            }
+            existing.push(path);
         }
-        None
+
+        if existing.len() > 1 {
+            warn!(
+                "⚠️  Inertia page '{}' is ambiguous — resolves to multiple extensions {:?}; preferring '{}'",
+                name,
+                existing
+                    .iter()
+                    .filter_map(|p| p.extension().and_then(|e| e.to_str()))
+                    .collect::<Vec<_>>(),
+                existing[0].display()
+            );
+        }
+
+        existing.into_iter().next()
     }
 
     /// The project's dominant Inertia page extension, detected at startup and
-    /// cached. Falls back to on-demand detection if the startup pass hasn't run
-    /// (e.g. a request arriving before background init completes).
+    /// cached. The cache is a two-level option (see the `inertia_default_ext`
+    /// field): once detection has run, both the "has an extension" and the
+    /// "non-Inertia project" outcomes are memoized as `Some(_)`, so a
+    /// non-Inertia project never re-walks the directory on every
+    /// goto/hover/diagnostic. Only the pre-detection `None` falls back to an
+    /// on-demand walk (a request arriving before background init completes).
     async fn inertia_dominant_extension(&self) -> Option<String> {
-        if let Some(ext) = self.inertia_default_ext.read().await.clone() {
-            return Some(ext);
+        if let Some(detected) = self.inertia_default_ext.read().await.clone() {
+            return detected;
         }
         let root = self.root_path.read().await.clone()?;
         laravel_lsp::inertia::detect_dominant_extension(&root)
@@ -20228,7 +20295,10 @@ impl LanguageServer for LaravelLanguageServer {
                 if let Some(ext) = &dom {
                     info!("🅸 Inertia detected — dominant page extension: .{}", ext);
                 }
-                *server.inertia_default_ext.write().await = dom;
+                // Wrap in `Some` to record that detection HAS run — `Some(None)`
+                // (non-Inertia project) is then distinct from the initial `None`,
+                // so we never re-walk the tree per request (issue #10).
+                *server.inertia_default_ext.write().await = Some(dom);
             }
 
             // Register project files with Salsa for reference finding (if config available).
@@ -20741,6 +20811,21 @@ impl LanguageServer for LaravelLanguageServer {
             let Ok(path) = change.uri.to_file_path() else {
                 continue;
             };
+            // Inertia page files (resources/js/Pages/**/*.{vue,tsx,jsx,svelte})
+            // are not PHP — they never enter the Salsa pattern index, so the
+            // Salsa update/remove path below doesn't apply. A create/change/
+            // delete only needs to evict the file-existence cache entry so
+            // resolve_inertia_file (goto, hover, and the missing-page
+            // diagnostic) sees the new on-disk state immediately instead of
+            // waiting out the 5-second TTL (issue #10).
+            if laravel_lsp::inertia::is_page_file(&path) {
+                self.file_exists_cache.write().await.remove(&path);
+                match change.typ {
+                    FileChangeType::DELETED => deleted += 1,
+                    _ => created_or_changed += 1,
+                }
+                continue;
+            }
             // A Command class can live anywhere, but conventionally sits under a
             // `Commands/` directory (app or package). That heuristic keeps the
             // index fresh without rebuilding on every unrelated `.php` save.
