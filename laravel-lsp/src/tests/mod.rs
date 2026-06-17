@@ -28,5 +28,6 @@ mod routes_dir_gate;
 mod slot_navigation_containment;
 mod slot_variable_resolution;
 mod translation_namespace_check;
+mod view_diagnostic_containment;
 mod view_navigation_containment;
 mod vite_completion_context;

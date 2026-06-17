@@ -15944,18 +15944,13 @@ return [
             // Check view() calls using Salsa patterns
             for view_ref in &patterns.views {
                 let possible_paths = config.resolve_view_path(&view_ref.name);
-                // Containment guard (issue #194, secondary): skip `.exists()`
-                // filesystem probes on candidates that resolve outside the
-                // project root, so an out-of-root `loadViewsFrom`/namespace
-                // registration can't make diagnostics stat-probe files outside
-                // the project tree. Lexical containment (the speculative-candidate
-                // helper) keeps not-yet-created in-root candidates — a genuinely
-                // missing in-root view still reports "not found" — while refusing
-                // out-of-root paths without probing them.
-                let exists = possible_paths
-                    .iter()
-                    .filter(|p| path_within_root_lexical(p, &config.root))
-                    .any(|p| p.exists());
+                // Containment guard (issue #194, secondary): out-of-root
+                // candidates are filtered out before the `.exists()` probe, so an
+                // out-of-root `loadViewsFrom`/namespace registration can't make
+                // diagnostics stat-probe files outside the project tree. See
+                // `any_in_root_candidate_exists` for the full rationale; the
+                // `@extends`/`@include` loop below shares the same decision.
+                let exists = any_in_root_candidate_exists(&possible_paths, &config.root);
 
                 if !exists {
                     let expected_path = possible_paths
@@ -16633,18 +16628,13 @@ return [
                         let possible_paths = config.resolve_view_path(&view_name);
 
                         // Check if ANY of the possible paths exist. Containment
-                        // guard (issue #194, secondary): skip `.exists()`
-                        // filesystem probes on candidates that resolve outside
-                        // the project root, so an out-of-root namespace can't make
-                        // `@extends`/`@include` diagnostics stat-probe files
-                        // outside the project tree. Lexical containment keeps
-                        // not-yet-created in-root candidates — a genuinely missing
-                        // in-root view still reports "not found" — while refusing
-                        // out-of-root paths without probing them.
-                        let exists = possible_paths
-                            .iter()
-                            .filter(|p| path_within_root_lexical(p, &config.root))
-                            .any(|p| p.exists());
+                        // guard (issue #194, secondary): out-of-root candidates
+                        // are filtered out before the `.exists()` probe, so an
+                        // out-of-root namespace can't make `@extends`/`@include`
+                        // diagnostics stat-probe files outside the project tree.
+                        // Shares the identical decision with the `view()` loop
+                        // above — see `any_in_root_candidate_exists`.
+                        let exists = any_in_root_candidate_exists(&possible_paths, &config.root);
 
                         if !exists {
                             // Use the first path for the diagnostic message
@@ -18654,6 +18644,24 @@ fn is_in_routes_dir(root: Option<&Path>, path: &Path) -> bool {
         (Ok(real_parent), Ok(real_routes)) => real_parent == real_routes,
         _ => parent == routes_dir,
     }
+}
+
+/// True if **any** of `candidates` exists on disk, considering only candidates
+/// that lexically resolve within `root`. The containment filter (issue #194,
+/// secondary) runs *before* the `.exists()` probe, so an out-of-root
+/// `loadViewsFrom`/namespace registration can never make the view-diagnostic
+/// loops stat-probe files outside the project tree — even one whose file
+/// happens to exist on disk is treated as absent. Lexical containment
+/// (`path_within_root_lexical`) is deliberate over the fail-closed
+/// `path_within_root`: it keeps not-yet-created **in-root** candidates so a
+/// genuinely missing in-root view still reports "View file not found", while
+/// still refusing interior-`..` escapes. Both the `view()` and
+/// `@extends`/`@include` diagnostic loops share this identical decision.
+fn any_in_root_candidate_exists(candidates: &[PathBuf], root: &Path) -> bool {
+    candidates
+        .iter()
+        .filter(|p| path_within_root_lexical(p, root))
+        .any(|p| p.exists())
 }
 
 /// Return the column range of the classified pattern under the cursor.
