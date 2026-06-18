@@ -23,6 +23,7 @@ mod generic_type_parsing;
 mod helper_identifier_hover;
 mod inertia_code_action;
 mod inertia_completion_context;
+mod inertia_handler;
 mod livewire_component_resolution;
 mod livewire_tag_navigation_containment;
 mod loop_variable_resolution;
