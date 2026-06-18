@@ -334,9 +334,16 @@ impl DatabaseSchemaProvider {
     /// completion paths against a known schema without a live MySQL /
     /// Postgres. The cache is the same one `get_schema` reads, so calls
     /// to `get_tables` / `get_columns_with_types` will see this data
-    /// immediately. Gated to test builds — no production caller should
-    /// be poking the cache manually.
-    #[cfg(test)]
+    /// immediately. No production caller should be poking the cache manually.
+    ///
+    /// Exposed as `#[doc(hidden)] pub` rather than `#[cfg(test)]`: the
+    /// `main.rs` binary's completion-handler integration tests
+    /// (`src/tests/query_chain_completion_handler.rs`) need to seed schema
+    /// from a separate crate, and Cargo does not enable `cfg(test)` on a
+    /// library consumed as a dependency — a `#[cfg(test)]` seam would be
+    /// invisible to that bin test crate. Hidden from docs so it stays off the
+    /// public API surface.
+    #[doc(hidden)]
     pub async fn set_test_schema(&self, schema: DatabaseSchema) {
         *self.schema_cache.write().await = Some(schema);
     }

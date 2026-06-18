@@ -28,6 +28,7 @@ mod inertia_handler;
 mod livewire_component_resolution;
 mod livewire_tag_navigation_containment;
 mod loop_variable_resolution;
+mod query_chain_completion_handler;
 mod rename_integration;
 mod route_binding_resolution;
 mod route_diagnostics;
