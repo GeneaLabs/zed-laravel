@@ -123,7 +123,10 @@ pub fn path_within_root_lexical(path: &Path, root: &Path) -> bool {
 ///
 /// The distinction lives in the `None` arm: `symlink_metadata` (lstat) succeeds
 /// for the dangling-symlink node (the leaf exists, it just won't resolve) and
-/// fails with `NotFound` for a path that truly doesn't exist. This closes the
+/// fails with `NotFound` for a path that truly doesn't exist. Only `NotFound`
+/// admits — every other lstat error (`EACCES` from a non-searchable parent,
+/// `ENOTDIR`, `ELOOP`) leaves the target unverifiable and is refused, so the
+/// guard fails *closed* on anything it cannot prove absent. This closes the
 /// residual the lexical guard's `unwrap_or(true)` leaves open for emitted paths
 /// — a *leaf* dangling symlink; a path traversing a dangling symlink *directory*
 /// is out of scope here (the conventional view-root surface never produces one).
@@ -136,12 +139,19 @@ pub fn path_within_root_emit_safe(path: &Path, root: &Path) -> bool {
         // The candidate exists on disk: trust its real, symlink-resolved target —
         // inside the root is safe to emit, an escape is refused.
         Some(contained) => contained,
-        // The candidate can't be canonicalized. Admit a genuinely-absent path (a
-        // legitimate speculative create target — nothing on disk to follow), but
-        // refuse a dangling under-root symlink whose target is missing: its leaf
-        // node exists (lstat succeeds) yet won't resolve, so a `CreateFile`
-        // following it could escape the root (issues #134/#155).
-        None => path.symlink_metadata().is_err(),
+        // The candidate can't be canonicalized. Admit ONLY a genuinely-absent
+        // path — lstat fails with `NotFound`, a legitimate speculative create
+        // target with nothing on disk to follow. Refuse every other case: a
+        // dangling under-root symlink (lstat succeeds, leaf exists but won't
+        // resolve), and any non-`NotFound` lstat error (`EACCES` from a
+        // no-search-permission parent, `ENOTDIR`, `ELOOP`) — all leave the real
+        // target unverifiable, so a `CreateFile` following the path could escape
+        // the root (issues #134/#155). `is_err()` would admit those, failing
+        // OPEN against this guard's contract; discriminate on `NotFound` to fail
+        // closed on anything we cannot prove absent.
+        None => path
+            .symlink_metadata()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
     }
 }
 
@@ -513,6 +523,92 @@ mod tests {
         assert!(
             !path_within_root_emit_safe(&escaping_link, &root),
             "an in-root symlink whose target escapes the root must be refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emit_safe_refuses_unverifiable_candidate_behind_a_file_component() {
+        // The corrected `None`-arm contract (PR #202 review): only a genuinely
+        // *absent* path (lstat `NotFound`) may be admitted — any OTHER lstat
+        // error means the candidate is unverifiable, not provably absent, and
+        // must fail CLOSED. Here a regular *file* sits where a directory is
+        // expected in the path, so lstat on `<file>/ghost.blade.php` returns
+        // `ENOTDIR`. The old `.is_err()` arm admitted any error (failing open);
+        // the `NotFound`-only arm refuses it. Deterministic on every unix uid
+        // (no permission dependence), so it pins the contract even under a CI
+        // runner that bypasses permission checks.
+        let root = TempDir::new().unwrap();
+        let views = root.path().join("resources").join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        let not_a_dir = views.join("home.blade.php");
+        std::fs::write(&not_a_dir, "{{ $x }}").unwrap();
+        let candidate = not_a_dir.join("ghost.blade.php");
+
+        // Precondition: lstat fails with a NON-`NotFound` error (`ENOTDIR`).
+        let err_kind = candidate.symlink_metadata().err().map(|e| e.kind());
+        assert!(
+            err_kind.is_some() && err_kind != Some(std::io::ErrorKind::NotFound),
+            "precondition: lstat must fail with a non-NotFound error, got {err_kind:?}"
+        );
+
+        // The lexical guard admits it (canonicalize fails ⇒ `unwrap_or(true)`);
+        // the emit-safe guard must refuse it — both halves of the contrast.
+        assert!(
+            path_within_root_lexical(&candidate, root.path()),
+            "the lexical guard admits an unverifiable in-root candidate"
+        );
+        assert!(
+            !path_within_root_emit_safe(&candidate, root.path()),
+            "a non-NotFound lstat error must fail closed — the candidate is \
+             unverifiable, not provably absent, so a CreateFile following it \
+             could escape the root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emit_safe_refuses_dangling_symlink_behind_unsearchable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The specific dangerous case Holmes named (PR #202 review): a dangling
+        // under-root symlink hidden behind a parent directory with no search
+        // permission. lstat on the leaf fails with `EACCES` (→ `PermissionDenied`),
+        // NOT `NotFound`, so the candidate is unverifiable-but-not-provably-absent.
+        // A `.is_err()` test would ADMIT it (failing open) and echo it into the
+        // "Expected at:" hint, where a client `CreateFile` could follow the link
+        // out of tree; the corrected `NotFound`-only contract must REFUSE it.
+        let root = TempDir::new().unwrap();
+        let locked = root.path().join("resources").join("views").join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let missing_target = root.path().join("..").join("never-created.blade.php");
+        let ghost = locked.join("ghost.blade.php");
+        std::os::unix::fs::symlink(&missing_target, &ghost).unwrap();
+
+        // Drop search permission on the parent so lstat on `ghost` returns EACCES.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Only meaningful when lstat is actually denied; a uid that bypasses
+        // permission checks (e.g. root in some CI containers) would see through.
+        // Restore perms (so the TempDir can be cleaned up) and skip in that case —
+        // the ENOTDIR sibling test pins the contract deterministically regardless.
+        let denied = ghost.symlink_metadata().err().map(|e| e.kind())
+            == Some(std::io::ErrorKind::PermissionDenied);
+        if !denied {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let refused = !path_within_root_emit_safe(&ghost, root.path());
+
+        // Restore perms before the assert (and TempDir drop) so cleanup always
+        // succeeds even if the assertion fails.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            refused,
+            "a dangling under-root symlink behind a no-search-permission parent \
+             (lstat EACCES, not NotFound) must be refused — the guard fails closed"
         );
     }
 }
