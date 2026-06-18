@@ -20,6 +20,7 @@ mod flux_goto_def_handler;
 mod flux_slot_name_context;
 mod folio_cursor_containment;
 mod folio_rename;
+mod fqcn_resolution_containment;
 mod generic_type_parsing;
 mod helper_identifier_hover;
 mod inertia_code_action;

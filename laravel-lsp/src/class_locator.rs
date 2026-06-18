@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
+use crate::path_containment::path_within_root;
+
 /// Locate the PHP source file for a given class name.
 ///
 /// Searches the project's `app/` directory recursively for `<ClassName>.php`,
@@ -111,7 +113,11 @@ pub fn find_php_class_file_in_app_or_vendor(class_name: &str, root: &Path) -> Op
 /// `search_vendor`: `true` consults the vendor heuristic only;
 /// `false` the App heuristic only. Callers chain both.
 ///
-/// Returns `None` if no candidate path exists on disk.
+/// Returns `None` if no candidate path exists on disk. Each candidate is gated
+/// by the fail-closed [`path_within_root`] guard before the on-disk check, so an
+/// FQCN whose `..` segments — or an under-root symlink in the constructed path —
+/// would resolve outside the project root is refused rather than read (issue
+/// #218, containment lineage #130 → #143 → #148 → #194 → #199 → #201 → #214).
 fn find_php_class_file_by_fqcn(
     fqcn: &str,
     project_root: &Path,
@@ -135,6 +141,14 @@ fn find_php_class_file_by_fqcn(
                     path = path.join(seg);
                 }
                 path = path.join(format!("{class_name}.php"));
+                // An FQCN segment may carry `..` (or the joined path may cross
+                // an under-root symlink), so the candidate can resolve outside
+                // the project root. Refuse it with the fail-closed guard before
+                // the read — a path that canonicalizes outside root (or can't be
+                // proven in-root) is skipped.
+                if !path_within_root(&path, project_root) {
+                    continue;
+                }
                 if path.exists() {
                     return Some(path);
                 }
@@ -162,6 +176,12 @@ fn find_php_class_file_by_fqcn(
             path = path.join(seg);
         }
         path = path.join(format!("{class_name}.php"));
+        // Same containment guard as the app branch: an FQCN with `..` segments
+        // (or an under-root symlink in the path) can escape the project root, so
+        // gate the candidate with the fail-closed guard before the read.
+        if !path_within_root(&path, project_root) {
+            continue;
+        }
         if path.exists() {
             return Some(path);
         }
