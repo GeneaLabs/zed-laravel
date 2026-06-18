@@ -2513,11 +2513,51 @@ class {} extends Component
     ) -> Option<CodeActionOrCommand> {
         let file_uri = Url::from_file_path(&self.target_path).ok()?;
 
+        // Containment backstop (issue #199) — the write/create seam of the
+        // #130 → #143 → #148 → #194 containment-guard chain, whose invariant is
+        // that no FS-touching path escapes the project root. Every create action
+        // materialises `self.target_path`, so refuse to *offer* the action when
+        // that target resolves outside `root` — return `None` rather than
+        // constructing an out-of-root `ResourceOp::Create`. `target_path` is
+        // server-authored from the diagnostic and already safe today; this is
+        // belt-and-suspenders against a forged or malformed diagnostic.
+        //
+        // NOT every type materialises *only* `target_path`: the multi-file types
+        // (`Livewire`, `BladeComponentWithClass`) each emit a SECOND create — a
+        // `view_uri` / `class_uri` derived from `self.name`, which is an
+        // independent diagnostic field, not coupled to `target_path`. Because
+        // `PathBuf::join`/`push` of an absolute-looking segment *replaces* the
+        // base, a forged `name` (e.g. `/etc/passwd`) escapes the root even when
+        // `target_path` is in-root. So each of those sibling paths is guarded at
+        // its own branch below, with the same primitive and the same `return None`.
+        //
+        // The guard uses `path_within_root_lexical`, NOT the fail-closed
+        // `path_within_root` the sibling *read* paths use: a create target never
+        // exists yet, so `path.canonicalize()` always fails for it, and the
+        // fail-closed guard would refuse *every* create — including legitimate
+        // in-root ones. The lexical guard refuses out-of-root and interior-`..`
+        // escapes while admitting a not-yet-created in-root target (and still
+        // canonicalizes to catch a symlink escape when the target does exist),
+        // which is exactly the contract a speculative emitted path needs. When the
+        // root is not yet known (`None`) there is nothing to check against, so
+        // pre-existing behaviour is preserved.
+        if let Some(root) = root {
+            if !path_within_root_lexical(&self.target_path, root) {
+                return None;
+            }
+        }
+
         // Handle different action types
         let workspace_edit = if let FileActionType::Livewire = self.action_type {
             // Livewire creates TWO files: PHP class and Blade view
             let root = root?;
             let view_path = self.get_livewire_view_path(root);
+            // Sibling create (issue #199): `view_path` is derived from
+            // `self.name`, an independent diagnostic field — guard it too, or a
+            // forged `name` escapes the root past the `target_path` check above.
+            if !path_within_root_lexical(&view_path, root) {
+                return None;
+            }
             let view_uri = Url::from_file_path(&view_path).ok()?;
             let view_template = Self::get_livewire_view_template();
 
@@ -2587,6 +2627,12 @@ class {} extends Component
             // Create both the Blade view and the PHP class
             let root = root?;
             let class_path = self.get_component_class_path(root);
+            // Sibling create (issue #199): `class_path` is derived from
+            // `self.name`, an independent diagnostic field — guard it too, or a
+            // forged `name` escapes the root past the `target_path` check above.
+            if !path_within_root_lexical(&class_path, root) {
+                return None;
+            }
             let class_uri = Url::from_file_path(&class_path).ok()?;
             let class_template = self.get_component_class_template();
             let view_template = "@props([])\n\n<div>\n    {{ $slot }}\n</div>\n".to_string();
@@ -18684,9 +18730,23 @@ return [
     async fn resolve_component_file(&self, name: &str) -> Option<PathBuf> {
         let config = self.get_cached_config().await?;
         for path in config.resolve_component_path(name) {
-            if self.file_exists_cached(&path).await {
-                return Some(path);
+            if !self.file_exists_cached(&path).await {
+                continue;
             }
+            // Containment guard (issue #199) — the next sibling in the
+            // #130 → #143 → #148 → #194 containment-guard chain, whose invariant
+            // is that the fail-closed `path_within_root` check holds *uniformly*
+            // on every FS-touching resolution path. `resolve_component_path`
+            // already drops out-of-root candidates with the *lexical*
+            // `path_within_root_lexical` filter, so this is defense-in-depth: it
+            // re-checks containment with the same fail-closed guard the sibling
+            // `resolve_component_existing_file` (`:13878`) applies, against the
+            // same `config.root`. `continue` so a later in-root candidate can
+            // still resolve.
+            if !path_within_root(&path, &config.root) {
+                continue;
+            }
+            return Some(path);
         }
         None
     }
