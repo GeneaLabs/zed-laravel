@@ -22,6 +22,19 @@
 //! symlink that canonicalizes outside), while a genuine in-root file still
 //! resolves through the guard's allow branch. They drive the private async
 //! method directly via `tower_lsp::LspService` / `inner()`.
+//!
+//! NOTE on what the two negative tests prove (issue #199 escalation, Option 1):
+//! they assert the *invariant* — that an out-of-root or symlink-escaping
+//! component never resolves — not the new guard's reject branch in isolation.
+//! Through the public API that reject branch is **unreachable today**: the
+//! upstream `path_within_root_lexical` filter in `resolve_component_path`
+//! (`salsa_impl.rs`) canonicalizes lexically-in-root candidates and drops *both*
+//! negative-test candidates before this loop runs, so each negative `None`
+//! actually comes from that upstream filter, with the resolver guard sitting
+//! behind it as the documented innermost backstop. The positive control is what
+//! exercises the guard's reachable (allow) branch. An earlier draft's assert
+//! messages misattributed the `None` solely to the new guard; they're corrected
+//! below to name the invariant.
 
 use crate::LaravelLanguageServer;
 use laravel_lsp::salsa_impl::LaravelConfigData;
@@ -31,7 +44,8 @@ use std::path::Path;
 use tower_lsp::LspService;
 
 /// Contents are irrelevant to resolution — only that the file exists, so a
-/// `None` result can come only from the containment guard, never a missing file.
+/// `None` result can come only from the containment invariant, never a missing
+/// file.
 const CARD_BLADE: &str = "<div>{{ $message }}</div>\n";
 
 /// Build a server instance for testing. `LspService::new` wires up a real
@@ -81,9 +95,13 @@ fn write(path: &Path, contents: &str) {
 async fn out_of_root_component_file_returns_none() {
     // The conventional components directory lives OUTSIDE the project root, and
     // `card.blade.php` genuinely exists there — so a `None` result can only come
-    // from the containment refusal, never a missing file. `resolve_component_path`
-    // drops this lexically-out-of-root candidate; the fail-closed guard in
-    // `resolve_component_file` is the boundary backstop for the same invariant.
+    // from the containment invariant, never a missing file. On the reachable
+    // path the `None` is produced by the upstream `path_within_root_lexical`
+    // filter in `resolve_component_path`, which drops this lexically-out-of-root
+    // candidate before the loop runs; the fail-closed guard in
+    // `resolve_component_file` is the documented innermost backstop for the same
+    // invariant. This test pins the invariant at the resolver boundary, not the
+    // guard's (today unreachable) reject branch.
     let root = tempfile::TempDir::new().unwrap();
     let outside = tempfile::TempDir::new().unwrap();
 
@@ -102,8 +120,10 @@ async fn out_of_root_component_file_returns_none() {
 
     assert!(
         result.is_none(),
-        "an out-of-root component file must not resolve, even though it exists \
-         on disk — the containment guard refuses it"
+        "an out-of-root component file must never resolve, even though it exists \
+         on disk — the containment invariant refuses it (the upstream lexical \
+         filter drops the candidate; the resolver guard is the fail-closed \
+         backstop)"
     );
 }
 
@@ -143,11 +163,18 @@ async fn under_root_symlink_to_outside_target_returns_none() {
     // conventional candidate `<root>/resources/views/components/card.blade.php`
     // is an under-root symlink whose target is a real file OUTSIDE the root. The
     // link path is lexically inside the root, and the target exists (so
-    // `file_exists_cached`, which follows symlinks, would pass) — only
+    // `file_exists_cached`, which follows symlinks, would pass) — so only
     // canonicalization, resolving the symlink to its out-of-tree target, can
-    // reject it. The lexical filter's canonicalize step catches it here, and the
-    // fail-closed `path_within_root` guard holds the same line at the resolver
-    // boundary.
+    // reject it. That canonicalization happens FIRST in the upstream
+    // `path_within_root_lexical` filter (`resolve_component_path`): it admits the
+    // lexically-in-root link path, then canonicalizes it, sees the out-of-tree
+    // target, and drops the candidate before this loop runs — so the `None` comes
+    // from the upstream filter, not the new guard. The fail-closed
+    // `path_within_root` guard holds the same line at the resolver boundary as the
+    // documented backstop. (The original AC's premise that "only `path_within_root`
+    // catches this" was wrong — `path_within_root_lexical` canonicalizes too;
+    // hence this test asserts the invariant, not the guard's unreachable reject
+    // branch.)
     let root = tempfile::TempDir::new().unwrap();
     let outside = tempfile::TempDir::new().unwrap();
 
@@ -174,7 +201,9 @@ async fn under_root_symlink_to_outside_target_returns_none() {
     assert!(
         result.is_none(),
         "a component file reached through an under-root symlink that resolves \
-         outside the project root must not resolve — canonicalization refuses it \
-         even though the link path is lexically inside"
+         outside the project root must never resolve — canonicalization refuses \
+         it (in the upstream lexical filter, mirrored by the resolver's \
+         fail-closed backstop) even though the link path is lexically inside the \
+         root"
     );
 }

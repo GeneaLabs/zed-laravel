@@ -2472,6 +2472,32 @@ class {} extends Component
     ) -> Option<CodeActionOrCommand> {
         let file_uri = Url::from_file_path(&self.target_path).ok()?;
 
+        // Containment backstop (issue #199) — the write/create seam of the
+        // #130 → #143 → #148 → #194 containment-guard chain, whose invariant is
+        // that no FS-touching path escapes the project root. Every create action
+        // (View, BladeComponent, Livewire, Inertia, …) materialises
+        // `self.target_path`, so refuse to *offer* the action when that target
+        // resolves outside `root` — return `None` rather than constructing an
+        // out-of-root `ResourceOp::Create`. `target_path` is server-authored from
+        // the diagnostic and already safe today; this is belt-and-suspenders
+        // against a forged or malformed diagnostic.
+        //
+        // The guard uses `path_within_root_lexical`, NOT the fail-closed
+        // `path_within_root` the sibling *read* paths use: a create target never
+        // exists yet, so `path.canonicalize()` always fails for it, and the
+        // fail-closed guard would refuse *every* create — including legitimate
+        // in-root ones. The lexical guard refuses out-of-root and interior-`..`
+        // escapes while admitting a not-yet-created in-root target (and still
+        // canonicalizes to catch a symlink escape when the target does exist),
+        // which is exactly the contract a speculative emitted path needs. When the
+        // root is not yet known (`None`) there is nothing to check against, so
+        // pre-existing behaviour is preserved.
+        if let Some(root) = root {
+            if !path_within_root_lexical(&self.target_path, root) {
+                return None;
+            }
+        }
+
         // Handle different action types
         let workspace_edit = if let FileActionType::Livewire = self.action_type {
             // Livewire creates TWO files: PHP class and Blade view
