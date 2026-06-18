@@ -36,15 +36,18 @@ use crate::path_containment::path_within_root;
 pub struct ComposerAutoload {
     /// (psr4_prefix_no_trailing_backslash, absolute_source_roots)
     prefixes: Vec<(String, Vec<PathBuf>)>,
-    /// The project root this autoload data was loaded for. Every candidate
-    /// `resolve` builds is gated against this with the fail-closed
-    /// [`path_within_root`] guard, so a `..`-bearing FQCN — or a PSR-4 mapping
-    /// / under-root symlink pointing outside the tree — can't yield a path that
-    /// escapes the root and is then `stat`'d and returned (issue #222,
-    /// containment lineage #130 → #143 → #148 → #194 → #199 → #201 → #214 →
-    /// #218). Stored at construction rather than threaded per-call so resolution
-    /// is bound to exactly the root the PSR-4 mappings were resolved against —
-    /// a caller can't hand `resolve` a mismatched root.
+    /// The project root this autoload data was loaded for. Every candidate that
+    /// [`resolve`](Self::resolve) (FQCN → file) and
+    /// [`resolve_namespace_dirs`](Self::resolve_namespace_dirs)
+    /// (namespace → directory) build is gated against this with the fail-closed
+    /// [`path_within_root`] guard, so a `..`-bearing FQCN / namespace — or a
+    /// PSR-4 mapping / under-root symlink pointing outside the tree — can't
+    /// yield a path that escapes the root and is then `stat`'d / walked and
+    /// returned (issues #222 for the FQCN branch and #226 for the directory
+    /// branch; containment lineage #130 → #143 → #148 → #194 → #199 → #201 →
+    /// #214 → #218 → #222). Stored at construction rather than threaded per-call
+    /// so resolution is bound to exactly the root the PSR-4 mappings were
+    /// resolved against — a caller can't hand a resolver a mismatched root.
     project_root: PathBuf,
 }
 
@@ -120,6 +123,18 @@ impl ComposerAutoload {
     /// the registered PHP namespace is turned into a directory whose class
     /// files become `<x-prefix::name>` candidates. Only directories that exist
     /// on disk are returned; a namespace with no matching prefix yields empty.
+    ///
+    /// Every candidate directory is gated by the fail-closed [`path_within_root`]
+    /// guard before the on-disk check (issue #226), the directory-resolution
+    /// sibling of the FQCN→file guard `resolve` carries (#222): a `..`-bearing
+    /// namespace, a PSR-4 mapping value pointing outside the tree, or an
+    /// under-root symlink along the path would otherwise yield a directory that
+    /// escapes [`Self::project_root`] and is then `stat`'d (`is_dir`) and walked
+    /// downstream (`scan_class_dir` → `scan_dir`'s `follow_links(true)`). A
+    /// candidate that canonicalizes outside the root — or can't be proven in-root
+    /// — is refused (skip to the next `source_root`), making the lineage's
+    /// invariant that the guard holds *uniformly* across every FS-touching
+    /// resolution path in `ComposerAutoload` actually true.
     pub fn resolve_namespace_dirs(&self, namespace: &str) -> Vec<PathBuf> {
         let normalized = namespace.trim_start_matches('\\').trim_end_matches('\\');
         let mut dirs = Vec::new();
@@ -144,6 +159,21 @@ impl ComposerAutoload {
             if let Some(rel) = rel {
                 for source_root in source_roots {
                     let dir = source_root.join(&rel);
+                    // The namespace remainder may carry `..` segments, which
+                    // `PathBuf::push`/`join` appends literally — or the mapped
+                    // `source_root` itself (an absolute / `..` PSR-4 value) or an
+                    // under-root symlink along the way may point outside the tree.
+                    // Either way the directory can escape the project root and be
+                    // `stat`'d (`is_dir`) here, then walked downstream by
+                    // `scan_class_dir` → `scan_dir`'s `follow_links(true)` traversal,
+                    // as an out-of-root read primitive. Gate it with the fail-closed
+                    // `path_within_root` guard before the on-disk check: a directory
+                    // that canonicalizes outside the root (or can't be proven
+                    // in-root) is skipped to the next `source_root` (issue #226),
+                    // mirroring the `resolve` / #222 pattern above.
+                    if !path_within_root(&dir, &self.project_root) {
+                        continue;
+                    }
                     if dir.is_dir() {
                         dirs.push(dir);
                     }

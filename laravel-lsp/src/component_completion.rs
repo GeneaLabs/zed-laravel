@@ -108,6 +108,20 @@ fn scan_dir(
 
     let want_blade = kind == CandidateKind::AnonymousView;
 
+    // Containment scope (issue #226): the `dir` reached via the PSR-4
+    // namespace→directory path (`ComposerAutoload::resolve_namespace_dirs` →
+    // `scan_class_dir`) is now containment-gated by the fail-closed
+    // `path_within_root` guard at its source, so the *root* of this walk can no
+    // longer be an out-of-root directory. What is NOT yet gated here is each
+    // *discovered* path under `follow_links(true)`: a symlink encountered
+    // *inside* an in-root `dir` whose target escapes the project root would be
+    // followed and its files emitted as candidates. That symlink-escape leg is
+    // deferred scope — `scan_dir` is shared by callers (e.g.
+    // `collect_flux_components`) whose `dir`s are constructed in-root by
+    // different means, so gating discovered paths uniformly belongs in a
+    // dedicated follow-up rather than this resolver-scoped change. Low practical
+    // risk under the LSP threat model: the scanned tree is the developer's own
+    // project, and the probe is a read.
     for entry in WalkDir::new(dir)
         .follow_links(true)
         .into_iter()
