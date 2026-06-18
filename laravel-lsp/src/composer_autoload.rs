@@ -27,6 +27,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use crate::path_containment::path_within_root;
+
 /// Cached autoload data for one Laravel project. The PSR-4 prefix list is
 /// sorted longest-first so a more specific prefix wins over a less specific
 /// one (e.g. `App\Models\` over `App\`).
@@ -34,6 +36,16 @@ use std::sync::{Mutex, OnceLock};
 pub struct ComposerAutoload {
     /// (psr4_prefix_no_trailing_backslash, absolute_source_roots)
     prefixes: Vec<(String, Vec<PathBuf>)>,
+    /// The project root this autoload data was loaded for. Every candidate
+    /// `resolve` builds is gated against this with the fail-closed
+    /// [`path_within_root`] guard, so a `..`-bearing FQCN — or a PSR-4 mapping
+    /// / under-root symlink pointing outside the tree — can't yield a path that
+    /// escapes the root and is then `stat`'d and returned (issue #222,
+    /// containment lineage #130 → #143 → #148 → #194 → #199 → #201 → #214 →
+    /// #218). Stored at construction rather than threaded per-call so resolution
+    /// is bound to exactly the root the PSR-4 mappings were resolved against —
+    /// a caller can't hand `resolve` a mismatched root.
+    project_root: PathBuf,
 }
 
 impl ComposerAutoload {
@@ -44,6 +56,16 @@ impl ComposerAutoload {
     /// FQCNs may have a leading `\` (fully qualified) — stripped before
     /// lookup. The match must end on a namespace separator boundary so
     /// `App\Models` doesn't accidentally match a prefix `App\Mo`.
+    ///
+    /// Every candidate is gated by the fail-closed [`path_within_root`] guard
+    /// before the on-disk check (issue #222, containment lineage
+    /// #130 → #143 → #148 → #194 → #199 → #201 → #214 → #218): a `..`-bearing
+    /// FQCN, a PSR-4 mapping pointing outside the tree, or an under-root symlink
+    /// along the candidate path would otherwise produce a path that escapes
+    /// [`Self::project_root`] and is then `stat`'d and returned — so a candidate
+    /// that canonicalizes outside the root (or can't be proven in-root) is
+    /// refused (skip to the next `source_root`), mirroring the #199 / PR #221
+    /// pattern.
     pub fn resolve(&self, fqcn: &str) -> Option<PathBuf> {
         let normalized = fqcn.trim_start_matches('\\');
         for (prefix, source_roots) in &self.prefixes {
@@ -69,6 +91,18 @@ impl ComposerAutoload {
             rel_path.set_extension("php");
             for source_root in source_roots {
                 let candidate = source_root.join(&rel_path);
+                // The PSR-4 remainder may carry `..` segments, which
+                // `PathBuf::push`/`join` appends literally — or the mapped
+                // `source_root` itself (an absolute / `..` PSR-4 value) or an
+                // under-root symlink along the way may point outside the tree.
+                // Either way the candidate can escape the project root and be
+                // `stat`'d/returned as an out-of-root read primitive. Gate it
+                // with the fail-closed `path_within_root` guard before the
+                // on-disk check: a candidate that canonicalizes outside the root
+                // (or can't be proven in-root) is skipped (issue #222).
+                if !path_within_root(&candidate, &self.project_root) {
+                    continue;
+                }
                 if candidate.exists() {
                     return Some(candidate);
                 }
@@ -167,7 +201,15 @@ impl ComposerAutoload {
         // would otherwise match an FQCN like `App\Models\User`.
         prefixes.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
 
-        Self { prefixes }
+        Self {
+            prefixes,
+            // Bind the containment guard in `resolve` to the root these PSR-4
+            // mappings were resolved against. Stored as given (not
+            // canonicalized): `path_within_root` canonicalizes both sides
+            // itself, so the macOS `/var`→`/private/var` symlinked-root case
+            // is handled there.
+            project_root: project_root.to_path_buf(),
+        }
     }
 
     /// Pull PSR-4 entries out of an `autoload` (or `autoload-dev`) JSON
