@@ -19,6 +19,7 @@
 //! | Middleware  | `resolve_class_to_file` (PSR-4 from class name)     | `..`-injected / out-of-root PSR-4 map |
 //! | Feature     | `resolve_class_to_file` + `root.join("app/Features")` | as middleware + uniform invariant |
 //! | Env         | `root.join(".env")` (structurally in-root)          | dangling `.env` symlink + uniform invariant |
+//! | Inertia page | `page_create_path` → `root.join("resources/js/Pages")` (structurally in-root) | dangling page symlink + uniform invariant (issue #220) |
 //!
 //! Each surface gets two cases, mirroring the #201 component test:
 //! a **regression** test (every candidate out-of-root → `"unknown"`, never a
@@ -257,5 +258,79 @@ fn env_hint_skips_dangling_under_root_symlink() {
         "unknown",
         "a dangling under-root .env symlink must not be echoed into the hint — \
          it falls back to \"unknown\""
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Inertia "page not found" — `page_create_path` → `resources/js/Pages/<page>.<ext>`
+// ---------------------------------------------------------------------------
+//
+// `inertia_not_found_diagnostic` builds `expected_path` via
+// `inertia::page_create_path`, which `root.join`s an `is_valid_page_name`-validated
+// name under `resources/js/Pages` — so `..`-injection and absolute-path escapes are
+// already blocked structurally. The one residual the emit-safe guard closes here is
+// a dangling under-root symlink at the page path (e.g. `resources/js/Pages/Foo.vue`),
+// whose target a client could follow out of the tree on `CreateFile`. Routing it
+// keeps the containment invariant uniform across every surface (issue #220). The
+// out-of-root regression case below documents the helper's contract for this surface
+// alongside the others.
+
+#[test]
+fn inertia_page_hint_is_unknown_when_all_candidates_out_of_root() {
+    let root = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+
+    let escapee = outside.path().join("resources/js/Pages/Dashboard.vue");
+
+    assert_eq!(
+        in_root_expected_path_hint(std::slice::from_ref(&escapee), root.path()),
+        "unknown",
+        "an out-of-root Inertia page path must never be echoed into the \"Expected \
+         at:\" hint — it falls back to \"unknown\""
+    );
+}
+
+#[test]
+fn inertia_page_hint_keeps_in_root_missing_candidate() {
+    let root = tempfile::TempDir::new().unwrap();
+    // The everyday case: an Inertia page that doesn't exist on disk yet.
+    let in_root = root.path().join("resources/js/Pages/Auth/Login.vue");
+
+    assert!(
+        in_root.canonicalize().is_err(),
+        "precondition: the in-root Inertia page candidate does not exist on disk"
+    );
+    assert_eq!(
+        in_root_expected_path_hint(std::slice::from_ref(&in_root), root.path()),
+        in_root.to_string_lossy(),
+        "a genuinely-absent in-root Inertia page path is a legitimate create \
+         target and must be surfaced unchanged"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn inertia_page_hint_skips_dangling_under_root_symlink() {
+    // A hostile repo ships `resources/js/Pages/Foo.vue` as a dangling under-root
+    // symlink (`→ ../../../outside`) whose target was never created. The link path
+    // is lexically inside the root, but a client `CreateFile` following it could
+    // write outside the project tree, so the hint must refuse it and fall back to
+    // "unknown" rather than leak the symlink's link path.
+    let root = tempfile::TempDir::new().unwrap();
+    let pages_dir = root.path().join("resources/js/Pages");
+    std::fs::create_dir_all(&pages_dir).unwrap();
+    let missing_target = std::path::Path::new("../../../outside");
+    let dangling = pages_dir.join("Foo.vue");
+    std::os::unix::fs::symlink(missing_target, &dangling).unwrap();
+
+    assert!(
+        dangling.canonicalize().is_err(),
+        "precondition: the candidate is a dangling symlink (can't canonicalize)"
+    );
+    assert_eq!(
+        in_root_expected_path_hint(std::slice::from_ref(&dangling), root.path()),
+        "unknown",
+        "a dangling under-root Inertia page symlink must not be echoed into the \
+         hint — it falls back to \"unknown\""
     );
 }

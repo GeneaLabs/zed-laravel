@@ -15908,6 +15908,16 @@ return [
     /// server. The "Expected at" path is built with the project's `dominant`
     /// extension so the downstream create-page code action lands a file of the
     /// right type.
+    ///
+    /// The "Expected at:" path is routed through [`in_root_expected_path_hint`]
+    /// (issue #220): this message is parsed back into a `CreateFile` target by
+    /// [`FileAction::from_diagnostic`], and the emit-safe guard refuses a dangling
+    /// under-root symlink at the page path (whose target a client could follow out
+    /// of the tree on create) — falling back to `"unknown"` — while still admitting
+    /// a genuinely-absent in-root page (the normal create target). This keeps the
+    /// containment invariant uniform across *every* `from_diagnostic → CreateFile`
+    /// surface, matching the view/component/translation/config/middleware/feature/env
+    /// surfaces (#201/#214).
     fn inertia_not_found_diagnostic(
         page_ref: &laravel_lsp::salsa_impl::InertiaReferenceData,
         resolved: bool,
@@ -15920,6 +15930,12 @@ return [
         // An invalid (traversing) page name yields no expected path; skip it
         // rather than emit an unactionable diagnostic.
         let expected_path = laravel_lsp::inertia::page_create_path(root, &page_ref.name, dominant)?;
+        // Route the create-page target through the emit-safe containment guard
+        // before echoing it in the "Expected at:" line, the same routing every
+        // other `from_diagnostic → CreateFile` surface uses (#220). A dangling
+        // under-root symlink at the page path falls back to "unknown" rather than
+        // leaking a path a client could follow out of the tree on CreateFile.
+        let expected_hint = in_root_expected_path_hint(std::slice::from_ref(&expected_path), root);
         Some(Diagnostic {
             range: Range {
                 start: Position {
@@ -15936,8 +15952,7 @@ return [
             source: Some("laravel".to_string()),
             message: format!(
                 "Inertia page not found: '{}'\nExpected at: {}",
-                page_ref.name,
-                expected_path.to_string_lossy()
+                page_ref.name, expected_hint
             ),
             related_information: None,
             tags: None,
