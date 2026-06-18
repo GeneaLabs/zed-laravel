@@ -500,6 +500,31 @@ async fn relationship_property_receiver_validates_against_related_table() {
 }
 
 #[tokio::test]
+async fn relationship_property_receiver_still_flags_unknown_column_on_related_table() {
+    // Symmetric negative for the property-access form: the hop narrows the table,
+    // it does not silence diagnostics. `emial` is a typo of a *users* column,
+    // gone after the property hop — on competitions it's unknown, so it's still
+    // flagged with the competitions table named (proving validation moved tables
+    // rather than being blanket-suppressed).
+    let (_dir, root, db) = competitions_project().await;
+    let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$user->competitions->where('emial', 1)->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "unknown column on competitions still flags via property access: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert!(
+        diags[0].message.contains("competitions"),
+        "diagnostic should name the competitions table; got: {}",
+        diags[0].message
+    );
+}
+
+#[tokio::test]
 async fn flags_unknown_table_in_db_table() {
     let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
     let db = provider_with(root.clone(), &[("users", &[("id", "int")])]).await;

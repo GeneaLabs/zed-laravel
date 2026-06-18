@@ -451,10 +451,14 @@ pub fn is_eloquent_static_starter(name: &str) -> bool {
 /// keeps its existing classification and never triggers a hop.
 ///
 /// Covers every table consulted by [`arg_kind`] and [`chain_effect`] plus the
-/// closure-carrier, join, and `from*()` tables, so the only names left over are
-/// genuinely-unknown calls (relationship accessors, custom local scopes, or
-/// builder methods we simply don't model — all of which `resolve_related_model`
-/// safely returns `None` for when they aren't relationships).
+/// closure-carrier, join, `from*()`, and Eloquent static-starter tables, so the
+/// only names left over are genuinely-unknown calls (relationship accessors,
+/// custom local scopes, or builder methods we simply don't model — all of which
+/// `resolve_related_model` safely returns `None` for when they aren't
+/// relationships). `ELOQUENT_STATIC_STARTERS` is included because pagination /
+/// limit / soft-delete starters such as `limit`, `take`, `withTrashed`, and
+/// `inRandomOrder` live only there; without it they would be mis-queued as
+/// relation-hop candidates mid-chain.
 pub fn is_known_builder_method(name: &str) -> bool {
     COLUMN_METHODS.contains(&name)
         || RAW_METHODS.contains(&name)
@@ -470,6 +474,7 @@ pub fn is_known_builder_method(name: &str) -> bool {
         || COLLECTION_TERMINATORS.contains(&name)
         || CHAIN_TERMINATORS.contains(&name)
         || TRANSPARENT.contains(&name)
+        || ELOQUENT_STATIC_STARTERS.contains(&name)
 }
 
 #[cfg(test)]

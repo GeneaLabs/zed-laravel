@@ -570,6 +570,24 @@ fn known_builder_methods_do_not_queue_relation_hops() {
 }
 
 #[test]
+fn eloquent_static_starter_methods_do_not_queue_relation_hops() {
+    // `withTrashed`, `limit` & friends live *only* in ELOQUENT_STATIC_STARTERS,
+    // so without that table in `is_known_builder_method` they would be mis-queued
+    // as relation-hop candidates mid-chain. Only the genuine relation accessor
+    // (`competitions`) may be queued — not the recognised builder methods that
+    // precede it.
+    let ctx =
+        detect("User::query()->withTrashed()->limit(10)->competitions()->where('ty|pe', 'x');")
+            .expect("ctx");
+    assert_eq!(
+        ctx.pending_relation_hops,
+        vec!["competitions".to_string()],
+        "only the relation accessor should be queued; got {:?}",
+        ctx.pending_relation_hops
+    );
+}
+
+#[test]
 fn relation_property_receiver_starts_collection_with_pending_hop() {
     // `$user->competitions->where('|')` — the relation read as a property is a
     // Collection of the related model; the property name is the first pending
