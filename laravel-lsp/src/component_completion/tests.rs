@@ -57,7 +57,7 @@ fn scan_anonymous_dir_emits_namespaced_blade_components() {
     ]);
     let scan_dir = root.join("views/test/components");
 
-    let mut got = scan_anonymous_dir(&scan_dir, "test::", &root);
+    let mut got = scan_anonymous_dir(&scan_dir, "test::", &root, &root);
     got.sort_by(|a, b| a.name.cmp(&b.name));
 
     assert_eq!(names(&got), vec!["test::backstage", "test::forms.input"]);
@@ -67,14 +67,14 @@ fn scan_anonymous_dir_emits_namespaced_blade_components() {
 #[test]
 fn scan_anonymous_dir_with_empty_prefix_for_root_components() {
     let (_dir, root) = dir_with_files(&[("components/button.blade.php", "x")]);
-    let got = scan_anonymous_dir(&root.join("components"), "", &root);
+    let got = scan_anonymous_dir(&root.join("components"), "", &root, &root);
     assert_eq!(names(&got), vec!["button"]);
 }
 
 #[test]
 fn scan_missing_dir_is_empty() {
     let (_dir, root) = dir_with_files(&[]);
-    assert!(scan_anonymous_dir(&root.join("nope"), "", &root).is_empty());
+    assert!(scan_anonymous_dir(&root.join("nope"), "", &root, &root).is_empty());
 }
 
 // ─── class scan ─────────────────────────────────────────────────────────
@@ -89,7 +89,7 @@ fn scan_class_dir_emits_kebab_class_components_and_skips_blade() {
     ]);
     let scan_dir = root.join("app/View/Components");
 
-    let mut got = scan_class_dir(&scan_dir, "", &root);
+    let mut got = scan_class_dir(&scan_dir, "", &root, &root);
     got.sort_by(|a, b| a.name.cmp(&b.name));
 
     assert_eq!(names(&got), vec!["alert", "forms.input-text"]);

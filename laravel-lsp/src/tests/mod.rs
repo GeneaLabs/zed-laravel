@@ -35,6 +35,7 @@ mod rename_integration;
 mod route_binding_resolution;
 mod route_diagnostics;
 mod routes_dir_gate;
+mod scan_dir_containment;
 mod slot_navigation_containment;
 mod slot_variable_resolution;
 mod translation_namespace_check;

@@ -41,6 +41,17 @@
 //!   write outside the tree (issues #134/#155), so it is refused while a path
 //!   with nothing at all on disk is admitted. Used by `main.rs`'s
 //!   `in_root_expected_path_hint`.
+//! - [`path_within_root_walk_entry`] is the fail-closed guard for a path
+//!   **discovered during a `follow_links(true)` directory walk** (issue #228).
+//!   A `WalkDir` rooted at a containment-trusted in-root directory still follows
+//!   a symlink encountered *inside* it whose target escapes the root, surfacing
+//!   out-of-root files as entries; gating each discovered entry drops those
+//!   before they become a read primitive or an emitted candidate. It mirrors
+//!   [`path_within_root`] exactly — a discovered entry the walk just yielded
+//!   normally exists and canonicalizes, an under-root symlink resolving inside
+//!   the root passes, and anything that escapes (or can't be canonicalized) is
+//!   refused. Used by `scan_dir` in `component_completion.rs` and the
+//!   `controllers_dir` walk in `main.rs`.
 
 use std::path::Path;
 
@@ -70,6 +81,30 @@ fn canonical_containment(path: &Path, root: &Path) -> Option<bool> {
 /// not admitted.
 pub fn path_within_root(path: &Path, root: &Path) -> bool {
     canonical_containment(path, root).unwrap_or(false)
+}
+
+/// True if a `path` **discovered during a `follow_links(true)` directory walk**
+/// resolves inside `root`. The containment gate for entries a `WalkDir` yields
+/// while following symlinks: the walk root may itself be in-root and
+/// containment-trusted, yet `follow_links(true)` still descends a symlink
+/// encountered *inside* it whose target escapes the project root and surfaces the
+/// files under that target as entries. Gating each discovered entry against the
+/// root drops those escaping paths before they become a read primitive or an
+/// emitted candidate — the discovered-path leg the resolver guard in #226
+/// deferred (issue #228).
+///
+/// **Fail-closed**, delegating to [`path_within_root`]: the entry's real,
+/// symlink-resolved path is compared against the real root, and an entry that
+/// can't be canonicalized is refused, not admitted. A discovered entry the walk
+/// just yielded normally exists on disk and canonicalizes; the fail-closed arm
+/// only bites a path that vanishes mid-walk, which is correctly refused. An
+/// under-root symlink whose target stays *inside* the root passes, so legitimate
+/// in-root symlinked content is still discovered — the gate does not over-refuse.
+///
+/// Takes the entry's `&Path` (from `walkdir::DirEntry::path`) rather than the
+/// `DirEntry`, so `path_containment` carries no `walkdir` coupling.
+pub fn path_within_root_walk_entry(path: &Path, root: &Path) -> bool {
+    path_within_root(path, root)
 }
 
 /// True if `path` is contained within `root`, gated by a **lexical** check that
@@ -667,5 +702,110 @@ mod tests {
             "a dangling under-root symlink behind a no-search-permission parent \
              (lstat EACCES, not NotFound) must be refused — the guard fails closed"
         );
+    }
+
+    // ─── walk-entry gate (issue #228) ───────────────────────────────────────
+
+    #[test]
+    fn walk_entry_admits_in_root_file() {
+        // The everyday case: a real file the walk yields from inside the root
+        // canonicalizes under the root and must be admitted (the gate does not
+        // over-refuse ordinary discovered entries).
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("app").join("View").join("Alert.php");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "<?php\n").unwrap();
+
+        assert!(path_within_root_walk_entry(&file, root.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_entry_refuses_path_through_under_root_symlink_escaping_root() {
+        // The #228 escape: a symlink *inside* an in-root walk root points OUTSIDE
+        // the root, so `follow_links(true)` would descend it and surface
+        // `<root>/components/escape/secret.php` as an entry — whose real path is
+        // `<tmp>/outside/secret.php`. The walk-entry gate must refuse it.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(root.join("components")).unwrap();
+
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.php");
+        std::fs::write(&secret, "<?php\n").unwrap();
+
+        let escape_link = root.join("components").join("escape");
+        std::os::unix::fs::symlink(&outside, &escape_link).unwrap();
+
+        // Precondition: the entry exists through the symlink and resolves OUTSIDE
+        // the root, so `false` can only be the gate refusing it, not absence.
+        let entry = root.join("components").join("escape").join("secret.php");
+        assert_eq!(
+            entry.canonicalize().unwrap(),
+            secret.canonicalize().unwrap(),
+            "precondition: the discovered entry resolves through the symlink to the \
+             out-of-root file"
+        );
+        assert!(
+            !entry
+                .canonicalize()
+                .unwrap()
+                .starts_with(root.canonicalize().unwrap()),
+            "precondition: the resolved entry escapes the project root"
+        );
+
+        assert!(
+            !path_within_root_walk_entry(&entry, &root),
+            "a discovered entry whose path crosses an under-root symlink resolving \
+             outside the root must be refused by the fail-closed walk-entry gate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_entry_admits_path_through_in_root_symlink() {
+        // The positive control for the symlink case: a symlink inside the walk
+        // root whose target stays *inside* the root must still admit the entries
+        // reached through it — the gate refuses escapes, not all symlinks.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        let real = root.join("real-components");
+        std::fs::create_dir_all(&real).unwrap();
+        let file = real.join("button.php");
+        std::fs::write(&file, "<?php\n").unwrap();
+
+        let link = root.join("linked-components");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The entry reached through the in-root symlink.
+        let entry = link.join("button.php");
+        assert!(
+            entry
+                .canonicalize()
+                .unwrap()
+                .starts_with(root.canonicalize().unwrap()),
+            "precondition: the entry resolves through an in-root symlink, staying \
+             inside the root"
+        );
+        assert!(
+            path_within_root_walk_entry(&entry, &root),
+            "an entry reached through an in-root symlink (target inside the root) \
+             must be admitted — the gate does not over-refuse"
+        );
+    }
+
+    #[test]
+    fn walk_entry_refuses_sibling_root_entry() {
+        // A real entry under a *sibling* root must not be reported as contained.
+        let parent = TempDir::new().unwrap();
+        let root = parent.path().join("project");
+        let sibling = parent.path().join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let escapee = sibling.join("secret.php");
+        std::fs::write(&escapee, "<?php\n").unwrap();
+
+        assert!(!path_within_root_walk_entry(&escapee, &root));
     }
 }

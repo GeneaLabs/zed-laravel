@@ -29,6 +29,7 @@ use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_fil
 use laravel_lsp::migration_index::{build_migration_index, MigrationIndex};
 use laravel_lsp::path_containment::{
     path_within_root, path_within_root_emit_safe, path_within_root_lexical,
+    path_within_root_walk_entry,
 };
 use laravel_lsp::query_chain::cursor::char_col_to_byte_offset;
 use laravel_lsp::route_discovery::{
@@ -10995,6 +10996,15 @@ impl LaravelLanguageServer {
                     .unwrap_or(false)
             })
         {
+            // Containment gate (issue #228): the walk root is in-root, but
+            // `follow_links(true)` would follow a symlink *inside* it whose target
+            // escapes the project root and `read_to_string` its contents below —
+            // an out-of-root read primitive. Gate each discovered entry against the
+            // root before reading it; an in-root symlink (target inside the root)
+            // still passes.
+            if !path_within_root_walk_entry(entry.path(), root) {
+                continue;
+            }
             if let Ok(content) = std::fs::read_to_string(entry.path()) {
                 if let Some(type_name) =
                     Self::extract_view_variable_type(&content, view_name, var_name)
@@ -12396,7 +12406,15 @@ impl LaravelLanguageServer {
                 continue;
             }
 
-            // Walk the directory recursively
+            // Containment audit (issue #228): no walk-entry gate is needed here.
+            // A discovered path becomes only the `path` *display* string of a
+            // `ViewNameCompletion` — it is never read, opened, or resolved to an FS
+            // primitive at this site. Selecting a completion inserts its `name`;
+            // navigation later resolves that name through the independently
+            // containment-gated view resolver (`locate_view_file`,
+            // `path_within_root`). So even a `follow_links(true)` symlink escape
+            // could at most surface an out-of-root *display* string, never an
+            // out-of-root read.
             for entry in walkdir::WalkDir::new(&view_path)
                 .follow_links(true)
                 .into_iter()
@@ -12444,6 +12462,12 @@ impl LaravelLanguageServer {
                     continue;
                 }
 
+                // Containment audit (issue #228): no walk-entry gate is needed
+                // here, same as the `view_path` walk above — a discovered path
+                // becomes only the `path` *display* string of a
+                // `ViewNameCompletion`, never a read or an FS primitive at this
+                // site; navigation resolves by `name` through the gated view
+                // resolver.
                 for entry in walkdir::WalkDir::new(package_path)
                     .follow_links(true)
                     .into_iter()
@@ -12544,19 +12568,29 @@ impl LaravelLanguageServer {
         // 1. Root anonymous components — `resources/views/components/*.blade.php`
         //    (also where class-paired views live). No namespace prefix.
         for (_namespace, component_path) in &component_paths {
-            candidates.extend(scan_anonymous_dir(component_path, "", &root));
+            candidates.extend(scan_anonymous_dir(component_path, "", &root, &root));
         }
 
         // 2. Package view namespaces (loadViewsFrom) — `{path}/components/`.
         for (namespace, package_path) in &view_namespaces {
             let dir = package_path.join("components");
-            candidates.extend(scan_anonymous_dir(&dir, &format!("{namespace}::"), &root));
+            candidates.extend(scan_anonymous_dir(
+                &dir,
+                &format!("{namespace}::"),
+                &root,
+                &root,
+            ));
         }
 
         // 3. Anonymous component paths (Blade::anonymousComponentPath) — the
         //    registered directory IS the components dir.
         for (namespace, dir) in &anon_paths {
-            candidates.extend(scan_anonymous_dir(dir, &format!("{namespace}::"), &root));
+            candidates.extend(scan_anonymous_dir(
+                dir,
+                &format!("{namespace}::"),
+                &root,
+                &root,
+            ));
         }
 
         // 4. Anonymous component namespaces (Blade::anonymousComponentNamespace)
@@ -12564,7 +12598,12 @@ impl LaravelLanguageServer {
         for (namespace, rel_dir) in &anon_namespaces {
             for view_path in &view_paths {
                 let dir = root.join(view_path).join(rel_dir);
-                candidates.extend(scan_anonymous_dir(&dir, &format!("{namespace}::"), &root));
+                candidates.extend(scan_anonymous_dir(
+                    &dir,
+                    &format!("{namespace}::"),
+                    &root,
+                    &root,
+                ));
             }
         }
 
@@ -12574,7 +12613,12 @@ impl LaravelLanguageServer {
             let autoload = laravel_lsp::composer_autoload::ComposerAutoload::for_project(&root);
             for (namespace, php_namespace) in &class_namespaces {
                 for dir in autoload.resolve_namespace_dirs(php_namespace) {
-                    candidates.extend(scan_class_dir(&dir, &format!("{namespace}::"), &root));
+                    candidates.extend(scan_class_dir(
+                        &dir,
+                        &format!("{namespace}::"),
+                        &root,
+                        &root,
+                    ));
                 }
             }
         }
@@ -12582,7 +12626,12 @@ impl LaravelLanguageServer {
         // 6. Non-namespaced class components — `app/View/Components/*.php`.
         //    These have no blade file of their own when render() is inline, so
         //    they're invisible to the view scans above.
-        candidates.extend(scan_class_dir(&root.join("app/View/Components"), "", &root));
+        candidates.extend(scan_class_dir(
+            &root.join("app/View/Components"),
+            "",
+            &root,
+            &root,
+        ));
 
         dedup_and_sort(candidates)
     }
@@ -12623,7 +12672,13 @@ impl LaravelLanguageServer {
 
         let mut completions = Vec::new();
 
-        // Walk the Livewire directory recursively
+        // Containment audit (issue #228): no walk-entry gate is needed here. A
+        // discovered path becomes only the `path` *display* string of a
+        // `LivewireComponentCompletion` — never read, opened, or resolved to an FS
+        // primitive at this site. Selecting a completion inserts its `name`;
+        // navigation resolves that name through the independently
+        // containment-gated Livewire resolver. So a `follow_links(true)` escape
+        // could at most surface an out-of-root display string, never a read.
         for entry in walkdir::WalkDir::new(&livewire_path)
             .follow_links(true)
             .into_iter()
@@ -12686,6 +12741,13 @@ impl LaravelLanguageServer {
 
         let mut completions = Vec::new();
 
+        // Containment audit (issue #228): no walk-entry gate is needed here. Each
+        // discovered path is reduced to a `base_dir`-*relative* string
+        // (`FilePathCompletion.path`) used purely as completion label/detail text
+        // for asset/vite/path helpers — it is never read, opened, or resolved to
+        // an FS primitive at this site, and the absolute discovered path is
+        // discarded. A `follow_links(true)` symlink escape would at most surface a
+        // relative path string, never an out-of-root read.
         for entry in walkdir::WalkDir::new(base_dir)
             .follow_links(true)
             .into_iter()

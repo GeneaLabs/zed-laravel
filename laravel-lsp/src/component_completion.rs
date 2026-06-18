@@ -16,6 +16,8 @@ use std::path::Path;
 
 use walkdir::WalkDir;
 
+use crate::path_containment::path_within_root_walk_entry;
+
 /// What backs a completion candidate — drives the LSP item kind and the
 /// dedup precedence when two sources produce the same tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,30 +77,42 @@ pub fn relative_path_to_tag_body(relative: &Path) -> Option<String> {
 /// Walk `dir` for anonymous `.blade.php` components, emitting candidates named
 /// `{tag_prefix}{body}` (`tag_prefix` is `""` for the root component path or
 /// `"ns::"` for a namespaced one). `display_root` is the project root used to
-/// shorten the detail path.
+/// shorten the detail path; `root` is the project root the discovered entries
+/// are containment-gated against (issue #228) — the two coincide today but stay
+/// distinct so containment never rides on the display concern.
 pub fn scan_anonymous_dir(
     dir: &Path,
     tag_prefix: &str,
     display_root: &Path,
+    root: &Path,
 ) -> Vec<ComponentCandidate> {
-    scan_dir(dir, tag_prefix, display_root, CandidateKind::AnonymousView)
+    scan_dir(
+        dir,
+        tag_prefix,
+        display_root,
+        root,
+        CandidateKind::AnonymousView,
+    )
 }
 
 /// Walk `dir` for `.php` class-backed components (skipping `.blade.php` view
 /// files), emitting `{tag_prefix}{body}` candidates with PascalCase filenames
-/// kebab-cased.
+/// kebab-cased. `display_root` shortens the detail path; `root` is the project
+/// root the discovered entries are containment-gated against (issue #228).
 pub fn scan_class_dir(
     dir: &Path,
     tag_prefix: &str,
     display_root: &Path,
+    root: &Path,
 ) -> Vec<ComponentCandidate> {
-    scan_dir(dir, tag_prefix, display_root, CandidateKind::Class)
+    scan_dir(dir, tag_prefix, display_root, root, CandidateKind::Class)
 }
 
 fn scan_dir(
     dir: &Path,
     tag_prefix: &str,
     display_root: &Path,
+    root: &Path,
     kind: CandidateKind,
 ) -> Vec<ComponentCandidate> {
     let mut out = Vec::new();
@@ -108,20 +122,17 @@ fn scan_dir(
 
     let want_blade = kind == CandidateKind::AnonymousView;
 
-    // Containment scope (issue #226): the `dir` reached via the PSR-4
-    // namespace→directory path (`ComposerAutoload::resolve_namespace_dirs` →
-    // `scan_class_dir`) is now containment-gated by the fail-closed
-    // `path_within_root` guard at its source, so the *root* of this walk can no
-    // longer be an out-of-root directory. What is NOT yet gated here is each
-    // *discovered* path under `follow_links(true)`: a symlink encountered
-    // *inside* an in-root `dir` whose target escapes the project root would be
-    // followed and its files emitted as candidates. That symlink-escape leg is
-    // deferred scope — `scan_dir` is shared by callers (e.g.
-    // `collect_flux_components`) whose `dir`s are constructed in-root by
-    // different means, so gating discovered paths uniformly belongs in a
-    // dedicated follow-up rather than this resolver-scoped change. Low practical
-    // risk under the LSP threat model: the scanned tree is the developer's own
-    // project, and the probe is a read.
+    // Containment scope: the `dir` reached via the PSR-4 namespace→directory path
+    // (`ComposerAutoload::resolve_namespace_dirs` → `scan_class_dir`) is gated by
+    // the fail-closed `path_within_root` guard at its source (issue #226), so the
+    // *root* of this walk can no longer be an out-of-root directory. The
+    // *discovered* paths under `follow_links(true)` are gated below (issue #228):
+    // a symlink encountered *inside* an in-root `dir` whose target escapes the
+    // project root is still followed by `follow_links(true)`, so each emitted
+    // entry is checked against `root` before becoming a candidate. This closes the
+    // discovered-path leg #226 deferred and holds for every caller — including
+    // ones (e.g. `collect_flux_components`) whose `dir`s are constructed in-root
+    // by other means.
     for entry in WalkDir::new(dir)
         .follow_links(true)
         .into_iter()
@@ -141,6 +152,17 @@ fn scan_dir(
         }
         // Class scan: require a plain `.php` extension.
         if !is_blade && path.extension().and_then(|e| e.to_str()) != Some("php") {
+            continue;
+        }
+
+        // Containment gate (issue #228): drop any discovered entry whose real,
+        // symlink-resolved path escapes the project root — `follow_links(true)`
+        // would otherwise emit files reached through an under-root symlink whose
+        // target lives outside the tree. Runs after the cheap type/extension
+        // filters so only entries that would actually be emitted pay the
+        // `canonicalize` cost. Fail-closed and canonicalize-based, so an in-root
+        // symlink (target inside the root) still yields its candidates.
+        if !path_within_root_walk_entry(path, root) {
             continue;
         }
 
@@ -178,7 +200,7 @@ pub fn collect_flux_components(root: &Path) -> Vec<ComponentCandidate> {
     ];
     let mut out = Vec::new();
     for dir in &dirs {
-        out.extend(scan_anonymous_dir(dir, "", root));
+        out.extend(scan_anonymous_dir(dir, "", root, root));
     }
     dedup_and_sort(out)
 }
