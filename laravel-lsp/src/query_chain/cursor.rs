@@ -11,7 +11,8 @@
 
 use super::chain::*;
 use super::methods::{
-    is_from_opaque, is_from_replace, is_from_sub, is_subquery_join, is_table_join,
+    is_from_opaque, is_from_replace, is_from_sub, is_known_builder_method, is_subquery_join,
+    is_table_join,
 };
 use std::sync::Arc;
 use tower_lsp::lsp_types::Position;
@@ -400,9 +401,61 @@ fn initial_receiver_context(
                 },
             }
         }
+        // `$user->competitions->where(...)` — start at the base variable's
+        // model in EloquentCollection mode (a relation read as a property is a
+        // hydrated collection). The relation→related-model hop is deferred: the
+        // walker seeds `relation` into `pending_relation_hops`, and the async
+        // finalize step advances `effective_model` to the related class. When
+        // the base type is unknown there's nothing to start from — no
+        // completion.
+        ChainReceiver::Eloquent(EloquentReceiver::RelationProperty { base_type, .. }) => (
+            BuilderMode::EloquentCollection,
+            None,
+            Some(base_type.clone()?),
+            None,
+        ),
         ChainReceiver::Unknown => return None,
     };
     Some(resolved)
+}
+
+/// The relationship hops the walker must apply (deferred to async finalize),
+/// assembled in source order: the receiver's property hop first (for a
+/// `$var->relation->…` chain), then every unrecognised method call seen *before*
+/// `up_to_idx` while the chain is still an `EloquentBuilder`. Collecting only in
+/// `EloquentBuilder` mode is deliberate — once the chain flips to a Collection
+/// or base builder, an unknown call is a Collection/array method, not a relation
+/// on the model.
+fn pending_relation_hops_through(
+    chain: &BuilderChain,
+    mode: BuilderMode,
+    up_to_idx: usize,
+) -> Vec<String> {
+    let mut hops = Vec::new();
+    if let ChainReceiver::Eloquent(EloquentReceiver::RelationProperty { relation, .. }) =
+        &chain.receiver
+    {
+        hops.push(relation.clone());
+    }
+    let mut running = mode;
+    for link in chain.links.iter().take(up_to_idx) {
+        match link.effect {
+            ChainEffect::FlipToBase => running = BuilderMode::BaseBuilder,
+            ChainEffect::FlipToCollection => {
+                if running == BuilderMode::EloquentBuilder {
+                    running = BuilderMode::EloquentCollection;
+                }
+            }
+            ChainEffect::Terminate => break,
+            ChainEffect::None => {
+                if running == BuilderMode::EloquentBuilder && !is_known_builder_method(&link.method)
+                {
+                    hops.push(link.method.clone());
+                }
+            }
+        }
+    }
+    hops
 }
 
 /// Resolve the chain context at a specific link index, applying the effects of
@@ -420,6 +473,7 @@ pub fn chain_context_for_link(
 ) -> Option<ChainContext> {
     let (mut mode, effective_table, effective_model, closure_relation_hop) =
         initial_receiver_context(chains, chain)?;
+    let initial_mode = mode;
     for link in chain.links.iter().take(link_idx) {
         match link.effect {
             ChainEffect::FlipToBase => mode = BuilderMode::BaseBuilder,
@@ -432,6 +486,7 @@ pub fn chain_context_for_link(
             ChainEffect::None => {}
         }
     }
+    let pending_relation_hops = pending_relation_hops_through(chain, initial_mode, link_idx);
     let arg = chain.links.get(link_idx)?.arg;
     let (mut joined_tables, mut from_clause) = scan_accessible_tables(chain);
     let mut join_parent_model = None;
@@ -453,6 +508,7 @@ pub fn chain_context_for_link(
         expecting: arg,
         dotted_prefix: None,
         closure_relation_hop,
+        pending_relation_hops,
         quote: '\'',
         joined_tables,
         from_clause,
@@ -488,6 +544,7 @@ fn detect_target_in_chain(
 ) -> Option<ChainTarget> {
     let (mut mode, effective_table, effective_model, closure_relation_hop) =
         initial_receiver_context(chains, chain)?;
+    let initial_mode = mode;
 
     // Walk links in source order. For each link, decide: (a) does the cursor
     // sit inside this link? (b) if not, apply this link's effect and move on.
@@ -514,7 +571,9 @@ fn detect_target_in_chain(
         }
     }
 
-    let cursor_link = &chain.links[cursor_link_idx?];
+    let cursor_idx = cursor_link_idx?;
+    let pending_relation_hops = pending_relation_hops_through(chain, initial_mode, cursor_idx);
+    let cursor_link = &chain.links[cursor_idx];
 
     // The cursor must be inside a string-literal arg of the cursor link.
     // `pluck` is `ArgKind::Column` even though it terminates the chain —
@@ -579,6 +638,7 @@ fn detect_target_in_chain(
             expecting,
             dotted_prefix,
             closure_relation_hop,
+            pending_relation_hops,
             quote,
             joined_tables,
             from_clause,

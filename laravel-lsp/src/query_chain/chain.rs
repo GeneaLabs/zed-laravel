@@ -84,6 +84,23 @@ pub enum EloquentReceiver {
         var: String,
         php_type: Option<String>,
     },
+    /// `$user->competitions->where(...)` — a relationship accessed as a
+    /// *property* (not a method call) eager-/lazy-loads it into a hydrated
+    /// `Collection` of the related model, so the chain runs in
+    /// `BuilderMode::EloquentCollection`. `base_type` is the declared FQCN of
+    /// the base variable (`$user` → `App\Models\User`), resolved synchronously
+    /// by the `var_type` resolver; `relation` is the property name
+    /// (`competitions`). The related model's FQCN can't be resolved in the
+    /// (synchronous) extractor pass — it needs a model-file read — so the
+    /// walker seeds `relation` as a pending relation hop
+    /// ([`ChainContext::pending_relation_hops`]) that the async finalize step
+    /// resolves into `effective_model`. `base_type` is `None` when the base
+    /// variable's type can't be determined, in which case completion no-ops.
+    RelationProperty {
+        var: String,
+        base_type: Option<String>,
+        relation: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -340,6 +357,19 @@ pub struct ChainContext {
     /// must resolve `rel` against it (one relation hop) to get the
     /// actual model to complete against.
     pub closure_relation_hop: Option<String>,
+    /// Relationship method calls the chain walked through *as builders*
+    /// (`User::query()->competitions()->whereIn('type', …)`) or a
+    /// relationship accessed as a property on the receiver
+    /// (`$user->competitions->where('type', …)`), in source order. Each is a
+    /// method/property name on the *running* `effective_model`; the synchronous
+    /// walker can't read model files, so it records the names here and the
+    /// async finalize step
+    /// ([`crate::query_chain::eloquent_completion::apply_relation_method_hops`])
+    /// walks them via `resolve_related_model`, advancing `effective_model` on
+    /// each successful hop. A name that doesn't resolve to a relationship is
+    /// skipped (it was an unrecognised builder call), leaving `effective_model`
+    /// unchanged — the `ChainEffect::None` fallback. Empty for the common case.
+    pub pending_relation_hops: Vec<String>,
     /// The quote character the user is typing inside (`'` or `"`). Used so the
     /// completion item doesn't double up quotes when inserting.
     pub quote: char,

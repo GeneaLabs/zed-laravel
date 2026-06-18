@@ -226,6 +226,23 @@ class User extends Model {
 }
 "#;
 
+/// A `User` with a single `competitions` hasMany relation — the issue #211
+/// shape, where the relation's table has columns the parent's doesn't.
+const USER_WITH_COMPETITIONS: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function competitions() { return $this->hasMany(Competition::class); }
+}
+"#;
+
+const COMPETITION_MODEL: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Competition extends Model {
+}
+"#;
+
 fn code_of(diag: &tower_lsp::lsp_types::Diagnostic) -> &str {
     match &diag.code {
         Some(NumberOrString::String(s)) => s.as_str(),
@@ -401,6 +418,84 @@ async fn valid_relation_produces_no_diagnostic() {
     assert!(
         diags.is_empty(),
         "valid relation must not be flagged: {diags:?}"
+    );
+}
+
+// ---- relationship hops (issue #211) ---------------------------------------
+
+/// Seed a project + schema for the issue #211 fixtures: a `User`/`Competition`
+/// model pair and their tables, where `type` lives on `competitions` but NOT on
+/// `users`.
+async fn competitions_project() -> (TempDir, PathBuf, DatabaseSchemaProvider) {
+    let (dir, root) = project_with_models(&[
+        ("User", USER_WITH_COMPETITIONS),
+        ("Competition", COMPETITION_MODEL),
+    ]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("email", "string")]),
+            ("competitions", &[("id", "int"), ("type", "string")]),
+        ],
+    )
+    .await;
+    (dir, root, db)
+}
+
+#[tokio::test]
+async fn relationship_method_hop_validates_against_related_table() {
+    // `User::query()->competitions()->whereIn('type', …)` — `competitions()`
+    // returns a builder for the related model, so `type` must validate against
+    // the competitions table. Before the hop this false-positived because
+    // `type` isn't a column on `users`.
+    let (_dir, root, db) = competitions_project().await;
+    let source = "<?php\nuse App\\Models\\User;\nUser::query()->competitions()->whereIn('type', ['squash'])->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "relationship hop must validate `type` against the competitions table: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn relationship_method_hop_still_flags_unknown_column_on_related_table() {
+    // The hop narrows the table; it does not silence diagnostics. `emial` is a
+    // typo of a *users* column, which is gone after the hop — on competitions
+    // it's unknown, so it's still flagged (proving validation moved tables).
+    let (_dir, root, db) = competitions_project().await;
+    let source =
+        "<?php\nuse App\\Models\\User;\nUser::query()->competitions()->where('emial', 1)->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "unknown column on competitions still flags: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert!(
+        diags[0].message.contains("competitions"),
+        "diagnostic should name the competitions table; got: {}",
+        diags[0].message
+    );
+}
+
+#[tokio::test]
+async fn relationship_property_receiver_validates_against_related_table() {
+    // `$user->competitions->where('type', …)` — accessing the relation as a
+    // property yields a Collection of Competition, so `type` validates against
+    // the competitions table. `$user`'s type comes from the `@var` docblock.
+    let (_dir, root, db) = competitions_project().await;
+    let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$user->competitions->where('type', 'squash')->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "property-access relation must validate `type` against competitions: {diags:?}"
     );
 }
 

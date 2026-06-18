@@ -3614,6 +3614,29 @@ impl LaravelLanguageServer {
             ctx
         };
 
+        // Step the effective model through any relationship hops the walker
+        // deferred — `User::query()->competitions()->where('|')` and the
+        // `$user->competitions->where('|')` receiver form. Runs before the
+        // post-`toBase()` table resolution, which reads `effective_model`.
+        let ctx = if ctx.pending_relation_hops.is_empty() {
+            ctx
+        } else {
+            let root_clone = self.initialized_root.read().await.clone();
+            match root_clone {
+                Some(root) => {
+                    let mut ctx = ctx;
+                    eloquent_completion::apply_relation_method_hops(&mut ctx, &root).await;
+                    ctx
+                }
+                None => {
+                    info!(
+                        "🔗 chain completion: relation hops need project root, not yet initialised"
+                    );
+                    return None;
+                }
+            }
+        };
+
         // Phase 6 post-toBase normalization: `User::where(...)->toBase()`
         // flips the chain mode to BaseBuilder, but we still know which
         // model was on the other side. effective_table stays None until
@@ -15097,6 +15120,10 @@ return [
                 Some(eloquent_completion::resolve_related_model(&parent, &rel, &root).await?);
             ctx.closure_relation_hop = None;
         }
+        // Step through any deferred relationship hops (`->competitions()->…` or
+        // a `$user->competitions->…` receiver) before resolving a post-`toBase`
+        // table from the effective model.
+        eloquent_completion::apply_relation_method_hops(&mut ctx, &root).await;
         if ctx.mode == BuilderMode::BaseBuilder && ctx.effective_table.is_none() {
             if let Some(model) = ctx.effective_model.clone() {
                 ctx.effective_table =

@@ -112,6 +112,7 @@ fn make_ctx(class: &str) -> ChainContext {
         expecting: ArgKind::Column,
         dotted_prefix: None,
         closure_relation_hop: None,
+        pending_relation_hops: Vec::new(),
         quote: '\'',
         joined_tables: Vec::new(),
         from_clause: FromClause::Inherit,
@@ -529,6 +530,94 @@ class User extends Model {
 }
 
 #[tokio::test]
+async fn relation_property_receiver_offers_related_collection_columns() {
+    // Issue #211: `$user->competitions->where('|')` resolves to an
+    // EloquentCollection over Competition with `competitions` queued as a
+    // pending relation hop. After the hop, collection completion must offer
+    // the competitions table's columns — not the users table's.
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function competitions() { return $this->hasMany(Competition::class); }
+}
+"#;
+    let competition = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Competition extends Model {}
+"#;
+    let (_dir, root) =
+        project_with_models_helper(&[("User", user), ("Competition", competition)]).await;
+    let db = provider_with_table(
+        root.clone(),
+        "competitions",
+        vec![("id", "int"), ("type", "string"), ("name", "string")],
+    )
+    .await;
+
+    // The shape the chain walker produces for `$user->competitions->where('|')`.
+    let mut ctx = make_ctx("App\\Models\\User");
+    ctx.mode = BuilderMode::EloquentCollection;
+    ctx.pending_relation_hops = vec!["competitions".to_string()];
+
+    apply_relation_method_hops(&mut ctx, &root).await;
+    assert_eq!(
+        ctx.effective_model.as_deref(),
+        Some("App\\Models\\Competition"),
+        "the hop should advance effective_model to the related class"
+    );
+
+    let items = columns_for_collection(&ctx, &db, None, &root).await;
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"type"),
+        "must offer competitions.type; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"name"),
+        "must offer competitions.name; got {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn apply_relation_method_hops_skips_unresolvable_names() {
+    // A hop that isn't a relationship (an unrecognised builder method like
+    // `query`) resolves to None and is skipped, leaving the model unchanged —
+    // the ChainEffect::None fallback.
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function competitions() { return $this->hasMany(Competition::class); }
+}
+"#;
+    let competition = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Competition extends Model {}
+"#;
+    let (_dir, root) =
+        project_with_models_helper(&[("User", user), ("Competition", competition)]).await;
+    let db = provider_with_table(root.clone(), "competitions", vec![("id", "int")]).await;
+    let _ = &db;
+
+    let mut ctx = make_ctx("App\\Models\\User");
+    // `query` is not a relation → skipped; `competitions` resolves.
+    ctx.pending_relation_hops = vec!["query".to_string(), "competitions".to_string()];
+    apply_relation_method_hops(&mut ctx, &root).await;
+    assert_eq!(
+        ctx.effective_model.as_deref(),
+        Some("App\\Models\\Competition"),
+        "unresolvable hop skipped, real relation still applied"
+    );
+    assert!(
+        ctx.pending_relation_hops.is_empty(),
+        "hops consumed after application"
+    );
+}
+
+#[tokio::test]
 async fn columns_for_collection_falls_back_when_model_missing() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
@@ -699,6 +788,7 @@ class Post extends Model {
         expecting: ArgKind::Relation,
         dotted_prefix: Some("posts".to_string()),
         closure_relation_hop: None,
+        pending_relation_hops: Vec::new(),
         quote: '\'',
         joined_tables: Vec::new(),
         from_clause: FromClause::Inherit,
@@ -736,6 +826,7 @@ class User extends Model {
         expecting: ArgKind::Relation,
         dotted_prefix: Some("nonexistent".to_string()),
         closure_relation_hop: None,
+        pending_relation_hops: Vec::new(),
         quote: '\'',
         joined_tables: Vec::new(),
         from_clause: FromClause::Inherit,
@@ -798,6 +889,7 @@ fn base_ctx(
         expecting: ArgKind::Column,
         dotted_prefix: dotted_prefix.map(|s| s.to_string()),
         closure_relation_hop: None,
+        pending_relation_hops: Vec::new(),
         quote: '\'',
         joined_tables,
         from_clause,
@@ -1041,6 +1133,7 @@ fn eloquent_ctx(
         expecting: ArgKind::Column,
         dotted_prefix: dotted_prefix.map(|s| s.to_string()),
         closure_relation_hop: None,
+        pending_relation_hops: Vec::new(),
         quote: '\'',
         joined_tables,
         from_clause,

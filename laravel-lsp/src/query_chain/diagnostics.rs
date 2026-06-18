@@ -45,8 +45,8 @@
 use super::chain::*;
 use super::cursor::{byte_offset_to_position, chain_context_for_link};
 use super::eloquent_completion::{
-    enrich_join_parent_tables, resolve_related_model, resolve_table_for_model, snake_pluralize,
-    walk_dotted_hops,
+    apply_relation_method_hops, enrich_join_parent_tables, resolve_related_model,
+    resolve_table_for_model, snake_pluralize, walk_dotted_hops,
 };
 use crate::class_locator::find_php_class_file;
 use crate::database::DatabaseSchemaProvider;
@@ -292,6 +292,12 @@ async fn finalize_context(mut ctx: ChainContext, root: &Path) -> Option<ChainCon
         let related = resolve_related_model(&parent, &rel, root).await?;
         ctx.effective_model = Some(related);
     }
+    // Step the effective model through any relationship hops the walker
+    // deferred (`->competitions()->…` or a `$user->competitions->…` receiver),
+    // so column validation runs against the related model's table — not the
+    // parent's. Must precede the post-`toBase()` table resolution below, which
+    // reads `effective_model`.
+    apply_relation_method_hops(&mut ctx, root).await;
     if ctx.mode == BuilderMode::BaseBuilder && ctx.effective_table.is_none() {
         if let Some(model) = ctx.effective_model.clone() {
             ctx.effective_table = resolve_table_for_model(&model, root).await;

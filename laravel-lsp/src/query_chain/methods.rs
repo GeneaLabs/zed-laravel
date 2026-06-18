@@ -443,5 +443,34 @@ pub fn is_eloquent_static_starter(name: &str) -> bool {
     ELOQUENT_STATIC_STARTERS.contains(&name)
 }
 
+/// Whether `name` appears in any of the builder-method classification tables —
+/// i.e. it's a query/collection builder method we recognise. The chain walker
+/// uses the negation: an *unrecognised* method call in `EloquentBuilder` mode
+/// is treated as a candidate relationship hop (`User::query()->competitions()
+/// ->where(…)`), resolved against the effective model. A method that IS known
+/// keeps its existing classification and never triggers a hop.
+///
+/// Covers every table consulted by [`arg_kind`] and [`chain_effect`] plus the
+/// closure-carrier, join, and `from*()` tables, so the only names left over are
+/// genuinely-unknown calls (relationship accessors, custom local scopes, or
+/// builder methods we simply don't model — all of which `resolve_related_model`
+/// safely returns `None` for when they aren't relationships).
+pub fn is_known_builder_method(name: &str) -> bool {
+    COLUMN_METHODS.contains(&name)
+        || RAW_METHODS.contains(&name)
+        || RELATION_METHODS.contains(&name)
+        || CLOSURE_CARRIERS.contains(&name)
+        || SAME_MODEL_CLOSURE_CARRIERS.contains(&name)
+        || TABLE_JOIN_METHODS.contains(&name)
+        || FROM_REPLACE_METHODS.contains(&name)
+        || FROM_OPAQUE_METHODS.contains(&name)
+        || FROM_SUB_METHODS.contains(&name)
+        || SUBQUERY_JOIN_METHODS.contains(&name)
+        || MODE_FLIP_TO_BASE.contains(&name)
+        || COLLECTION_TERMINATORS.contains(&name)
+        || CHAIN_TERMINATORS.contains(&name)
+        || TRANSPARENT.contains(&name)
+}
+
 #[cfg(test)]
 mod tests;

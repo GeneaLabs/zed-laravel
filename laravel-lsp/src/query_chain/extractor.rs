@@ -641,10 +641,60 @@ fn member_chain_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> Chai
         // declaration) and route through the same EloquentBuilder path as
         // static calls.
         "parenthesized_expression" => parenthesized_receiver(node, bytes, aliases),
+        // `$user->competitions->where(...)` — a relationship read as a
+        // *property* (no `()`). Accessing a relation as a property returns the
+        // hydrated `Collection` of the related model, so the chain operates in
+        // `EloquentCollection` mode against the related model. We resolve the
+        // base variable's type synchronously (`$user` → `App\Models\User`) but
+        // defer the relation→related-model hop (`competitions` → `Competition`)
+        // to the async finalize step, since it needs a model-file read. The
+        // base must be a bare `$var`; nested receivers (`$this->user->rel`,
+        // `method()->rel`) stay Unknown for now.
+        "member_access_expression" => member_access_receiver(node, bytes, aliases),
         // (Future) `$this->prop->...`, `$obj->method()->...`, etc. fall
         // through. Lands alongside the var-type resolver in Phase 9.
         _ => ChainReceiver::Unknown,
     }
+}
+
+/// Resolve a `$var->relationName->...` receiver — a relationship accessed as a
+/// property. The deepest non-call node is the `member_access_expression`
+/// `$var->relationName`; its `object` is the base variable and its `name` is
+/// the property. We produce an [`EloquentReceiver::RelationProperty`] carrying
+/// the base variable's resolved type (sync) and the property name (the relation
+/// to hop, resolved async downstream).
+///
+/// Only a bare `$var` base is handled; any other object shape (nested member
+/// access, a method call, `$this->prop->rel`) returns `Unknown` so completion
+/// silently no-ops rather than guessing.
+fn member_access_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> ChainReceiver {
+    let Some(object) = node.child_by_field_name("object") else {
+        return ChainReceiver::Unknown;
+    };
+    if object.kind() != "variable_name" {
+        return ChainReceiver::Unknown;
+    }
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return ChainReceiver::Unknown;
+    };
+    let Some(relation) = node_text(name_node, bytes) else {
+        return ChainReceiver::Unknown;
+    };
+    let relation = relation.to_string();
+    let Some(raw_var) = node_text(object, bytes) else {
+        return ChainReceiver::Unknown;
+    };
+    let var = raw_var.trim_start_matches('$').to_string();
+    // Resolve `$var`'s declared class the same way the `$var->method()` form
+    // does (typed param / `@var` docblock / flow assignment). `None` is fine —
+    // it just means we couldn't determine the base model, so the receiver
+    // resolves to no completion downstream.
+    let base_type = super::var_type::resolve(object, bytes, &var, aliases);
+    ChainReceiver::Eloquent(EloquentReceiver::RelationProperty {
+        var,
+        base_type,
+        relation,
+    })
 }
 
 /// Resolve `(new X)->...` style receivers. The parens wrap exactly one

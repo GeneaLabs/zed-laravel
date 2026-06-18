@@ -738,6 +738,41 @@ pub async fn resolve_related_model(
     rel.related_model
 }
 
+/// Walk the relationship hops the chain walker deferred
+/// ([`ChainContext::pending_relation_hops`]) and advance `effective_model`
+/// through each one. Covers two shapes:
+///
+/// - method-call hops — `User::query()->competitions()->whereIn('type', …)`,
+///   where `competitions()` isn't a known builder method, so it's a relation
+///   the chain stepped into; and
+/// - a property-access receiver — `$user->competitions->where('type', …)`,
+///   whose `competitions` property hop is seeded as the first pending hop.
+///
+/// Each hop resolves against the *running* model via [`resolve_related_model`].
+/// A hop that doesn't name a relationship (an unrecognised builder method like
+/// `->limit()`, or a non-relation property) returns `None` and is skipped,
+/// leaving the model unchanged — the `ChainEffect::None` fallback. The mode is
+/// untouched: a relationship method returns a builder of the related model
+/// (`EloquentBuilder` stays `EloquentBuilder`), and the property form already
+/// entered the walker as `EloquentCollection`. No-op when there are no hops or
+/// the chain has no resolved model to start from.
+pub async fn apply_relation_method_hops(ctx: &mut ChainContext, project_root: &Path) {
+    if ctx.pending_relation_hops.is_empty() {
+        return;
+    }
+    let hops = std::mem::take(&mut ctx.pending_relation_hops);
+    let Some(mut current) = ctx.effective_model.clone() else {
+        return;
+    };
+    for hop in hops {
+        if let Some(related) = resolve_related_model(&current, &hop, project_root).await {
+            current = related;
+        }
+        // `None` → not a relationship; keep `current` and try the next hop.
+    }
+    ctx.effective_model = Some(current);
+}
+
 /// Phase 6 helper: resolve a model class to its table name.
 ///
 /// Used for the post-`->toBase()` case where the chain has flipped to
