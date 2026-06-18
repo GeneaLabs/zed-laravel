@@ -66,3 +66,18 @@ fn all_known_routes_flag_nothing() {
         LaravelLanguageServer::route_not_found_diagnostics(Some(&idx), &[route_ref("home")]);
     assert!(diags.is_empty());
 }
+
+#[test]
+fn wildcard_route_names_flag_nothing() {
+    // Wildcard patterns (`players.*`, `players.competitions.*`) match a family
+    // of registered routes — `Route::has`, `routeIs`, Ziggy — and never appear
+    // verbatim in the index, so they must not be flagged as "not found" even
+    // against a non-empty index that holds no exact match for them (issue #209).
+    let idx = index_with(&["players.competitions.index", "players.competitions.create"]);
+    let refs = vec![route_ref("players.*"), route_ref("players.competitions.*")];
+    let diags = LaravelLanguageServer::route_not_found_diagnostics(Some(&idx), &refs);
+    assert!(
+        diags.is_empty(),
+        "wildcard route patterns must not be flagged as not found"
+    );
+}

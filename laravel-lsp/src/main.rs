@@ -15814,6 +15814,16 @@ return [
             return out;
         }
         for r in route_refs {
+            // Wildcard patterns (e.g. `players.*`, `players.competitions.*`)
+            // reference a *family* of registered routes — `Route::has`,
+            // `routeIs`, Ziggy, etc. — and never appear verbatim in the index,
+            // so flagging them as "not found" is a false positive. Suppress the
+            // diagnostic for any name containing `*` (issue #209). Applied here,
+            // in the pure function before any I/O, so both the PHP and Blade
+            // call sites inherit it with no LSP restart or cache flush.
+            if r.name.contains('*') {
+                continue;
+            }
             if index.get(&r.name).is_none() {
                 out.push(Diagnostic {
                     range: Range {
