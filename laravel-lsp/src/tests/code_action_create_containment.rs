@@ -8,7 +8,11 @@
 //!
 //! The guard runs before any `ResourceOp::Create` is constructed: if the project
 //! root is known and `target_path` resolves outside it, `build_code_action`
-//! returns `None` (no action offered) instead of an out-of-root create.
+//! returns `None` (no action offered) instead of an out-of-root create. The
+//! multi-file types (`Livewire`, `BladeComponentWithClass`) emit a SECOND create
+//! beyond `target_path` — a view/class path derived from the independent `name`
+//! field — so each of those sibling paths is guarded the same way; a forged `name`
+//! cannot escape the root past the in-root `target_path` check.
 //!
 //! Why `path_within_root_lexical` and NOT the fail-closed `path_within_root` the
 //! sibling *read* paths use: a create target does not exist yet, so
@@ -61,6 +65,35 @@ fn view_action(target: PathBuf) -> FileAction {
     FileAction {
         action_type: FileActionType::View,
         name: "welcome".to_string(),
+        target_path: target,
+        file_exists: false,
+        copy_from: None,
+    }
+}
+
+/// A `Livewire` create action. This is a MULTI-FILE type: it emits `target_path`
+/// (the PHP class) AND a second create — the Blade view at
+/// `get_livewire_view_path`, which is derived from `name`, NOT from `target_path`.
+/// `name` and `target_path` are independent diagnostic fields, so they're set
+/// separately here to exercise the second-file containment guard.
+fn livewire_action(name: &str, target: PathBuf) -> FileAction {
+    FileAction {
+        action_type: FileActionType::Livewire,
+        name: name.to_string(),
+        target_path: target,
+        file_exists: false,
+        copy_from: None,
+    }
+}
+
+/// A `BladeComponentWithClass` create action. Also MULTI-FILE: it emits
+/// `target_path` (the Blade view) AND a second create — the PHP class at
+/// `get_component_class_path`, derived from `name`. Same independence of `name`
+/// and `target_path` as `livewire_action`.
+fn blade_component_with_class_action(name: &str, target: PathBuf) -> FileAction {
+    FileAction {
+        action_type: FileActionType::BladeComponentWithClass,
+        name: name.to_string(),
         target_path: target,
         file_exists: false,
         copy_from: None,
@@ -155,5 +188,93 @@ fn under_root_symlink_create_target_returns_none() {
         "a create target reached through an under-root symlink that resolves \
          outside the root must not be offered — canonicalization refuses it even \
          though the link path is lexically inside"
+    );
+}
+
+// --- Multi-file create actions (issue #199) -------------------------------
+//
+// `Livewire` and `BladeComponentWithClass` each emit a SECOND `ResourceOp::Create`
+// beyond `target_path` — a view/class path derived from the *independent* `name`
+// diagnostic field. The `target_path` guard alone does not cover it: because
+// `PathBuf::join`/`push` of an absolute-looking segment *replaces* the base, a
+// forged `name` escapes the root even when `target_path` is in-root. These tests
+// pin an in-root `target_path` (so the first guard passes) and an escaping `name`,
+// proving the second-file guard fires. Each negative would return `Some(_)` —
+// i.e. fail — if its sibling guard were removed, so none is vacuous.
+
+#[test]
+fn livewire_out_of_root_view_path_returns_none() {
+    // In-root `target_path` (passes the first guard), but `name = "/etc/passwd"`
+    // makes `get_livewire_view_path` emit `/etc/passwd.blade.php` — the absolute
+    // segment replaces the `resources/views/livewire` base, escaping the root. The
+    // second-file guard must refuse to offer the action.
+    let root = tempfile::TempDir::new().unwrap();
+    let target = root.path().join("app/Livewire/Counter.php");
+
+    assert!(
+        build(&livewire_action("/etc/passwd", target), root.path()).is_none(),
+        "a Livewire action whose name-derived view path escapes the root must not \
+         be offered, even when target_path is in-root — the second create is guarded"
+    );
+}
+
+#[test]
+fn blade_component_with_class_out_of_root_class_path_returns_none() {
+    // In-root `target_path` (the Blade view, passes the first guard), but
+    // `name = "/etc/passwd"` makes `get_component_class_path` emit `/etc/passwd.php`
+    // — the absolute segment replaces the `app/View/Components` base, escaping the
+    // root. The second-file guard must refuse to offer the action.
+    let root = tempfile::TempDir::new().unwrap();
+    let target = root
+        .path()
+        .join("resources/views/components/card.blade.php");
+
+    assert!(
+        build(
+            &blade_component_with_class_action("/etc/passwd", target),
+            root.path()
+        )
+        .is_none(),
+        "a BladeComponentWithClass action whose name-derived class path escapes the \
+         root must not be offered, even when target_path is in-root — the second \
+         create is guarded"
+    );
+}
+
+#[test]
+fn livewire_in_root_is_offered() {
+    // Positive control: both the in-root `target_path` (PHP class) and the
+    // name-derived view path (`resources/views/livewire/counter.blade.php`) stay
+    // inside the root, so the multi-file action IS offered — the sibling guard does
+    // not regress legitimate Livewire creates.
+    let root = tempfile::TempDir::new().unwrap();
+    let target = root.path().join("app/Livewire/Counter.php");
+
+    assert!(
+        build(&livewire_action("counter", target), root.path()).is_some(),
+        "a valid in-root Livewire create (both files under the root) must still be \
+         offered as a code action"
+    );
+}
+
+#[test]
+fn blade_component_with_class_in_root_is_offered() {
+    // Positive control: both the in-root `target_path` (Blade view) and the
+    // name-derived class path (`app/View/Components/Card.php`) stay inside the root,
+    // so the multi-file action IS offered — the sibling guard does not regress
+    // legitimate component-with-class creates.
+    let root = tempfile::TempDir::new().unwrap();
+    let target = root
+        .path()
+        .join("resources/views/components/card.blade.php");
+
+    assert!(
+        build(
+            &blade_component_with_class_action("card", target),
+            root.path()
+        )
+        .is_some(),
+        "a valid in-root BladeComponentWithClass create (both files under the root) \
+         must still be offered as a code action"
     );
 }
