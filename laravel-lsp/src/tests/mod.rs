@@ -11,6 +11,7 @@ mod code_lens_opt_in;
 mod component_file_navigation_containment;
 mod component_navigation_containment;
 mod composer_autoload_containment;
+mod controllers_dir_containment;
 mod diagnostic_severity;
 mod directive_navigation_containment;
 mod dynamic_where_sparseness;
