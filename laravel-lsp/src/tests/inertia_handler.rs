@@ -75,6 +75,24 @@ async fn goto_backend(root: &Path) -> LaravelLanguageServer {
     backend
 }
 
+/// Build a backend for the **goto** handler (`resolve_inertia_file`) with a
+/// dominant extension primed. Same shape as [`goto_backend`] — a root-only
+/// `cached_config` is what the handler resolves against — but the
+/// `inertia_default_ext` cache slot is also set to `Some(Some(dominant_ext))`.
+/// That two-level `Some` is the "detection already ran and found a dominant
+/// extension" state, so `inertia_dominant_extension` short-circuits to
+/// `Some(dominant_ext)` and never walks `root_path` (left unprimed). With a
+/// dominant extension in play, the handler floats that extension's candidate to
+/// the front of the probe order (main.rs:18673–18679) instead of falling back
+/// to the static `PAGE_EXTENSIONS` priority.
+async fn goto_backend_with_dominant(root: &Path, dominant_ext: &str) -> LaravelLanguageServer {
+    let (service, _socket) = LspService::new(LaravelLanguageServer::new);
+    let backend = service.inner().clone();
+    *backend.cached_config.write().await = Some(inertia_config(root.to_path_buf()));
+    *backend.inertia_default_ext.write().await = Some(Some(dominant_ext.to_string()));
+    backend
+}
+
 /// Build a backend for the **completion** handler (`get_all_inertia_pages`)
 /// primed with `root_path`. That handler lists pages against `root_path`, not the
 /// cached config, so this is the only state it needs.
@@ -170,6 +188,65 @@ async fn inertia_page_extension_priority_prefers_vue() {
     assert_eq!(
         resolved, expected,
         ".vue wins on the static PAGE_EXTENSIONS priority order when no dominant extension is set"
+    );
+    assert_eq!(
+        resolved.extension().and_then(|e| e.to_str()),
+        Some("vue"),
+        "the resolved target carries the .vue extension"
+    );
+}
+
+#[tokio::test]
+async fn inertia_dominant_extension_floats_tsx_over_vue() {
+    // goto — dominant-extension float: both `Dashboard.vue` and `Dashboard.tsx`
+    // exist, and a dominant extension of `"tsx"` is primed. The handler must
+    // float the `.tsx` candidate ahead of `.vue` (first in the static
+    // `PAGE_EXTENSIONS` order) so the dominant extension wins the ambiguous
+    // match — exercising the `sort_by_key` float at main.rs:18673–18679 at the
+    // handler level. The complementary arm to
+    // `inertia_page_extension_priority_prefers_vue`, which proves `.vue` wins
+    // when *no* dominant extension is primed.
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "resources/js/Pages/Dashboard.vue", PAGE_BODY);
+    let expected = write_file(dir.path(), "resources/js/Pages/Dashboard.tsx", PAGE_BODY);
+
+    let backend = goto_backend_with_dominant(dir.path(), "tsx").await;
+    let resolved = backend
+        .resolve_inertia_file("Dashboard")
+        .await
+        .expect("an ambiguous page still resolves to a target");
+
+    assert_eq!(
+        resolved, expected,
+        ".tsx wins because the primed dominant extension floats it ahead of .vue"
+    );
+    assert_eq!(
+        resolved.extension().and_then(|e| e.to_str()),
+        Some("tsx"),
+        "the resolved target carries the .tsx extension"
+    );
+}
+
+#[tokio::test]
+async fn inertia_dominant_extension_absent_file_falls_back_to_static_priority() {
+    // goto — dominant float, candidate absent on disk: a dominant extension of
+    // `"tsx"` is primed, but only `Dashboard.vue` exists (no `.tsx` file). The
+    // float still fires — `.tsx` sorts to the front of the candidates — but the
+    // existence probe skips the dominant candidate, so the resolver falls
+    // through to the `.vue` file that *does* exist. Proves the float reorders
+    // without inventing a phantom target for a missing dominant extension.
+    let dir = TempDir::new().unwrap();
+    let expected = write_file(dir.path(), "resources/js/Pages/Dashboard.vue", PAGE_BODY);
+
+    let backend = goto_backend_with_dominant(dir.path(), "tsx").await;
+    let resolved = backend
+        .resolve_inertia_file("Dashboard")
+        .await
+        .expect("the static-priority candidate still resolves when the dominant one is absent");
+
+    assert_eq!(
+        resolved, expected,
+        ".vue resolves because the floated .tsx candidate does not exist on disk"
     );
     assert_eq!(
         resolved.extension().and_then(|e| e.to_str()),
