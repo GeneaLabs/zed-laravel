@@ -206,6 +206,11 @@ fn livewire_fallback_in_root_view_suppresses_diagnostic() {
 // dangling under-root symlink — whose target a client `CreateFile` could follow
 // out of the project tree — is refused too. A genuinely-absent in-root path is
 // still admitted, since the hint is for a *missing* view.
+//
+// Four "Expected at:" surfaces share this helper: the `view()` loop, the
+// `@extends`/`@include` twin, and — closed in this PR's review round — the
+// "Blade component not found" loop (`resolve_component_path`, the fourth and
+// last surface in the `from_diagnostic` → `CreateFile` family).
 
 #[test]
 fn expected_path_hint_is_unknown_when_all_candidates_out_of_root() {
@@ -240,6 +245,11 @@ fn expected_path_hint_picks_first_in_root_candidate() {
     let out_of_root = outside.path().join("pkg/card.blade.php");
     let in_root = root.path().join("resources/views/card.blade.php");
 
+    assert!(
+        in_root.canonicalize().is_err(),
+        "precondition: the in-root candidate does not exist on disk (the hint is \
+         for a missing view; only lexical containment is checked)"
+    );
     assert_eq!(
         in_root_expected_path_hint(&[out_of_root, in_root.clone()], root.path()),
         in_root.to_string_lossy().to_string(),
@@ -301,5 +311,31 @@ fn expected_path_hint_skips_dangling_symlink_for_next_in_root_candidate() {
         speculative_in_root.to_string_lossy().to_string(),
         "the hint must skip the dangling symlink and pick the genuinely-absent \
          in-root candidate ordered after it"
+    );
+}
+
+#[test]
+fn component_expected_path_hint_is_unknown_when_all_candidates_out_of_root() {
+    // The fourth "Expected at:" surface, closed in this PR's review round: the
+    // "Blade component not found" diagnostic (`resolve_component_path`) used to
+    // echo an unfiltered `possible_paths.first()`, leaving the same dangling-
+    // symlink → `CreateFile` escape open that the `view()`/`@extends`/`@include`
+    // loops had already closed. It now routes through `in_root_expected_path_hint`
+    // like the other three. This regression test mirrors AC #5 for the component
+    // surface: when every resolved component candidate is outside the project
+    // root (the shape an out-of-root `component_namespaces` registration
+    // produces), the hint must fall back to "unknown", never a leaked out-of-root
+    // absolute path the client could parse into an escaping create target.
+    let root = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+
+    let escapee_a = outside.path().join("packages/ui/card.blade.php");
+    let escapee_b = outside.path().join("vendor/widgets/card.blade.php");
+
+    assert_eq!(
+        in_root_expected_path_hint(&[escapee_a, escapee_b], root.path()),
+        "unknown",
+        "when every component candidate is out-of-root the hint must be \
+         \"unknown\", never a leaked out-of-root absolute path"
     );
 }

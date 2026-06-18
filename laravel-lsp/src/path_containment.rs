@@ -452,15 +452,29 @@ mod tests {
     #[test]
     fn emit_safe_refuses_out_of_root_candidate() {
         // The lexical gate refuses an out-of-root candidate before any probe,
-        // exactly as the other two guards do.
+        // exactly as the other two guards do. The escapee is written to disk so
+        // the intent is unambiguous: even a *real, existing* out-of-root file is
+        // refused — the lexical gate fires before `canonical_containment` can run
+        // its `Some(false)` arm, so no `stat`-probe ever touches the file.
         let parent = TempDir::new().unwrap();
         let root = parent.path().join("project");
         let sibling = parent.path().join("other");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&sibling).unwrap();
         let escapee = sibling.join("secret.blade.php");
+        std::fs::write(&escapee, "{{ $x }}").unwrap();
 
-        assert!(!path_within_root_emit_safe(&escapee, &root));
+        // Precondition: the out-of-root candidate exists on disk, so a `false`
+        // result can only come from the lexical containment gate, never absence.
+        assert!(
+            escapee.exists(),
+            "precondition: the out-of-root candidate exists on disk"
+        );
+        assert!(
+            !path_within_root_emit_safe(&escapee, &root),
+            "an existing out-of-root candidate must be refused on root grounds \
+             alone — the lexical gate rejects it before any disk probe"
+        );
     }
 
     #[cfg(unix)]
@@ -561,6 +575,49 @@ mod tests {
         assert!(
             !path_within_root_emit_safe(&candidate, root.path()),
             "a non-NotFound lstat error must fail closed — the candidate is \
+             unverifiable, not provably absent, so a CreateFile following it \
+             could escape the root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emit_safe_refuses_unverifiable_candidate_behind_a_symlink_loop() {
+        // The third non-`NotFound` lstat error named in the `None`-arm contract
+        // (`path_containment.rs` doc): `ELOOP`. Two under-root symlinks point at
+        // each other (`a -> b`, `b -> a`); a candidate routed through one of them
+        // makes lstat traverse the cycle and fail with `ELOOP` — the candidate is
+        // unverifiable, not provably absent, so it must fail CLOSED. Like the
+        // `ENOTDIR` sibling this is deterministic on every unix uid (no
+        // permission dependence), so it pins the contract even under a CI runner
+        // that bypasses permission checks.
+        let root = TempDir::new().unwrap();
+        let views = root.path().join("resources").join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        let loop_a = views.join("loop_a");
+        let loop_b = views.join("loop_b");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+        // A candidate whose path traverses the cycle as an intermediate
+        // component: lstat must resolve `loop_a` and loops → `ELOOP`.
+        let candidate = loop_a.join("ghost.blade.php");
+
+        // Precondition: lstat fails with a NON-`NotFound` error (`ELOOP`).
+        let err_kind = candidate.symlink_metadata().err().map(|e| e.kind());
+        assert!(
+            err_kind.is_some() && err_kind != Some(std::io::ErrorKind::NotFound),
+            "precondition: lstat must fail with a non-NotFound error, got {err_kind:?}"
+        );
+
+        // The lexical guard admits it (canonicalize fails ⇒ `unwrap_or(true)`);
+        // the emit-safe guard must refuse it — both halves of the contrast.
+        assert!(
+            path_within_root_lexical(&candidate, root.path()),
+            "the lexical guard admits an unverifiable in-root candidate"
+        );
+        assert!(
+            !path_within_root_emit_safe(&candidate, root.path()),
+            "an `ELOOP` lstat error must fail closed — the candidate is \
              unverifiable, not provably absent, so a CreateFile following it \
              could escape the root"
         );

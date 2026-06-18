@@ -16681,10 +16681,7 @@ return [
             // Nothing resolved — surface as "not found" so the user gets a
             // Create Missing View / Create Missing Component code action.
             let possible_paths = config.resolve_component_path(&comp_ref.name);
-            let expected_path = possible_paths
-                .first()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
+            let expected_path = in_root_expected_path_hint(&possible_paths, &config.root);
 
             let diagnostic = Diagnostic {
                 range: Range {
@@ -18686,8 +18683,8 @@ fn any_in_root_candidate_exists(candidates: &[PathBuf], root: &Path) -> bool {
 /// under-root symlink whose target could escape the tree if a client followed it
 /// on create. It still admits a genuinely-absent in-root path — the hint is for a
 /// *missing* view, so the fail-closed guard would drop every normal create
-/// target. The `view()` and `@extends`/`@include` diagnostic loops share this
-/// identical decision.
+/// target. The `view()`, `@extends`/`@include`, and "Blade component not found"
+/// (`resolve_component_path`) diagnostic loops all share this identical decision.
 fn in_root_expected_path_hint(candidates: &[PathBuf], root: &Path) -> String {
     candidates
         .iter()
