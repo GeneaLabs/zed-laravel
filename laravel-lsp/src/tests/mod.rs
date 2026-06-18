@@ -13,6 +13,7 @@ mod component_navigation_containment;
 mod diagnostic_severity;
 mod directive_navigation_containment;
 mod dynamic_where_sparseness;
+mod expected_path_diagnostic_containment;
 mod flux_component_context;
 mod flux_component_hover;
 mod flux_goto_def_handler;

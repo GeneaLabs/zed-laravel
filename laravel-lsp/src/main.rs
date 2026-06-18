@@ -13772,18 +13772,27 @@ return [
     ///
     /// - `dotted_severity`: Severity for dotted keys (ERROR in PHP, WARNING in @lang)
     /// - Text keys always get INFORMATION severity
+    ///
+    /// The "Expected at:" path is routed through [`in_root_expected_path_hint`]
+    /// (issue #214): `check.expected_path` for a namespaced key is built from
+    /// `vendor_map.get(namespace)` — a user-registered, possibly out-of-root
+    /// absolute path — and this message is parsed back into a `CreateFile` target
+    /// by [`FileAction::from_diagnostic`]. The emit-safe guard keeps an out-of-root
+    /// vendor-map path (and a dangling under-root symlink) out of the hint,
+    /// falling back to `"unknown"`, while still admitting a genuinely-absent
+    /// in-root path (the hint is for a *missing* file). `root` is the project root.
     fn create_translation_diagnostic(
         translation_key: &str,
         check: &TranslationCheck,
         line: u32,
         column: u32,
         end_column: u32,
+        root: &Path,
     ) -> Diagnostic {
-        let expected_path_str = check
-            .expected_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let expected_path_str = match check.expected_path.as_ref() {
+            Some(p) => in_root_expected_path_hint(std::slice::from_ref(p), root),
+            None => String::new(),
+        };
 
         let (severity, message) = if check.is_dotted_key {
             let action_hint = if check.file_exists {
@@ -13884,18 +13893,26 @@ return [
     }
 
     /// Create a diagnostic for a missing config
+    ///
+    /// The "Expected at:" path is routed through [`in_root_expected_path_hint`]
+    /// (issue #214) for the same `from_diagnostic → CreateFile` containment
+    /// invariant the translation/view/component surfaces hold. `check.expected_path`
+    /// is `root.join("config")`-rooted and so structurally in-root, but routing it
+    /// keeps the guarantee uniform across *every* "Expected at:" surface and
+    /// refuses a dangling under-root symlink the client could follow out of the
+    /// tree on create. `root` is the project root.
     fn create_config_diagnostic(
         config_key: &str,
         check: &ConfigCheck,
         line: u32,
         column: u32,
         end_column: u32,
+        root: &Path,
     ) -> Diagnostic {
-        let expected_path_str = check
-            .expected_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let expected_path_str = match check.expected_path.as_ref() {
+            Some(p) => in_root_expected_path_hint(std::slice::from_ref(p), root),
+            None => String::new(),
+        };
 
         let action_hint = if check.file_exists {
             format!(
@@ -16251,6 +16268,19 @@ return [
                         .map(|p| p.exists())
                         .unwrap_or(false);
 
+                    // Emit-safe containment (issue #214): the "Expected at:" path
+                    // is parsed back into a `CreateFile` target by
+                    // `from_diagnostic`. `.env` is `root.join`-rooted, but routing
+                    // it through the guard keeps the invariant uniform across every
+                    // surface and refuses a dangling `.env` under-root symlink a
+                    // client `CreateFile` could follow out of the project tree.
+                    let env_expected_hint = match (root_for_env.as_ref(), env_path.as_ref()) {
+                        (Some(root), Some(p)) => {
+                            Some(in_root_expected_path_hint(std::slice::from_ref(p), root))
+                        }
+                        _ => None,
+                    };
+
                     // Build the message with Expected at: and optionally Copy from:
                     // Format varies based on whether .env file exists:
                     // - .env exists: "not found in file" → append to file
@@ -16269,8 +16299,8 @@ return [
                             )
                         };
                         // Add Expected at: for code action
-                        if let Some(ref p) = env_path {
-                            msg.push_str(&format!("\nExpected at: {}", p.display()));
+                        if let Some(ref hint) = env_expected_hint {
+                            msg.push_str(&format!("\nExpected at: {}", hint));
                         }
                         // If .env doesn't exist but .env.example does, add Copy from:
                         if !env_exists && env_example_exists {
@@ -16292,8 +16322,8 @@ return [
                             )
                         };
                         // Add Expected at: for code action
-                        if let Some(ref p) = env_path {
-                            msg.push_str(&format!("\nExpected at: {}", p.display()));
+                        if let Some(ref hint) = env_expected_hint {
+                            msg.push_str(&format!("\nExpected at: {}", hint));
                         }
                         // If .env doesn't exist but .env.example does, add Copy from:
                         if !env_exists && env_example_exists {
@@ -16413,7 +16443,16 @@ return [
                                         "Middleware '{}' not found\nClass: {}\nExpected at: {}\n\nThe middleware alias is registered but the class file doesn't exist.\n💡 Click to view where the alias is defined.",
                                         middleware_name,
                                         class_name,
-                                        mw_class_path.to_string_lossy()
+                                        // Emit-safe containment (issue #214): the
+                                        // class path is resolved via PSR-4 from a
+                                        // user-controlled class name and parsed
+                                        // back into a `CreateFile` target by
+                                        // `from_diagnostic`, so route it through
+                                        // the guard like the view/component hints.
+                                        in_root_expected_path_hint(
+                                            std::slice::from_ref(mw_class_path),
+                                            root
+                                        )
                                     ),
                                     related_information: None,
                                     tags: None,
@@ -16468,7 +16507,15 @@ return [
                                     message: format!(
                                         "Middleware '{}' not found\nExpected at: {}\n\nCreate the middleware or add an alias in bootstrap/app.php",
                                         middleware_name,
-                                        mw_file_path.to_string_lossy()
+                                        // Emit-safe containment (issue #214):
+                                        // `resolve_class_to_file` maps a
+                                        // user-controlled class name through PSR-4
+                                        // and the hint becomes a `CreateFile`
+                                        // target, so guard it.
+                                        in_root_expected_path_hint(
+                                            std::slice::from_ref(&mw_file_path),
+                                            root
+                                        )
                                     ),
                                     related_information: None,
                                     tags: None,
@@ -16526,6 +16573,7 @@ return [
                             trans_ref.line,
                             trans_ref.column,
                             trans_ref.end_column,
+                            root,
                         ));
                     }
                 }
@@ -16544,6 +16592,7 @@ return [
                             config_ref.line,
                             config_ref.column,
                             config_ref.end_column,
+                            root,
                         ));
                     }
                 }
@@ -16745,7 +16794,14 @@ return [
                                     message: format!(
                                         "Feature class not found: '{}'\nExpected at: {}",
                                         feature_ref.feature_name,
-                                        class_path.to_string_lossy()
+                                        // Emit-safe containment (issue #214): the
+                                        // class path is PSR-4-resolved from a
+                                        // user-controlled class reference and
+                                        // parsed back into a `CreateFile` target.
+                                        in_root_expected_path_hint(
+                                            std::slice::from_ref(&class_path),
+                                            root
+                                        )
                                     ),
                                     related_information: None,
                                     tags: None,
@@ -16783,7 +16839,13 @@ return [
                                 message: format!(
                                     "Feature not found: '{}'\nExpected at: {}",
                                     feature_ref.feature_name,
-                                    expected_path.to_string_lossy()
+                                    // Emit-safe containment (issue #214): keep the
+                                    // "Expected at:" → `CreateFile` invariant
+                                    // uniform across every feature surface.
+                                    in_root_expected_path_hint(
+                                        std::slice::from_ref(&expected_path),
+                                        root
+                                    )
                                 ),
                                 related_information: None,
                                 tags: None,
@@ -16848,6 +16910,7 @@ return [
                         trans_ref.line,
                         trans_ref.column,
                         trans_ref.end_column,
+                        root,
                     ));
                 }
             }
@@ -17041,6 +17104,7 @@ return [
                                     dir_ref.line,
                                     dir_ref.column,
                                     dir_ref.end_column,
+                                    root,
                                 ));
                             }
                         }
@@ -17093,7 +17157,14 @@ return [
                                     message: format!(
                                         "Feature not found: '{}'\nExpected at: {}",
                                         feature_name,
-                                        feature_path.to_string_lossy()
+                                        // Emit-safe containment (issue #214): same
+                                        // guard as the other "Expected at:" hints
+                                        // so the @feature directive surface can't
+                                        // leak an out-of-root create target.
+                                        in_root_expected_path_hint(
+                                            std::slice::from_ref(&feature_path),
+                                            root
+                                        )
                                     ),
                                     related_information: None,
                                     tags: None,

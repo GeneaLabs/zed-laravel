@@ -19,8 +19,14 @@ fn missing_dotted_translation_is_a_warning_not_error() {
         file_exists: true,
         nested_key: Some("welcome".to_string()),
     };
-    let d =
-        LaravelLanguageServer::create_translation_diagnostic("messages.welcome", &check, 0, 0, 5);
+    let d = LaravelLanguageServer::create_translation_diagnostic(
+        "messages.welcome",
+        &check,
+        0,
+        0,
+        5,
+        std::path::Path::new("/p"),
+    );
     assert_eq!(d.severity, Some(DiagnosticSeverity::WARNING));
 }
 
@@ -35,6 +41,13 @@ fn missing_non_dotted_translation_stays_information() {
         file_exists: false,
         nested_key: None,
     };
-    let d = LaravelLanguageServer::create_translation_diagnostic("Welcome", &check, 0, 0, 5);
+    let d = LaravelLanguageServer::create_translation_diagnostic(
+        "Welcome",
+        &check,
+        0,
+        0,
+        5,
+        std::path::Path::new("/p"),
+    );
     assert_eq!(d.severity, Some(DiagnosticSeverity::INFORMATION));
 }
