@@ -5,8 +5,8 @@
 //! `slot_navigation.rs`, and an inline `retain` in `salsa_impl.rs`), each with
 //! its own fallback behaviour that could drift apart (issue #156). They are
 //! consolidated here behind one canonical-first core ([`canonical_containment`])
-//! and **two** public entry points that differ only in what they do when a path
-//! can't be canonicalized:
+//! and **three** public entry points that differ only in what they do when a
+//! path can't be canonicalized:
 //!
 //! - [`path_within_root`] is **fail-closed**: an unverifiable path is refused.
 //!   It is the security guard — a `WorkspaceEdit` must never leak a path whose
@@ -29,6 +29,18 @@
 //!   interior-`..` escapes (`normalize_path` collapses `..`/`.` before the prefix
 //!   test, because `Path::starts_with` is component-wise and does NOT resolve
 //!   `..`).
+//! - [`path_within_root_emit_safe`] is the middle ground for a *speculative
+//!   candidate that will be emitted* — e.g. the "Expected at:" create-this-file
+//!   hint baked into a "view not found" diagnostic, which a client can turn back
+//!   into a `CreateFile` (issue #201). Like the lexical guard it admits a
+//!   genuinely-absent in-root path — the diagnostic fires *because* the target
+//!   doesn't exist, so the fail-closed guard would drop every normal
+//!   not-yet-created in-root hint. Unlike the lexical guard it does **not** admit
+//!   a *dangling* under-root symlink whose target is missing: `canonicalize`
+//!   can't prove where that link resolves, and following it on create could
+//!   write outside the tree (issues #134/#155), so it is refused while a path
+//!   with nothing at all on disk is admitted. Used by `main.rs`'s
+//!   `in_root_expected_path_hint`.
 
 use std::path::Path;
 
@@ -82,18 +94,7 @@ pub fn path_within_root(path: &Path, root: &Path) -> bool {
 /// `salsa_impl.rs` relies on. Not a security guard for paths that will be read or
 /// emitted: those must use [`path_within_root`], which is fail-closed.
 pub fn path_within_root_lexical(path: &Path, root: &Path) -> bool {
-    let normalized = normalize_path(path);
-
-    // Lexical gate — never canonicalizes the candidate. A path under neither the
-    // root as given nor its symlink-resolved form is out-of-root and refused with
-    // no probe of it (the existence oracle issue #145 closes). Canonicalizing the
-    // root only tolerates the macOS `/var`→`/private/var` symlinked-root case.
-    let lexically_in_root = normalized.starts_with(root)
-        || root
-            .canonicalize()
-            .map(|real_root| normalized.starts_with(&real_root))
-            .unwrap_or(false);
-    if !lexically_in_root {
+    if !lexically_in_root(path, root) {
         return false;
     }
 
@@ -101,6 +102,67 @@ pub fn path_within_root_lexical(path: &Path, root: &Path) -> bool {
     // speculative not-yet-created candidate (canonicalize fails) is admitted,
     // already proven lexically contained above.
     canonical_containment(path, root).unwrap_or(true)
+}
+
+/// True if `path` is contained within `root` **and is safe to emit** as a
+/// speculative create target — the guard for a path baked into client-facing
+/// text that may be turned back into a `CreateFile`, such as the "Expected at:"
+/// hint of a "view not found" diagnostic (issue #201).
+///
+/// It shares [`path_within_root_lexical`]'s lexical gate (an out-of-root
+/// candidate is refused with no disk probe, issue #145) and likewise admits a
+/// *genuinely-absent* in-root candidate: the diagnostic fires precisely because
+/// the target view doesn't exist, so the fail-closed [`path_within_root`] would
+/// drop every normal not-yet-created in-root hint and break the "create view"
+/// affordance. The one case it refuses that the lexical guard admits is a
+/// **dangling under-root symlink** — a link whose path is lexically inside the
+/// root but whose target is missing, so `canonicalize` can't prove where it
+/// resolves. Emitting it could let the client's `CreateFile` follow the link out
+/// of the project tree (issues #134/#155), so it is refused, while a path with
+/// nothing on disk to follow is admitted.
+///
+/// The distinction lives in the `None` arm: `symlink_metadata` (lstat) succeeds
+/// for the dangling-symlink node (the leaf exists, it just won't resolve) and
+/// fails with `NotFound` for a path that truly doesn't exist. This closes the
+/// residual the lexical guard's `unwrap_or(true)` leaves open for emitted paths
+/// — a *leaf* dangling symlink; a path traversing a dangling symlink *directory*
+/// is out of scope here (the conventional view-root surface never produces one).
+pub fn path_within_root_emit_safe(path: &Path, root: &Path) -> bool {
+    if !lexically_in_root(path, root) {
+        return false;
+    }
+
+    match canonical_containment(path, root) {
+        // The candidate exists on disk: trust its real, symlink-resolved target —
+        // inside the root is safe to emit, an escape is refused.
+        Some(contained) => contained,
+        // The candidate can't be canonicalized. Admit a genuinely-absent path (a
+        // legitimate speculative create target — nothing on disk to follow), but
+        // refuse a dangling under-root symlink whose target is missing: its leaf
+        // node exists (lstat succeeds) yet won't resolve, so a `CreateFile`
+        // following it could escape the root (issues #134/#155).
+        None => path.symlink_metadata().is_err(),
+    }
+}
+
+/// The lexical containment gate shared by [`path_within_root_lexical`] and
+/// [`path_within_root_emit_safe`]. True when `path`, with interior `..`/`.`
+/// collapsed by `normalize_path`, is a `starts_with` prefix-match of `root` —
+/// first against the root as given, then (only if that fails) against the root's
+/// canonicalized form. **Never canonicalizes the candidate**, so an out-of-root
+/// candidate is refused before any `stat`/`realpath` probe of it (the existence
+/// oracle issue #145 closes). Canonicalizing the *root* (a trusted in-root path)
+/// is not an oracle; it only tolerates the macOS `/var`→`/private/var`
+/// symlinked-root case, where an in-root candidate carries the resolved prefix
+/// the raw `root` lacks. `normalize_path` collapses `..`/`.` first because
+/// `Path::starts_with` is component-wise and does NOT resolve `..`.
+fn lexically_in_root(path: &Path, root: &Path) -> bool {
+    let normalized = normalize_path(path);
+    normalized.starts_with(root)
+        || root
+            .canonicalize()
+            .map(|real_root| normalized.starts_with(&real_root))
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -338,6 +400,119 @@ mod tests {
         assert!(
             !path_within_root_lexical(&escaping_link, &root),
             "an in-root symlink whose target escapes the root must be refused — no containment downgrade"
+        );
+    }
+
+    #[test]
+    fn emit_safe_admits_speculative_in_root_candidate() {
+        // The everyday "Expected at:" case: the hint points at a view the
+        // developer hasn't created yet. Nothing exists on disk, so the path can't
+        // canonicalize — but it is lexically in-root with no symlink to follow,
+        // so it is safe to emit as a create target and must be admitted (the
+        // fail-closed guard would wrongly drop it).
+        let root = TempDir::new().unwrap();
+        let candidate = root
+            .path()
+            .join("resources")
+            .join("views")
+            .join("ghost.blade.php");
+
+        assert!(
+            candidate.canonicalize().is_err(),
+            "candidate must not exist on disk"
+        );
+        assert!(path_within_root_emit_safe(&candidate, root.path()));
+    }
+
+    #[test]
+    fn emit_safe_admits_in_root_existing_file() {
+        // A real in-root file canonicalizes inside the root → safe to emit.
+        let root = TempDir::new().unwrap();
+        let file = root
+            .path()
+            .join("resources")
+            .join("views")
+            .join("home.blade.php");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "{{ $x }}").unwrap();
+
+        assert!(path_within_root_emit_safe(&file, root.path()));
+    }
+
+    #[test]
+    fn emit_safe_refuses_out_of_root_candidate() {
+        // The lexical gate refuses an out-of-root candidate before any probe,
+        // exactly as the other two guards do.
+        let parent = TempDir::new().unwrap();
+        let root = parent.path().join("project");
+        let sibling = parent.path().join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let escapee = sibling.join("secret.blade.php");
+
+        assert!(!path_within_root_emit_safe(&escapee, &root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emit_safe_refuses_dangling_under_root_symlink() {
+        // The issue #201 residual: a symlink at `<root>/resources/views/ghost`
+        // whose target was never created. Its link path is lexically inside the
+        // root, but `canonicalize` fails (dangling), so the lexical guard's
+        // `unwrap_or(true)` ADMITS it — and would echo it into the "Expected at:"
+        // hint, where a client `CreateFile` could follow the link out of tree.
+        // The emit-safe guard must refuse it: the leaf node exists (lstat
+        // succeeds) but won't resolve. This is the one case where the two guards
+        // diverge, so assert both halves of the contrast.
+        let root = TempDir::new().unwrap();
+        let views = root.path().join("resources").join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        let missing_target = root.path().join("..").join("never-created.blade.php");
+        let dangling = views.join("ghost.blade.php");
+        std::os::unix::fs::symlink(&missing_target, &dangling).unwrap();
+
+        // Preconditions: the link exists but can't be canonicalized, and its link
+        // path is lexically inside the root.
+        assert!(
+            dangling.canonicalize().is_err(),
+            "a dangling symlink must fail to canonicalize"
+        );
+        assert!(
+            dangling.symlink_metadata().is_ok(),
+            "the dangling symlink node itself exists (lstat succeeds)"
+        );
+
+        assert!(
+            path_within_root_lexical(&dangling, root.path()),
+            "the lexical guard admits the dangling under-root symlink — the residual"
+        );
+        assert!(
+            !path_within_root_emit_safe(&dangling, root.path()),
+            "the emit-safe guard must refuse a dangling under-root symlink — its \
+             target is unknown and a CreateFile following it could escape the root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emit_safe_refuses_in_root_symlink_escaping_the_root() {
+        // A symlink whose link path is in-root but whose target resolves OUTSIDE
+        // the root: `canonical_containment` returns `Some(false)`, so the
+        // emit-safe guard refuses it — no containment downgrade (#55/#134).
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let secret = outside_dir.join("secret.blade.php");
+        std::fs::write(&secret, "{{ $x }}").unwrap();
+
+        let escaping_link = root.join("escape.blade.php");
+        std::os::unix::fs::symlink(&secret, &escaping_link).unwrap();
+
+        assert!(
+            !path_within_root_emit_safe(&escaping_link, &root),
+            "an in-root symlink whose target escapes the root must be refused"
         );
     }
 }

@@ -198,10 +198,14 @@ fn livewire_fallback_in_root_view_suppresses_diagnostic() {
 // "Expected at:" message-hint containment (issue #201)
 // ---------------------------------------------------------------------------
 //
-// The "not found" diagnostics echo an "Expected at:" path back to the client.
-// `in_root_expected_path_hint` sources it from the first *in-root* candidate so
-// a maliciously-registered out-of-root namespace path is never leaked into the
-// message text — it considers only lexical containment, never disk existence.
+// The "not found" diagnostics echo an "Expected at:" path back to the client,
+// which `from_diagnostic` can parse into a `CreateFile` target.
+// `in_root_expected_path_hint` sources it from the first candidate that passes
+// the *emit-safe* guard (`path_within_root_emit_safe`): a maliciously-registered
+// out-of-root namespace path is never leaked into the message text, and a
+// dangling under-root symlink — whose target a client `CreateFile` could follow
+// out of the project tree — is refused too. A genuinely-absent in-root path is
+// still admitted, since the hint is for a *missing* view.
 
 #[test]
 fn expected_path_hint_is_unknown_when_all_candidates_out_of_root() {
@@ -241,5 +245,61 @@ fn expected_path_hint_picks_first_in_root_candidate() {
         in_root.to_string_lossy().to_string(),
         "the hint must be the first in-root candidate, skipping the out-of-root \
          one ordered ahead of it"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn expected_path_hint_skips_dangling_under_root_symlink() {
+    // The issue #201 residual closed in this PR: a candidate that is a dangling
+    // under-root symlink — link path lexically inside the root, target never
+    // created — must NOT be echoed into the hint. Following such a link on a
+    // client `CreateFile` could write outside the project tree. With it as the
+    // sole candidate the hint falls back to "unknown" rather than leaking the
+    // dangling link path. (The lexical guard would have admitted it; the
+    // emit-safe guard refuses it — see `path_containment`'s unit tests.)
+    let root = tempfile::TempDir::new().unwrap();
+    let views = root.path().join("resources/views");
+    fs::create_dir_all(&views).unwrap();
+
+    let missing_target = root.path().join("../never-created.blade.php");
+    let dangling = views.join("card.blade.php");
+    std::os::unix::fs::symlink(&missing_target, &dangling).unwrap();
+
+    assert!(
+        dangling.canonicalize().is_err(),
+        "precondition: the candidate is a dangling symlink (can't canonicalize)"
+    );
+    assert_eq!(
+        in_root_expected_path_hint(&[dangling], root.path()),
+        "unknown",
+        "a dangling under-root symlink must not be echoed into the hint — it \
+         falls back to \"unknown\""
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn expected_path_hint_skips_dangling_symlink_for_next_in_root_candidate() {
+    // Multi-candidate shape: a dangling under-root symlink ordered ahead of a
+    // genuinely-absent in-root candidate. The hint must skip the dangling link
+    // (unsafe to emit) and surface the speculative in-root path (a safe create
+    // target), proving the emit-safe filter rejects only the symlink, not every
+    // not-yet-created view.
+    let root = tempfile::TempDir::new().unwrap();
+    let views = root.path().join("resources/views");
+    fs::create_dir_all(&views).unwrap();
+
+    let missing_target = root.path().join("../never-created.blade.php");
+    let dangling = views.join("pkg-card.blade.php");
+    std::os::unix::fs::symlink(&missing_target, &dangling).unwrap();
+
+    let speculative_in_root = views.join("card.blade.php");
+
+    assert_eq!(
+        in_root_expected_path_hint(&[dangling, speculative_in_root.clone()], root.path()),
+        speculative_in_root.to_string_lossy().to_string(),
+        "the hint must skip the dangling symlink and pick the genuinely-absent \
+         in-root candidate ordered after it"
     );
 }

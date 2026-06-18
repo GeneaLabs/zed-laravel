@@ -27,7 +27,9 @@ use laravel_lsp::completion_format::CompletionDoc;
 use laravel_lsp::config::find_project_root;
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
 use laravel_lsp::migration_index::{build_migration_index, MigrationIndex};
-use laravel_lsp::path_containment::{path_within_root, path_within_root_lexical};
+use laravel_lsp::path_containment::{
+    path_within_root, path_within_root_emit_safe, path_within_root_lexical,
+};
 use laravel_lsp::route_discovery::{
     build_route_index, discover_route_files, normalize_path, RouteIndex,
 };
@@ -18683,20 +18685,24 @@ fn any_in_root_candidate_exists(candidates: &[PathBuf], root: &Path) -> bool {
 }
 
 /// The "Expected at:" hint for a "not found" diagnostic, sourced from the first
-/// candidate that lexically resolves within `root` (issue #201). Falls back to
-/// `"unknown"` when no candidate qualifies.
+/// candidate that resolves within `root` and is **safe to emit** (issue #201).
+/// Falls back to `"unknown"` when no candidate qualifies.
 ///
 /// `config.resolve_view_path` can return out-of-root candidates (an out-of-root
-/// `loadViewsFrom`/`component_namespaces` registration), and the diagnostic
-/// message text is echoed back to the client. Selecting the first *in-root*
-/// candidate keeps a maliciously-registered out-of-root absolute path out of the
-/// message — the same containment invariant `any_in_root_candidate_exists` holds
-/// for the `.exists()` probe, applied here to the message text. The `view()` and
-/// `@extends`/`@include` diagnostic loops share this identical decision.
+/// `loadViewsFrom`/`component_namespaces` registration), and this hint is echoed
+/// back to the client in the diagnostic message text — which `from_diagnostic`
+/// can parse into a `CreateFile` target. Selecting the first candidate that
+/// passes [`path_within_root_emit_safe`] keeps a maliciously-registered
+/// out-of-root absolute path out of the message *and* refuses a dangling
+/// under-root symlink whose target could escape the tree if a client followed it
+/// on create. It still admits a genuinely-absent in-root path — the hint is for a
+/// *missing* view, so the fail-closed guard would drop every normal create
+/// target. The `view()` and `@extends`/`@include` diagnostic loops share this
+/// identical decision.
 fn in_root_expected_path_hint(candidates: &[PathBuf], root: &Path) -> String {
     candidates
         .iter()
-        .find(|p| path_within_root_lexical(p, root))
+        .find(|p| path_within_root_emit_safe(p, root))
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
