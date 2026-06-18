@@ -85,7 +85,15 @@ pub enum MethodNameContext {
 /// support both bare names (`User`), namespaced names (`App\Models\User`),
 /// and leading-backslash FQCNs (`\App\Models\User`).
 pub fn detect_method_name_position(line: &str, cursor_col: usize) -> Option<MethodNameContext> {
-    if cursor_col > line.len() {
+    // `cursor_col` is a byte offset into `line`. The live caller
+    // (`try_method_name_completion`) converts the LSP `position.character`
+    // code-point column through `char_col_to_byte_offset` first, so on the
+    // real path it already lands on a valid char boundary clamped to the line.
+    // The guard keeps this public fn panic-safe for *any* caller: an
+    // out-of-range or mid-codepoint offset returns `None` rather than slicing
+    // `&line[..cursor_col]` into a `panic!` (issue #182), and preserves the
+    // documented reject-past-end-of-line contract.
+    if cursor_col > line.len() || !line.is_char_boundary(cursor_col) {
         return None;
     }
     let before = &line[..cursor_col];

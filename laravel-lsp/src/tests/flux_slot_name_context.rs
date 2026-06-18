@@ -150,15 +150,19 @@ fn blade_component_context_excludes_slot_syntax() {
 
 // ─── enclosing-Flux-component resolution ──────────────────────────────────
 
-/// Byte `(line, character)` of the caret marker `│` in `doc`, with the marker
-/// stripped. Columns are byte offsets within the line — the convention the
-/// production helpers use.
+/// `(line, character)` of the caret marker `│` in `doc`, with the marker
+/// stripped. The column is counted in Unicode code points, matching what an
+/// LSP client sends — and what `position_to_byte_offset` (the converter
+/// `enclosing_flux_component` now routes through) expects. On ASCII lines this
+/// equals the byte offset, so existing ASCII fixtures are unaffected; on a line
+/// with multibyte characters before the caret the two diverge, and the
+/// code-point count is the correct one.
 fn caret(doc: &str) -> (String, Position) {
     let idx = doc.find('│').expect("fixture must contain a `│` caret");
     let before = &doc[..idx];
     let line = before.matches('\n').count() as u32;
     let line_start = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
-    let character = (idx - line_start) as u32;
+    let character = before[line_start..].chars().count() as u32;
     (doc.replace('│', ""), Position { line, character })
 }
 
@@ -195,6 +199,31 @@ fn enclosing_returns_none_without_flux_ancestor() {
     assert!(
         LaravelLanguageServer::enclosing_flux_component(&doc, pos).is_none(),
         "no wrapping `<flux:…>` component → no owner",
+    );
+}
+
+#[test]
+fn enclosing_correct_with_multibyte_prefix() {
+    // Regression for issue #206: the cursor line opens with multibyte chars
+    // (six `🎉`, 4 bytes each) before a self-contained `<flux:badge></flux:badge>`
+    // pair, then a `<flux:slot name="│">` holding the cursor. The owner is the
+    // outer `<flux:modal>`, because the inner `<flux:badge>` is opened *and*
+    // closed before the cursor.
+    //
+    // The old `character as usize` byte-offset shortcut computed a cursor offset
+    // too small (it counted each `🎉` as one byte, not four), so `</flux:badge>`'s
+    // `m.end()` landed *after* that bogus cursor and was skipped — leaving
+    // `flux:badge` on the open-tag stack and wrongly returned as the owner.
+    // Routing through `position_to_byte_offset` (code-point aware) places the
+    // cursor correctly, so the close tag pops the child and `flux:modal` wins.
+    let (doc, pos) = caret(
+        "<flux:modal>\n🎉🎉🎉🎉🎉🎉<flux:badge></flux:badge><flux:slot name=\"│\">\n</flux:modal>\n",
+    );
+    assert_eq!(
+        LaravelLanguageServer::enclosing_flux_component(&doc, pos).as_deref(),
+        Some("flux:modal"),
+        "the multibyte prefix must not cause the closed inner `<flux:badge>` to \
+         be mistaken for the enclosing component",
     );
 }
 
