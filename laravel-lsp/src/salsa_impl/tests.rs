@@ -967,6 +967,61 @@ async fn snapshot_bindings_maps_keys_to_concrete() {
     );
 }
 
+#[test]
+fn container_aware_resolver_prefers_bindings_and_normalizes() {
+    // The live-query-path resolver: bindings win over singletons on collision,
+    // concrete FQCNs are backslash-normalized, and class_file delegates to the
+    // class index.
+    use crate::member_resolver::ClassFileResolver;
+
+    let reg = |concrete: &str, bt: BindingTypeData| BindingRegistrationData {
+        abstract_name: "x".to_string(),
+        concrete_class: concrete.to_string(),
+        file_path: None,
+        binding_type: bt,
+        source_file: None,
+        source_line: None,
+        priority: 2,
+    };
+
+    let mut bindings = HashMap::new();
+    bindings.insert(
+        "dup".to_string(),
+        reg("App\\FromBind", BindingTypeData::Bind),
+    );
+    let mut singletons = HashMap::new();
+    singletons.insert(
+        "dup".to_string(),
+        reg("App\\FromSingleton", BindingTypeData::Singleton),
+    );
+    singletons.insert(
+        "tenant".to_string(),
+        reg("\\App\\Models\\Tenant", BindingTypeData::Singleton),
+    );
+
+    let index = crate::class_hierarchy_index::ClassHierarchyIndex::default();
+    let resolver = ContainerAwareResolver {
+        index: &index,
+        bindings: &bindings,
+        singletons: &singletons,
+    };
+
+    // Singleton-only key resolves; leading backslash normalized.
+    assert_eq!(
+        resolver.binding_concrete("tenant").as_deref(),
+        Some("App\\Models\\Tenant"),
+    );
+    // Bindings win over singletons on key collision.
+    assert_eq!(
+        resolver.binding_concrete("dup").as_deref(),
+        Some("App\\FromBind"),
+    );
+    // Unknown key → None.
+    assert_eq!(resolver.binding_concrete("nope"), None);
+    // class_file delegates to the (here empty) class index.
+    assert_eq!(resolver.class_file("App\\Models\\Tenant"), None);
+}
+
 // ─── collect_matches_for_symbol (find-references engine) ───────────────
 
 use std::path::PathBuf;
