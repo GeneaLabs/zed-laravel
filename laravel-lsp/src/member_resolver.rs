@@ -37,6 +37,19 @@ use tree_sitter::Node;
 /// works the same on either.
 pub trait ClassFileResolver {
     fn class_file(&self, fqcn: &str) -> Option<PathBuf>;
+
+    /// Resolve a container-binding key — the string in `app('key')` /
+    /// `resolve('key')` — to the concrete class FQCN it was bound to, if any.
+    ///
+    /// Defaulted to `None` so implementors that don't model container bindings
+    /// (the bare class index, the `HashMap<String, PathBuf>` test stub) need no
+    /// changes; the binding-aware resolvers on the salsa and main sides override
+    /// it with the parsed binding registry. This is the seam that lets the
+    /// receiver resolver type `app('key')->member` without threading a second
+    /// resolver argument through the whole call graph.
+    fn binding_concrete(&self, _key: &str) -> Option<String> {
+        None
+    }
 }
 
 impl ClassFileResolver for ClassHierarchyIndex {
@@ -645,6 +658,14 @@ fn resolve_receiver(
         return Some(resolved);
     }
 
+    // Container-resolution receivers (`app('key')`, `resolve('key')`) resolve
+    // the binding key to its registered concrete class. Checked before the
+    // generic match because these are `function_call_expression`s the arms
+    // below don't model, and the binding lookup rides in on `resolver`.
+    if let Some(resolved) = resolve_container_receiver(receiver, bytes, resolver) {
+        return Some(resolved);
+    }
+
     match receiver.kind() {
         "variable_name" => {
             let raw = receiver.utf8_text(bytes).ok()?;
@@ -702,6 +723,73 @@ fn resolve_receiver(
         }
         _ => None,
     }
+}
+
+/// Resolve a container-resolution receiver — `app('key')` / `resolve('key')` —
+/// to the concrete class its binding key was registered with.
+///
+/// The binding registry (reached through [`ClassFileResolver::binding_concrete`])
+/// maps the key to the concrete class the developer bound
+/// (`$this->app->singleton('currentTenant', Tenant::class)`), so a hit resolves
+/// at HIGH confidence — the registration is explicit, not inferred. A key with
+/// no registered binding, or one bound to a closure, returns a concrete the
+/// class index won't know, so it drops to `None` downstream rather than guessing.
+///
+/// Only the string-keyed helper forms are handled here; the `::class` argument
+/// form, `app()->make(…)`, and `App::make(…)` are separate receiver shapes.
+fn resolve_container_receiver(
+    receiver: Node,
+    bytes: &[u8],
+    resolver: &impl ClassFileResolver,
+) -> Option<(String, Confidence)> {
+    if receiver.kind() != "function_call_expression" {
+        return None;
+    }
+    let func = receiver
+        .child_by_field_name("function")?
+        .utf8_text(bytes)
+        .ok()?
+        .trim_start_matches('\\');
+    if !matches!(func, "app" | "resolve") {
+        return None;
+    }
+    let key = single_string_argument(receiver, bytes)?;
+    let concrete = resolver.binding_concrete(&key)?;
+    Some((concrete, Confidence::High))
+}
+
+/// The sole string-literal argument of a call — `'currentTenant'` in
+/// `app('currentTenant')`. Returns `None` when the call has zero or more than
+/// one argument, or the lone argument isn't a plain string literal (a variable,
+/// a `::class` const, a concatenation — none of which name a binding key here).
+fn single_string_argument(call: Node, bytes: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let mut named = args.named_children(&mut cursor);
+    let first = named.next()?;
+    if named.next().is_some() {
+        return None;
+    }
+    // tree-sitter-php wraps each actual argument in an `argument` node.
+    let expr = if first.kind() == "argument" {
+        first.named_child(0)?
+    } else {
+        first
+    };
+    string_literal_value(expr, bytes)
+}
+
+/// The content of a single/double-quoted string literal node, or `None`.
+fn string_literal_value(node: Node, bytes: &[u8]) -> Option<String> {
+    if !matches!(node.kind(), "string" | "encapsed_string") {
+        return None;
+    }
+    Some(
+        node.utf8_text(bytes)
+            .ok()?
+            .trim_matches(['\'', '"'])
+            .to_string(),
+    )
 }
 
 /// Resolve a `$user`-style receiver that is the first parameter of a Gate

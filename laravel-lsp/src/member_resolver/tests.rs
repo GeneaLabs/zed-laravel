@@ -351,6 +351,137 @@ fn resolve_in(p: &Project, caller: &str, member: &str) -> Option<ResolvedMemberA
     )
 }
 
+// ─── Container-resolution receivers: app('key')->member ───────────────────
+//
+// `app('currentTenant')->logo` types its receiver through the binding registry
+// (key → concrete FQCN) instead of variable flow. `WithBindings` is the test
+// analogue of the salsa/main `ContainerAwareResolver`: a class index that also
+// answers `binding_concrete`.
+
+use std::collections::HashMap;
+
+const TENANT_MODEL: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Tenant extends Model {
+    protected $fillable = ['name'];
+    public function getLogoAttribute(): string { return ''; }
+}
+"#;
+
+/// A resolver that pairs a class index with a container-binding map, so a test
+/// can exercise `app('key')` receivers without standing up the salsa actor.
+struct WithBindings<'a> {
+    index: &'a ClassHierarchyIndex,
+    bindings: HashMap<String, String>,
+}
+
+impl ClassFileResolver for WithBindings<'_> {
+    fn class_file(&self, fqcn: &str) -> Option<PathBuf> {
+        self.index.class_file(fqcn)
+    }
+    fn binding_concrete(&self, key: &str) -> Option<String> {
+        self.bindings.get(key).cloned()
+    }
+}
+
+/// Resolve `$x->{member}` in `caller` against an arbitrary resolver.
+fn resolve_with(
+    resolver: &impl ClassFileResolver,
+    root: &std::path::Path,
+    caller: &str,
+    member: &str,
+) -> Option<ResolvedMemberAccess> {
+    let tree = parse_php(caller).expect("parse caller");
+    let bytes = caller.as_bytes();
+    let aliases = extract_use_aliases(&tree, caller);
+    let receiver = receiver_of(&tree, bytes, member)?;
+    let mut cache = ClassViewCache::new();
+    resolve_and_classify(
+        receiver,
+        member,
+        AccessForm::Property,
+        bytes,
+        &aliases,
+        resolver,
+        &mut cache,
+        root,
+        None,
+    )
+}
+
+/// Build a `WithBindings` resolver mapping `currentTenant` → the given concrete.
+fn tenant_bound_to<'a>(p: &'a Project, concrete: &str) -> WithBindings<'a> {
+    WithBindings {
+        index: &p.index,
+        bindings: HashMap::from([("currentTenant".to_string(), concrete.to_string())]),
+    }
+}
+
+#[test]
+fn resolves_app_string_binding_to_accessor() {
+    let p = project("app/Models/Tenant.php", TENANT_MODEL);
+    let resolver = tenant_bound_to(&p, "App\\Models\\Tenant");
+    let caller = "<?php $x = app('currentTenant')->logo;";
+    let r = resolve_with(&resolver, &p.root, caller, "logo").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::Accessor);
+    assert_eq!(r.confidence, Confidence::High);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\Tenant");
+}
+
+#[test]
+fn resolves_resolve_helper_string_binding() {
+    let p = project("app/Models/Tenant.php", TENANT_MODEL);
+    let resolver = tenant_bound_to(&p, "App\\Models\\Tenant");
+    let caller = r#"<?php $x = resolve("currentTenant")->logo;"#;
+    let r = resolve_with(&resolver, &p.root, caller, "logo").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::Accessor);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\Tenant");
+}
+
+#[test]
+fn resolves_app_string_binding_to_column() {
+    // The bridge feeds the whole classifier, not just accessors: a fillable
+    // column on the bound model resolves too.
+    let p = project("app/Models/Tenant.php", TENANT_MODEL);
+    let resolver = tenant_bound_to(&p, "App\\Models\\Tenant");
+    let caller = "<?php $x = app('currentTenant')->name;";
+    let r = resolve_with(&resolver, &p.root, caller, "name").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\Tenant");
+}
+
+#[test]
+fn unbound_container_key_does_not_resolve() {
+    let p = project("app/Models/Tenant.php", TENANT_MODEL);
+    let resolver = WithBindings {
+        index: &p.index,
+        bindings: HashMap::new(),
+    };
+    let caller = "<?php $x = app('currentTenant')->logo;";
+    assert!(resolve_with(&resolver, &p.root, caller, "logo").is_none());
+}
+
+#[test]
+fn closure_bound_key_does_not_resolve() {
+    // A binding registered with a closure has no concrete class the index knows;
+    // the receiver stays unresolved rather than resolving to a phantom "Closure".
+    let p = project("app/Models/Tenant.php", TENANT_MODEL);
+    let resolver = tenant_bound_to(&p, "Closure");
+    let caller = "<?php $x = app('currentTenant')->logo;";
+    assert!(resolve_with(&resolver, &p.root, caller, "logo").is_none());
+}
+
+#[test]
+fn class_const_argument_is_not_a_string_key() {
+    // `app(Tenant::class)` is a separate (later) receiver shape — the string-key
+    // path must not misfire on it.
+    let p = project("app/Models/Tenant.php", TENANT_MODEL);
+    let resolver = tenant_bound_to(&p, "App\\Models\\Tenant");
+    let caller = "<?php $x = app(Tenant::class)->logo;";
+    assert!(resolve_with(&resolver, &p.root, caller, "logo").is_none());
+}
+
 #[test]
 fn resolves_typed_param_property_to_column_high() {
     let p = project("app/Models/User.php", USER_MODEL);
