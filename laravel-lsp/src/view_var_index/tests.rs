@@ -358,6 +358,69 @@ fn blade_var_with_no_inferred_type_is_dropped() {
     assert!(entries.is_empty(), "got {entries:?}");
 }
 
+/// A `SnapshotResolver` binding `currentUser` → the indexed `User` model.
+fn user_bound_resolver(p: &BladeProject, key: &str) -> crate::member_resolver::SnapshotResolver {
+    crate::member_resolver::SnapshotResolver {
+        class_files: Arc::new(std::collections::HashMap::from([(
+            "App\\Models\\User".to_string(),
+            p.root.join("app/Models/User.php"),
+        )])),
+        bindings: Arc::new(std::collections::HashMap::from([(
+            key.to_string(),
+            "App\\Models\\User".to_string(),
+        )])),
+    }
+}
+
+#[test]
+fn blade_container_binding_receiver_resolves() {
+    // `{{ app('currentUser')->email }}` — the receiver is a container
+    // resolution, not a view variable, so it has no entry in the view-var index.
+    // A binding-aware resolver types it to the bound model and the column
+    // classifies. This is the path that lights up `app('currentTenant')->logo`.
+    let p = blade_project();
+    let idx = ViewVarIndex::new(); // no controller render — type comes from the binding
+    let resolver = user_bound_resolver(&p, "currentUser");
+    let refs = vec![member_ref("app('currentUser')", "email", 5, 12)];
+    let mut cache = ClassViewCache::new();
+    let entries = resolve_blade_member_accesses(
+        &refs,
+        "users.show",
+        &idx,
+        &[],
+        &resolver,
+        &mut cache,
+        &p.root,
+        None,
+    );
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert_eq!(entries[0].fqcn, "App\\Models\\User");
+    assert_eq!(entries[0].member, "email");
+    assert_eq!(entries[0].line, 5);
+}
+
+#[test]
+fn blade_container_binding_unknown_key_is_dropped() {
+    // No binding registered for the accessed key → receiver unresolved → no
+    // entry (the resolver is binding-aware but the registry is empty for it).
+    let p = blade_project();
+    let idx = ViewVarIndex::new();
+    let resolver = user_bound_resolver(&p, "someOtherKey");
+    let refs = vec![member_ref("app('currentUser')", "email", 1, 0)];
+    let mut cache = ClassViewCache::new();
+    let entries = resolve_blade_member_accesses(
+        &refs,
+        "users.show",
+        &idx,
+        &[],
+        &resolver,
+        &mut cache,
+        &p.root,
+        None,
+    );
+    assert!(entries.is_empty(), "got {entries:?}");
+}
+
 #[test]
 fn blade_relationship_resolves() {
     let p = blade_project();

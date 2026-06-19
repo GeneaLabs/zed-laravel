@@ -3236,6 +3236,7 @@ async fn build_magic_member_entries(
         for (path, data) in blade_targets {
             let permit_owner = blade_sem.clone();
             let class_files = class_files.clone();
+            let bindings = bindings.clone();
             let view_var_index = view_var_index.clone();
             let view_paths = view_paths.clone();
             let root = root.clone();
@@ -3243,6 +3244,12 @@ async fn build_magic_member_entries(
                 let _permit = permit_owner.acquire_owned().await.ok()?;
                 tokio::task::spawn_blocking(move || {
                     let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+                    // Container-aware resolver so `app('key')->member` accesses in
+                    // Blade/Volt resolve to the bound model during indexing.
+                    let resolver = laravel_lsp::member_resolver::SnapshotResolver {
+                        class_files,
+                        bindings,
+                    };
                     // A Volt component (own front-matter, or an MFC template
                     // referencing `$this->`) needs the file source — for property
                     // typing AND for keying `$this->member` component references.
@@ -3266,7 +3273,7 @@ async fn build_magic_member_entries(
                         source.as_deref().map(|src| {
                             laravel_lsp::view_var_index::volt_property_types(
                                 src,
-                                &*class_files,
+                                &resolver,
                                 &mut classviews,
                                 &root,
                             )
@@ -3274,7 +3281,7 @@ async fn build_magic_member_entries(
                     } else if uses_this {
                         laravel_lsp::view_var_index::mfc_volt_property_types(
                             &path,
-                            &*class_files,
+                            &resolver,
                             &mut classviews,
                             &root,
                         )
@@ -3288,7 +3295,7 @@ async fn build_magic_member_entries(
                             &data.member_access_refs,
                             &prop_types,
                             &data.blade_loops,
-                            &*class_files,
+                            &resolver,
                             &mut classviews,
                             &root,
                             Some(&mut deps),
@@ -3301,7 +3308,7 @@ async fn build_magic_member_entries(
                             &view_name,
                             &view_var_index,
                             &data.blade_loops,
-                            &*class_files,
+                            &resolver,
                             &mut classviews,
                             &root,
                             Some(&mut deps),
@@ -6104,10 +6111,19 @@ impl LaravelLanguageServer {
 
         let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
         let mut deps: HashSet<String> = HashSet::new();
+        // Container-aware resolver shared by all three resolution paths so
+        // `app('key')->member` resolves to the bound model. Fetched here — after
+        // the early returns and before any view-var read guard — so the await is
+        // safe.
+        let bindings = self.salsa.snapshot_bindings().await.unwrap_or_default();
+        let resolver = laravel_lsp::member_resolver::SnapshotResolver {
+            class_files: class_files.clone(),
+            bindings,
+        };
         let mut entries = if is_volt {
             let prop_types = laravel_lsp::view_var_index::volt_property_types(
                 content,
-                &*class_files,
+                &resolver,
                 &mut classviews,
                 &root,
             );
@@ -6115,7 +6131,7 @@ impl LaravelLanguageServer {
                 &patterns.member_access_refs,
                 &prop_types,
                 &patterns.blade_loops,
-                &*class_files,
+                &resolver,
                 &mut classviews,
                 &root,
                 Some(&mut deps),
@@ -6138,7 +6154,7 @@ impl LaravelLanguageServer {
                         &view_name,
                         &vv,
                         &patterns.blade_loops,
-                        &*class_files,
+                        &resolver,
                         &mut classviews,
                         &root,
                         Some(&mut deps),
@@ -6148,14 +6164,6 @@ impl LaravelLanguageServer {
                 None => Vec::new(),
             }
         } else {
-            // Plain PHP: pair the class-file snapshot with the binding registry
-            // so `app('key')->member` resolves to the bound model. Safe to await
-            // here — unlike the Blade branch above, no read guard is held.
-            let bindings = self.salsa.snapshot_bindings().await.unwrap_or_default();
-            let resolver = laravel_lsp::member_resolver::SnapshotResolver {
-                class_files: class_files.clone(),
-                bindings,
-            };
             laravel_lsp::member_resolver::resolve_member_access_entries(
                 content,
                 &patterns.member_access_refs,
