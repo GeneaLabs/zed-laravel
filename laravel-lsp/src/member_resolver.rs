@@ -64,6 +64,26 @@ impl ClassFileResolver for HashMap<String, PathBuf> {
     }
 }
 
+/// A [`ClassFileResolver`] backed by owned snapshots — the resolver the
+/// out-of-actor magic-member build passes use. The `fqcn → file` snapshot
+/// answers `class_file`; the `binding key → concrete FQCN` snapshot answers
+/// `binding_concrete`, so `app('key')->member` resolves during indexing exactly
+/// as it does for the live, in-actor query path. Both maps are `Arc`-shared, so
+/// the per-file build tasks clone the resolver cheaply.
+pub struct SnapshotResolver {
+    pub class_files: Arc<HashMap<String, PathBuf>>,
+    pub bindings: Arc<HashMap<String, String>>,
+}
+
+impl ClassFileResolver for SnapshotResolver {
+    fn class_file(&self, fqcn: &str) -> Option<PathBuf> {
+        self.class_files.get(fqcn).cloned()
+    }
+    fn binding_concrete(&self, key: &str) -> Option<String> {
+        self.bindings.get(key).cloned()
+    }
+}
+
 // `AccessForm` moved to `salsa_impl` (it now travels inside
 // `MemberAccessReferenceData` through the pattern cache); re-exported here so
 // the engine's callers keep their `member_resolver::AccessForm` paths.

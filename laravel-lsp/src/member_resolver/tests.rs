@@ -482,6 +482,57 @@ fn class_const_argument_is_not_a_string_key() {
     assert!(resolve_with(&resolver, &p.root, caller, "logo").is_none());
 }
 
+// ─── SnapshotResolver: the build-pass resolver over owned snapshots ────────
+
+#[test]
+fn snapshot_resolver_answers_class_file_and_binding() {
+    let class_files = Arc::new(HashMap::from([(
+        "App\\Models\\Tenant".to_string(),
+        PathBuf::from("/x/Tenant.php"),
+    )]));
+    let bindings = Arc::new(HashMap::from([(
+        "currentTenant".to_string(),
+        "App\\Models\\Tenant".to_string(),
+    )]));
+    let r = SnapshotResolver {
+        class_files,
+        bindings,
+    };
+    assert_eq!(
+        r.class_file("App\\Models\\Tenant"),
+        Some(PathBuf::from("/x/Tenant.php"))
+    );
+    assert_eq!(
+        r.binding_concrete("currentTenant"),
+        Some("App\\Models\\Tenant".to_string())
+    );
+    assert_eq!(r.binding_concrete("missing"), None);
+}
+
+#[test]
+fn snapshot_resolver_resolves_app_binding_through_engine() {
+    // The production resolver type, driven through the real resolution path
+    // (not just the `WithBindings` stub) — proves the build pass will resolve
+    // `app('currentTenant')->logo` to the bound model's accessor.
+    let p = project("app/Models/Tenant.php", TENANT_MODEL);
+    let class_files = Arc::new(HashMap::from([(
+        "App\\Models\\Tenant".to_string(),
+        p.index.class_file("App\\Models\\Tenant").expect("indexed"),
+    )]));
+    let bindings = Arc::new(HashMap::from([(
+        "currentTenant".to_string(),
+        "App\\Models\\Tenant".to_string(),
+    )]));
+    let resolver = SnapshotResolver {
+        class_files,
+        bindings,
+    };
+    let caller = "<?php $x = app('currentTenant')->logo;";
+    let r = resolve_with(&resolver, &p.root, caller, "logo").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::Accessor);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\Tenant");
+}
+
 #[test]
 fn resolves_typed_param_property_to_column_high() {
     let p = project("app/Models/User.php", USER_MODEL);

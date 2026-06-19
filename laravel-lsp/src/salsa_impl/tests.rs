@@ -915,6 +915,58 @@ async fn salsa_config_refreshes_when_provider_registered_after_first_build() {
     );
 }
 
+#[tokio::test]
+async fn snapshot_bindings_maps_keys_to_concrete() {
+    // The build-pass snapshot must expose `app('key') → concrete FQCN` so
+    // `app('currentTenant')->member` resolves while indexing. It merges both
+    // registries (singletons + plain binds) and normalizes the concrete to the
+    // leading-backslash-free form the class index keys on.
+    let handle = SalsaActor::spawn();
+
+    let reg = |abstract_name: &str, concrete: &str, bt: BindingTypeData| BindingRegistrationData {
+        abstract_name: abstract_name.to_string(),
+        concrete_class: concrete.to_string(),
+        file_path: None,
+        binding_type: bt,
+        source_file: None,
+        source_line: None,
+        priority: 2,
+    };
+
+    let mut singletons = HashMap::new();
+    // Leading backslash on purpose — the snapshot must strip it.
+    singletons.insert(
+        "currentTenant".to_string(),
+        reg(
+            "currentTenant",
+            "\\App\\Models\\Tenant",
+            BindingTypeData::Singleton,
+        ),
+    );
+    let mut bindings = HashMap::new();
+    bindings.insert(
+        "reporter".to_string(),
+        reg("reporter", "App\\Services\\Reporter", BindingTypeData::Bind),
+    );
+
+    handle
+        .register_service_provider_registry(HashMap::new(), bindings, singletons)
+        .await
+        .unwrap();
+
+    let snapshot = handle.snapshot_bindings().await.unwrap();
+    assert_eq!(
+        snapshot.get("currentTenant").map(String::as_str),
+        Some("App\\Models\\Tenant"),
+        "singleton key maps to concrete, leading backslash normalized",
+    );
+    assert_eq!(
+        snapshot.get("reporter").map(String::as_str),
+        Some("App\\Services\\Reporter"),
+        "plain bind key maps to concrete",
+    );
+}
+
 // ─── collect_matches_for_symbol (find-references engine) ───────────────
 
 use std::path::PathBuf;

@@ -3068,6 +3068,9 @@ async fn build_magic_member_entries(
     if class_files.is_empty() {
         return Default::default();
     }
+    // Container-binding snapshot, paired with `class_files` in a `SnapshotResolver`
+    // so `app('key')->member` accesses resolve to the bound model during the build.
+    let bindings = salsa.snapshot_bindings().await.unwrap_or_default();
     let root = root.to_path_buf();
 
     // ── Pass 1: build the view-variable index ────────────────────────────
@@ -3153,6 +3156,7 @@ async fn build_magic_member_entries(
     for (path, data) in targets {
         let permit_owner = magic_sem.clone();
         let class_files = class_files.clone();
+        let bindings = bindings.clone();
         let root = root.clone();
         magic_handles.push(tokio::spawn(async move {
             let _permit = permit_owner.acquire_owned().await.ok()?;
@@ -3160,10 +3164,14 @@ async fn build_magic_member_entries(
                 let source = std::fs::read_to_string(&path).ok()?;
                 let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
                 let mut deps = HashSet::new();
+                let resolver = laravel_lsp::member_resolver::SnapshotResolver {
+                    class_files,
+                    bindings,
+                };
                 let mut entries = laravel_lsp::member_resolver::resolve_member_access_entries(
                     &source,
                     &data.member_access_refs,
-                    &*class_files,
+                    &resolver,
                     &mut classviews,
                     &root,
                     Some(&mut deps),
@@ -6140,10 +6148,18 @@ impl LaravelLanguageServer {
                 None => Vec::new(),
             }
         } else {
+            // Plain PHP: pair the class-file snapshot with the binding registry
+            // so `app('key')->member` resolves to the bound model. Safe to await
+            // here — unlike the Blade branch above, no read guard is held.
+            let bindings = self.salsa.snapshot_bindings().await.unwrap_or_default();
+            let resolver = laravel_lsp::member_resolver::SnapshotResolver {
+                class_files: class_files.clone(),
+                bindings,
+            };
             laravel_lsp::member_resolver::resolve_member_access_entries(
                 content,
                 &patterns.member_access_refs,
-                &*class_files,
+                &resolver,
                 &mut classviews,
                 &root,
                 Some(&mut deps),

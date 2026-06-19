@@ -3985,6 +3985,12 @@ pub enum SalsaRequest {
     SnapshotClassFiles {
         reply: oneshot::Sender<Arc<std::collections::HashMap<String, PathBuf>>>,
     },
+    /// Snapshot the `binding key → concrete FQCN` map for the same out-of-actor
+    /// build, so `app('key')` / `resolve('key')` receivers resolve to their
+    /// bound class while indexing.
+    SnapshotBindings {
+        reply: oneshot::Sender<Arc<std::collections::HashMap<String, String>>>,
+    },
     /// Snapshot every indexed class grouped by file, so warming can persist
     /// the hierarchy to the disk cache.
     SnapshotHierarchyNodes {
@@ -4631,6 +4637,23 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::SnapshotClassFiles { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Snapshot the container-binding registry as a `binding key → concrete
+    /// FQCN` map for the out-of-actor magic-member build. Mirrors
+    /// [`Self::snapshot_class_files`]: the build pass resolves `app('key')`
+    /// receivers against this owned copy without borrowing the actor.
+    pub async fn snapshot_bindings(
+        &self,
+    ) -> Result<Arc<std::collections::HashMap<String, String>>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SnapshotBindings { reply: reply_tx })
             .await
             .map_err(|_| "Salsa actor disconnected")?;
         reply_rx
@@ -5815,6 +5838,24 @@ impl SalsaActor {
                     }
                     let snapshot = self.class_files_snapshot.clone().unwrap_or_default();
                     let _ = reply.send(snapshot);
+                }
+                SalsaRequest::SnapshotBindings { reply } => {
+                    // Bindings number in the dozens, not thousands, so build
+                    // fresh each call — no cache to invalidate on service-
+                    // provider edits. Singletons first, then plain binds, so a
+                    // plain bind wins on key collision (mirrors the precedence
+                    // in `handle_get_binding_by_name`). Concrete FQCNs are
+                    // normalized to the leading-backslash-free form the class
+                    // index keys on.
+                    let mut map: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    for (key, reg) in self.sp_singletons.iter().chain(self.sp_bindings.iter()) {
+                        map.insert(
+                            key.clone(),
+                            reg.concrete_class.trim_start_matches('\\').to_string(),
+                        );
+                    }
+                    let _ = reply.send(Arc::new(map));
                 }
                 SalsaRequest::SnapshotHierarchyNodes { reply } => {
                     let _ = reply.send(self.class_hierarchy_index.nodes_by_file());
