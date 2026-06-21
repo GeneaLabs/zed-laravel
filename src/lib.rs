@@ -186,6 +186,9 @@ impl LaravelExtension {
             }
             (zed::Os::Linux, zed::Architecture::X8664) => "laravel-lsp-linux-x64".to_string(),
             (zed::Os::Linux, zed::Architecture::Aarch64) => "laravel-lsp-linux-arm64".to_string(),
+            // Defensive fallback for any future Linux arch the SDK adds: still
+            // honor musl so we never serve a glibc binary to a musl host.
+            (zed::Os::Linux, _) if is_musl => "laravel-lsp-musl".to_string(),
             (zed::Os::Linux, _) => "laravel-lsp".to_string(),
         }
     }
