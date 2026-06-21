@@ -225,6 +225,14 @@ jobs:
           # and the Rust linker both pick it up from PATH / the env below.
           curl -fL --retry 3 --retry-delay 5 \
             https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/aarch64-musl-cross.tgz
+          # Pin the tarball: musl.cc is an unsigned single-maintainer mirror and
+          # this toolchain compiles a published release binary, so verify a
+          # known-good sha256 before extracting. A MITM'd, compromised, or
+          # silently-rebuilt tarball then fails the build loudly instead of
+          # backdooring the shipped arm64-musl binary. Update this hash if the
+          # upstream toolchain is intentionally rebuilt.
+          echo "c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38  /tmp/aarch64-musl-cross.tgz" \
+            | sha256sum -c -
           sudo tar -xzf /tmp/aarch64-musl-cross.tgz -C /opt
           echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
           mkdir -p ~/.cargo
