@@ -160,6 +160,12 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             binary_name: laravel-lsp-linux-arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary_name: laravel-lsp-linux-x64-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            binary_name: laravel-lsp-linux-arm64-musl
           - os: macos-latest
             target: x86_64-apple-darwin
             binary_name: laravel-lsp-macos-x64
@@ -197,6 +203,36 @@ jobs:
           [target.aarch64-unknown-linux-gnu]
           linker = "aarch64-linux-gnu-gcc"
           EOF
+
+      - name: Install musl cross-compilation tools (Linux x64 musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          # The cc crate (build.rs compiles the tree-sitter C grammar) and the
+          # Rust linker both need to target musl, not the host glibc.
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml << EOF
+          [target.x86_64-unknown-linux-musl]
+          linker = "musl-gcc"
+          EOF
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> $GITHUB_ENV
+
+      - name: Install musl cross-compilation tools (Linux ARM64 musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          # musl.cc ships a complete aarch64 musl cross toolchain; the cc crate
+          # and the Rust linker both pick it up from PATH / the env below.
+          curl -fL --retry 3 --retry-delay 5 \
+            https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/aarch64-musl-cross.tgz
+          sudo tar -xzf /tmp/aarch64-musl-cross.tgz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml << EOF
+          [target.aarch64-unknown-linux-musl]
+          linker = "aarch64-linux-musl-gcc"
+          EOF
+          echo "CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc" >> $GITHUB_ENV
 
       - name: Build LSP Server
         run: |
