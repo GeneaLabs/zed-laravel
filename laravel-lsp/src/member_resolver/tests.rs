@@ -2096,10 +2096,10 @@ function show($mystery) {
 // ─── End-to-end: a closure-bound key resolves app('key')->member ───────────
 //
 // Proves the new tree-sitter binding walker feeds the SAME `concrete_class`
-// the class-concrete path does, so a closure singleton parsed from a provider
-// resolves `app('currentTenant')->member` through the shared engine that backs
-// the PHP, Blade, and Volt resolution paths (they all funnel through
-// `resolve_and_classify` on a PHP receiver node).
+// the class-concrete path does. A closure-derived concrete is a plain FQCN,
+// byte-identical to a class-const one, and PHP, Blade, and Volt converge on the
+// same `resolve_container_receiver` leaf that consumes it — so the PHP caller
+// below is representative of all three surfaces.
 
 #[test]
 fn closure_singleton_resolves_app_member_end_to_end() {

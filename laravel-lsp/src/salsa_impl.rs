@@ -2113,14 +2113,7 @@ fn classify_binding_call(
 
     let args = node.child_by_field_name("arguments")?;
     let mut cursor = args.walk();
-    let mut arg_exprs = args.named_children(&mut cursor).map(|a| {
-        // tree-sitter-php wraps each actual argument in an `argument` node.
-        if a.kind() == "argument" {
-            a.named_child(0)
-        } else {
-            Some(a)
-        }
-    });
+    let mut arg_exprs = args.named_children(&mut cursor).map(argument_value);
 
     let key_node = arg_exprs.next()??;
     let abstract_name = string_literal_text(key_node, bytes)?;
@@ -2153,6 +2146,20 @@ fn classify_binding_call(
     })
 }
 
+/// The value expression of a call argument. tree-sitter-php wraps each argument
+/// in an `argument` node; for a named argument (`bind(abstract: 'k', concrete: …)`)
+/// the parameter label is the `name` field, so the value is the other child —
+/// `named_child(0)` alone would return the label and drop the binding.
+fn argument_value(arg: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if arg.kind() != "argument" {
+        return Some(arg);
+    }
+    let label = arg.child_by_field_name("name");
+    (0..arg.named_child_count() as u32)
+        .filter_map(|i| arg.named_child(i))
+        .find(|&ch| Some(ch) != label)
+}
+
 /// Whether `object` is the `$this->app` receiver.
 fn is_this_app_receiver(object: tree_sitter::Node, bytes: &[u8]) -> bool {
     object.kind() == "member_access_expression"
@@ -2167,20 +2174,37 @@ fn is_this_app_receiver(object: tree_sitter::Node, bytes: &[u8]) -> bool {
 }
 
 /// The content of a single/double-quoted string literal node, or `None`.
+/// Descends to the `string_content` child, matching the rest of the LSP
+/// (`route_chain::read_string_content`, `config_key_locator`); an empty literal
+/// has no such child, so fall back to stripping a surrounding quote pair.
 fn string_literal_text(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
     if !matches!(node.kind(), "string" | "encapsed_string") {
         return None;
     }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "string_content" {
+            return Some(child.utf8_text(bytes).ok()?.to_string());
+        }
+    }
     Some(
         node.utf8_text(bytes)
             .ok()?
-            .trim_matches(['\'', '"'])
+            .trim_start_matches(['\'', '"'])
+            .trim_end_matches(['\'', '"'])
             .to_string(),
     )
 }
 
 /// The class named by a `Class::class` constant access, leading `\` trimmed.
+/// tree-sitter-php parses both `Class::class` and `Class::SOME_CONST` as a
+/// `class_constant_access_expression`, so require the constant child to be the
+/// literal `class` — otherwise this is an ordinary constant, not a class
+/// reference, and resolving its scope would point at the wrong target.
 fn class_const_name(expr: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    if expr.named_child(1)?.utf8_text(bytes).ok()? != "class" {
+        return None;
+    }
     Some(
         expr.named_child(0)?
             .utf8_text(bytes)

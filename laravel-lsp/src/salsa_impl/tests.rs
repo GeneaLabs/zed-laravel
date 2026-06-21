@@ -3200,3 +3200,45 @@ fn variable_concrete_binding_is_skipped() {
         "variable concrete must not register a binding, got {found:?}"
     );
 }
+
+#[test]
+fn non_class_constant_concrete_is_skipped() {
+    // tree-sitter-php parses `Tenant::TABLE` as the same node kind as
+    // `Tenant::class`; only the latter names a class. A non-`::class` constant
+    // must be skipped, not misclassified as the scope class (which would point
+    // `app('currentTenant')->member` at the wrong target).
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src = tenant_provider("$this->app->singleton('currentTenant', Tenant::TABLE);");
+    let found = discovered_bindings(&src, root);
+    assert!(
+        concrete_for(&found, "currentTenant").is_none(),
+        "a `::SOME_CONST` concrete must not register a binding, got {found:?}"
+    );
+}
+
+#[test]
+fn named_argument_binding_is_extracted() {
+    // Named arguments wrap the value behind a `name` label child; reading the
+    // value (not the label) keeps the binding from being silently dropped.
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src = tenant_provider(
+        "$this->app->singleton(abstract: 'currentTenant', concrete: Tenant::class);",
+    );
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, _) =
+        concrete_for(&found, "currentTenant").expect("named-argument binding registered");
+    assert_eq!(concrete, "Tenant");
+}
+
+#[test]
+fn quoted_key_content_is_read_without_greedy_trim() {
+    // The key is read from the `string_content` child, so a key whose content
+    // includes quote characters is preserved exactly rather than greedily
+    // stripped from both ends.
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src = tenant_provider("$this->app->bind(\"'wrapped'\", Tenant::class);");
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, _) =
+        concrete_for(&found, "'wrapped'").expect("key with embedded quotes registered verbatim");
+    assert_eq!(concrete, "Tenant");
+}
