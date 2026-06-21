@@ -46,9 +46,9 @@ jobs:
           echo "Extracted version: ${VERSION}"
 
       - name: Update versions and lock files
+        env:
+          VERSION: ${{ steps.extract_version.outputs.version }}
         run: |
-          VERSION="${{ steps.extract_version.outputs.version }}"
-
           # Update root Cargo.toml
           sed -i 's/^version = "[^"]*"/version = "'"$VERSION"'"/' Cargo.toml
           echo "Updated root Cargo.toml version to $VERSION"
@@ -82,6 +82,7 @@ jobs:
         env:
           GH_TOKEN: ${{ env.GITHUB_TOKEN }}
           SIGNING_KEY: ${{ secrets.COMMIT_SIGNING_SSH_KEY }}
+          VERSION: ${{ steps.extract_version.outputs.version }}
         run: |
           # Commit as the token owner (not github-actions[bot]) and SSH-sign so the
           # version-bump commit is "Verified" and satisfies the signed-commits rule
@@ -110,7 +111,7 @@ jobs:
             echo "new_commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
           else
             git add -A
-            git commit -m "chore: update version to ${{ steps.extract_version.outputs.version }}"
+            git commit -m "chore: update version to ${VERSION}"
             git push origin main
             NEW_COMMIT_SHA=$(git rev-parse HEAD)
             echo "new_commit_sha=${NEW_COMMIT_SHA}" >> $GITHUB_OUTPUT
