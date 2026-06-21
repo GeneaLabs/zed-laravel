@@ -90,3 +90,10 @@ jobs:
 
       - name: cargo check
         run: cargo check --target wasm32-wasip2
+
+      # The unit tests in src/lib.rs live in this (root) crate, so they only run
+      # here — the laravel-lsp job's `cargo test` is a different crate. Run on the
+      # host target: the tests are pure (no wasm runtime needed), so no wasm test
+      # runner is required despite the crate being a cdylib.
+      - name: cargo test
+        run: cargo test
