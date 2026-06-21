@@ -145,6 +145,104 @@ class User extends \Illuminate\Database\Eloquent\Model {
     );
 }
 
+#[test]
+fn mutator_usage_name_maps_setter_to_snake_member() {
+    // `set{Name}Attribute` → snake-cased member; the empty middle
+    // (`setAttribute`, Eloquent's own setter) and non-mutators are `None`.
+    assert_eq!(
+        mutator_usage_name("setLogoAttribute").as_deref(),
+        Some("logo")
+    );
+    assert_eq!(
+        mutator_usage_name("setFullNameAttribute").as_deref(),
+        Some("full_name")
+    );
+    assert_eq!(mutator_usage_name("setAttribute"), None);
+    assert_eq!(mutator_usage_name("getLogoAttribute"), None);
+    assert_eq!(mutator_usage_name("save"), None);
+}
+
+#[test]
+fn model_mutator_only_gets_a_lens() {
+    // A model with only a setter (no matching getter) exposes a lens for the
+    // magic member — closes the setter-only gap (#232).
+    let src = r#"<?php
+namespace App\Models;
+class User extends \Illuminate\Database\Eloquent\Model {
+    public function setLogoAttribute($value) { $this->attributes['logo'] = $value; }
+}
+"#;
+    let targets = code_lens_targets(Path::new("/proj/app/Models/User.php"), src);
+    let k = keys(&targets);
+    assert!(
+        k.contains(&("App\\Models\\User", "logo")),
+        "setter-only mutator lens, got {k:?}"
+    );
+    // The lens anchors on the method name, not the derived attribute.
+    let m = targets
+        .iter()
+        .find(
+            |t| matches!(&t.symbol, SymbolRefData::MagicMember { member, .. } if member == "logo"),
+        )
+        .unwrap();
+    let line = src.lines().nth(m.line as usize).unwrap();
+    assert_eq!(m.column, line.find("setLogoAttribute").unwrap() as u32);
+}
+
+#[test]
+fn model_getter_and_setter_shows_a_single_lens_on_the_getter() {
+    // Reads and writes share one reference count, so a model with both accessor
+    // and mutator must show exactly one lens — on the getter, not the setter
+    // (#232, option b).
+    let src = r#"<?php
+namespace App\Models;
+class User extends \Illuminate\Database\Eloquent\Model {
+    public function getLogoAttribute() { return $this->attributes['logo']; }
+    public function setLogoAttribute($value) { $this->attributes['logo'] = $value; }
+}
+"#;
+    let targets = code_lens_targets(Path::new("/proj/app/Models/User.php"), src);
+    let logo: Vec<_> = targets
+        .iter()
+        .filter(
+            |t| matches!(&t.symbol, SymbolRefData::MagicMember { member, .. } if member == "logo"),
+        )
+        .collect();
+    assert_eq!(logo.len(), 1, "exactly one lens for `logo`, got {logo:?}");
+    // The single lens sits on the getter.
+    let line = src.lines().nth(logo[0].line as usize).unwrap();
+    assert_eq!(
+        logo[0].column,
+        line.find("getLogoAttribute").unwrap() as u32
+    );
+}
+
+#[test]
+fn model_new_style_attribute_is_not_double_counted_as_a_mutator() {
+    // A new-style `Attribute`-returning method covers get+set in one
+    // declaration — it must produce exactly one lens, never a second one for the
+    // write side (#232).
+    let src = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Casts\Attribute;
+class User extends \Illuminate\Database\Eloquent\Model {
+    public function logo(): Attribute { return Attribute::make(get: fn () => $this->x, set: fn ($v) => $v); }
+}
+"#;
+    let targets = code_lens_targets(Path::new("/proj/app/Models/User.php"), src);
+    let logo: Vec<_> = targets
+        .iter()
+        .filter(
+            |t| matches!(&t.symbol, SymbolRefData::MagicMember { member, .. } if member == "logo"),
+        )
+        .collect();
+    assert_eq!(
+        logo.len(),
+        1,
+        "new-style attribute single lens, got {logo:?}"
+    );
+}
+
 // ── Route-name declaration lenses ─────────────────────────────────────────
 
 use crate::route_name_locator::RouteNameDeclaration;
