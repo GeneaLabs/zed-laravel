@@ -242,13 +242,6 @@ fn model_targets(source: &str) -> Vec<CodeLensTarget> {
         return Vec::new();
     };
 
-    // Every member that already carries an accessor lens. Reads and writes share
-    // a single reference count today, so a mutator gets its own lens only when no
-    // accessor covers the same member (#232, option b — fallback-only): that
-    // closes the setter-only gap without showing the same number twice on a model
-    // that has both a getter and a setter.
-    let accessor_members = accessor_member_names(tree.root_node(), bytes);
-
     let mut out = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(n) = stack.pop() {
@@ -259,9 +252,7 @@ fn model_targets(source: &str) -> Vec<CodeLensTarget> {
                         out.push(target(&fqcn, &usage, line, col, end));
                     } else if let Some(usage) = accessor_usage_name(n, &name, bytes) {
                         out.push(target(&fqcn, &usage, line, col, end));
-                    } else if let Some(usage) =
-                        mutator_usage_name(&name).filter(|m| !accessor_members.contains(m))
-                    {
+                    } else if let Some(usage) = mutator_usage_name(&name) {
                         out.push(target(&fqcn, &usage, line, col, end));
                     } else if method_is_relationship(n, bytes) {
                         out.push(target(&fqcn, &name, line, col, end));
@@ -280,6 +271,19 @@ fn model_targets(source: &str) -> Vec<CodeLensTarget> {
             stack.push(ch);
         }
     }
+
+    // Collapse to one lens per `(fqcn, member)`. Scopes (`scopeActive`),
+    // accessors (`getActiveAttribute` / `active(): Attribute`), mutators
+    // (`setActiveAttribute`), and public properties (`public $active`) each
+    // snake-case a member name independently, so several declaration kinds can
+    // resolve to the same member — e.g. `scopeActive` + `public $active`, or a
+    // getter + setter. Reads and writes share a single reference count, so
+    // emitting more than one lens for a member would display the same number
+    // twice (#239). Sort by source position and keep the first occurrence, so
+    // the surviving lens anchors on the member's topmost declaration.
+    out.sort_by_key(|t| (t.line, t.column));
+    let mut seen = HashSet::new();
+    out.retain(|t| seen.insert(t.symbol.clone()));
     out
 }
 
@@ -349,32 +353,6 @@ fn mutator_usage_name(name: &str) -> Option<String> {
         .strip_prefix("set")
         .and_then(|s| s.strip_suffix("Attribute"))?;
     (!middle.is_empty()).then(|| pascal_to_snake(middle))
-}
-
-/// Every member name that already carries an accessor lens in this class —
-/// old-style `get{X}Attribute` or a new-style `Attribute`-returning method.
-/// Lets `model_targets` add a mutator lens only as a fallback, when no accessor
-/// covers the same member (#232, option b).
-fn accessor_member_names(root: Node, bytes: &[u8]) -> HashSet<String> {
-    let mut members = HashSet::new();
-    let mut stack = vec![root];
-    while let Some(n) = stack.pop() {
-        if n.kind() == "method_declaration" {
-            if let Some(name) = n
-                .child_by_field_name("name")
-                .and_then(|nm| nm.utf8_text(bytes).ok())
-            {
-                if let Some(usage) = accessor_usage_name(n, name, bytes) {
-                    members.insert(usage);
-                }
-            }
-        }
-        let mut c = n.walk();
-        for ch in n.children(&mut c) {
-            stack.push(ch);
-        }
-    }
-    members
 }
 
 /// True if a method body calls an Eloquent relationship factory

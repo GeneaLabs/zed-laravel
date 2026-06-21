@@ -243,6 +243,164 @@ class User extends \Illuminate\Database\Eloquent\Model {
     );
 }
 
+/// How many magic-member lenses resolve to `member` — used by the cross-kind
+/// dedup tests (#239), where two declarations snake-case to the same name.
+fn member_lens_count(targets: &[CodeLensTarget], member: &str) -> usize {
+    targets
+        .iter()
+        .filter(
+            |t| matches!(&t.symbol, SymbolRefData::MagicMember { member: m, .. } if m == member),
+        )
+        .count()
+}
+
+#[test]
+fn scope_and_accessor_collision_yields_one_lens() {
+    // `scopeActive` and `getActiveAttribute` both resolve to member `active`;
+    // they share one reference count, so exactly one lens (#239).
+    let src = r#"<?php
+namespace App\Models;
+class User extends \Illuminate\Database\Eloquent\Model {
+    public function scopeActive($q) { return $q->where('active', true); }
+    public function getActiveAttribute() { return true; }
+}
+"#;
+    let targets = code_lens_targets(Path::new("/proj/app/Models/User.php"), src);
+    assert_eq!(
+        member_lens_count(&targets, "active"),
+        1,
+        "scope + accessor, got {:?}",
+        keys(&targets)
+    );
+}
+
+#[test]
+fn scope_and_public_property_collision_yields_one_lens() {
+    // `scopeActive` and `public $active` both resolve to member `active` — a
+    // collision possible since before #238 (#239).
+    let src = r#"<?php
+namespace App\Models;
+class User extends \Illuminate\Database\Eloquent\Model {
+    public bool $active = true;
+    public function scopeActive($q) { return $q->where('active', true); }
+}
+"#;
+    let targets = code_lens_targets(Path::new("/proj/app/Models/User.php"), src);
+    assert_eq!(
+        member_lens_count(&targets, "active"),
+        1,
+        "scope + public property, got {:?}",
+        keys(&targets)
+    );
+}
+
+#[test]
+fn accessor_and_public_property_collision_yields_one_lens() {
+    // `getActiveAttribute` and `public $active` both resolve to `active` (#239).
+    let src = r#"<?php
+namespace App\Models;
+class User extends \Illuminate\Database\Eloquent\Model {
+    public bool $active = true;
+    public function getActiveAttribute() { return true; }
+}
+"#;
+    let targets = code_lens_targets(Path::new("/proj/app/Models/User.php"), src);
+    assert_eq!(
+        member_lens_count(&targets, "active"),
+        1,
+        "accessor + public property, got {:?}",
+        keys(&targets)
+    );
+}
+
+#[test]
+fn scope_and_mutator_collision_yields_one_lens() {
+    // `scopeActive` and `setActiveAttribute` both resolve to `active`; the
+    // mutator branch (#238) must not double-anchor against a scope (#239).
+    let src = r#"<?php
+namespace App\Models;
+class User extends \Illuminate\Database\Eloquent\Model {
+    public function scopeActive($q) { return $q->where('active', true); }
+    public function setActiveAttribute($v) { $this->attributes['active'] = $v; }
+}
+"#;
+    let targets = code_lens_targets(Path::new("/proj/app/Models/User.php"), src);
+    assert_eq!(
+        member_lens_count(&targets, "active"),
+        1,
+        "scope + mutator, got {:?}",
+        keys(&targets)
+    );
+}
+
+#[test]
+fn mutator_and_public_property_collision_yields_one_lens() {
+    // `setActiveAttribute` and `public $active` both resolve to `active` (#239).
+    let src = r#"<?php
+namespace App\Models;
+class User extends \Illuminate\Database\Eloquent\Model {
+    public bool $active = true;
+    public function setActiveAttribute($v) { $this->attributes['active'] = $v; }
+}
+"#;
+    let targets = code_lens_targets(Path::new("/proj/app/Models/User.php"), src);
+    assert_eq!(
+        member_lens_count(&targets, "active"),
+        1,
+        "mutator + public property, got {:?}",
+        keys(&targets)
+    );
+}
+
+#[test]
+fn new_style_accessor_and_old_style_mutator_collision_yields_one_lens() {
+    // Regression for #238's `accessor_member_names`: a new-style accessor
+    // (`logo(): Attribute`) and an old-style mutator (`setLogoAttribute`) both
+    // resolve to `logo` — exactly one lens, no double-anchor (#239).
+    let src = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Casts\Attribute;
+class User extends \Illuminate\Database\Eloquent\Model {
+    public function logo(): Attribute { return Attribute::make(fn () => $this->x); }
+    public function setLogoAttribute($v) { $this->attributes['logo'] = $v; }
+}
+"#;
+    let targets = code_lens_targets(Path::new("/proj/app/Models/User.php"), src);
+    assert_eq!(
+        member_lens_count(&targets, "logo"),
+        1,
+        "new-style accessor + old-style mutator, got {:?}",
+        keys(&targets)
+    );
+}
+
+#[test]
+fn distinct_members_across_all_kinds_each_get_one_lens() {
+    // Dedup must not collapse genuinely distinct members: a scope, accessor,
+    // mutator, and public property that resolve to four different names still
+    // emit one lens each (#239).
+    let src = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Casts\Attribute;
+class User extends \Illuminate\Database\Eloquent\Model {
+    public string $nickname = '';
+    public function scopeRecent($q) { return $q->latest(); }
+    public function getFullNameAttribute() { return $this->first.' '.$this->last; }
+    public function setAvatarAttribute($v) { $this->attributes['avatar'] = $v; }
+}
+"#;
+    let targets = code_lens_targets(Path::new("/proj/app/Models/User.php"), src);
+    let k = keys(&targets);
+    for member in ["nickname", "recent", "full_name", "avatar"] {
+        assert_eq!(
+            member_lens_count(&targets, member),
+            1,
+            "{member} should have one lens, got {k:?}"
+        );
+    }
+    assert_eq!(k.len(), 4, "four distinct members, no extras, got {k:?}");
+}
+
 // ── Route-name declaration lenses ─────────────────────────────────────────
 
 use crate::route_name_locator::RouteNameDeclaration;
