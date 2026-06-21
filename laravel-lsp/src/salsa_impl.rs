@@ -1580,34 +1580,6 @@ pub fn parse_service_provider_source<'db>(
     use regex::Regex;
 
     lazy_static! {
-        /// Matches `$this->app->bind('name', Class::class)` or
-        /// `$this->app->singleton('name', Class::class)` where the concrete
-        /// is given as a static class reference.
-        ///
-        /// Two earlier shapes — `..., function () { ... })` (closure concrete)
-        /// and `..., $variable` (variable concrete) — are matched separately
-        /// below so they can be classified rather than mis-extracted as a
-        /// class name. The original combined regex back-tracked into closure
-        /// parameter lists (e.g. `function ($app)`) and pulled `"p"` out of
-        /// `$app`, which is the bug being fixed here.
-        static ref BINDING_CLASS_RE: Regex = Regex::new(
-            r#"\$this->app->(bind|singleton)\s*\(\s*['"]([^'"]+)['"]\s*,\s*\\?([A-Za-z0-9_\\]+)::class"#
-        ).unwrap();
-
-        /// Matches `$this->app->bind('name', function ...)` or `fn (...) =>`.
-        /// The concrete in this case is a closure — we record `"Closure"`
-        /// rather than trying to derive a class name.
-        static ref BINDING_CLOSURE_RE: Regex = Regex::new(
-            r#"\$this->app->(bind|singleton)\s*\(\s*['"]([^'"]+)['"]\s*,\s*(?:function\s*\(|fn\s*\()"#
-        ).unwrap();
-
-        /// Matches a bare `$this->app->bind('name')` or `->singleton('name')`
-        /// — no second argument. Falls back to abstract = concrete in the
-        /// handler.
-        static ref BINDING_BARE_RE: Regex = Regex::new(
-            r#"\$this->app->(bind|singleton)\s*\(\s*['"]([^'"]+)['"]\s*\)"#
-        ).unwrap();
-
         /// Matches $this->app->alias('concrete', 'alias')
         static ref ALIAS_RE: Regex = Regex::new(
             r#"\$this->app->alias\s*\(\s*\\?([A-Za-z0-9_\\]+)(?:::class)?\s*,\s*['"]([^'"]+)['"]\s*\)"#
@@ -1759,87 +1731,33 @@ pub fn parse_service_provider_source<'db>(
         }
     }
 
-    // Parse bind/singleton registrations. Three regexes target the three
-    // forms a binding's concrete can take — explicit class, closure, or no
-    // second argument. Each abstract name is registered exactly once, with
-    // the class regex taking precedence over closure, which takes precedence
-    // over bare (no second arg). The earlier combined regex back-tracked
-    // into closure parameter lists and pulled garbage like `"p"` out of
-    // `function ($app)`; the three narrower regexes can't do that.
-    let mut bindings_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for cap in BINDING_CLASS_RE.captures_iter(text) {
-        if let (Some(method), Some(name), Some(concrete)) = (cap.get(1), cap.get(2), cap.get(3)) {
-            let abstract_name = name.as_str();
-            if !bindings_seen.insert(abstract_name.to_string()) {
+    // Parse bind/singleton/scoped registrations via tree-sitter. Walking the
+    // PHP AST (rather than the former BINDING_*_RE regexes) lets a closure's
+    // return expression be resolved to its concrete model — a closure body's
+    // nested braces, quotes, and multiple returns are beyond what a regex can
+    // reliably parse. The argument node's kind classifies each concrete as a
+    // `Class::class` const, a closure, or a bare key. Each abstract name is
+    // registered once (first occurrence in source order wins).
+    if let Ok(binding_tree) = parse_php(text) {
+        let aliases = crate::query_chain::use_aliases::extract_use_aliases(&binding_tree, text);
+        let mut bindings_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for pb in extract_provider_bindings(&binding_tree, text, &root, &aliases) {
+            if !bindings_seen.insert(pb.abstract_name.clone()) {
                 continue;
             }
-            let concrete_class = concrete.as_str().trim_start_matches('\\').to_string();
-            let binding_type = match method.as_str() {
-                "singleton" => BindingTypeEnum::Singleton,
-                _ => BindingTypeEnum::Bind,
+            let file_path = if pb.resolve_file {
+                resolve_class_to_file_internal(&pb.concrete_class, &root)
+            } else {
+                None
             };
-            let line = text[..name.start()].lines().count() as u32;
-            let file_path = resolve_class_to_file_internal(&concrete_class, &root);
-            let binding_name = BindingName::new(db, abstract_name.to_string());
+            let binding_name = BindingName::new(db, pb.abstract_name);
             bindings.push(ParsedBindingReg::new(
                 db,
                 binding_name,
-                concrete_class,
+                pb.concrete_class,
                 file_path,
-                binding_type,
-                line,
-                priority,
-                path.clone(),
-            ));
-        }
-    }
-
-    for cap in BINDING_CLOSURE_RE.captures_iter(text) {
-        if let (Some(method), Some(name)) = (cap.get(1), cap.get(2)) {
-            let abstract_name = name.as_str();
-            if !bindings_seen.insert(abstract_name.to_string()) {
-                continue;
-            }
-            let binding_type = match method.as_str() {
-                "singleton" => BindingTypeEnum::Singleton,
-                _ => BindingTypeEnum::Bind,
-            };
-            let line = text[..name.start()].lines().count() as u32;
-            let binding_name = BindingName::new(db, abstract_name.to_string());
-            bindings.push(ParsedBindingReg::new(
-                db,
-                binding_name,
-                "Closure".to_string(),
-                None,
-                binding_type,
-                line,
-                priority,
-                path.clone(),
-            ));
-        }
-    }
-
-    for cap in BINDING_BARE_RE.captures_iter(text) {
-        if let (Some(method), Some(name)) = (cap.get(1), cap.get(2)) {
-            let abstract_name = name.as_str();
-            if !bindings_seen.insert(abstract_name.to_string()) {
-                continue;
-            }
-            let binding_type = match method.as_str() {
-                "singleton" => BindingTypeEnum::Singleton,
-                _ => BindingTypeEnum::Bind,
-            };
-            let line = text[..name.start()].lines().count() as u32;
-            let file_path = resolve_class_to_file_internal(abstract_name, &root);
-            let binding_name = BindingName::new(db, abstract_name.to_string());
-            bindings.push(ParsedBindingReg::new(
-                db,
-                binding_name,
-                abstract_name.to_string(),
-                file_path,
-                binding_type,
-                line,
+                pb.binding_type,
+                pb.source_line,
                 priority,
                 path.clone(),
             ));
@@ -2108,6 +2026,249 @@ pub fn parse_service_provider_source<'db>(
         anonymous_component_paths,
         anonymous_component_namespaces,
     )
+}
+
+/// A container binding extracted from a provider's AST, ready to become a
+/// `ParsedBindingReg`. `concrete_class` is the resolved concrete FQCN, the
+/// abstract name (bare form), or `"Closure"` for an unresolved closure;
+/// `resolve_file` gates the PSR-4 file lookup (skipped for `"Closure"`).
+struct ProviderBinding {
+    abstract_name: String,
+    concrete_class: String,
+    binding_type: BindingTypeEnum,
+    source_line: u32,
+    resolve_file: bool,
+}
+
+/// A [`ClassFileResolver`](crate::member_resolver::ClassFileResolver) used while
+/// resolving a closure's return expression during provider parsing: FQCN→file
+/// via PSR-4, with no container-binding lookup (a closure that resolves another
+/// bound key isn't modelled — it degrades to `"Closure"`).
+struct ProviderBindingResolver<'a> {
+    root: &'a Path,
+}
+
+impl crate::member_resolver::ClassFileResolver for ProviderBindingResolver<'_> {
+    fn class_file(&self, fqcn: &str) -> Option<PathBuf> {
+        resolve_class_to_file_internal(fqcn, self.root)
+    }
+}
+
+/// Walk a provider's PHP AST for `$this->app->{bind,singleton,scoped}` container
+/// registrations, classifying each by the kind of its concrete argument.
+fn extract_provider_bindings(
+    tree: &tree_sitter::Tree,
+    text: &str,
+    root: &Path,
+    aliases: &crate::query_chain::use_aliases::UseAliases,
+) -> Vec<ProviderBinding> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    walk_provider_bindings(tree.root_node(), bytes, root, aliases, text, &mut out);
+    out
+}
+
+/// Pre-order (document-order) descent collecting `ProviderBinding`s, so the
+/// first registration of any key wins the dedup in the caller.
+fn walk_provider_bindings(
+    node: tree_sitter::Node,
+    bytes: &[u8],
+    root: &Path,
+    aliases: &crate::query_chain::use_aliases::UseAliases,
+    text: &str,
+    out: &mut Vec<ProviderBinding>,
+) {
+    if node.kind() == "member_call_expression" {
+        if let Some(pb) = classify_binding_call(node, bytes, root, aliases, text) {
+            out.push(pb);
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_provider_bindings(child, bytes, root, aliases, text, out);
+    }
+}
+
+/// Classify one `$this->app->{bind,singleton,scoped}('key', <concrete>)` call.
+/// Returns `None` for any call that isn't such a registration, or whose
+/// concrete argument can't be statically resolved to a class (e.g. a variable).
+fn classify_binding_call(
+    node: tree_sitter::Node,
+    bytes: &[u8],
+    root: &Path,
+    aliases: &crate::query_chain::use_aliases::UseAliases,
+    text: &str,
+) -> Option<ProviderBinding> {
+    if !is_this_app_receiver(node.child_by_field_name("object")?, bytes) {
+        return None;
+    }
+    let method = node.child_by_field_name("name")?.utf8_text(bytes).ok()?;
+    let binding_type = match method {
+        // `scoped` is a request-lifecycle singleton; for static resolution it
+        // behaves identically to a singleton — a concrete bound to a key.
+        "singleton" | "scoped" => BindingTypeEnum::Singleton,
+        "bind" => BindingTypeEnum::Bind,
+        _ => return None,
+    };
+
+    let args = node.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let mut arg_exprs = args.named_children(&mut cursor).map(|a| {
+        // tree-sitter-php wraps each actual argument in an `argument` node.
+        if a.kind() == "argument" {
+            a.named_child(0)
+        } else {
+            Some(a)
+        }
+    });
+
+    let key_node = arg_exprs.next()??;
+    let abstract_name = string_literal_text(key_node, bytes)?;
+    let source_line = text[..key_node.start_byte()].lines().count() as u32;
+
+    let (concrete_class, resolve_file) = match arg_exprs.next() {
+        // Bare `$this->app->bind('name')`: concrete = abstract.
+        None => (abstract_name.clone(), true),
+        Some(Some(expr)) => match expr.kind() {
+            "class_constant_access_expression" => (class_const_name(expr, bytes)?, true),
+            "arrow_function" | "anonymous_function" => {
+                match resolve_closure_concrete(expr, bytes, aliases, root) {
+                    Some(fqcn) => (fqcn, true),
+                    None => ("Closure".to_string(), false),
+                }
+            }
+            // A variable, helper call, etc. — not statically a class. Skipped,
+            // matching the former regexes, which only matched these three forms.
+            _ => return None,
+        },
+        Some(None) => return None,
+    };
+
+    Some(ProviderBinding {
+        abstract_name,
+        concrete_class,
+        binding_type,
+        source_line,
+        resolve_file,
+    })
+}
+
+/// Whether `object` is the `$this->app` receiver.
+fn is_this_app_receiver(object: tree_sitter::Node, bytes: &[u8]) -> bool {
+    object.kind() == "member_access_expression"
+        && object
+            .child_by_field_name("object")
+            .and_then(|o| o.utf8_text(bytes).ok())
+            == Some("$this")
+        && object
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())
+            == Some("app")
+}
+
+/// The content of a single/double-quoted string literal node, or `None`.
+fn string_literal_text(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    if !matches!(node.kind(), "string" | "encapsed_string") {
+        return None;
+    }
+    Some(
+        node.utf8_text(bytes)
+            .ok()?
+            .trim_matches(['\'', '"'])
+            .to_string(),
+    )
+}
+
+/// The class named by a `Class::class` constant access, leading `\` trimmed.
+fn class_const_name(expr: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    Some(
+        expr.named_child(0)?
+            .utf8_text(bytes)
+            .ok()?
+            .trim_start_matches('\\')
+            .to_string(),
+    )
+}
+
+/// Resolve the concrete model a binding closure returns, or `None` to fall back
+/// to `"Closure"`. The contract is to degrade cleanly — only a single, concrete,
+/// on-disk class is ever returned; the hard tiers (relationship hops, multiple
+/// returns, union/nullable return types) yield `None` rather than a wrong guess.
+fn resolve_closure_concrete(
+    closure: tree_sitter::Node,
+    bytes: &[u8],
+    aliases: &crate::query_chain::use_aliases::UseAliases,
+    root: &Path,
+) -> Option<String> {
+    // An explicit, single, named return type is the most authoritative signal.
+    // optional_type (`?Tenant`), union_type (`A|B`), intersection_type, and
+    // primitive_type are the ambiguous tiers — never resolved from the hint;
+    // they fall through to the body expression below.
+    if let Some(rt) = closure.child_by_field_name("return_type") {
+        if rt.kind() == "named_type" {
+            if let Ok(raw) = rt.utf8_text(bytes) {
+                let fqcn = crate::query_chain::use_aliases::resolve_class_name(raw, aliases);
+                if resolve_class_to_file_internal(&fqcn, root).is_some() {
+                    return Some(fqcn);
+                }
+            }
+        }
+    }
+
+    // Otherwise resolve the return expression. An arrow body is the expression
+    // itself; a block body must have exactly one `return <expr>;` (multiple
+    // returns are the conditional hard tier — give up rather than pick one).
+    let body = closure.child_by_field_name("body")?;
+    let expr = if body.kind() == "compound_statement" {
+        single_return_expr(body)?
+    } else {
+        body
+    };
+
+    let resolver = ProviderBindingResolver { root };
+    let mut classviews = crate::member_resolver::ClassViewCache::new();
+    let (fqcn, confidence) = crate::member_resolver::resolve_expression_type(
+        expr,
+        bytes,
+        aliases,
+        &resolver,
+        &mut classviews,
+        root,
+    )?;
+    if !matches!(confidence, Confidence::High | Confidence::Medium) {
+        return None;
+    }
+    // Only store a concrete that names a real class file — an inferred FQCN that
+    // doesn't resolve to disk would be a guess, and the contract is to degrade
+    // to "Closure" rather than point at a wrong or absent target.
+    resolve_class_to_file_internal(&fqcn, root)
+        .is_some()
+        .then_some(fqcn)
+}
+
+/// The expression of a block body's sole `return <expr>;`, or `None` when there
+/// are zero or multiple returns (the conditional/multiple-return hard tier).
+/// Nested closures' own returns are ignored.
+fn single_return_expr(block: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut found: Option<tree_sitter::Node> = None;
+    let mut stack = vec![block];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "return_statement" {
+            if found.is_some() {
+                return None;
+            }
+            found = n.named_child(0);
+        }
+        let mut cursor = n.walk();
+        for child in n.named_children(&mut cursor) {
+            // A nested closure's returns belong to it, not this block.
+            if matches!(child.kind(), "arrow_function" | "anonymous_function") {
+                continue;
+            }
+            stack.push(child);
+        }
+    }
+    found
 }
 
 /// Resolve a PHP path expression to an absolute filesystem path without

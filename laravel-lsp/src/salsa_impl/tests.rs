@@ -2999,3 +2999,204 @@ class C {
         .expect("mid-chain scope call should be renameable");
     assert_eq!(rename.method_name, "scopeActive");
 }
+
+// ─── Container bindings: tree-sitter extraction + closure concrete resolution ─
+
+/// Minimal on-disk Tenant model so closure concretes resolve to a real file.
+const TENANT_FILE: (&str, &str) = (
+    "app/Models/Tenant.php",
+    "<?php namespace App\\Models; class Tenant {}",
+);
+
+/// A provider whose `register()` body is `binding_line`, with the Tenant model
+/// imported (so a bare `Tenant` resolves via the use-alias).
+fn tenant_provider(binding_line: &str) -> String {
+    format!(
+        r#"<?php
+namespace App\Providers;
+
+use Illuminate\Support\ServiceProvider;
+use App\Models\Tenant;
+
+class AppServiceProvider extends ServiceProvider
+{{
+    public function register(): void
+    {{
+        {binding_line}
+    }}
+}}
+"#
+    )
+}
+
+/// The (abstract, concrete, file_path) triples a provider source registers.
+fn discovered_bindings(source: &str, root: PathBuf) -> Vec<(String, String, Option<PathBuf>)> {
+    let db = LaravelDatabase::default();
+    let file = ServiceProviderFile::new(
+        &db,
+        root.join("app/Providers/AppServiceProvider.php"),
+        0,
+        source.to_string(),
+        2,
+    );
+    let parsed = parse_service_provider_source(&db, file, root);
+    parsed
+        .bindings(&db)
+        .iter()
+        .map(|b| {
+            (
+                b.abstract_name(&db).name(&db).clone(),
+                b.concrete_class(&db).clone(),
+                b.file_path(&db).clone(),
+            )
+        })
+        .collect()
+}
+
+fn concrete_for<'a>(
+    bindings: &'a [(String, String, Option<PathBuf>)],
+    key: &str,
+) -> Option<&'a (String, String, Option<PathBuf>)> {
+    bindings.iter().find(|(a, _, _)| a == key)
+}
+
+#[test]
+fn closure_arrow_static_chain_resolves_to_bound_model() {
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src = tenant_provider(
+        "$this->app->singleton('currentTenant', fn () => Tenant::where('domain', request()->host())->first());",
+    );
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, file) = concrete_for(&found, "currentTenant").expect("binding registered");
+    assert_eq!(concrete, "App\\Models\\Tenant");
+    assert!(file
+        .as_ref()
+        .is_some_and(|f| f.ends_with("app/Models/Tenant.php")));
+}
+
+#[test]
+fn closure_new_model_resolves_to_bound_model() {
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src =
+        tenant_provider("$this->app->bind('currentTenant', function () { return new Tenant(); });");
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, _) = concrete_for(&found, "currentTenant").expect("binding registered");
+    assert_eq!(concrete, "App\\Models\\Tenant");
+}
+
+#[test]
+fn closure_return_type_hint_resolves_to_bound_model() {
+    // The body call is opaque; the explicit `: Tenant` return type is the signal.
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src = tenant_provider(
+        "$this->app->singleton('currentTenant', fn (): Tenant => $this->makeTenant());",
+    );
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, _) = concrete_for(&found, "currentTenant").expect("binding registered");
+    assert_eq!(concrete, "App\\Models\\Tenant");
+}
+
+#[test]
+fn scoped_closure_binding_is_extracted_and_resolved() {
+    // `scoped` is new surface (the old regex only matched bind/singleton).
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src =
+        tenant_provider("$this->app->scoped('currentTenant', fn () => Tenant::query()->first());");
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, _) =
+        concrete_for(&found, "currentTenant").expect("scoped binding registered");
+    assert_eq!(concrete, "App\\Models\\Tenant");
+}
+
+#[test]
+fn unresolvable_closure_falls_back_to_closure_marker() {
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src =
+        tenant_provider("$this->app->singleton('currentTenant', fn () => collect([])->first());");
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, file) = concrete_for(&found, "currentTenant").expect("binding registered");
+    assert_eq!(concrete, "Closure");
+    assert!(file.is_none());
+}
+
+#[test]
+fn union_return_type_degrades_to_closure() {
+    // A union return type can't be classified against a single member surface.
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src = tenant_provider(
+        "$this->app->singleton('currentTenant', fn (): Tenant|TenantStub => $this->make());",
+    );
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, _) = concrete_for(&found, "currentTenant").expect("binding registered");
+    assert_eq!(concrete, "Closure");
+}
+
+#[test]
+fn nullable_return_type_does_not_guess_when_body_opaque() {
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src =
+        tenant_provider("$this->app->singleton('currentTenant', fn (): ?Tenant => $this->make());");
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, _) = concrete_for(&found, "currentTenant").expect("binding registered");
+    assert_eq!(concrete, "Closure");
+}
+
+#[test]
+fn multiple_return_closure_degrades_to_closure() {
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src = tenant_provider(
+        "$this->app->bind('currentTenant', function () { if (request()->secure()) { return new Tenant(); } return new Tenant(); });",
+    );
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, _) = concrete_for(&found, "currentTenant").expect("binding registered");
+    assert_eq!(concrete, "Closure");
+}
+
+#[test]
+fn class_const_binding_records_raw_name_unchanged() {
+    // Regression: the class-concrete form the regex used to handle records the
+    // name exactly as written (no use-alias expansion) — the tree-sitter walker
+    // preserves that behavior byte-for-byte.
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src = tenant_provider("$this->app->singleton('currentTenant', Tenant::class);");
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, _) = concrete_for(&found, "currentTenant").expect("binding registered");
+    assert_eq!(concrete, "Tenant");
+}
+
+#[test]
+fn class_const_binding_with_fqn_resolves_file() {
+    // A fully-qualified `::class` concrete resolves to its file, exactly as the
+    // former regex did (the regex captured `[A-Za-z0-9_\\]+` including the `\`s).
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src =
+        tenant_provider("$this->app->singleton('currentTenant', \\App\\Models\\Tenant::class);");
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, file) = concrete_for(&found, "currentTenant").expect("binding registered");
+    assert_eq!(concrete, "App\\Models\\Tenant");
+    assert!(file
+        .as_ref()
+        .is_some_and(|f| f.ends_with("app/Models/Tenant.php")));
+}
+
+#[test]
+fn bare_binding_uses_abstract_as_concrete() {
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src = tenant_provider("$this->app->bind('my.service');");
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, _) = concrete_for(&found, "my.service").expect("bare binding registered");
+    assert_eq!(concrete, "my.service");
+}
+
+#[test]
+fn variable_concrete_binding_is_skipped() {
+    // A variable concrete can't be statically resolved — preserved regex
+    // behavior: it isn't registered at all.
+    let (_dir, root) = project_with_files(&[TENANT_FILE]);
+    let src = tenant_provider("$impl = new Tenant(); $this->app->bind('currentTenant', $impl);");
+    let found = discovered_bindings(&src, root);
+    assert!(
+        concrete_for(&found, "currentTenant").is_none(),
+        "variable concrete must not register a binding, got {found:?}"
+    );
+}
