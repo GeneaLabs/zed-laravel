@@ -30,12 +30,15 @@ jobs:
 
       - name: Extract version from release tag
         id: extract_version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           # Get tag from release event or workflow dispatch input
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
+            TAG="$INPUT_TAG"
           else
-            TAG="${{ github.event.release.tag_name }}"
+            TAG="$RELEASE_TAG"
           fi
           # Remove 'v' prefix if present (e.g., v1.2.3 -> 1.2.3)
           VERSION="${TAG#v}"
@@ -117,8 +120,9 @@ jobs:
 
       - name: Update tag and release
         if: github.event_name == 'release' && steps.commit_changes.outputs.new_commit_sha != ''
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
-          TAG_NAME="${{ github.event.release.tag_name }}"
           RELEASE_ID="${{ github.event.release.id }}"
           FINAL_COMMIT_SHA="${{ steps.commit_changes.outputs.new_commit_sha }}"
 
