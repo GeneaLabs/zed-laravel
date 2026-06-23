@@ -19,7 +19,7 @@ jobs:
       new_version: ${{ steps.extract_version.outputs.version }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           token: ${{ env.GITHUB_TOKEN }}
           fetch-depth: 0
@@ -185,7 +185,7 @@ jobs:
             binary_name: laravel-lsp-windows-arm64.exe
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: main
 
@@ -286,7 +286,7 @@ jobs:
       - update-version
       - build-lsp
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: main
 
