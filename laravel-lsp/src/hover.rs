@@ -44,6 +44,11 @@ use std::path::Path;
 /// re-typing the literal.
 pub const FILE_NOT_FOUND_TRAILER: &str = "*(file not found)*";
 
+/// The italic trailer [`translation_card`] renders when a key resolves to no
+/// value in the default locale. Single source of truth so tests assert against
+/// the production string.
+pub const TRANSLATION_NOT_FOUND_TRAILER: &str = "*(translation not found for default locale)*";
+
 /// Anything the cursor might be hovering. Pattern variants come straight from
 /// the Salsa position index; the Blade-variable variant is extracted by line
 /// scanning, and only matters in `.blade.php` files.
@@ -162,6 +167,53 @@ pub fn render(content: &HoverContent<'_>) -> String {
     }
 
     sections.join("\n\n")
+}
+
+/// Build the hover card for a translation key. The detail line carries just
+/// the key's leaf segment (inline code) and the locale it resolved against —
+/// the full key is already under the cursor, so repeating it is noise. The
+/// value follows on its own line wrapped in typographic quotes, which mark it
+/// unmistakably as the resolved string. `value` is the already-unquoted,
+/// length-capped string, or `None` when the key resolves to nothing — in which
+/// case the not-found trailer renders instead. `source_link` is a pre-built
+/// markdown link to the lang file, or `None`.
+///
+/// ```text
+/// `title` · en
+///
+/// “Status changed”
+///
+/// [lang/app/en/notification.php](file://…)
+/// ```
+pub fn translation_card(
+    key: &str,
+    locale: &str,
+    value: Option<&str>,
+    source_link: Option<&str>,
+) -> String {
+    let detail = format!("`{}` · {locale}", leaf_segment(key));
+    // Curly quotes delimit the value so it can't be mistaken for the key or a
+    // path, and won't clash with any straight quotes inside the string itself.
+    let quoted = value.map(|v| format!("“{v}”"));
+    let trailer = value.is_none().then_some(TRANSLATION_NOT_FOUND_TRAILER);
+    render(&HoverContent {
+        detail: Some(&detail),
+        description: quoted.as_deref(),
+        source_link,
+        trailer,
+        ..Default::default()
+    })
+}
+
+/// The leaf of a translation key: the last `.`-segment, after dropping any
+/// `namespace::` prefix. `app::notification.task.title` → `title`,
+/// `messages.welcome` → `welcome`, a spaced JSON text key → unchanged.
+fn leaf_segment(key: &str) -> &str {
+    let after_namespace = key.split_once("::").map(|(_, rest)| rest).unwrap_or(key);
+    after_namespace
+        .rsplit('.')
+        .next()
+        .unwrap_or(after_namespace)
 }
 
 /// Build a semantic hover card for a resolved magic member (M6) — the

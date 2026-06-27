@@ -445,3 +445,37 @@ fn helper_identifier_card_is_none_for_non_curated_helper() {
         "non-curated helpers render no card"
     );
 }
+
+// ============================================================================
+// translation_card — leaf key + locale detail, quoted value, not-found trailer
+// ============================================================================
+
+#[test]
+fn translation_card_shows_leaf_key_locale_quoted_value_and_link() {
+    let link = "[lang/app/en/notification.php](file:///p/lang/app/en/notification.php)";
+    let out = translation_card(
+        "app::notification.task_group_status_change.title",
+        "en",
+        Some("Status changed"),
+        Some(link),
+    );
+    // Only the leaf (`title`) — not the full namespaced key — and the value in
+    // typographic quotes on its own line.
+    assert_eq!(out, format!("`title` · en\n\n“Status changed”\n\n{link}"));
+}
+
+#[test]
+fn translation_card_leaf_strips_namespace_and_parent_segments() {
+    // A non-namespaced dotted key reduces to its last segment too.
+    let out = translation_card("messages.nav.home", "fr", Some("Accueil"), None);
+    assert_eq!(out, "`home` · fr\n\n“Accueil”");
+}
+
+#[test]
+fn translation_card_without_value_shows_not_found_trailer() {
+    let out = translation_card("app::missing.key", "en", None, None);
+    assert_eq!(
+        out,
+        format!("`key` · en\n\n{TRANSLATION_NOT_FOUND_TRAILER}")
+    );
+}

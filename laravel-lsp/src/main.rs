@@ -14753,22 +14753,44 @@ return [
         let root_guard = self.root_path.read().await;
         let root = root_guard.as_ref()?;
 
-        // Determine if this is a dotted key (PHP file) or text key (JSON file)
-        let is_dotted_key = trans.key.contains('.') && !trans.key.contains(' ');
-
-        let translation_path = if is_dotted_key {
-            // Dotted key: "validation.required" -> lang/en/validation.php
-            let parts: Vec<&str> = trans.key.split('.').collect();
-            if parts.is_empty() {
-                return None;
-            }
-            root.join("lang")
-                .join("en")
-                .join(format!("{}.php", parts[0]))
-        } else {
-            // Text key: "Welcome to our app" -> lang/en.json
-            root.join("lang").join("en.json")
-        };
+        // Resolve the target lang file. Three shapes, mirroring
+        // `check_translation_file` / `hover_for_translation` so navigation,
+        // diagnostics, and hover all agree on where a key lives:
+        //  - namespaced (`app::file.key`) → <dir>/en/<file>.php, where <dir>
+        //    comes from the merged vendor/app-provider map (falling back to
+        //    the published `lang/vendor/<namespace>` path)
+        //  - dotted (`validation.required`) → lang/en/<file>.php
+        //  - text (`Welcome to our app`) → lang/en.json
+        // For PHP files, `php_key_path` is the nested array path to the key
+        // *within* the file (the segments after the file name), used to jump to
+        // the key's exact line. `None` marks a JSON text key.
+        let (translation_path, php_key_path) =
+            if let Some((namespace, rest)) = trans.key.split_once("::") {
+                let mut segments = rest.split('.');
+                let file_segment = segments.next().unwrap_or(rest);
+                let key_path: Vec<&str> = segments.collect();
+                let vendor_map = self.vendor_translation_namespaces_for(root).await;
+                let lang_dir = vendor_map
+                    .as_ref()
+                    .and_then(|m| m.get(namespace).cloned())
+                    .unwrap_or_else(|| root.join("lang/vendor").join(namespace));
+                (
+                    lang_dir.join("en").join(format!("{file_segment}.php")),
+                    Some(key_path),
+                )
+            } else if trans.key.contains('.') && !trans.key.contains(' ') {
+                // Dotted key: "validation.required" -> lang/en/validation.php
+                let mut segments = trans.key.split('.');
+                let file = segments.next().unwrap_or(&trans.key);
+                let key_path: Vec<&str> = segments.collect();
+                (
+                    root.join("lang").join("en").join(format!("{file}.php")),
+                    Some(key_path),
+                )
+            } else {
+                // Text key: "Welcome to our app" -> lang/en.json
+                (root.join("lang").join("en.json"), None)
+            };
 
         if self.file_exists_cached(&translation_path).await {
             if let Ok(target_uri) = Url::from_file_path(&translation_path) {
@@ -14783,13 +14805,17 @@ return [
                     },
                 };
 
-                // Find the line number of the key in the file
-                let target_range = if !is_dotted_key {
-                    // For JSON files, find the line where the key is defined
-                    Self::find_json_key_location(&translation_path, &trans.key).unwrap_or_default()
-                } else {
-                    // For PHP files, default to start (could be enhanced later)
-                    Range::default()
+                // Jump to the key's own line where we can locate it, else the
+                // top of the file (the file resolved, only the key didn't).
+                let target_range = match php_key_path.as_deref() {
+                    // JSON text key: line of the `"key":` property.
+                    None => Self::find_json_key_location(&translation_path, &trans.key)
+                        .unwrap_or_default(),
+                    // PHP nested array key: walk the array to the leaf's line.
+                    Some(key_path) if !key_path.is_empty() => {
+                        Self::locate_php_key_range(&translation_path, key_path).unwrap_or_default()
+                    }
+                    Some(_) => Range::default(),
                 };
 
                 return Some(GotoDefinitionResponse::Link(vec![LocationLink {
@@ -14801,6 +14827,27 @@ return [
             }
         }
         None
+    }
+
+    /// Find the line/columns of a nested array key in a PHP lang file via the
+    /// tree-sitter array walker [`config_key_locator`] (translation files are
+    /// the same nested-array shape as config files). `key_path` is the segments
+    /// *inside* the file — e.g. `["task_group_status_change", "title"]` for
+    /// `app::notification.task_group_status_change.title`. `None` when the file
+    /// can't be read or the key path isn't present.
+    fn locate_php_key_range(php_path: &Path, key_path: &[&str]) -> Option<Range> {
+        let content = std::fs::read_to_string(php_path).ok()?;
+        let pos = laravel_lsp::config_key_locator::locate_in_source(&content, key_path)?;
+        Some(Range {
+            start: Position {
+                line: pos.line,
+                character: pos.start_column,
+            },
+            end: Position {
+                line: pos.line,
+                character: pos.end_column,
+            },
+        })
     }
 
     /// Find the line and column of a key in a JSON translation file
@@ -18548,15 +18595,18 @@ return [
         }
     }
 
-    /// Translation — resolved value (with outer quotes stripped) as a plain
-    /// code block, link to the lang file.
+    /// Translation — the key and locale on a detail line, the resolved value
+    /// (outer quotes stripped) in a plain code block, link to the lang file.
     async fn hover_for_translation(&self, key: &str, root: Option<&Path>) -> String {
         use laravel_lsp::hover;
+        let locale = "en";
         let resolution = match root {
             Some(r) => {
                 let vendor_map = self.vendor_translation_namespaces_for(r).await;
                 let map_ref = vendor_map.as_ref().map(|m| m.as_ref());
-                laravel_lsp::translation_lookup::resolve_translation_detailed(r, key, "en", map_ref)
+                laravel_lsp::translation_lookup::resolve_translation_detailed(
+                    r, key, locale, map_ref,
+                )
             }
             None => None,
         };
@@ -18565,32 +18615,17 @@ return [
             None => None,
         };
         // Translation values are PHP literals (`'foo'`) — strip the outer
-        // quotes for nicer in-block display.
-        let unquoted = resolution.as_ref().map(|r| {
+        // quotes and cap the length for in-block display.
+        let value = resolution.as_ref().map(|r| {
             let v = r.value.trim();
-            v.strip_prefix('\'')
+            let unquoted = v
+                .strip_prefix('\'')
                 .and_then(|s| s.strip_suffix('\''))
                 .or_else(|| v.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-                .unwrap_or(v)
-                .to_string()
+                .unwrap_or(v);
+            hover::truncate_for_display(unquoted, 200)
         });
-        let truncated = unquoted
-            .as_deref()
-            .map(|s| laravel_lsp::hover::truncate_for_display(s, 200));
-        let trailer = if resolution.is_none() {
-            Some("*(translation not found for default locale)*")
-        } else {
-            None
-        };
-        hover::render(&hover::HoverContent {
-            code: truncated.as_deref().map(|s| hover::CodeBlock {
-                language: hover::CodeLanguage::Plain,
-                content: s,
-            }),
-            source_link: link.as_deref(),
-            trailer,
-            ..Default::default()
-        })
+        hover::translation_card(key, locale, value.as_deref(), link.as_deref())
     }
 
     /// Middleware — header is the alias's class FQN (the new info beyond
@@ -19019,9 +19054,21 @@ return [
         }
         // Cache miss — scan and store. Done under spawn_blocking so the
         // walkdir traversal doesn't block the LSP event loop.
+        //
+        // Two passes merge into one map: the vendor scan first, then the
+        // app-provider scan, which overrides vendor on namespace conflict —
+        // the app boots last, so an app `loadTranslationsFrom` for a namespace
+        // a package also registers is the one that wins at runtime.
         let root_clone = root.to_path_buf();
         let scanned = tokio::task::spawn_blocking(move || {
-            laravel_lsp::vendor_translations::scan_vendor_translation_namespaces(&root_clone)
+            let mut map =
+                laravel_lsp::vendor_translations::scan_vendor_translation_namespaces(&root_clone);
+            for (namespace, dir) in
+                laravel_lsp::vendor_translations::scan_app_translation_namespaces(&root_clone)
+            {
+                map.insert(namespace, dir);
+            }
+            map
         })
         .await
         .ok()?;

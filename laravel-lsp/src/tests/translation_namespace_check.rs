@@ -67,6 +67,66 @@ fn missing_namespaced_key_still_flags_with_vendor_path() {
 }
 
 #[test]
+fn app_provider_load_translations_from_resolves_namespaced_key() {
+    // Issue #248: an `AppServiceProvider` registering
+    // `loadTranslationsFrom(lang_path('app'), 'app')` must make
+    // `app::notification.title` resolve to `lang/app/en/notification.php` —
+    // no false "translation not found" diagnostic.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // The registered lang files.
+    let lang_en = root.join("lang/app/en");
+    fs::create_dir_all(&lang_en).unwrap();
+    fs::write(
+        lang_en.join("notification.php"),
+        "<?php return ['task_group_status_change' => ['title' => 'Status changed']];",
+    )
+    .unwrap();
+
+    // The provider that registers them.
+    let providers = root.join("app/Providers");
+    fs::create_dir_all(&providers).unwrap();
+    fs::write(
+        providers.join("AppServiceProvider.php"),
+        r#"<?php
+namespace App\Providers;
+class AppServiceProvider {
+    public function boot(): void {
+        $this->loadTranslationsFrom(lang_path('app'), 'app');
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // The merged map the LSP builds — here just the app-provider scan.
+    let map = laravel_lsp::vendor_translations::scan_app_translation_namespaces(&root);
+    // The dir exists, so the scan canonicalizes it (resolving macOS's
+    // /var → /private/var symlink) — compare against the canonical form.
+    assert_eq!(
+        map.get("app"),
+        Some(&root.join("lang/app").canonicalize().unwrap()),
+        "app scan must register the 'app' namespace at lang/app"
+    );
+
+    let check = LaravelLanguageServer::check_translation_file(
+        &root,
+        "app::notification.task_group_status_change.title",
+        Some(&map),
+    );
+    assert!(
+        check.exists,
+        "the app-registered translation must resolve via the merged map"
+    );
+    let expected = check.expected_path.expect("expected path set");
+    assert!(
+        expected.ends_with("lang/app/en/notification.php"),
+        "expected path must target the app-registered lang file: {expected:?}"
+    );
+}
+
+#[test]
 fn namespaced_key_without_vendor_map_expects_published_path() {
     let (_dir, root, _vendor_map) = project_with_vendor_translations();
 

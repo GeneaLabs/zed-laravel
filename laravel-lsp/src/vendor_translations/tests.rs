@@ -138,6 +138,149 @@ fn first_registration_wins_on_namespace_conflict() {
     assert!(s.contains("first") || s.contains("second"), "got: {}", s);
 }
 
+// ─── Path-helper argument forms (lang_path / base_path / dirname) ────────
+
+#[test]
+fn extracts_lang_path_argument_form() {
+    // A vendor provider could conceivably use lang_path(); more importantly
+    // this exercises the helper independent of where the file lives.
+    let project = TempDir::new().unwrap();
+    let provider = fake_vendor_package(project.path(), "acme", "billing", "BillingServiceProvider");
+    fs::write(
+        &provider,
+        r#"<?php
+class BillingServiceProvider {
+    public function boot() {
+        $this->loadTranslationsFrom(lang_path('app'), 'app');
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let map = scan_vendor_translation_namespaces(project.path());
+    let resolved = map
+        .get("app")
+        .expect("lang_path('app') must register 'app'");
+    assert_eq!(
+        resolved,
+        &project.path().join("lang").join("app"),
+        "lang_path('app') resolves to <root>/lang/app"
+    );
+}
+
+#[test]
+fn extracts_base_path_argument_form() {
+    let project = TempDir::new().unwrap();
+    let provider = fake_vendor_package(project.path(), "acme", "billing", "BillingServiceProvider");
+    fs::write(
+        &provider,
+        r#"<?php
+class BillingServiceProvider {
+    public function boot() {
+        $this->loadTranslationsFrom(base_path('lang/custom'), 'custom');
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let map = scan_vendor_translation_namespaces(project.path());
+    let resolved = map
+        .get("custom")
+        .expect("base_path('lang/custom') must register 'custom'");
+    assert_eq!(
+        resolved,
+        &project.path().join("lang").join("custom"),
+        "base_path('lang/custom') resolves to <root>/lang/custom"
+    );
+}
+
+#[test]
+fn extracts_dirname_dir_argument_form() {
+    // `dirname(__DIR__).'/lang'` resolves relative to the provider's parent
+    // directory: provider lives in <pkg>/src, so dirname(__DIR__) is <pkg>.
+    let project = TempDir::new().unwrap();
+    let provider = fake_vendor_package(project.path(), "acme", "billing", "BillingServiceProvider");
+    let lang_dir = provider.parent().unwrap().join("../lang");
+    fs::create_dir_all(&lang_dir).unwrap();
+    fs::write(
+        &provider,
+        r#"<?php
+class BillingServiceProvider {
+    public function boot() {
+        $this->loadTranslationsFrom(dirname(__DIR__).'/lang', 'billing');
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let map = scan_vendor_translation_namespaces(project.path());
+    let resolved = map
+        .get("billing")
+        .expect("dirname(__DIR__).'/lang' must register 'billing'");
+    // <pkg>/src is the provider dir; dirname(__DIR__) is <pkg>; + /lang.
+    assert_eq!(
+        resolved.canonicalize().unwrap(),
+        lang_dir.canonicalize().unwrap(),
+        "dirname(__DIR__).'/lang' resolves to the package's lang dir"
+    );
+}
+
+// ─── App service provider scanning (app/Providers/**/*.php) ──────────────
+
+/// Write an app service provider at `app/Providers/<name>.php`.
+fn fake_app_provider(project: &Path, name: &str, body: &str) -> PathBuf {
+    let dir = project.join("app").join("Providers");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.php"));
+    fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn scans_app_provider_load_translations_from() {
+    let project = TempDir::new().unwrap();
+    fake_app_provider(
+        project.path(),
+        "AppServiceProvider",
+        r#"<?php
+namespace App\Providers;
+class AppServiceProvider {
+    public function boot(): void {
+        $this->loadTranslationsFrom(lang_path('app'), 'app');
+    }
+}
+"#,
+    );
+
+    let map = scan_app_translation_namespaces(project.path());
+    let resolved = map
+        .get("app")
+        .expect("app provider registration must yield the 'app' namespace");
+    assert_eq!(resolved, &project.path().join("lang").join("app"));
+}
+
+#[test]
+fn app_scan_returns_empty_when_providers_dir_missing() {
+    let project = TempDir::new().unwrap();
+    let map = scan_app_translation_namespaces(project.path());
+    assert!(map.is_empty());
+}
+
+#[test]
+fn app_scan_ignores_providers_without_load_translations() {
+    let project = TempDir::new().unwrap();
+    fake_app_provider(
+        project.path(),
+        "AppServiceProvider",
+        "<?php\nclass AppServiceProvider { public function boot(): void {} }\n",
+    );
+    let map = scan_app_translation_namespaces(project.path());
+    assert!(map.is_empty());
+}
+
 // ─── Fluent package-builder registrations (->name()->hasTranslations()) ──
 
 #[test]

@@ -40,6 +40,7 @@ mod scan_dir_containment;
 mod slot_navigation_containment;
 mod slot_variable_resolution;
 mod translation_namespace_check;
+mod translation_namespace_navigation;
 mod view_diagnostic_containment;
 mod view_navigation_containment;
 mod vite_completion_context;
