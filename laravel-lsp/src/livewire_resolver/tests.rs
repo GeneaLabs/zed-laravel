@@ -139,18 +139,69 @@ fn resolves_volt_via_class_extends() {
 }
 
 #[test]
-fn plain_blade_file_without_volt_signature_isnt_volt() {
+fn resolves_anonymous_volt_under_mount_without_signature() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     let cfg = config_for(root);
 
-    // Bare .blade.php with no PHP front-matter at all — just template. The
-    // resolver should NOT classify this as Volt (no signature) and should
-    // fall through past every check, returning None.
+    // Bare .blade.php with no PHP front-matter at all — just template. Volt
+    // auto-mounts every file under `view_path` (resources/views/livewire) as a
+    // component, so an anonymous component with no class and no functional-API
+    // signature must still resolve as Volt (issue #250).
     let path = root.join("resources/views/livewire/counter.blade.php");
     write(&path, "<div>no php here</div>");
 
-    assert!(resolve_component("counter", &cfg, LivewireVersion::V4).is_none());
+    let component = resolve_component("counter", &cfg, LivewireVersion::V4).expect("resolves");
+    assert_eq!(component.kind, LivewireComponentKind::Volt);
+    assert_eq!(component.paths, vec![path]);
+}
+
+#[test]
+fn resolves_nested_anonymous_volt_without_signature() {
+    // Issue #250: `<livewire:stats.team-stats />` backed by a signature-less
+    // `resources/views/livewire/stats/team-stats.blade.php`.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+
+    let path = root.join("resources/views/livewire/stats/team-stats.blade.php");
+    write(&path, "<div>{{ $slot }}</div>");
+
+    let component =
+        resolve_component("stats.team-stats", &cfg, LivewireVersion::V4).expect("resolves");
+    assert_eq!(component.kind, LivewireComponentKind::Volt);
+    assert_eq!(component.paths, vec![path]);
+}
+
+#[test]
+fn resolves_anonymous_volt_on_livewire_v3() {
+    // Volt ships on Livewire 3 too — the signature-less mount discovery must
+    // not be gated behind the v4-only SFC/MFC check.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+
+    let path = root.join("resources/views/livewire/counter.blade.php");
+    write(&path, "<div>no php here</div>");
+
+    let component = resolve_component("counter", &cfg, LivewireVersion::V3).expect("resolves");
+    assert_eq!(component.kind, LivewireComponentKind::Volt);
+}
+
+#[test]
+fn signature_less_blade_under_components_dir_isnt_volt() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+
+    // A plain `.blade.php` under resources/views/components is an anonymous
+    // *Blade* component, not Volt. Only the Volt mount root (view_path) gets
+    // the signature-less treatment; elsewhere a Volt signature is required, so
+    // this must NOT resolve as a Livewire component here.
+    let path = root.join("resources/views/components/card.blade.php");
+    write(&path, "<div>{{ $slot }}</div>");
+
+    assert!(resolve_component("card", &cfg, LivewireVersion::V4).is_none());
 }
 
 #[test]

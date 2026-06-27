@@ -180,13 +180,18 @@ pub struct LivewireComponent {
 /// Resolution order, mirroring Livewire 4's discovery preference:
 ///   1. V4 SFC — `⚡{leaf}.blade.php` under each candidate base
 ///   2. V4 MFC — `⚡{leaf}/` directory with the required `{leaf}.php` child
-///   3. Volt — plain `{leaf}.blade.php` with a Volt front-matter signature
+///   3. Volt (signature) — `{leaf}.blade.php` carrying a Volt front-matter
+///      signature, under any component location
 ///   4. V3 Class — `{class_path}/{Pascal}/{Pascal}.php` (skipped when the
 ///      name is namespaced — class lookups don't honor `<livewire:pages::...>`)
+///   5. Volt (anonymous) — a signature-less `{leaf}.blade.php` directly under
+///      the Volt mount root (`view_path`) with no backing class. Checked last
+///      so a class-based component's companion view isn't mistaken for a
+///      standalone Volt component.
 ///
-/// V3 projects (per `version`) skip the V4 SFC/MFC and Volt checks and go
-/// straight to class-based resolution. Unknown-version projects try all
-/// four — better to over-discover than to miss a component.
+/// V3 projects (per `version`) skip the V4 SFC/MFC checks but still try Volt
+/// (which ships on Livewire 3 too) and class-based resolution. Unknown-version
+/// projects try everything — better to over-discover than to miss a component.
 pub fn resolve_component(
     name: &str,
     config: &LivewireConfig,
@@ -218,6 +223,7 @@ pub fn resolve_component(
             base.join(&sub)
         };
 
+        // SFC and MFC are the v4-only `⚡`-prefixed shapes.
         if try_v4 {
             if let Some(c) = try_v4_sfc(&parent_dir, leaf) {
                 return Some(c);
@@ -225,9 +231,13 @@ pub fn resolve_component(
             if let Some(c) = try_v4_mfc(&parent_dir, leaf) {
                 return Some(c);
             }
-            if let Some(c) = try_volt(&parent_dir, leaf) {
-                return Some(c);
-            }
+        }
+
+        // Volt ships on both Livewire 3 and 4, so it isn't gated on `version`.
+        // A signature-bearing `.blade.php` is an unambiguous standalone Volt
+        // component anywhere a component location points.
+        if let Some(c) = try_volt(&parent_dir, leaf, true) {
+            return Some(c);
         }
     }
 
@@ -236,6 +246,25 @@ pub fn resolve_component(
     // ever fall through here.
     if namespace.is_none() {
         if let Some(c) = try_v3_class(bare, config) {
+            return Some(c);
+        }
+    }
+
+    // Anonymous Volt fallback (issue #250). Volt auto-mounts every `.blade.php`
+    // under `view_path` (default `resources/views/livewire`) as a component,
+    // including anonymous ones with no class and no functional-API signature.
+    // This runs *after* the v3-class check so that a signature-less blade which
+    // is actually a class-based component's companion view stays attached to its
+    // class rather than being mistaken for a standalone Volt component. Only
+    // un-namespaced names apply — Volt mounts `view_path`, which the namespace
+    // map doesn't cover.
+    if namespace.is_none() {
+        let parent_dir = if sub.as_os_str().is_empty() {
+            config.view_path.clone()
+        } else {
+            config.view_path.join(&sub)
+        };
+        if let Some(c) = try_volt(&parent_dir, leaf, false) {
             return Some(c);
         }
     }
@@ -378,12 +407,21 @@ fn try_v4_mfc(parent_dir: &Path, leaf: &str) -> Option<LivewireComponent> {
     })
 }
 
-fn try_volt(parent_dir: &Path, leaf: &str) -> Option<LivewireComponent> {
+/// Resolve a Volt component blade file (`{leaf}.blade.php`) under `parent_dir`.
+///
+/// When `require_signature` is true the file must carry a Volt front-matter
+/// signature (a functional-API call or `Volt\Component`). That guard applies to
+/// general component locations, where a signature-less `.blade.php` is an
+/// anonymous *Blade* component — not Volt. Under the Volt mount root
+/// (`view_path`) callers pass `false`: Volt auto-discovers every `.blade.php`
+/// there as a component, including anonymous ones with no class and no
+/// functional-API call (issue #250).
+fn try_volt(parent_dir: &Path, leaf: &str, require_signature: bool) -> Option<LivewireComponent> {
     let candidate = parent_dir.join(format!("{}.blade.php", leaf));
     if !candidate.is_file() {
         return None;
     }
-    if !blade_contains_volt_signature(&candidate) {
+    if require_signature && !blade_contains_volt_signature(&candidate) {
         return None;
     }
     Some(LivewireComponent {
