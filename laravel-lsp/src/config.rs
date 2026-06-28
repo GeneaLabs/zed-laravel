@@ -517,6 +517,65 @@ fn parse_component_aliases(source: &str, aliases: &mut HashMap<String, String>) 
 }
 
 // ============================================================================
+// Facade aliases (config/app.php 'aliases')
+// ============================================================================
+
+/// Parse the `'aliases'` array from a `config/app.php` source into a
+/// token → facade-FQCN map (`'Auth' => 'Illuminate\Support\Facades\Auth'`).
+///
+/// This is the legacy facade-alias registration: a `Facade::defaultAliases()`
+/// override returned from `config/app.php`, each entry an `'Alias' =>
+/// Class::class` pair. It is the **opposite** of [`parse_component_aliases`],
+/// which *skips* `::class` values (those are Blade component classes); here a
+/// `::class` value is exactly what we want — it names the facade class the
+/// alias resolves to.
+///
+/// Values are read as written: a `::class` constant (`Auth::class`,
+/// `Illuminate\Support\Facades\Auth::class`, or a leading-`\` form). We strip
+/// the `::class` suffix and any leading `\`, taking the remaining FQCN
+/// verbatim. config/app.php's `aliases` are written fully-qualified by Laravel
+/// convention, so no `use`-import resolution is needed for this source (the
+/// `bootstrap/app.php` `withAliases` source, parsed via tree-sitter, does
+/// resolve imports). A non-`::class` value (a bare string, a computed
+/// expression) is skipped — it can't name a facade class statically.
+pub fn parse_facade_aliases(source: &str) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    let Some(block) = php_array_block(source, "aliases") else {
+        return aliases;
+    };
+
+    for raw_line in block.lines() {
+        let line = raw_line.trim();
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('#')
+            || line.starts_with("/*")
+        {
+            continue;
+        }
+
+        let Some((alias, value)) = split_arrow_pair(line) else {
+            continue;
+        };
+        let Some(alias_name) = unquote(alias) else {
+            continue;
+        };
+        // Only `Class::class` values name a facade class; anything else is not
+        // a static class reference.
+        let Some(class_ref) = value.strip_suffix("::class") else {
+            continue;
+        };
+        let fqcn = class_ref.trim().trim_start_matches('\\');
+        if fqcn.is_empty() {
+            continue;
+        }
+        aliases.insert(alias_name.to_string(), fqcn.to_string());
+    }
+
+    aliases
+}
+
+// ============================================================================
 // Livewire component namespaces (Livewire v4)
 // ============================================================================
 

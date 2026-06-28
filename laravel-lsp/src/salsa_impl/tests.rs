@@ -3242,3 +3242,139 @@ fn quoted_key_content_is_read_without_greedy_trim() {
         concrete_for(&found, "'wrapped'").expect("key with embedded quotes registered verbatim");
     assert_eq!(concrete, "Tenant");
 }
+
+// ─── Facade aliases (bootstrap/app.php withAliases + merge precedence) ──────
+
+#[test]
+fn extract_with_aliases_resolves_imported_class_consts() {
+    // `use` import resolution: the bare `Auth::class` becomes the full FQCN.
+    let src = r#"<?php
+use Illuminate\Support\Facades\Auth;
+use App\Support\CustomCache;
+
+return Application::configure(basePath: __DIR__)
+    ->withAliases([
+        'Auth' => Auth::class,
+        'Cache' => CustomCache::class,
+    ])
+    ->create();
+"#;
+    let tree = parse_php(src).unwrap();
+    let aliases = extract_with_aliases(&tree, src);
+    assert_eq!(
+        aliases.get("Auth").map(String::as_str),
+        Some("Illuminate\\Support\\Facades\\Auth")
+    );
+    assert_eq!(
+        aliases.get("Cache").map(String::as_str),
+        Some("App\\Support\\CustomCache")
+    );
+}
+
+#[test]
+fn extract_with_aliases_skips_non_class_values() {
+    let src = r#"<?php
+return Application::configure(basePath: __DIR__)
+    ->withAliases([
+        'Legacy' => 'not.a.class',
+    ])
+    ->create();
+"#;
+    let tree = parse_php(src).unwrap();
+    assert!(extract_with_aliases(&tree, src).is_empty());
+}
+
+#[tokio::test]
+async fn facade_alias_snapshot_seeds_defaults() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+
+    let aliases = handle.snapshot_facade_aliases().await.unwrap();
+    // A built-in default is present even with no config/bootstrap sources.
+    assert_eq!(
+        aliases.get("Auth").map(String::as_str),
+        Some("Illuminate\\Support\\Facades\\Auth")
+    );
+}
+
+#[tokio::test]
+async fn facade_alias_snapshot_merges_sources_by_precedence() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // config/app.php: overrides the default `Auth` to a custom class and adds
+    // a new `LegacyAlias`.
+    let app_config = r#"<?php
+return [
+    'aliases' => [
+        'Auth' => App\Facades\LegacyAuth::class,
+        'LegacyAlias' => App\Facades\Legacy::class,
+    ],
+];
+"#;
+    let app_config_path = root.join("config/app.php");
+    std::fs::create_dir_all(app_config_path.parent().unwrap()).unwrap();
+    std::fs::write(&app_config_path, app_config).unwrap();
+
+    // bootstrap/app.php: withAliases overrides `Auth` again (highest source)
+    // and adds a brand-new `Modern` alias.
+    let bootstrap = r#"<?php
+use App\Facades\ModernAuth;
+use App\Facades\Modern;
+
+return Application::configure(basePath: __DIR__)
+    ->withAliases([
+        'Auth' => ModernAuth::class,
+        'Modern' => Modern::class,
+    ])
+    ->create();
+"#;
+    let bootstrap_path = root.join("bootstrap/app.php");
+    std::fs::create_dir_all(bootstrap_path.parent().unwrap()).unwrap();
+    std::fs::write(&bootstrap_path, bootstrap).unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .update_config_file(app_config_path, app_config.to_string())
+        .await
+        .unwrap();
+    handle
+        .register_service_provider_source(bootstrap_path, bootstrap.to_string(), 2, root.clone())
+        .await
+        .unwrap();
+
+    let aliases = handle.snapshot_facade_aliases().await.unwrap();
+
+    // withAliases wins over config/app.php wins over the seed for `Auth`.
+    assert_eq!(
+        aliases.get("Auth").map(String::as_str),
+        Some("App\\Facades\\ModernAuth"),
+        "bootstrap withAliases has the highest precedence"
+    );
+    // config/app.php adds a new alias the seed lacks.
+    assert_eq!(
+        aliases.get("LegacyAlias").map(String::as_str),
+        Some("App\\Facades\\Legacy")
+    );
+    // withAliases adds a new alias.
+    assert_eq!(
+        aliases.get("Modern").map(String::as_str),
+        Some("App\\Facades\\Modern")
+    );
+    // An untouched default is still present.
+    assert_eq!(
+        aliases.get("DB").map(String::as_str),
+        Some("Illuminate\\Support\\Facades\\DB")
+    );
+}

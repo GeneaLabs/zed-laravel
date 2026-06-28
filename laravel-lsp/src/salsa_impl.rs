@@ -2214,6 +2214,104 @@ fn class_const_name(expr: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
     )
 }
 
+/// Extract `$app->withAliases([...])` facade-alias registrations from a
+/// `bootstrap/app.php` source into a token → facade-FQCN map (`'Auth' =>
+/// 'Illuminate\Support\Facades\Auth'`).
+///
+/// `withAliases` is the Laravel 11+ way to override `Facade::defaultAliases()`,
+/// the modern counterpart to `config/app.php`'s `aliases` array (parsed by
+/// [`crate::config::parse_facade_aliases`]). It is a `member_call_expression`
+/// whose method is `withAliases` and whose single argument is an array literal
+/// of `'Alias' => Class::class` pairs. We walk the AST (mirroring
+/// [`extract_provider_bindings`]) so each `::class` value resolves through the
+/// file's `use` imports — `withAliases([…Auth::class])` under
+/// `use Illuminate\Support\Facades\Auth;` yields the full FQCN.
+///
+/// Only `Class::class` values are honored; a non-`::class` entry (a bare
+/// string, a computed expression) is skipped — it can't name a facade class
+/// statically.
+pub fn extract_with_aliases(tree: &tree_sitter::Tree, text: &str) -> HashMap<String, String> {
+    let bytes = text.as_bytes();
+    let aliases = crate::query_chain::use_aliases::extract_use_aliases(tree, text);
+    let mut out = HashMap::new();
+    walk_with_aliases(tree.root_node(), bytes, &aliases, &mut out);
+    out
+}
+
+/// Pre-order descent collecting `withAliases([...])` entries.
+fn walk_with_aliases(
+    node: tree_sitter::Node,
+    bytes: &[u8],
+    aliases: &crate::query_chain::use_aliases::UseAliases,
+    out: &mut HashMap<String, String>,
+) {
+    if node.kind() == "member_call_expression"
+        && node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())
+            == Some("withAliases")
+    {
+        collect_with_aliases_args(node, bytes, aliases, out);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_with_aliases(child, bytes, aliases, out);
+    }
+}
+
+/// Pull `'Alias' => Class::class` pairs from the array-literal argument of a
+/// `withAliases(...)` call, resolving each `::class` value through `aliases`.
+fn collect_with_aliases_args(
+    call: tree_sitter::Node,
+    bytes: &[u8],
+    aliases: &crate::query_chain::use_aliases::UseAliases,
+    out: &mut HashMap<String, String>,
+) {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    for arg in args.named_children(&mut cursor) {
+        let Some(value) = argument_value(arg) else {
+            continue;
+        };
+        if value.kind() != "array_creation_expression" {
+            continue;
+        }
+        let mut el_cursor = value.walk();
+        for element in value.named_children(&mut el_cursor) {
+            if element.kind() != "array_element_initializer" {
+                continue;
+            }
+            let Some(key_node) = element
+                .child_by_field_name("key")
+                .or_else(|| element.named_child(0))
+            else {
+                continue;
+            };
+            let Some(value_node) = element
+                .child_by_field_name("value")
+                .or_else(|| element.named_child(1))
+            else {
+                continue;
+            };
+            let Some(alias) = string_literal_text(key_node, bytes) else {
+                continue;
+            };
+            // Only `Class::class` values name a facade class; resolve the bare
+            // class name through the file's `use` imports to its full FQCN.
+            if value_node.kind() != "class_constant_access_expression" {
+                continue;
+            }
+            let Some(class_ref) = class_const_name(value_node, bytes) else {
+                continue;
+            };
+            let fqcn = crate::query_chain::use_aliases::resolve_class_name(&class_ref, aliases);
+            out.insert(alias, fqcn.trim_start_matches('\\').to_string());
+        }
+    }
+}
+
 /// Resolve the concrete model a binding closure returns, or `None` to fall back
 /// to `"Closure"`. The contract is to degrade cleanly — only a single, concrete,
 /// on-disk class is ever returned; the hard tiers (relationship hops, multiple
@@ -4203,6 +4301,14 @@ pub enum SalsaRequest {
     SnapshotBindings {
         reply: oneshot::Sender<Arc<std::collections::HashMap<String, String>>>,
     },
+    /// Snapshot the facade alias map — token → facade FQCN (`Auth` →
+    /// `Illuminate\Support\Facades\Auth`) — merged from the built-in seed,
+    /// `config/app.php`'s `aliases`, and `bootstrap/app.php`'s `withAliases`.
+    /// Mirrors [`Self::SnapshotBindings`]: the facade receiver path resolves a
+    /// static-call token to its facade FQCN against this owned copy.
+    SnapshotFacadeAliases {
+        reply: oneshot::Sender<Arc<std::collections::HashMap<String, String>>>,
+    },
     /// Snapshot every indexed class grouped by file, so warming can persist
     /// the hierarchy to the disk cache.
     SnapshotHierarchyNodes {
@@ -4866,6 +4972,23 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::SnapshotBindings { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Snapshot the facade alias map — token → facade FQCN — for the facade
+    /// receiver resolver. Mirrors [`Self::snapshot_bindings`]: the map merges
+    /// the built-in seed with any user aliases from `config/app.php`'s
+    /// `aliases` and `bootstrap/app.php`'s `withAliases`, user sources winning.
+    pub async fn snapshot_facade_aliases(
+        &self,
+    ) -> Result<Arc<std::collections::HashMap<String, String>>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SnapshotFacadeAliases { reply: reply_tx })
             .await
             .map_err(|_| "Salsa actor disconnected")?;
         reply_rx
@@ -6068,6 +6191,9 @@ impl SalsaActor {
                         );
                     }
                     let _ = reply.send(Arc::new(map));
+                }
+                SalsaRequest::SnapshotFacadeAliases { reply } => {
+                    let _ = reply.send(self.build_facade_alias_snapshot());
                 }
                 SalsaRequest::SnapshotHierarchyNodes { reply } => {
                     let _ = reply.send(self.class_hierarchy_index.nodes_by_file());
@@ -8011,6 +8137,42 @@ impl SalsaActor {
             find_elapsed,
         );
         results
+    }
+
+    /// Build the facade alias snapshot — token → facade FQCN — merging three
+    /// sources in ascending precedence: the built-in seed
+    /// (`default_facade_aliases`), `config/app.php`'s `aliases` array, then
+    /// `bootstrap/app.php`'s `withAliases([...])`. A later source overrides an
+    /// earlier one's token (a user `'Auth' => Custom::class` wins over the
+    /// default) and adds new tokens. Built fresh each call — the sources number
+    /// in the dozens, with no cache to invalidate on a config/bootstrap edit
+    /// (mirrors the `SnapshotBindings` rationale).
+    fn build_facade_alias_snapshot(&self) -> Arc<HashMap<String, String>> {
+        let mut map = crate::facade_resolver::default_facade_aliases();
+
+        // config/app.php 'aliases' (legacy) — overrides the seed.
+        if let Some(root) = self.config_root.as_ref() {
+            if let Some(file) = self.config_files.get(&root.join("config/app.php")) {
+                for (token, fqcn) in crate::config::parse_facade_aliases(file.text(&self.db)) {
+                    map.insert(token, fqcn);
+                }
+            }
+        }
+
+        // bootstrap/app.php withAliases (Laravel 11+) — overrides both above.
+        if let Some(root) = self.salsa_sp_root.as_ref().or(self.config_root.as_ref()) {
+            let bootstrap = root.join("bootstrap/app.php");
+            if let Some(file) = self.salsa_sp_files.get(&bootstrap) {
+                let text = file.text(&self.db);
+                if let Ok(tree) = parse_php(text) {
+                    for (token, fqcn) in extract_with_aliases(&tree, text) {
+                        map.insert(token, fqcn);
+                    }
+                }
+            }
+        }
+
+        Arc::new(map)
     }
 
     // === Service Provider Handlers ===

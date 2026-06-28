@@ -636,3 +636,73 @@ fn resolve_config_string_app_override_wins_over_package_default() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ============================================================================
+// Facade aliases (config/app.php 'aliases')
+// ============================================================================
+
+#[test]
+fn parse_facade_aliases_reads_fully_qualified_class_consts() {
+    // The canonical config/app.php form: fully-qualified `::class` values.
+    let source = r#"<?php
+return [
+    'name' => env('APP_NAME', 'Laravel'),
+    'aliases' => [
+        'App' => Illuminate\Support\Facades\App::class,
+        'Auth' => Illuminate\Support\Facades\Auth::class,
+    ],
+];
+"#;
+    let aliases = parse_facade_aliases(source);
+    assert_eq!(
+        aliases.get("App").map(String::as_str),
+        Some("Illuminate\\Support\\Facades\\App")
+    );
+    assert_eq!(
+        aliases.get("Auth").map(String::as_str),
+        Some("Illuminate\\Support\\Facades\\Auth")
+    );
+}
+
+#[test]
+fn parse_facade_aliases_strips_leading_backslash() {
+    let source = r#"<?php
+return [
+    'aliases' => [
+        'Cache' => \Illuminate\Support\Facades\Cache::class,
+    ],
+];
+"#;
+    let aliases = parse_facade_aliases(source);
+    assert_eq!(
+        aliases.get("Cache").map(String::as_str),
+        Some("Illuminate\\Support\\Facades\\Cache")
+    );
+}
+
+#[test]
+fn parse_facade_aliases_skips_non_class_values() {
+    // A non-`::class` value can't name a facade class statically — skip it,
+    // but keep the valid sibling. (Contrast `parse_component_aliases`, which
+    // skips `::class` and keeps the string.)
+    let source = r#"<?php
+return [
+    'aliases' => [
+        'Legacy' => 'some.string.binding',
+        'Auth' => Illuminate\Support\Facades\Auth::class,
+    ],
+];
+"#;
+    let aliases = parse_facade_aliases(source);
+    assert!(!aliases.contains_key("Legacy"));
+    assert_eq!(
+        aliases.get("Auth").map(String::as_str),
+        Some("Illuminate\\Support\\Facades\\Auth")
+    );
+}
+
+#[test]
+fn parse_facade_aliases_absent_key_yields_empty() {
+    let source = "<?php return ['name' => 'Laravel'];";
+    assert!(parse_facade_aliases(source).is_empty());
+}

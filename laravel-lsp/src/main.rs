@@ -4294,6 +4294,22 @@ impl LaravelLanguageServer {
         } else {
             info!("Laravel: Config files registered with Salsa for incremental caching");
         }
+
+        // config/app.php — registered as a ConfigFile so the facade-alias
+        // snapshot can read its legacy `aliases` array. Not part of the
+        // `register_config_files` triple (which models view/livewire discovery);
+        // `did_change` of any `config/*.php` already routes through
+        // `update_config_file`, so this only seeds it at boot.
+        let app_config_path = root_path.join("config/app.php");
+        if let Ok(app_config) = fs::read_to_string(&app_config_path) {
+            if let Err(e) = self
+                .salsa
+                .update_config_file(app_config_path, app_config)
+                .await
+            {
+                debug!("Failed to register config/app.php with Salsa: {}", e);
+            }
+        }
     }
 
     /// Register project files with Salsa for reference finding
