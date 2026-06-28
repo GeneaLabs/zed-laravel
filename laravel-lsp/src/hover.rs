@@ -241,6 +241,11 @@ pub fn magic_member_card(
         MagicMemberKind::Relationship => "Eloquent relationship",
         MagicMemberKind::Column => "Database column",
         MagicMemberKind::DynamicFinder => "Dynamic finder",
+        MagicMemberKind::Macro => "Macro",
+        // A method reached through a facade proxy — `declaring_fqcn` is the bound
+        // concrete the facade forwards to. Worth a card precisely because
+        // Intelephense can't see through the proxy.
+        MagicMemberKind::FacadeMethod => "Facade method",
         // Generic property — Intelephense already covers it. Don't duplicate.
         MagicMemberKind::PlainMember => return String::new(),
     };

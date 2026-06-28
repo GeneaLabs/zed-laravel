@@ -3075,6 +3075,10 @@ async fn build_magic_member_entries(
     // receivers (`Auth::check()`) resolve to their bound implementation during
     // the build exactly as they do on the live query path.
     let facade_aliases = salsa.snapshot_facade_aliases().await.unwrap_or_default();
+    // Macro registry snapshot, fed into the `SnapshotResolver` so a runtime-
+    // registered macro/mixin member (`Str::uuid7()`) classifies during the build
+    // exactly as it does on the live query path.
+    let macros = salsa.snapshot_macros().await.unwrap_or_default();
     let root = root.to_path_buf();
 
     // ── Pass 1: build the view-variable index ────────────────────────────
@@ -3162,6 +3166,7 @@ async fn build_magic_member_entries(
         let class_files = class_files.clone();
         let bindings = bindings.clone();
         let facade_aliases = facade_aliases.clone();
+        let macros = macros.clone();
         let root = root.clone();
         magic_handles.push(tokio::spawn(async move {
             let _permit = permit_owner.acquire_owned().await.ok()?;
@@ -3173,6 +3178,7 @@ async fn build_magic_member_entries(
                     class_files,
                     bindings,
                     facade_aliases,
+                    macros,
                 };
                 let mut entries = laravel_lsp::member_resolver::resolve_member_access_entries(
                     &source,
@@ -3244,6 +3250,7 @@ async fn build_magic_member_entries(
             let class_files = class_files.clone();
             let bindings = bindings.clone();
             let facade_aliases = facade_aliases.clone();
+            let macros = macros.clone();
             let view_var_index = view_var_index.clone();
             let view_paths = view_paths.clone();
             let root = root.clone();
@@ -3257,6 +3264,7 @@ async fn build_magic_member_entries(
                         class_files,
                         bindings,
                         facade_aliases,
+                        macros,
                     };
                     // A Volt component (own front-matter, or an MFC template
                     // referencing `$this->`) needs the file source — for property
@@ -6145,10 +6153,12 @@ impl LaravelLanguageServer {
             .snapshot_facade_aliases()
             .await
             .unwrap_or_default();
+        let macros = self.salsa.snapshot_macros().await.unwrap_or_default();
         let resolver = laravel_lsp::member_resolver::SnapshotResolver {
             class_files: class_files.clone(),
             bindings,
             facade_aliases,
+            macros,
         };
         let mut entries = if is_volt {
             let prop_types = laravel_lsp::view_var_index::volt_property_types(
@@ -17757,10 +17767,15 @@ return [
     ///   to its declaration site on the model.
     /// - **Dynamic finder** → the underlying column's migration line
     ///   (`whereEmail` → `email`); a finder has no declaring method.
-    /// - **Relationship / scope / accessor** → the declaring method's name
-    ///   token in the declaring class (inheritance/trait-resolved), located
-    ///   the same way the rename path rewrites it; falls back to the
-    ///   declaration's start line when the token can't be located.
+    /// - **Relationship / scope / accessor / facade method** → the declaring
+    ///   method's name token in the declaring class (inheritance/trait-resolved),
+    ///   located the same way the rename path rewrites it; falls back to the
+    ///   declaration's start line when the token can't be located. For a facade
+    ///   method (`Auth::check()`) the declaring class is the bound concrete
+    ///   (`AuthManager`); when the concrete only FORWARDS the call via
+    ///   `__call`/a guard (the `@method`-documented case) no token exists, so the
+    ///   fallback lands on the concrete class line — still a useful target,
+    ///   never `None`. This is exactly the case Intelephense can't see through.
     /// - **Plain member** → `None` — Intelephense already handles those (the
     ///   multi-LSP dedup policy: suppress at the source).
     async fn create_magic_member_location(
@@ -17792,6 +17807,16 @@ return [
             }
             // `$casts`-declared column with no migration: the Salsa side
             // already located its declaration site (property / class line).
+            let decl_file = data.decl_file?;
+            return Self::goto_link(&decl_file, data.decl_line.unwrap_or(0), 0, 0);
+        }
+
+        // A macro/mixin member resolves straight to its registered definition
+        // site (the closure, or the mixin method) — the Salsa side already read
+        // it from the macro registry into `decl_file`/`decl_line`. There is no
+        // method-name token to narrow to on the Macroable host (it's vendor), so
+        // jump to the definition's start with a zero-width caret.
+        if matches!(data.kind, MagicMemberKind::Macro) {
             let decl_file = data.decl_file?;
             return Self::goto_link(&decl_file, data.decl_line.unwrap_or(0), 0, 0);
         }
@@ -21386,6 +21411,24 @@ impl LanguageServer for LaravelLanguageServer {
                     return Ok(Some(loc));
                 }
 
+                // Facade-receiver fallback: cmd-click on the receiver token of a
+                // facade static call (`\Auth` in `\Auth::check()`) jumps to the
+                // bound concrete class (`AuthManager`). The position index only
+                // marks the method-name token, so the receiver lands here.
+                if let Ok(Some(target)) = self
+                    .salsa
+                    .resolve_facade_receiver_at(
+                        file_path.clone(),
+                        position.line,
+                        position.character,
+                    )
+                    .await
+                {
+                    if let Some(loc) = Self::goto_link(&target.file, target.decl_line, 0, 0) {
+                        return Ok(Some(loc));
+                    }
+                }
+
                 // Debug: show what middleware patterns exist on this line
                 let mw_on_line: Vec<_> = patterns
                     .middleware_refs
@@ -21571,7 +21614,7 @@ impl LanguageServer for LaravelLanguageServer {
         // Salsa pattern lookup. The target dispatch in `find_hover_target`
         // tries patterns first and only falls back to Blade variables when
         // nothing matched at the cursor.
-        let patterns = match self.salsa.get_patterns(file_path).await {
+        let patterns = match self.salsa.get_patterns(file_path.clone()).await {
             Ok(Some(p)) => p,
             _ => {
                 // No cached patterns — Blade-variable hover can still fire on
@@ -21605,9 +21648,51 @@ impl LanguageServer for LaravelLanguageServer {
             is_blade,
         ) {
             Some(t) => t,
-            // No Salsa-indexed hover target — try the Artisan command-string
-            // fallback (call sites aren't position-indexed) before giving up.
-            None => return Ok(self.command_hover_response(uri, position).await),
+            // No Salsa-indexed hover target. Before giving up, try the facade
+            // receiver (`\Auth`) — its token isn't position-indexed — rendering a
+            // class-definition card for the bound concrete; then the Artisan
+            // command-string fallback.
+            None => {
+                if is_php {
+                    if let Ok(Some(target)) = self
+                        .salsa
+                        .resolve_facade_receiver_at(
+                            file_path.clone(),
+                            position.line,
+                            position.character,
+                        )
+                        .await
+                    {
+                        // Render the bound concrete as a class-definition card —
+                        // FQCN header + class signature snippet + source link —
+                        // the same shape the Livewire/class hover uses.
+                        use laravel_lsp::hover;
+                        let snippet = laravel_lsp::php_class::extract_class_signature(&target.file);
+                        let header = laravel_lsp::php_class::extract_class_fqn(&target.file)
+                            .unwrap_or(target.fqcn);
+                        let link = self
+                            .source_link(&target.file, Some(target.decl_line + 1))
+                            .await;
+                        let card = hover::render(&hover::HoverContent {
+                            header: Some(&header),
+                            code: snippet.as_deref().map(|s| hover::CodeBlock {
+                                language: hover::CodeLanguage::Php,
+                                content: s,
+                            }),
+                            source_link: Some(&link),
+                            ..Default::default()
+                        });
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: card,
+                            }),
+                            range: None,
+                        }));
+                    }
+                }
+                return Ok(self.command_hover_response(uri, position).await);
+            }
         };
 
         let value = match self.build_hover_markdown(target, uri).await {

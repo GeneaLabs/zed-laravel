@@ -1005,6 +1005,7 @@ fn container_aware_resolver_prefers_bindings_and_normalizes() {
         bindings: &bindings,
         singletons: &singletons,
         facade_aliases: std::sync::Arc::new(crate::facade_resolver::default_facade_aliases()),
+        macros: Default::default(),
     };
 
     // Singleton-only key resolves; leading backslash normalized.
@@ -3085,6 +3086,79 @@ fn closure_new_model_resolves_to_bound_model() {
     assert_eq!(concrete, "App\\Models\\Tenant");
 }
 
+// ─── FIX #1: bare same-namespace `new X` in a binding closure ──────────────
+//
+// The REAL Laravel `AuthServiceProvider` shape: a provider that lives in the
+// same namespace as the concrete it binds, registering
+// `singleton('auth', fn ($app) => new AuthManager($app))` with NO `use` import
+// — PHP resolves the bare `AuthManager` against the current namespace. Before
+// the fix `resolve_expression_type` returned the bare `AuthManager`, which
+// failed the on-disk gate (it looked up `AuthManager`, not
+// `Illuminate\Auth\AuthManager`) and degraded the binding to "Closure" — so
+// `binding_concrete("auth")` resolved nothing and EVERY `Auth::*` facade goto
+// died at the source. The fix qualifies the bare name against the closure's
+// file namespace before the gate.
+
+/// The vendor `AuthManager`, at the PSR-4-mapped `Illuminate\` path so
+/// `resolve_class_to_file_internal` finds it on disk.
+const AUTH_MANAGER_FILE: (&str, &str) = (
+    "vendor/laravel/framework/src/Illuminate/Auth/AuthManager.php",
+    "<?php namespace Illuminate\\Auth; class AuthManager { public function check() {} }",
+);
+
+/// A provider in `Illuminate\Auth` (the concrete's OWN namespace) whose
+/// `register()` body is `binding_line` — with NO import, so a bare `AuthManager`
+/// only resolves if qualified against this file namespace.
+fn same_namespace_auth_provider(binding_line: &str) -> String {
+    format!(
+        r#"<?php
+namespace Illuminate\Auth;
+
+use Illuminate\Support\ServiceProvider;
+
+class AuthServiceProvider extends ServiceProvider
+{{
+    public function register(): void
+    {{
+        {binding_line}
+    }}
+}}
+"#
+    )
+}
+
+#[test]
+fn closure_bare_same_namespace_new_resolves_to_concrete() {
+    // FIX #1: `fn ($app) => new AuthManager($app)` in a provider that lives in
+    // `Illuminate\Auth` — the bare `AuthManager` (no import) must qualify to
+    // `Illuminate\Auth\AuthManager` and resolve to its file, NOT degrade to
+    // "Closure".
+    let (_dir, root) = project_with_files(&[AUTH_MANAGER_FILE]);
+    let src = same_namespace_auth_provider(
+        "$this->app->singleton('auth', fn ($app) => new AuthManager($app));",
+    );
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, file) = concrete_for(&found, "auth").expect("binding registered");
+    assert_eq!(concrete, "Illuminate\\Auth\\AuthManager");
+    assert!(file
+        .as_ref()
+        .is_some_and(|f| f.ends_with("Illuminate/Auth/AuthManager.php")));
+}
+
+#[test]
+fn closure_fully_qualified_new_resolves_unchanged_control() {
+    // Control: the fully-qualified `new \Illuminate\Auth\AuthManager($app)` was
+    // already resolvable (absolute names don't need qualification) — the fix's
+    // qualify step must leave it byte-for-byte identical, never double-qualify.
+    let (_dir, root) = project_with_files(&[AUTH_MANAGER_FILE]);
+    let src = same_namespace_auth_provider(
+        "$this->app->singleton('auth', fn ($app) => new \\Illuminate\\Auth\\AuthManager($app));",
+    );
+    let found = discovered_bindings(&src, root);
+    let (_, concrete, _) = concrete_for(&found, "auth").expect("binding registered");
+    assert_eq!(concrete, "Illuminate\\Auth\\AuthManager");
+}
+
 #[test]
 fn closure_return_type_hint_resolves_to_bound_model() {
     // The body call is opaque; the explicit `: Tenant` return type is the signal.
@@ -3377,5 +3451,745 @@ return Application::configure(basePath: __DIR__)
     assert_eq!(
         aliases.get("DB").map(String::as_str),
         Some("Illuminate\\Support\\Facades\\DB")
+    );
+}
+
+// ─── Macro registry extraction (commit 1) ─────────────────────────────────
+
+#[test]
+fn extract_provider_macros_reads_scalar_macro() {
+    // `Str::macro('uuid7', fn () => …)` in a provider, with `Str` imported:
+    // the receiver token resolves to the Macroable host FQCN, the name is the
+    // first string argument, and the definition line is the closure's.
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let provider = dir.path().join("app/Providers/AppServiceProvider.php");
+    let src = r#"<?php
+namespace App\Providers;
+use Illuminate\Support\Str;
+use Illuminate\Support\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Str::macro('uuid7', fn () => 'x');
+    }
+}
+"#;
+    let tree = parse_php(src).unwrap();
+    let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, src);
+    let macros = extract_provider_macros(&tree, src, &provider, dir.path(), &aliases);
+    assert_eq!(macros.len(), 1);
+    assert_eq!(macros[0].receiver_fqcn, "Illuminate\\Support\\Str");
+    assert_eq!(macros[0].macro_name, "uuid7");
+    assert_eq!(macros[0].decl_file, provider);
+    // The closure is on the same line as the call (0-based line 6).
+    assert_eq!(macros[0].decl_line, 6);
+}
+
+#[test]
+fn extract_provider_macros_ignores_non_macro_static_calls() {
+    // A `Str::upper(...)` call (a real method, not a macro registration) and a
+    // `bind(...)` are not macro registrations — only `macro`/`mixin` count.
+    let src = r#"<?php
+use Illuminate\Support\Str;
+Str::upper('x');
+"#;
+    let tree = parse_php(src).unwrap();
+    let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, src);
+    let macros = extract_provider_macros(
+        &tree,
+        src,
+        std::path::Path::new("/x/Provider.php"),
+        std::path::Path::new("/x"),
+        &aliases,
+    );
+    assert!(macros.is_empty());
+}
+
+#[test]
+fn extract_provider_macros_expands_mixin_methods() {
+    // `Str::mixin(new StrMixin)` reflects every PUBLIC and PROTECTED method of
+    // `StrMixin` onto the host as a macro — mirroring Laravel's
+    // `getMethods(IS_PUBLIC | IS_PROTECTED)` + `setAccessible(true)`. Each one's
+    // definition site is its own declaration in the mixin file. PRIVATE methods
+    // are the only visibility excluded; Laravel does NOT filter by `__` name, so
+    // `__construct` reflects too (a real mixin never returns a closure from it,
+    // but the registry faithfully mirrors the reflection scope rather than
+    // second-guessing it).
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // composer PSR-4 so `App\Mixins\StrMixin` resolves to its file.
+    std::fs::write(
+        root.join("composer.json"),
+        r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#,
+    )
+    .unwrap();
+    let mixin_path = root.join("app/Mixins/StrMixin.php");
+    std::fs::create_dir_all(mixin_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &mixin_path,
+        r#"<?php
+namespace App\Mixins;
+class StrMixin {
+    public function __construct() {}
+    public function shout(): callable { return fn () => ''; }
+    protected function helper(): callable { return fn () => ''; }
+    private function secret(): void {}
+    public function whisper(): callable { return fn () => ''; }
+}
+"#,
+    )
+    .unwrap();
+
+    let provider_src = r#"<?php
+namespace App\Providers;
+use Illuminate\Support\Str;
+use App\Mixins\StrMixin;
+use Illuminate\Support\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Str::mixin(new StrMixin);
+    }
+}
+"#;
+    let tree = parse_php(provider_src).unwrap();
+    let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, provider_src);
+    let provider = root.join("app/Providers/AppServiceProvider.php");
+    let mut macros = extract_provider_macros(&tree, provider_src, &provider, root, &aliases);
+    macros.sort_by(|a, b| a.macro_name.cmp(&b.macro_name));
+
+    // Public + protected register on the `Str` host (4 of the 5 methods); the
+    // PRIVATE `secret` is the only one excluded. After sorting by name:
+    // `__construct`, `helper`, `shout`, `whisper`. Each points at its own
+    // declaration line in the mixin file.
+    let names: Vec<&str> = macros.iter().map(|m| m.macro_name.as_str()).collect();
+    assert_eq!(names, vec!["__construct", "helper", "shout", "whisper"]);
+    assert!(
+        !macros.iter().any(|m| m.macro_name == "secret"),
+        "the PRIVATE mixin method must NOT register as a macro"
+    );
+    for m in &macros {
+        assert_eq!(m.receiver_fqcn, "Illuminate\\Support\\Str");
+        assert_eq!(m.decl_file, mixin_path);
+    }
+    // The PROTECTED `helper` registers at its own 0-based declaration line (line
+    // 5: `<?php`=0, `namespace`=1, `class`=2, `__construct`=3, `shout`=4,
+    // `helper`=5) — protected mixin methods ARE live macros, with correct goto.
+    let helper = macros
+        .iter()
+        .find(|m| m.macro_name == "helper")
+        .expect("protected mixin method registers");
+    assert_eq!(helper.decl_line, 5);
+}
+
+#[test]
+fn extract_provider_macros_expands_relative_name_mixin() {
+    // `Str::mixin(new namespace\StrMixin)` — the `relative_name` argument shape
+    // (PHP's `namespace\…` keyword form, an `object_creation_expression` whose
+    // class node is `relative_name`, not `name`/`qualified_name`). The arm must
+    // reach it and resolve exactly as the sibling `new X` resolvers in
+    // `query_chain::extractor`/`flow` do: feed the raw `namespace\StrMixin` text
+    // through `resolve_class_name` (which leaves the literal `namespace\` prefix
+    // alone, since there is no `use namespace …` alias) and resolve THAT FQCN to
+    // a file. PSR-4 here maps the literal prefix so the mixin resolves and its
+    // public methods expand — proving the `relative_name` arm is wired without
+    // inventing a new resolution path.
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // PSR-4 keyed on the literal `namespace\` prefix the sibling resolvers leave
+    // intact, so `namespace\StrMixin` → `mixins/StrMixin.php`.
+    std::fs::write(
+        root.join("composer.json"),
+        r#"{ "autoload": { "psr-4": { "namespace\\": "mixins/" } } }"#,
+    )
+    .unwrap();
+    let mixin_path = root.join("mixins/StrMixin.php");
+    std::fs::create_dir_all(mixin_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &mixin_path,
+        r#"<?php
+namespace namespace;
+class StrMixin {
+    public function shout(): callable { return fn () => ''; }
+}
+"#,
+    )
+    .unwrap();
+
+    let provider_src = r#"<?php
+namespace App\Providers;
+use Illuminate\Support\Str;
+use Illuminate\Support\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Str::mixin(new namespace\StrMixin);
+    }
+}
+"#;
+    let tree = parse_php(provider_src).unwrap();
+    let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, provider_src);
+    let provider = root.join("app/Providers/AppServiceProvider.php");
+    let macros = extract_provider_macros(&tree, provider_src, &provider, root, &aliases);
+
+    // The relative_name mixin resolved and its public method expanded — before
+    // the fix, the arm matched only `name`/`qualified_name` and yielded nothing.
+    assert_eq!(macros.len(), 1, "the relative_name mixin must resolve");
+    assert_eq!(macros[0].macro_name, "shout");
+    assert_eq!(macros[0].receiver_fqcn, "Illuminate\\Support\\Str");
+    assert_eq!(macros[0].decl_file, mixin_path);
+}
+
+#[tokio::test]
+async fn snapshot_macros_registers_provider_macro_at_definition_site() {
+    // End-to-end: register a provider source declaring `Str::macro('uuid7', …)`,
+    // then assert the macro registry snapshot keys it on the resolved host FQCN
+    // and points the definition site at the provider/closure line.
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let provider = root.join("app/Providers/AppServiceProvider.php");
+    let src = r#"<?php
+namespace App\Providers;
+use Illuminate\Support\Str;
+use Illuminate\Support\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Str::macro('uuid7', fn () => 'x');
+    }
+}
+"#;
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .register_service_provider_source(provider.clone(), src.to_string(), 2, root.clone())
+        .await
+        .unwrap();
+
+    let macros = handle.snapshot_macros().await.unwrap();
+    let target = macros.get(&("Illuminate\\Support\\Str".to_string(), "uuid7".to_string()));
+    assert_eq!(target, Some(&(provider, 6)));
+}
+
+#[tokio::test]
+async fn snapshot_macros_priority_merges_vendor_and_app() {
+    // A package provider (priority 1) and an app provider (priority 2) both
+    // register `Str::shared`; the app's site wins on key collision. The package
+    // also ships `Str::pkgOnly`, which is resolvable on its own. This is the
+    // framework=0 < package=1 < app=2 merge the binding registry uses, applied to
+    // macros — vendor providers are already `ServiceProviderFile` Salsa inputs,
+    // so the same plumbing covers them.
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Package provider (priority 1): two macros.
+    let pkg = root.join("vendor/acme/pkg/src/PkgServiceProvider.php");
+    let pkg_src = r#"<?php
+namespace Acme\Pkg;
+use Illuminate\Support\Str;
+use Illuminate\Support\ServiceProvider;
+class PkgServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Str::macro('shared', fn () => 'pkg');
+        Str::macro('pkgOnly', fn () => 'pkg');
+    }
+}
+"#;
+
+    // App provider (priority 2): overrides `shared`.
+    let app = root.join("app/Providers/AppServiceProvider.php");
+    let app_src = r#"<?php
+namespace App\Providers;
+use Illuminate\Support\Str;
+use Illuminate\Support\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Str::macro('shared', fn () => 'app');
+    }
+}
+"#;
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .register_service_provider_source(pkg.clone(), pkg_src.to_string(), 1, root.clone())
+        .await
+        .unwrap();
+    handle
+        .register_service_provider_source(app.clone(), app_src.to_string(), 2, root.clone())
+        .await
+        .unwrap();
+
+    let macros = handle.snapshot_macros().await.unwrap();
+
+    // App override wins for the colliding key — points at the app provider.
+    let shared = macros.get(&("Illuminate\\Support\\Str".to_string(), "shared".to_string()));
+    assert_eq!(shared, Some(&(app, 6)));
+
+    // The package-only macro still resolves to the package provider.
+    let pkg_only = macros.get(&(
+        "Illuminate\\Support\\Str".to_string(),
+        "pkgOnly".to_string(),
+    ));
+    assert_eq!(pkg_only, Some(&(pkg, 7)));
+}
+
+#[tokio::test]
+async fn resolve_magic_member_at_classifies_macro_call() {
+    // The headline feature, end-to-end through the actor: register a provider
+    // declaring `Str::macro('uuid7', fn () => …)`, then resolve a `Str::uuid7()`
+    // call site. The receiver `Str` is a VENDOR class the index doesn't carry —
+    // it resolves only because the macro registry knows it as a Macroable host
+    // (`has_macro_host`) — and the member classifies as `Macro`, with decl_file /
+    // decl_line read straight from the registry (the closure's location, NOT a
+    // method on the host class). Drives the `kind == Macro` arm of
+    // `handle_resolve_magic_member_at` (`salsa_impl.rs`).
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let provider = root.join("app/Providers/AppServiceProvider.php");
+    let provider_src = r#"<?php
+namespace App\Providers;
+use Illuminate\Support\Str;
+use Illuminate\Support\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Str::macro('uuid7', fn () => 'x');
+    }
+}
+"#;
+
+    // The call site. `Str` is imported so it qualifies to the framework host.
+    let caller_path = root.join("app/Support/Ids.php");
+    let caller_src = r#"<?php
+namespace App\Support;
+use Illuminate\Support\Str;
+class Ids {
+    public function make(): string { return Str::uuid7(); }
+}
+"#;
+    std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
+    std::fs::write(&caller_path, caller_src).unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .register_service_provider_source(
+            provider.clone(),
+            provider_src.to_string(),
+            2,
+            root.clone(),
+        )
+        .await
+        .unwrap();
+    handle
+        .update_file(caller_path.clone(), 1, caller_src.to_string())
+        .await
+        .unwrap();
+    handle.get_patterns(caller_path.clone()).await.unwrap();
+
+    // Cursor on the `uuid7` member token.
+    let (line, col) = position_of(caller_src, "uuid7");
+    let data = handle
+        .resolve_magic_member_at(caller_path, line, col)
+        .await
+        .unwrap()
+        .expect("a registered macro call should resolve");
+
+    assert_eq!(data.kind, MagicMemberKind::Macro);
+    assert_eq!(data.declaring_fqcn, "Illuminate\\Support\\Str");
+    assert_eq!(data.member, "uuid7");
+    // The definition site is the registered closure's location in the provider —
+    // line 6 (0-based) where `Str::macro('uuid7', …)` lives — not a method on the
+    // vendor host. No end line (the registry stores only the start).
+    assert_eq!(data.decl_file, Some(provider));
+    assert_eq!(data.decl_line, Some(6));
+    assert_eq!(data.decl_end_line, None);
+}
+
+// ─── Facade goto/hover end-to-end (the gap that hid both breaks) ───────────
+//
+// The PERMANENT regression test for the whole facade feature, driving the REAL
+// request path (`SalsaHandle::resolve_magic_member_at` — the exact call
+// goto_definition / hover make), not a direct resolver call. It models a real
+// Laravel 12 project:
+//
+//   - a vendor `Illuminate\Auth\AuthManager` declaring `check()` (but NOT
+//     `guard()`, which Laravel forwards via `__call`/a guard),
+//   - a vendor `Illuminate\Auth\AuthServiceProvider` registering the EXACT
+//     arrow-fn `singleton('auth', fn ($app) => new AuthManager($app))` — the
+//     bare same-namespace `new` that FIX #1 must namespace-qualify, and
+//   - a namespaced `AboutController` calling `Auth::check()` in each of the
+//     three facade forms.
+//
+// Without the two fixes this resolves NOTHING: FIX #1's break degrades the
+// `auth` binding to "Closure" so `binding_concrete("auth")` is empty and the
+// receiver never reaches the concrete; FIX #2's break classifies the method as
+// `PlainMember` which the consumer drops as Intelephense's. With both, the call
+// resolves to `FacadeMethod` on `AuthManager` with a non-None decl site.
+
+const VENDOR_AUTH_MANAGER_SRC: &str = r#"<?php
+namespace Illuminate\Auth;
+class AuthManager {
+    public function check() { return true; }
+}
+"#;
+
+/// The vendor `AuthServiceProvider`, in `AuthManager`'s OWN namespace, binding
+/// `auth` via the bare same-namespace arrow-fn `new` — the FIX #1 shape.
+const VENDOR_AUTH_PROVIDER_SRC: &str = r#"<?php
+namespace Illuminate\Auth;
+use Illuminate\Support\ServiceProvider;
+class AuthServiceProvider extends ServiceProvider {
+    public function register(): void {
+        $this->app->singleton('auth', fn ($app) => new AuthManager($app));
+    }
+}
+"#;
+
+/// Spawn an actor over a tempdir Laravel project with the vendor `AuthManager`
+/// plus `AuthServiceProvider` registered and a namespaced caller whose body is
+/// `caller_body` (the `Auth::…` call). Returns the caller path so the test can
+/// position on the member token.
+async fn auth_facade_e2e_project(caller_body: &str) -> (TempDir, SalsaHandle, PathBuf, String) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Vendor AuthManager on disk at its PSR-4-mapped path so the binding's
+    // concrete resolves to a real file.
+    let manager_path = root.join("vendor/laravel/framework/src/Illuminate/Auth/AuthManager.php");
+    std::fs::create_dir_all(manager_path.parent().unwrap()).unwrap();
+    std::fs::write(&manager_path, VENDOR_AUTH_MANAGER_SRC).unwrap();
+
+    let provider_path =
+        root.join("vendor/laravel/framework/src/Illuminate/Auth/AuthServiceProvider.php");
+    std::fs::write(&provider_path, VENDOR_AUTH_PROVIDER_SRC).unwrap();
+
+    let caller_src = format!(
+        r#"<?php
+namespace App\Http\Controllers;
+
+class AboutController {{
+    public function show() {{
+        {caller_body}
+    }}
+}}
+"#
+    );
+    let caller_path = root.join("app/Http/Controllers/AboutController.php");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
+    std::fs::write(&caller_path, &caller_src).unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    // Registering the provider source parses the `auth → AuthManager` binding
+    // (via FIX #1's qualification); `register_cached_binding_batch` below mirrors
+    // production's `populate_cache_from_salsa` to land it in the container
+    // registry the resolver reads. (FIX #1 is what makes the parsed concrete
+    // `AuthManager` instead of "Closure"; without it this binding is useless.)
+    handle
+        .register_service_provider_source(
+            provider_path,
+            VENDOR_AUTH_PROVIDER_SRC.to_string(),
+            0,
+            root.clone(),
+        )
+        .await
+        .unwrap();
+    register_parsed_bindings_into_registry(&handle).await;
+    handle
+        .update_file(caller_path.clone(), 1, caller_src.clone())
+        .await
+        .unwrap();
+    // Force the vendor AuthManager's parse so it lands in the class-hierarchy
+    // index (the on-demand population path) — the consumer needs its file/line.
+    handle.get_patterns(manager_path).await.unwrap();
+    handle.get_patterns(caller_path.clone()).await.unwrap();
+    (dir, handle, caller_path, caller_src)
+}
+
+/// Mirror production's `populate_cache_from_salsa` binding step: pull the bindings
+/// the actor parsed from registered provider SOURCES and feed them back through
+/// `register_cached_binding_batch`, which is what actually fills the `sp_bindings`
+/// registry the live-query resolver (`binding_concrete`) reads. The source path
+/// alone only fills the lazy `salsa_sp_files` Salsa input, not that registry — so
+/// without this round-trip a facade's accessor never reaches its concrete.
+async fn register_parsed_bindings_into_registry(handle: &SalsaHandle) {
+    let parsed = handle.get_all_parsed_bindings().await.unwrap();
+    let entries: Vec<_> = parsed
+        .into_iter()
+        .map(|b| {
+            (
+                b.abstract_name,
+                b.concrete_class,
+                format!("{:?}", b.binding_type).to_lowercase(),
+                b.file_path.map(|p| p.to_string_lossy().into_owned()),
+                Some(b.source_file.to_string_lossy().into_owned()),
+                b.source_line,
+            )
+        })
+        .collect();
+    handle.register_cached_binding_batch(entries).await.unwrap();
+}
+
+/// Resolve `member` at its position in `caller_body` through the real request
+/// path. Asserts it classifies as a `FacadeMethod` on `AuthManager` with a
+/// non-None decl site (NEVER None — the break this guards).
+async fn assert_facade_method_resolves(caller_body: &str, member: &str) -> MagicMemberHoverData {
+    let (_dir, handle, caller_path, caller_src) = auth_facade_e2e_project(caller_body).await;
+    let (line, col) = position_of(&caller_src, member);
+    let data = handle
+        .resolve_magic_member_at(caller_path, line, col)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| {
+            panic!("`{caller_body}` must resolve to a facade method, got None (the break)")
+        });
+    assert_eq!(data.kind, MagicMemberKind::FacadeMethod);
+    assert_eq!(data.declaring_fqcn, "Illuminate\\Auth\\AuthManager");
+    assert_eq!(data.member, member);
+    // A non-None decl site is the whole point: goto/hover must have somewhere to
+    // jump. (For a declared method it's the method line; for the __call degrade
+    // it's the class line — either way, present.)
+    assert!(
+        data.decl_file.is_some() && data.decl_line.is_some(),
+        "facade goto must have a decl site, got {data:?}"
+    );
+    data
+}
+
+#[tokio::test]
+async fn facade_e2e_receiver_resolves_to_concrete_class() {
+    // Cursor on the RECEIVER token `\Auth` (not the method) navigates to the
+    // bound concrete class `AuthManager` — bullet #1. The position index only
+    // marks the method token, so this exercises the receiver fallback path.
+    let (_dir, handle, caller_path, caller_src) =
+        auth_facade_e2e_project(r#"\Auth::check();"#).await;
+
+    let (line, col) = position_of(&caller_src, "Auth");
+    let target = handle
+        .resolve_facade_receiver_at(caller_path.clone(), line, col)
+        .await
+        .unwrap()
+        .expect("receiver `\\Auth` must resolve to the concrete class");
+    assert!(
+        target.file.ends_with("Illuminate/Auth/AuthManager.php"),
+        "expected AuthManager file, got {:?}",
+        target.file
+    );
+    // `class AuthManager {` is line 2 (0-based) in VENDOR_AUTH_MANAGER_SRC.
+    assert_eq!(target.decl_line, 2);
+    assert_eq!(target.fqcn, "Illuminate\\Auth\\AuthManager");
+
+    // The METHOD token is NOT the receiver path — it must decline so the normal
+    // member-access goto (FacadeMethod) handles it.
+    let (mline, mcol) = position_of(&caller_src, "check");
+    assert!(
+        handle
+            .resolve_facade_receiver_at(caller_path, mline, mcol)
+            .await
+            .unwrap()
+            .is_none(),
+        "cursor on the method name must not resolve as a receiver"
+    );
+}
+
+#[tokio::test]
+async fn facade_e2e_global_alias_check_resolves_in_namespaced_file() {
+    // Global-alias form in a NAMESPACED controller: `\Auth::check();`. The
+    // leading `\` forces global resolution despite the file's namespace, so the
+    // seed alias `Auth → …\Facades\Auth` applies. This is the headline real-world
+    // shape (`\Auth::check()` in `App\Http\Controllers\AboutController`).
+    let data = assert_facade_method_resolves(r#"\Auth::check();"#, "check").await;
+    assert_eq!(data.decl_line, Some(3));
+}
+
+#[tokio::test]
+async fn facade_e2e_inline_fully_qualified_check_resolves() {
+    // Inline fully-qualified form: `\Illuminate\Support\Facades\Auth::check();`
+    // with no import — the path lands directly in the Facades namespace.
+    let data =
+        assert_facade_method_resolves(r#"\Illuminate\Support\Facades\Auth::check();"#, "check")
+            .await;
+    assert_eq!(data.decl_line, Some(3));
+}
+
+#[tokio::test]
+async fn facade_e2e_imported_alias_check_resolves() {
+    // The true imported form, with the `use` inside the file. Built bespoke (not
+    // via the shared helper) so the import sits above the class.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let manager_path = root.join("vendor/laravel/framework/src/Illuminate/Auth/AuthManager.php");
+    std::fs::create_dir_all(manager_path.parent().unwrap()).unwrap();
+    std::fs::write(&manager_path, VENDOR_AUTH_MANAGER_SRC).unwrap();
+    let provider_path =
+        root.join("vendor/laravel/framework/src/Illuminate/Auth/AuthServiceProvider.php");
+    std::fs::write(&provider_path, VENDOR_AUTH_PROVIDER_SRC).unwrap();
+
+    let caller_src = r#"<?php
+namespace App\Http\Controllers;
+
+use Illuminate\Support\Facades\Auth;
+
+class AboutController {
+    public function show() {
+        Auth::check();
+    }
+}
+"#;
+    let caller_path = root.join("app/Http/Controllers/AboutController.php");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
+    std::fs::write(&caller_path, caller_src).unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .register_service_provider_source(
+            provider_path,
+            VENDOR_AUTH_PROVIDER_SRC.to_string(),
+            0,
+            root.clone(),
+        )
+        .await
+        .unwrap();
+    register_parsed_bindings_into_registry(&handle).await;
+    handle
+        .update_file(caller_path.clone(), 1, caller_src.to_string())
+        .await
+        .unwrap();
+    handle.get_patterns(manager_path).await.unwrap();
+    handle.get_patterns(caller_path.clone()).await.unwrap();
+
+    // Position on the `check` member of `Auth::check()` (skip the `use` line's
+    // none — `check` appears only in the call).
+    let (line, col) = position_of(caller_src, "check");
+    let data = handle
+        .resolve_magic_member_at(caller_path, line, col)
+        .await
+        .unwrap()
+        .expect("imported `Auth::check()` must resolve, not None");
+    assert_eq!(data.kind, MagicMemberKind::FacadeMethod);
+    assert_eq!(data.declaring_fqcn, "Illuminate\\Auth\\AuthManager");
+    assert_eq!(data.decl_line, Some(3));
+}
+
+#[tokio::test]
+async fn facade_e2e_undeclared_method_degrades_to_class_never_none() {
+    // `\Auth::guard()` — `guard` is NOT declared on the AuthManager stub (real
+    // Laravel forwards it via `__call`/a guard). We must NOT chase the forwarding
+    // chain and must NOT return None: DEGRADE to the concrete CLASS line. This is
+    // the __call caveat, end-to-end.
+    let (_dir, handle, caller_path, caller_src) =
+        auth_facade_e2e_project(r#"\Auth::guard();"#).await;
+    let (line, col) = position_of(&caller_src, "guard");
+    let data = handle
+        .resolve_magic_member_at(caller_path, line, col)
+        .await
+        .unwrap()
+        .expect("undeclared facade method must degrade, not return None");
+    assert_eq!(data.kind, MagicMemberKind::FacadeMethod);
+    assert_eq!(data.declaring_fqcn, "Illuminate\\Auth\\AuthManager");
+    // No `guard` method token → decl line falls back to the class declaration
+    // line (2, 0-based: `class AuthManager {` — line 0 `<?php`, 1 `namespace`),
+    // still a real target.
+    assert!(data.decl_file.is_some());
+    assert_eq!(data.decl_line, Some(2));
+}
+
+#[tokio::test]
+async fn snapshot_macros_invalidates_when_provider_body_changes() {
+    // Salsa invalidation for macros: register a provider source, snapshot, then
+    // re-register the SAME path with a renamed macro and a removed one. The next
+    // snapshot must reflect the edit — the renamed key replaces the old, and the
+    // removed macro is gone. Mirrors
+    // `salsa_config_refreshes_when_provider_registered_after_first_build`: the
+    // provider is a `ServiceProviderFile` Salsa input, so re-registering the path
+    // bumps the input and recomputes `parse_service_provider_source`.
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let provider = root.join("app/Providers/AppServiceProvider.php");
+
+    let before_src = r#"<?php
+namespace App\Providers;
+use Illuminate\Support\Str;
+use Illuminate\Support\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Str::macro('oldName', fn () => 'x');
+        Str::macro('doomed', fn () => 'y');
+    }
+}
+"#;
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .register_service_provider_source(provider.clone(), before_src.to_string(), 2, root.clone())
+        .await
+        .unwrap();
+
+    let key = |name: &str| ("Illuminate\\Support\\Str".to_string(), name.to_string());
+
+    let before = handle.snapshot_macros().await.unwrap();
+    assert!(
+        before.contains_key(&key("oldName")),
+        "precondition: oldName registered"
+    );
+    assert!(
+        before.contains_key(&key("doomed")),
+        "precondition: doomed registered"
+    );
+
+    // Re-register the SAME path: `oldName` → `newName`, and `doomed` removed.
+    let after_src = r#"<?php
+namespace App\Providers;
+use Illuminate\Support\Str;
+use Illuminate\Support\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Str::macro('newName', fn () => 'x');
+    }
+}
+"#;
+    handle
+        .register_service_provider_source(provider.clone(), after_src.to_string(), 2, root.clone())
+        .await
+        .unwrap();
+
+    let after = handle.snapshot_macros().await.unwrap();
+    assert!(
+        after.contains_key(&key("newName")),
+        "the renamed macro must appear after re-registration (Salsa recomputed the input)"
+    );
+    assert!(
+        !after.contains_key(&key("oldName")),
+        "the old macro name must be GONE after the rename — stale registry entry would mean no invalidation"
+    );
+    assert!(
+        !after.contains_key(&key("doomed")),
+        "the removed macro must be GONE after re-registration"
     );
 }

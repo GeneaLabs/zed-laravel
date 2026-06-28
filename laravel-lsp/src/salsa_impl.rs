@@ -1448,6 +1448,32 @@ pub struct ParsedBindingReg<'db> {
     pub source_file: PathBuf,
 }
 
+/// A parsed macro/mixin registration (Salsa tracked).
+///
+/// Example: `Str::macro('uuid7', fn () => ...)` registers a `uuid7` macro on the
+/// `Macroable` host `Illuminate\Support\Str`; `Str::mixin(new MyMixin)` registers
+/// every public method of `MyMixin` as a macro on the same host. The
+/// `receiver_fqcn` is the resolved host FQCN (token resolved through the file's
+/// `use` imports + facade alias map, so it agrees with the call-site receiver
+/// resolution), `macro_name` is the registered member name, and the source
+/// file + line point at the **definition site** — the closure for a scalar macro,
+/// the mixin method for a mixin-expanded one.
+#[salsa::tracked]
+pub struct ParsedMacroReg<'db> {
+    /// Resolved Macroable host FQCN (e.g. "Illuminate\\Support\\Str").
+    pub receiver_fqcn: BindingName<'db>,
+    /// The registered macro/method name (e.g. "uuid7").
+    pub macro_name: BindingName<'db>,
+    /// Definition site file — the provider for a scalar macro (closure), or the
+    /// mixin class file for a mixin-expanded method.
+    #[returns(ref)]
+    pub decl_file: PathBuf,
+    /// 0-based definition line — the closure's line, or the mixin method's line.
+    pub decl_line: u32,
+    /// Priority (0=framework, 1=package, 2=app)
+    pub priority: u8,
+}
+
 /// A parsed view namespace registration from loadViewsFrom() (Salsa tracked)
 /// Example: $this->loadViewsFrom(__DIR__.'/../resources/views', 'courier')
 #[salsa::tracked]
@@ -1552,6 +1578,10 @@ pub struct ParsedServiceProvider<'db> {
     /// Container bindings found in this provider
     #[returns(ref)]
     pub bindings: Vec<ParsedBindingReg<'db>>,
+    /// Macro/mixin registrations found in this provider (`Str::macro(...)`,
+    /// `Str::mixin(...)`)
+    #[returns(ref)]
+    pub macros: Vec<ParsedMacroReg<'db>>,
     /// View namespace registrations from loadViewsFrom()
     #[returns(ref)]
     pub view_namespaces: Vec<ParsedViewNamespaceReg<'db>>,
@@ -1760,6 +1790,33 @@ pub fn parse_service_provider_source<'db>(
                 pb.source_line,
                 priority,
                 path.clone(),
+            ));
+        }
+    }
+
+    // Parse macro/mixin registrations (`Str::macro('foo', fn …)`,
+    // `Str::mixin(new MyMixin)`) via tree-sitter. The receiver token is resolved
+    // to its Macroable host FQCN the same way the call site resolves it (use
+    // imports + facade alias map), so registry keys agree with lookup keys. The
+    // first registration of a `(host, name)` pair in source order wins the dedup.
+    let mut macros = Vec::new();
+    if let Ok(macro_tree) = parse_php(text) {
+        let aliases = crate::query_chain::use_aliases::extract_use_aliases(&macro_tree, text);
+        let mut macros_seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for pm in extract_provider_macros(&macro_tree, text, path, &root, &aliases) {
+            if !macros_seen.insert((pm.receiver_fqcn.clone(), pm.macro_name.clone())) {
+                continue;
+            }
+            let receiver = BindingName::new(db, pm.receiver_fqcn);
+            let name = BindingName::new(db, pm.macro_name);
+            macros.push(ParsedMacroReg::new(
+                db,
+                receiver,
+                name,
+                pm.decl_file,
+                pm.decl_line,
+                priority,
             ));
         }
     }
@@ -2020,6 +2077,7 @@ pub fn parse_service_provider_source<'db>(
         db,
         middleware,
         bindings,
+        macros,
         view_namespaces,
         blade_components,
         component_namespaces,
@@ -2214,6 +2272,242 @@ fn class_const_name(expr: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
     )
 }
 
+/// A macro/mixin registration extracted from a provider's AST, ready to become
+/// a `ParsedMacroReg`. `receiver_fqcn` is the resolved Macroable host FQCN,
+/// `macro_name` the registered member, and `decl_file`/`decl_line` the
+/// definition site (the closure for a scalar macro, the mixin method otherwise).
+struct ProviderMacro {
+    receiver_fqcn: String,
+    macro_name: String,
+    decl_file: PathBuf,
+    decl_line: u32,
+}
+
+/// Walk a provider's PHP AST for `Receiver::macro('name', <closure>)` and
+/// `Receiver::mixin(new Mixin)` static calls, resolving each to a definition
+/// site. Mirrors [`extract_provider_bindings`]: a pre-order descent so the first
+/// registration of a `(host, name)` pair in source order wins the caller's dedup.
+///
+/// ## Coverage boundaries (be honest about the caps)
+///
+/// - **Which files**: every file registered as a [`ServiceProviderFile`] Salsa
+///   input — app providers (priority 2), framework providers (0), and package
+///   providers (1), the last two discovered by the vendor scan
+///   (`rescan_vendor_providers`). Priority merging happens in
+///   [`SalsaActor::build_macro_registry`], not here.
+/// - **Which calls**: only a STATIC `Receiver::macro(...)` / `Receiver::mixin(...)`
+///   (`scoped_call_expression`). The dominant registration site is a provider's
+///   `boot()`, but the walk is whole-file, not `boot()`-scoped — so a macro
+///   registered in any method of a registered provider is caught. An instance-form
+///   `$compiler->macro(...)` is intentionally NOT matched (it's a
+///   `member_call_expression`, and `macro` as an instance method is rarely a
+///   Macroable registration on a resolvable host).
+/// - **Known caps** (registrations we do NOT see): a macro registered OUTSIDE a
+///   registered provider (e.g. directly in `routes/`, a test bootstrap, or a
+///   package file that isn't a `*ServiceProvider.php`); a host token that doesn't
+///   resolve to an FQCN statically; a `macro` name that isn't a plain string
+///   literal (a variable / concatenation); and a `mixin` whose class can't be
+///   resolved to an on-disk file. These degrade silently to "no macro" rather
+///   than a wrong target.
+fn extract_provider_macros(
+    tree: &tree_sitter::Tree,
+    text: &str,
+    provider_path: &Path,
+    root: &Path,
+    aliases: &crate::query_chain::use_aliases::UseAliases,
+) -> Vec<ProviderMacro> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    walk_provider_macros(
+        tree.root_node(),
+        bytes,
+        provider_path,
+        root,
+        aliases,
+        &mut out,
+    );
+    out
+}
+
+fn walk_provider_macros(
+    node: tree_sitter::Node,
+    bytes: &[u8],
+    provider_path: &Path,
+    root: &Path,
+    aliases: &crate::query_chain::use_aliases::UseAliases,
+    out: &mut Vec<ProviderMacro>,
+) {
+    if node.kind() == "scoped_call_expression" {
+        classify_macro_call(node, bytes, provider_path, root, aliases, out);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_provider_macros(child, bytes, provider_path, root, aliases, out);
+    }
+}
+
+/// Classify one `Receiver::macro('name', <closure>)` / `Receiver::mixin(<expr>)`
+/// static call, pushing zero or more `ProviderMacro`s into `out`. A scalar macro
+/// yields one entry (definition site = the closure); a mixin yields one entry per
+/// public method of the resolved mixin class (definition site = each method).
+/// Returns silently for any call that isn't such a registration or whose receiver
+/// can't be resolved to a host FQCN.
+fn classify_macro_call(
+    node: tree_sitter::Node,
+    bytes: &[u8],
+    provider_path: &Path,
+    root: &Path,
+    aliases: &crate::query_chain::use_aliases::UseAliases,
+    out: &mut Vec<ProviderMacro>,
+) {
+    let Some(method) = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(bytes).ok())
+    else {
+        return;
+    };
+    if !matches!(method, "macro" | "mixin") {
+        return;
+    }
+    // Resolve the receiver token to its Macroable host FQCN the same way the
+    // call site does — through the file's `use` imports (and, for a facade
+    // token, the alias map fed via the seed; user aliases ride at the snapshot
+    // merge, not here). A token with a `\` separator is already qualified.
+    let Some(scope) = node
+        .child_by_field_name("scope")
+        .and_then(|s| s.utf8_text(bytes).ok())
+    else {
+        return;
+    };
+    let receiver_fqcn = resolve_macro_host_fqcn(scope, aliases);
+
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    let mut arg_exprs = args.named_children(&mut cursor).map(argument_value);
+
+    if method == "macro" {
+        // `macro('name', <closure>)` — the name is the first string argument and
+        // the definition site is the closure (second argument).
+        let Some(Some(name_node)) = arg_exprs.next() else {
+            return;
+        };
+        let Some(macro_name) = string_literal_text(name_node, bytes) else {
+            return;
+        };
+        let closure = arg_exprs.next().flatten();
+        // The definition line: the closure if present (where the body lives),
+        // otherwise the call itself. 0-based to match the rest of the stack. The
+        // definition file for a scalar macro is the provider source itself.
+        let decl_line = closure.unwrap_or(node).start_position().row as u32;
+        out.push(ProviderMacro {
+            receiver_fqcn,
+            macro_name,
+            decl_file: provider_path.to_path_buf(),
+            decl_line,
+        });
+        return;
+    }
+
+    // `mixin(new MyMixin)` / `mixin(MyMixin::class)` — expand each public OR
+    // protected method of the mixin class into a macro on the same host. The
+    // mixin's methods ARE the registered members (Laravel reflects them onto the
+    // host at runtime), so each one's definition site is its own declaration in
+    // the mixin file.
+    let Some(Some(arg)) = arg_exprs.next() else {
+        return;
+    };
+    let Some(mixin_fqcn) = mixin_class_fqcn(arg, bytes, aliases) else {
+        return;
+    };
+    let Some(mixin_file) = resolve_class_to_file_internal(&mixin_fqcn, root) else {
+        return;
+    };
+    // Analyze the mixin to enumerate its methods with their declaration lines —
+    // the same inheritance-resolved walk the model surfaces use (and the same
+    // `ReflectionClass::getMethods` inheritance scope Laravel reflects over). A
+    // mixin that can't be analyzed (unreadable, no class) yields nothing.
+    let Some(view) = crate::laravel_introspector::chain::analyze(&mixin_file, root) else {
+        return;
+    };
+    for m in &view.all_methods {
+        let method = &m.value;
+        // Laravel's `Macroable::mixin` reflects with
+        // `getMethods(ReflectionMethod::IS_PUBLIC | ReflectionMethod::IS_PROTECTED)`
+        // and `setAccessible(true)` on each before registering it — so PUBLIC and
+        // PROTECTED methods alike become live macros; only PRIVATE methods are
+        // excluded. Laravel does NOT filter by `__` name (a real mixin never
+        // returns a closure from `__construct`/`__call`, so they don't surface as
+        // callable macros in practice), so we mirror that and exclude purely by
+        // visibility.
+        if method.visibility == crate::laravel_introspector::walker::PhpVisibility::Private {
+            continue;
+        }
+        // The method's own declaring file (a trait the mixin composes lives
+        // elsewhere); fall back to the mixin file when the source class isn't
+        // separately resolvable.
+        let decl_file = resolve_class_to_file_internal(&m.source_class, root)
+            .unwrap_or_else(|| mixin_file.clone());
+        out.push(ProviderMacro {
+            receiver_fqcn: receiver_fqcn.clone(),
+            macro_name: method.name.clone(),
+            decl_file,
+            decl_line: method.start_line,
+        });
+    }
+}
+
+/// Resolve the mixin class FQCN from a `mixin(...)` argument — either
+/// `new MyMixin` / `new MyMixin()` (an `object_creation_expression`) or
+/// `MyMixin::class` (a `class_constant_access_expression`) — through the file's
+/// `use` imports. Returns `None` for any other argument shape (a variable, a
+/// computed expression — none of which name a mixin class statically).
+fn mixin_class_fqcn(
+    arg: tree_sitter::Node,
+    bytes: &[u8],
+    aliases: &crate::query_chain::use_aliases::UseAliases,
+) -> Option<String> {
+    let class_ref = match arg.kind() {
+        "class_constant_access_expression" => class_const_name(arg, bytes)?,
+        "object_creation_expression" => {
+            // The class name is the first named child that is a name / qualified
+            // name / relative name (skipping the `new` keyword and any argument
+            // list). `relative_name` covers `new namespace\MyMixin`; this matches
+            // the sibling `new X` resolvers in `query_chain::extractor` and
+            // `query_chain::flow`, which feed the same raw text through
+            // `resolve_class_name`. Collect into a Vec so the walk cursor doesn't
+            // outlive the borrow.
+            let mut cursor = arg.walk();
+            let children: Vec<_> = arg.named_children(&mut cursor).collect();
+            let name_node = children
+                .into_iter()
+                .find(|c| matches!(c.kind(), "name" | "qualified_name" | "relative_name"))?;
+            name_node.utf8_text(bytes).ok()?.to_string()
+        }
+        _ => return None,
+    };
+    Some(
+        crate::query_chain::use_aliases::resolve_class_name(&class_ref, aliases)
+            .trim_start_matches('\\')
+            .to_string(),
+    )
+}
+
+/// Resolve a `Receiver::macro(...)` scope token to its Macroable host FQCN.
+/// Expands the file's `use` imports and strips a leading `\`; a bare token with
+/// no import stays as written (the framework Macroables — `Str`, `Arr`,
+/// `Request`, … — are referenced by their imported short name in practice, and
+/// the call-site resolver qualifies the same way).
+fn resolve_macro_host_fqcn(
+    scope: &str,
+    aliases: &crate::query_chain::use_aliases::UseAliases,
+) -> String {
+    crate::query_chain::use_aliases::resolve_class_name(scope, aliases)
+        .trim_start_matches('\\')
+        .to_string()
+}
+
 /// Extract `$app->withAliases([...])` facade-alias registrations from a
 /// `bootstrap/app.php` source into a token → facade-FQCN map (`'Auth' =>
 /// 'Illuminate\Support\Facades\Auth'`).
@@ -2360,6 +2654,16 @@ fn resolve_closure_concrete(
     if !matches!(confidence, Confidence::High | Confidence::Medium) {
         return None;
     }
+    // `resolve_expression_type` expands `use`-aliases and absolute names but
+    // leaves a bare SAME-NAMESPACE `new X` unqualified — the real Laravel shape
+    // `singleton('auth', fn ($app) => new AuthManager($app))` in a provider that
+    // lives in `AuthManager`'s own namespace returns the bare `AuthManager`,
+    // which then fails the on-disk gate below and degrades the binding to
+    // "Closure". Qualify it against the closure's FILE namespace with the SAME
+    // helper the static-receiver arm uses, so the bare name becomes
+    // `Illuminate\Auth\AuthManager` before the gate. (A name `resolve_class_name`
+    // already qualified — imported or absolute — is left untouched.)
+    let fqcn = crate::member_resolver::qualify_fqcn(fqcn, expr, bytes);
     // Only store a concrete that names a real class file — an inferred FQCN that
     // doesn't resolve to disk would be a guess, and the contract is to degrade
     // to "Closure" rather than point at a wrong or absent target.
@@ -2894,6 +3198,22 @@ pub enum MagicMemberKind {
     Column,
     /// Dynamic finder (`User::whereEmail(...)` → `where('email', ...)`).
     DynamicFinder,
+    /// Runtime-registered macro / mixin method (`Str::macro('foo', fn …)`,
+    /// `Str::mixin(new MyMixin)`). Resolved via the project-wide macro registry
+    /// rather than the receiver class's own surfaces — its definition site is the
+    /// registered closure (or the mixin method), carried in the registry entry.
+    Macro,
+    /// A method reached through a FACADE proxy (`Auth::check()`,
+    /// `Cache::get()`). The facade's own class carries only `@method` docblocks,
+    /// so resolution walked it to the bound concrete (facade FQCN → accessor →
+    /// container binding); `declaring_fqcn` is that concrete. The goto/hover
+    /// target is the member's declaration on the concrete when it declares one
+    /// (`AuthManager::check`), DEGRADING to the concrete CLASS when the concrete
+    /// only forwards the call via `__call`/a guard (`Auth::guard()` is
+    /// `@method`-documented, not declared). Distinct from `PlainMember` —
+    /// which the consumers drop as Intelephense's territory — because a facade
+    /// call is precisely what Intelephense CAN'T see through, so we own it.
+    FacadeMethod,
     /// Generic (non-magic) property on a resolved class.
     PlainMember,
 }
@@ -3672,6 +3992,24 @@ pub struct BindingRegistrationData {
     pub priority: u8,
 }
 
+/// A resolved macro/mixin registration for transfer across async boundaries and
+/// for the live query path. Keyed in the actor registry on
+/// `(receiver_fqcn, macro_name)`; the `decl_file`/`decl_line` point at the
+/// definition site (the registered closure, or the mixin method).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MacroRegistrationData {
+    /// Resolved Macroable host FQCN (e.g. "Illuminate\\Support\\Str").
+    pub receiver_fqcn: String,
+    /// The registered macro/method name (e.g. "uuid7").
+    pub macro_name: String,
+    /// Definition site file.
+    pub decl_file: PathBuf,
+    /// 0-based definition line.
+    pub decl_line: u32,
+    /// Priority: 0=framework, 1=package, 2=app (higher wins on key collision).
+    pub priority: u8,
+}
+
 /// Pairs the class-hierarchy index (FQCN → file) with the in-actor container
 /// binding registry (binding key → concrete FQCN) behind the
 /// [`crate::member_resolver::ClassFileResolver`] seam, so the live query path
@@ -3686,6 +4024,10 @@ struct ContainerAwareResolver<'a> {
     /// resolves facade receivers (`Auth::check()`) to their implementation the
     /// same way the build pass does.
     facade_aliases: Arc<HashMap<String, String>>,
+    /// The macro registry — `(receiver_fqcn, macro_name)` → definition site —
+    /// so the live query path classifies a runtime-registered macro/mixin member
+    /// the same way the build pass does.
+    macros: Arc<HashMap<(String, String), MacroRegistrationData>>,
 }
 
 impl crate::member_resolver::ClassFileResolver for ContainerAwareResolver<'_> {
@@ -3703,6 +4045,14 @@ impl crate::member_resolver::ClassFileResolver for ContainerAwareResolver<'_> {
     }
     fn facade_aliases(&self) -> std::borrow::Cow<'_, HashMap<String, String>> {
         std::borrow::Cow::Borrowed(&self.facade_aliases)
+    }
+    fn macro_target(&self, receiver_fqcn: &str, name: &str) -> Option<(PathBuf, u32)> {
+        self.macros
+            .get(&(receiver_fqcn.to_string(), name.to_string()))
+            .map(|m| (m.decl_file.clone(), m.decl_line))
+    }
+    fn has_macro_host(&self, receiver_fqcn: &str) -> bool {
+        self.macros.keys().any(|(host, _)| host == receiver_fqcn)
     }
 }
 
@@ -4158,6 +4508,17 @@ impl ParsedPatternsData {
 // Actor Pattern - For async integration
 // ============================================================================
 
+/// A facade receiver (`\Auth`) resolved to its bound concrete class — the
+/// goto/hover target shared by both handlers. Goto jumps to `file`/`decl_line`;
+/// hover renders a class-definition card from the file (FQCN header + class
+/// signature snippet), the same way the Livewire/class hover does.
+#[derive(Debug, Clone)]
+pub struct FacadeReceiverTarget {
+    pub fqcn: String,
+    pub file: PathBuf,
+    pub decl_line: u32,
+}
+
 /// Requests that can be sent to the Salsa actor
 pub enum SalsaRequest {
     /// Update or create a file in the database
@@ -4316,6 +4677,13 @@ pub enum SalsaRequest {
     SnapshotFacadeAliases {
         reply: oneshot::Sender<Arc<std::collections::HashMap<String, String>>>,
     },
+    /// Snapshot the macro registry — `(receiver_fqcn, macro_name)` → `(decl_file,
+    /// decl_line)` — for the same out-of-actor build, so a runtime-registered
+    /// macro/mixin member (`Str::uuid7()`) classifies while indexing exactly as
+    /// it does on the live query path. Mirrors [`Self::SnapshotBindings`].
+    SnapshotMacros {
+        reply: oneshot::Sender<Arc<std::collections::HashMap<(String, String), (PathBuf, u32)>>>,
+    },
     /// Snapshot every indexed class grouped by file, so warming can persist
     /// the hierarchy to the disk cache.
     SnapshotHierarchyNodes {
@@ -4377,6 +4745,15 @@ pub enum SalsaRequest {
         line: u32,
         column: u32,
         reply: oneshot::Sender<Option<MagicMemberHoverData>>,
+    },
+
+    /// Resolve a facade receiver token (`\Auth`) at a cursor to its bound
+    /// concrete class location (`AuthManager` file + decl line).
+    ResolveFacadeReceiverAt {
+        path: PathBuf,
+        line: u32,
+        column: u32,
+        reply: oneshot::Sender<Option<FacadeReceiverTarget>>,
     },
 
     /// Resolve the magic member at a cursor for rename (M7) — method-backed
@@ -5003,6 +5380,23 @@ impl SalsaHandle {
             .map_err(|_| "Salsa actor dropped reply channel")
     }
 
+    /// Snapshot the macro registry — `(receiver_fqcn, macro_name)` →
+    /// `(decl_file, decl_line)` — for the out-of-actor magic-member build.
+    /// Mirrors [`Self::snapshot_bindings`].
+    pub async fn snapshot_macros(
+        &self,
+    ) -> Result<Arc<std::collections::HashMap<(String, String), (PathBuf, u32)>>, &'static str>
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SnapshotMacros { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
     /// Snapshot every indexed class grouped by declaring file, so warming can
     /// persist the hierarchy to the disk cache (it survives a warm restart
     /// only if persisted — fresh parses are the sole other populator).
@@ -5157,6 +5551,30 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::ResolveMagicMemberAt {
+                path,
+                line,
+                column,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Resolve a facade receiver token at `(line, column)` to its bound concrete
+    /// class location (`AuthManager` file + 0-based decl line), or `None` when
+    /// the cursor isn't on a resolvable facade receiver.
+    pub async fn resolve_facade_receiver_at(
+        &self,
+        path: PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Result<Option<FacadeReceiverTarget>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ResolveFacadeReceiverAt {
                 path,
                 line,
                 column,
@@ -6202,6 +6620,18 @@ impl SalsaActor {
                 SalsaRequest::SnapshotFacadeAliases { reply } => {
                     let _ = reply.send(self.build_facade_alias_snapshot());
                 }
+                SalsaRequest::SnapshotMacros { reply } => {
+                    // Reduce the registration data to the (decl_file, decl_line)
+                    // the build-pass resolver needs; priority merging already
+                    // happened in `build_macro_registry`.
+                    let registry = self.build_macro_registry();
+                    let mut map: std::collections::HashMap<(String, String), (PathBuf, u32)> =
+                        std::collections::HashMap::with_capacity(registry.len());
+                    for (key, data) in registry.iter() {
+                        map.insert(key.clone(), (data.decl_file.clone(), data.decl_line));
+                    }
+                    let _ = reply.send(Arc::new(map));
+                }
                 SalsaRequest::SnapshotHierarchyNodes { reply } => {
                     let _ = reply.send(self.class_hierarchy_index.nodes_by_file());
                 }
@@ -6259,6 +6689,15 @@ impl SalsaActor {
                     reply,
                 } => {
                     let result = self.handle_resolve_magic_member_at(&path, line, column);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::ResolveFacadeReceiverAt {
+                    path,
+                    line,
+                    column,
+                    reply,
+                } => {
+                    let result = self.handle_resolve_facade_receiver_at(&path, line, column);
                     let _ = reply.send(result);
                 }
                 SalsaRequest::ResolveMagicMemberRenameAt {
@@ -7942,6 +8381,29 @@ impl SalsaActor {
                 }
             };
 
+        // A macro/mixin member's definition site is the registered closure (or
+        // mixin method), carried in the macro registry — NOT a method on the
+        // declaring (Macroable host) class, which is typically a vendor class
+        // with no such method. Look it up directly; no end line (the registry
+        // stores only the definition's start).
+        if kind == MagicMemberKind::Macro {
+            let (decl_file, decl_line) = self
+                .build_macro_registry()
+                .get(&(declaring_fqcn.clone(), member_ref.member.clone()))
+                .map(|m| (Some(m.decl_file.clone()), Some(m.decl_line)))
+                .unwrap_or((None, None));
+            return Some(MagicMemberHoverData {
+                declaring_fqcn,
+                member: member_ref.member.clone(),
+                kind,
+                confidence,
+                decl_file,
+                decl_line,
+                decl_end_line: None,
+                tentative: false,
+            });
+        }
+
         // Locate the declaration in the declaring class. A method-backed member
         // (relationship / scope / accessor / finder) yields both start+end lines
         // so the hover can show its source; a property (column / plain) yields
@@ -7961,9 +8423,33 @@ impl SalsaActor {
                         node.properties.iter().find(|p| p.name == member_ref.member)
                     {
                         (Some(node.file_path.clone()), Some(p.start_line), None)
+                    } else if kind == MagicMemberKind::FacadeMethod {
+                        // The concrete doesn't declare this member — it forwards
+                        // via `__call`/`@mixin` (e.g. `AuthManager` → `Guard::check`).
+                        // Chase the real declaration from source; fall back to the
+                        // concrete class line only when the chase comes up empty.
+                        match crate::facade_resolver::facade_method_decl(
+                            &declaring_fqcn,
+                            &member_ref.member,
+                            &project_root,
+                        ) {
+                            Some((f, l)) => (Some(f), Some(l), None),
+                            None => (Some(node.file_path.clone()), Some(node.start_line), None),
+                        }
                     } else {
                         (Some(node.file_path.clone()), Some(node.start_line), None)
                     }
+                }
+                // A facade's concrete may be a vendor class absent from the
+                // hierarchy index — still chase its declaration from disk.
+                None if kind == MagicMemberKind::FacadeMethod => {
+                    crate::facade_resolver::facade_method_decl(
+                        &declaring_fqcn,
+                        &member_ref.member,
+                        &project_root,
+                    )
+                    .map(|(f, l)| (Some(f), Some(l), None))
+                    .unwrap_or((None, None, None))
                 }
                 None => (None, None, None),
             };
@@ -7977,6 +8463,77 @@ impl SalsaActor {
             decl_line,
             decl_end_line,
             tentative,
+        })
+    }
+
+    /// Resolve a facade *receiver* at a cursor (`\Auth` in `\Auth::check()`) to
+    /// its bound concrete class location. The position index only marks the
+    /// method-name token, so this is the goto/hover path when the cursor sits on
+    /// the receiver itself: find the enclosing `scoped_call_expression`, confirm
+    /// the cursor is on its `scope`, resolve the facade to the concrete it
+    /// proxies (`AuthManager`), and locate that class's declaration line.
+    fn handle_resolve_facade_receiver_at(
+        &mut self,
+        path: &PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Option<FacadeReceiverTarget> {
+        let project_root = self.config_root.clone()?;
+        self.ensure_file_registered(path);
+        let file = self.files.get(path)?;
+        let text = file.text(&self.db).clone();
+        let tree = crate::parser::parse_php(&text).ok()?;
+        let bytes = text.as_bytes();
+
+        // The node under the cursor, then the static call it belongs to.
+        let point = tree_sitter::Point {
+            row: line as usize,
+            column: column as usize,
+        };
+        let node = tree.root_node().descendant_for_point_range(point, point)?;
+        let mut call = node;
+        while call.kind() != "scoped_call_expression" {
+            call = call.parent()?;
+        }
+        let scope = call.child_by_field_name("scope")?;
+        // Only fire on the receiver — when the cursor is on the method name the
+        // normal member-access goto handles it.
+        if node.start_byte() < scope.start_byte() || node.end_byte() > scope.end_byte() {
+            return None;
+        }
+
+        let raw = scope.utf8_text(bytes).ok()?;
+        let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &text);
+        let resolver = self.container_aware_resolver();
+        let (concrete, _) = crate::member_resolver::resolve_facade_receiver(
+            scope,
+            raw,
+            bytes,
+            &aliases,
+            &resolver,
+            &project_root,
+        )?;
+
+        // Locate the concrete class's own declaration line.
+        let class_file =
+            crate::class_locator::find_php_class_file_in_app_or_vendor(&concrete, &project_root)?;
+        let class_src = std::fs::read_to_string(&class_file).ok()?;
+        let class_tree = crate::parser::parse_php(&class_src).ok()?;
+        let structure = crate::laravel_introspector::walker::extract_php_structure_from_tree(
+            &class_tree,
+            class_src.as_bytes(),
+        );
+        let short = concrete.rsplit('\\').next().unwrap_or(&concrete);
+        let decl_line = structure
+            .structures
+            .iter()
+            .find(|s| s.name == short)
+            .map(|s| s.start_line)
+            .unwrap_or(0);
+        Some(FacadeReceiverTarget {
+            fqcn: concrete,
+            file: class_file,
+            decl_line,
         })
     }
 
@@ -8182,6 +8739,42 @@ impl SalsaActor {
         Arc::new(map)
     }
 
+    /// Build the macro registry — `(receiver_fqcn, macro_name)` → registration —
+    /// by merging every Salsa-parsed service provider's `macros`, highest
+    /// priority winning on key collision (framework=0 < package=1 < app=2). Built
+    /// fresh each call from the tracked-query outputs (mirrors
+    /// [`Self::build_facade_alias_snapshot`]); macros number in the dozens-to-
+    /// hundreds, with no cache to invalidate on a provider edit.
+    fn build_macro_registry(&self) -> Arc<HashMap<(String, String), MacroRegistrationData>> {
+        let mut map: HashMap<(String, String), MacroRegistrationData> = HashMap::new();
+        let Some(root) = self.salsa_sp_root.as_ref() else {
+            return Arc::new(map);
+        };
+        for sp_file in self.salsa_sp_files.values() {
+            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+            for m in parsed.macros(&self.db) {
+                let key = (
+                    m.receiver_fqcn(&self.db).name(&self.db).clone(),
+                    m.macro_name(&self.db).name(&self.db).clone(),
+                );
+                let data = MacroRegistrationData {
+                    receiver_fqcn: key.0.clone(),
+                    macro_name: key.1.clone(),
+                    decl_file: m.decl_file(&self.db).clone(),
+                    decl_line: m.decl_line(&self.db),
+                    priority: m.priority(&self.db),
+                };
+                match map.get(&key) {
+                    Some(existing) if existing.priority >= data.priority => {}
+                    _ => {
+                        map.insert(key, data);
+                    }
+                }
+            }
+        }
+        Arc::new(map)
+    }
+
     // === Service Provider Handlers ===
 
     /// Handle service provider registry registration
@@ -8221,6 +8814,7 @@ impl SalsaActor {
             bindings: &self.sp_bindings,
             singletons: &self.sp_singletons,
             facade_aliases: self.build_facade_alias_snapshot(),
+            macros: self.build_macro_registry(),
         }
     }
 

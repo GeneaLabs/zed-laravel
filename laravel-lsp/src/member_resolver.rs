@@ -70,6 +70,38 @@ pub trait ClassFileResolver {
     fn facade_aliases(&self) -> std::borrow::Cow<'_, HashMap<String, String>> {
         std::borrow::Cow::Owned(crate::facade_resolver::default_facade_aliases())
     }
+
+    /// Resolve a runtime-registered macro/mixin member — the
+    /// `(receiver_fqcn, name)` pair where `receiver_fqcn` is the resolved
+    /// Macroable host (`Illuminate\Support\Str`) and `name` is the called member
+    /// (`uuid7`) — to its definition site `(file, 0-based line)`, if the
+    /// project-wide macro registry has one.
+    ///
+    /// Defaulted to `None` so implementors that don't model macros (the bare
+    /// class index, the `HashMap<String, PathBuf>` test stub) need no changes;
+    /// the registry-aware resolvers on the salsa and main sides override it with
+    /// the parsed macro registry. This is the classification surface that lets
+    /// `Str::uuid7()` resolve when `uuid7` is registered in a provider — it rides
+    /// the resolver exactly as [`binding_concrete`](Self::binding_concrete) does.
+    fn macro_target(&self, _receiver_fqcn: &str, _name: &str) -> Option<(PathBuf, u32)> {
+        None
+    }
+
+    /// Whether the macro registry holds *any* macro for `receiver_fqcn` — i.e.
+    /// `receiver_fqcn` is a known Macroable host.
+    ///
+    /// The static-receiver arm uses this to yield an FQCN for a host the class
+    /// index doesn't carry: the dominant Macroable hosts (`Illuminate\Support\Str`,
+    /// `Arr`, `Request`) are vendor classes absent from the project index, so the
+    /// plain `class_file`-gated resolution drops them and no macro on them would
+    /// ever classify. A host with a registered macro is resolvable even without an
+    /// indexed file; the per-member [`macro_target`](Self::macro_target) lookup in
+    /// classification still gates which members actually resolve.
+    ///
+    /// Defaulted to `false` so non-registry implementors are unaffected.
+    fn has_macro_host(&self, _receiver_fqcn: &str) -> bool {
+        false
+    }
 }
 
 impl ClassFileResolver for ClassHierarchyIndex {
@@ -97,6 +129,11 @@ pub struct SnapshotResolver {
     /// actor alongside `bindings` so the build pass resolves facade receivers
     /// (`Auth::check()`) the same way the live query path does.
     pub facade_aliases: Arc<HashMap<String, String>>,
+    /// The macro registry — `(receiver_fqcn, macro_name)` → `(decl_file,
+    /// decl_line)` — snapshotted from the actor so the build pass classifies
+    /// runtime-registered macro/mixin members the same way the live query path
+    /// does.
+    pub macros: Arc<HashMap<(String, String), (PathBuf, u32)>>,
 }
 
 impl ClassFileResolver for SnapshotResolver {
@@ -108,6 +145,14 @@ impl ClassFileResolver for SnapshotResolver {
     }
     fn facade_aliases(&self) -> std::borrow::Cow<'_, HashMap<String, String>> {
         std::borrow::Cow::Borrowed(&self.facade_aliases)
+    }
+    fn macro_target(&self, receiver_fqcn: &str, name: &str) -> Option<(PathBuf, u32)> {
+        self.macros
+            .get(&(receiver_fqcn.to_string(), name.to_string()))
+            .cloned()
+    }
+    fn has_macro_host(&self, receiver_fqcn: &str) -> bool {
+        self.macros.keys().any(|(host, _)| host == receiver_fqcn)
     }
 }
 
@@ -317,8 +362,15 @@ pub fn resolve_member_access_entries(
         // codebase — Intelephense's territory and pure index bloat. Only the
         // magic kinds (scope / finder / relationship) index from calls.
         // Property-form plain members stay (bounded: declared properties on
-        // resolved classes).
-        if m.form.is_call() && resolved.kind == MagicMemberKind::PlainMember {
+        // resolved classes). Facade methods (`Auth::check()`) are likewise
+        // unbounded across a codebase; they're a goto/hover surface, not a
+        // find-references one, so they don't index here either.
+        if m.form.is_call()
+            && matches!(
+                resolved.kind,
+                MagicMemberKind::PlainMember | MagicMemberKind::FacadeMethod
+            )
+        {
             continue;
         }
         out.push(MagicMemberEntry {
@@ -359,26 +411,55 @@ pub fn resolve_and_classify(
     project_root: &Path,
     mut deps: Option<&mut HashSet<String>>,
 ) -> Option<ResolvedMemberAccess> {
-    let (fqcn, confidence) =
-        match resolve_receiver(receiver, bytes, aliases, resolver, classviews, project_root) {
-            Some(r) => r,
-            // Call-form receivers are frequently builder CHAINS
-            // (`User::query()->active()`, `User::where(…)->active()`) whose
-            // links the direct resolver can't type. The chain's subject is its
-            // root — resolve that instead (#77 review). Property-form chains
-            // (`User::first()->full_name`) deliberately stay chain-blind: the
-            // column surface makes property terminals a far bigger
-            // false-positive net than the call surfaces gated below.
-            None if form.is_call() => resolve_call_chain_receiver(
+    // Facade interception, checked first for a static-call name receiver —
+    // `Auth::check()` — so the "resolved via facade" signal threads cleanly into
+    // classification. A `Some` here means the concrete came through the facade
+    // proxy (facade FQCN → accessor → bound concrete), so the member is a FACADE
+    // method (tag `FacadeMethod`, goto the concrete's decl site) rather than a
+    // plain method Intelephense owns. `resolve_receiver` runs the same
+    // interception internally for any other caller; doing it explicitly here is
+    // what carries the boolean to `classify_against`.
+    let via_facade = matches!(receiver.kind(), "name" | "qualified_name");
+    let facade_concrete = if via_facade {
+        receiver.utf8_text(bytes).ok().and_then(|raw| {
+            resolve_facade_receiver(receiver, raw, bytes, aliases, resolver, project_root)
+        })
+    } else {
+        None
+    };
+
+    let (fqcn, confidence, via_facade) = match facade_concrete {
+        Some((fqcn, confidence)) => (fqcn, confidence, true),
+        None => {
+            let (fqcn, confidence) = match resolve_receiver(
                 receiver,
                 bytes,
                 aliases,
                 resolver,
                 classviews,
                 project_root,
-            )?,
-            None => return None,
-        };
+            ) {
+                Some(r) => r,
+                // Call-form receivers are frequently builder CHAINS
+                // (`User::query()->active()`, `User::where(…)->active()`) whose
+                // links the direct resolver can't type. The chain's subject is its
+                // root — resolve that instead (#77 review). Property-form chains
+                // (`User::first()->full_name`) deliberately stay chain-blind: the
+                // column surface makes property terminals a far bigger
+                // false-positive net than the call surfaces gated below.
+                None if form.is_call() => resolve_call_chain_receiver(
+                    receiver,
+                    bytes,
+                    aliases,
+                    resolver,
+                    classviews,
+                    project_root,
+                )?,
+                None => return None,
+            };
+            (fqcn, confidence, false)
+        }
+    };
 
     if let Some(d) = deps.as_deref_mut() {
         d.insert(fqcn.clone());
@@ -389,6 +470,7 @@ pub fn resolve_and_classify(
         member,
         form,
         confidence,
+        via_facade,
         resolver,
         classviews,
         project_root,
@@ -417,6 +499,7 @@ pub fn resolve_and_classify(
             member,
             form,
             Confidence::Medium,
+            false, // a builder retry never comes through a facade
             resolver,
             classviews,
             project_root,
@@ -428,23 +511,81 @@ pub fn resolve_and_classify(
 
 /// Classify `member` against `fqcn`'s resolved surfaces — the shared tail of
 /// [`resolve_and_classify`]'s direct path and its builder retry.
+///
+/// `via_facade` is the "receiver resolved through the facade proxy" signal: when
+/// set, a member that would otherwise classify as a plain method is tagged
+/// [`MagicMemberKind::FacadeMethod`] instead — a facade call's target IS the
+/// concrete's decl site (goto-able / hoverable), NOT Intelephense's territory
+/// the way a plain `$obj->method()` is. (Magic kinds — scope / accessor /
+/// relationship / finder — still win over the facade tag: those are the
+/// concrete's own Eloquent surfaces and resolve more precisely.)
+#[allow(clippy::too_many_arguments)]
 fn classify_against(
     fqcn: &str,
     member: &str,
     form: AccessForm,
     confidence: Confidence,
+    via_facade: bool,
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
 ) -> Option<ResolvedMemberAccess> {
-    let file_path = resolver.class_file(fqcn)?;
-    let view = classviews.get_or_build(fqcn, &file_path, project_root)?;
-    let classified = classify_member(&view, member, form)?;
-    Some(ResolvedMemberAccess {
-        declaring_fqcn: classified.declaring_fqcn,
-        kind: classified.kind,
-        confidence,
-    })
+    // A class the index knows: classify against its real surfaces first.
+    if let Some(file_path) = resolver.class_file(fqcn) {
+        if let Some(view) = classviews.get_or_build(fqcn, &file_path, project_root) {
+            if let Some(classified) = classify_member(&view, member, form) {
+                // A facade call whose member is just a plain method on the
+                // concrete (`Auth::check()` → `AuthManager::check()`) is a real
+                // goto target — tag it `FacadeMethod` so the consumers don't drop
+                // it as Intelephense's. A magic kind keeps its own classification
+                // (it's already a precise, goto-able surface).
+                if via_facade && classified.kind == MagicMemberKind::PlainMember {
+                    return Some(ResolvedMemberAccess {
+                        declaring_fqcn: classified.declaring_fqcn,
+                        kind: MagicMemberKind::FacadeMethod,
+                        confidence,
+                    });
+                }
+                return Some(ResolvedMemberAccess {
+                    declaring_fqcn: classified.declaring_fqcn,
+                    kind: classified.kind,
+                    confidence,
+                });
+            }
+        }
+        // A facade call whose member is NOT declared on the concrete — the
+        // `__call`/`@method` forwarding case (`Auth::guard()`,
+        // `DB::beginTransaction()` are forwarded, not declared). The exact method
+        // can't be located (chasing `__call`/guard chains is out of scope), so
+        // DEGRADE to the concrete CLASS as the target — still useful — rather
+        // than dropping to None. The declaring FQCN is the concrete itself; the
+        // consumer falls back to the class's start line.
+        if via_facade && form.is_call() {
+            return Some(ResolvedMemberAccess {
+                declaring_fqcn: fqcn.to_string(),
+                kind: MagicMemberKind::FacadeMethod,
+                confidence,
+            });
+        }
+    }
+    // Macro / mixin fallback: a call-form member that matches none of the class's
+    // own surfaces may be a runtime-registered macro (`Str::macro('foo', …)`) or
+    // a mixin method. Consulted last — after the real surfaces, before giving up
+    // — and crucially OUTSIDE the `class_file` guard above: the dominant
+    // Macroable hosts (`Str`, `Arr`, `Request`) are vendor classes the project
+    // index doesn't carry, so requiring a buildable ClassView would drop every
+    // framework-host macro. The registry is keyed on the resolved receiver FQCN
+    // (exactly `fqcn`); the declaring class is that Macroable host. Only
+    // call-form: a macro is reached via `__callStatic` / `__call`, never a
+    // property read. The registry carries the true definition site for goto/hover.
+    if form.is_call() && resolver.macro_target(fqcn, member).is_some() {
+        return Some(ResolvedMemberAccess {
+            declaring_fqcn: fqcn.to_string(),
+            kind: MagicMemberKind::Macro,
+            confidence,
+        });
+    }
+    None
 }
 
 /// Resolve a call-chain receiver by its ROOT (#77 review). The chain's
@@ -757,23 +898,18 @@ fn resolve_receiver(
             // the plain class-index lookup below: the facade class itself may be
             // indexed (vendor), and resolving to it would classify against the
             // empty proxy instead of the implementation.
-            let is_namespaced = file_namespace(receiver, bytes).is_some();
-            if let Some(facade_fqcn) = crate::facade_resolver::resolve_facade_fqcn(
-                raw,
-                aliases,
-                &resolver.facade_aliases(),
-                is_namespaced,
-            ) {
-                if let Some(concrete) =
-                    crate::facade_resolver::facade_accessor(&facade_fqcn, project_root)
-                        .and_then(|accessor| resolver.binding_concrete(&accessor))
-                {
-                    return Some((concrete, Confidence::High));
-                }
+            if let Some(concrete) =
+                resolve_facade_receiver(receiver, raw, bytes, aliases, resolver, project_root)
+            {
+                return Some(concrete);
             }
 
             let fqcn = qualify_fqcn(resolve_class_name(raw, aliases), receiver, bytes);
-            if resolver.class_file(&fqcn).is_some() {
+            if resolver.class_file(&fqcn).is_some() || resolver.has_macro_host(&fqcn) {
+                // The class is indexed, OR it's a known Macroable host the index
+                // doesn't carry (vendor `Str`/`Arr`/…) but the macro registry
+                // does — either way the receiver resolves at HIGH (explicit
+                // class name). Per-member classification still gates the result.
                 Some((fqcn, Confidence::High))
             } else {
                 None
@@ -797,6 +933,42 @@ fn resolve_receiver(
         }
         _ => None,
     }
+}
+
+/// Resolve a static-call receiver THROUGH a facade to its concrete
+/// implementation: `Auth::check()`, `\Auth::check()`,
+/// `\Illuminate\Support\Facades\Auth::check()` → `Illuminate\Auth\AuthManager`.
+///
+/// A facade is a thin static proxy whose own class carries only `@method`
+/// docblocks, never the real members — so when the receiver token resolves to a
+/// facade we walk facade FQCN → accessor key → bound concrete and return THAT,
+/// so the member classifies against the real class. Returns `None` when the
+/// token isn't a facade (or its accessor has no bound concrete), letting the
+/// plain class-index lookup take over.
+///
+/// Extracted from [`resolve_receiver`]'s `name`/`qualified_name` arm so
+/// [`resolve_and_classify`] can call it directly: a `Some` here is the
+/// "resolved via the facade interception" signal that classification keys on to
+/// tag [`MagicMemberKind::FacadeMethod`] instead of a plain method (a facade
+/// call's target is the concrete's decl site, NOT Intelephense's territory).
+pub(crate) fn resolve_facade_receiver(
+    receiver: Node,
+    raw: &str,
+    bytes: &[u8],
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    project_root: &Path,
+) -> Option<(String, Confidence)> {
+    let is_namespaced = file_namespace(receiver, bytes).is_some();
+    let facade_fqcn = crate::facade_resolver::resolve_facade_fqcn(
+        raw,
+        aliases,
+        &resolver.facade_aliases(),
+        is_namespaced,
+    )?;
+    let concrete = crate::facade_resolver::facade_accessor(&facade_fqcn, project_root)
+        .and_then(|accessor| resolver.binding_concrete(&accessor))?;
+    Some((concrete, Confidence::High))
 }
 
 /// Resolve a container-resolution receiver — `app('key')` / `resolve('key')` —
@@ -1108,7 +1280,15 @@ fn resolve_typed_property(
 /// `namespace App;`) is treated as already-qualified and won't resolve to
 /// `App\Models\User` — a false negative both the static-receiver arm and the
 /// chain-root arm inherit.
-fn qualify_fqcn(name: String, node: Node, bytes: &[u8]) -> String {
+///
+/// `pub` so the provider-binding closure resolver
+/// ([`crate::salsa_impl::resolve_closure_concrete`]) reuses the SAME
+/// namespace-qualification the static-receiver arm uses: a binding bound to a
+/// bare same-namespace `new X` (e.g. `singleton('auth', fn ($app) => new
+/// AuthManager($app))` in a provider that lives in `AuthManager`'s namespace)
+/// must qualify `AuthManager` → `Illuminate\Auth\AuthManager` before the
+/// on-disk gate, or the binding degrades to `"Closure"`.
+pub fn qualify_fqcn(name: String, node: Node, bytes: &[u8]) -> String {
     let trimmed = name.trim_start_matches('\\').to_string();
     if trimmed.contains('\\') {
         // Already namespaced (alias-resolved or absolute).

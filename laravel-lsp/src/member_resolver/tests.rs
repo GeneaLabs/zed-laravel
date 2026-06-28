@@ -498,6 +498,7 @@ fn snapshot_resolver_answers_class_file_and_binding() {
         class_files,
         bindings,
         facade_aliases: Arc::new(crate::facade_resolver::default_facade_aliases()),
+        macros: Default::default(),
     };
     assert_eq!(
         r.class_file("App\\Models\\Tenant"),
@@ -528,6 +529,7 @@ fn snapshot_resolver_resolves_app_binding_through_engine() {
         class_files,
         bindings,
         facade_aliases: Arc::new(crate::facade_resolver::default_facade_aliases()),
+        macros: Default::default(),
     };
     let caller = "<?php $x = app('currentTenant')->logo;";
     let r = resolve_with(&resolver, &p.root, caller, "logo").expect("resolves");
@@ -578,6 +580,7 @@ fn auth_facade_project() -> (Project, SnapshotResolver) {
         class_files,
         bindings,
         facade_aliases: Arc::new(crate::facade_resolver::default_facade_aliases()),
+        macros: Default::default(),
     };
     (p, resolver)
 }
@@ -638,7 +641,9 @@ use Illuminate\Support\Facades\Auth;
 Auth::check();
 "#;
     let r = resolve_static_call(&resolver, &p.root, caller, "check").expect("resolves");
-    assert_eq!(r.kind, MagicMemberKind::PlainMember);
+    // `check()` IS declared on `AuthManager` here, so it's a facade method
+    // pointing at that declaration (not a plain method the consumers drop).
+    assert_eq!(r.kind, MagicMemberKind::FacadeMethod);
     assert_eq!(r.confidence, Confidence::High);
     assert_eq!(r.declaring_fqcn, "Illuminate\\Auth\\AuthManager");
 }
@@ -652,7 +657,7 @@ fn facade_global_alias_resolves_to_concrete() {
     let (p, resolver) = auth_facade_project();
     let caller = "<?php \\Auth::check();";
     let r = resolve_static_call(&resolver, &p.root, caller, "check").expect("resolves");
-    assert_eq!(r.kind, MagicMemberKind::PlainMember);
+    assert_eq!(r.kind, MagicMemberKind::FacadeMethod);
     assert_eq!(r.declaring_fqcn, "Illuminate\\Auth\\AuthManager");
 }
 
@@ -664,7 +669,7 @@ fn facade_inline_fully_qualified_resolves_to_concrete() {
     let (p, resolver) = auth_facade_project();
     let caller = "<?php \\Illuminate\\Support\\Facades\\Auth::check();";
     let r = resolve_static_call(&resolver, &p.root, caller, "check").expect("resolves");
-    assert_eq!(r.kind, MagicMemberKind::PlainMember);
+    assert_eq!(r.kind, MagicMemberKind::FacadeMethod);
     assert_eq!(r.declaring_fqcn, "Illuminate\\Auth\\AuthManager");
 }
 
@@ -681,6 +686,130 @@ namespace App\Http;
 Auth::check();
 "#;
     assert!(resolve_static_call(&resolver, &p.root, caller, "check").is_none());
+}
+
+#[test]
+fn facade_method_not_declared_on_concrete_degrades_to_class() {
+    // `Auth::guard()` — `guard` is NOT declared on this `AuthManager` stub (it's
+    // forwarded via `__call`/`@method` in real Laravel). We must NOT drop to None
+    // and we must NOT chase the forwarding chain: DEGRADE to the concrete CLASS
+    // (`AuthManager`) as the goto target. Still a useful jump — and exactly the
+    // case Intelephense can't resolve.
+    let (p, resolver) = auth_facade_project();
+    let caller = r#"<?php
+use Illuminate\Support\Facades\Auth;
+Auth::guard();
+"#;
+    let r = resolve_static_call(&resolver, &p.root, caller, "guard").expect("degrades, not None");
+    assert_eq!(r.kind, MagicMemberKind::FacadeMethod);
+    // The declaring FQCN is the concrete itself — the consumer falls back to its
+    // class line since there's no `guard` method token to narrow to.
+    assert_eq!(r.declaring_fqcn, "Illuminate\\Auth\\AuthManager");
+    assert_eq!(r.confidence, Confidence::High);
+}
+
+// ─── Macro receivers: Str::macro('foo', …) classification (commit 1) ──────
+//
+// A runtime-registered macro on a Macroable host (the dominant host being the
+// vendor `Illuminate\Support\Str`, which the project class index does NOT carry)
+// classifies a static call as `MagicMemberKind::Macro` via the macro registry,
+// keyed on the resolved receiver FQCN. `macros_resolver` is the test analogue of
+// the `ContainerAwareResolver`/`SnapshotResolver` macro path: a `SnapshotResolver`
+// whose `macros` map holds one `(host, name) → (decl_file, line)` entry, with no
+// indexed class file for the host (proving the host need not be indexed).
+
+/// A `SnapshotResolver` with a single macro `(host, name)` registered at a
+/// definition site — and crucially no class file for `host`, so it exercises the
+/// "Macroable host the index doesn't carry" path.
+fn macros_resolver(host: &str, name: &str, decl: (PathBuf, u32)) -> SnapshotResolver {
+    SnapshotResolver {
+        class_files: Default::default(),
+        bindings: Default::default(),
+        facade_aliases: Arc::new(crate::facade_resolver::default_facade_aliases()),
+        macros: Arc::new(HashMap::from([(
+            (host.to_string(), name.to_string()),
+            decl,
+        )])),
+    }
+}
+
+#[test]
+fn registered_macro_on_imported_host_classifies_as_macro() {
+    // `use Illuminate\Support\Str; Str::uuid7();` with `uuid7` registered as a
+    // macro on `Illuminate\Support\Str`. The receiver resolves to the host FQCN
+    // through the `use` import even though the host isn't indexed (the macro
+    // registry vouches for it), and the member classifies as a Macro.
+    let dir = TempDir::new().unwrap();
+    let provider = dir.path().join("app/Providers/AppServiceProvider.php");
+    let resolver = macros_resolver("Illuminate\\Support\\Str", "uuid7", (provider.clone(), 17));
+    let caller = r#"<?php
+use Illuminate\Support\Str;
+Str::uuid7();
+"#;
+    let r = resolve_static_call(&resolver, dir.path(), caller, "uuid7").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::Macro);
+    assert_eq!(r.confidence, Confidence::High);
+    assert_eq!(r.declaring_fqcn, "Illuminate\\Support\\Str");
+    // The registry carries the true definition site (the closure) for goto/hover.
+    assert_eq!(
+        resolver.macro_target("Illuminate\\Support\\Str", "uuid7"),
+        Some((provider, 17))
+    );
+}
+
+#[test]
+fn unregistered_member_on_macro_host_does_not_resolve() {
+    // The host has *a* macro (`uuid7`), so it's a known Macroable host the static
+    // arm will yield — but a different, unregistered member (`notAMacro`) matches
+    // no real surface and no registry entry, so classification drops to None
+    // rather than guessing.
+    let dir = TempDir::new().unwrap();
+    let provider = dir.path().join("app/Providers/AppServiceProvider.php");
+    let resolver = macros_resolver("Illuminate\\Support\\Str", "uuid7", (provider, 17));
+    let caller = r#"<?php
+use Illuminate\Support\Str;
+Str::notAMacro();
+"#;
+    assert!(resolve_static_call(&resolver, dir.path(), caller, "notAMacro").is_none());
+}
+
+#[test]
+fn macro_lookup_keys_on_resolved_fqcn_not_token() {
+    // A bare `\Str::uuid7()` (root-qualified, no import) must resolve to the same
+    // `Illuminate\Support\Str` key the import form uses — proving registry keys
+    // and lookup keys agree on the resolved FQCN, not the raw token. Here `\Str`
+    // has no import and isn't in the Facades namespace, so it resolves to the
+    // global `Str` — which is NOT the registered host, so it must NOT resolve.
+    // (The faithful agreement case is the imported form above; this guards the
+    // negative: a token that resolves elsewhere doesn't collide.)
+    let dir = TempDir::new().unwrap();
+    let provider = dir.path().join("app/Providers/AppServiceProvider.php");
+    let resolver = macros_resolver("Illuminate\\Support\\Str", "uuid7", (provider, 17));
+    let caller = "<?php \\Str::uuid7();";
+    assert!(resolve_static_call(&resolver, dir.path(), caller, "uuid7").is_none());
+}
+
+#[test]
+fn mixin_method_classifies_as_macro_and_targets_mixin_file() {
+    // A mixin-expanded member behaves identically to a scalar macro at the
+    // classification surface — `(host, method)` is a registry entry whose
+    // definition site is the mixin method's own file/line. `Str::shout()` with
+    // `shout` registered (host = Str, target = the mixin file) classifies as a
+    // Macro and goto lands on the mixin method.
+    let dir = TempDir::new().unwrap();
+    let mixin = dir.path().join("app/Mixins/StrMixin.php");
+    let resolver = macros_resolver("Illuminate\\Support\\Str", "shout", (mixin.clone(), 4));
+    let caller = r#"<?php
+use Illuminate\Support\Str;
+Str::shout();
+"#;
+    let r = resolve_static_call(&resolver, dir.path(), caller, "shout").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::Macro);
+    assert_eq!(r.declaring_fqcn, "Illuminate\\Support\\Str");
+    assert_eq!(
+        resolver.macro_target("Illuminate\\Support\\Str", "shout"),
+        Some((mixin, 4))
+    );
 }
 
 #[test]

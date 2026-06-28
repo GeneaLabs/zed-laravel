@@ -45,7 +45,7 @@
 use crate::query_chain::use_aliases::resolve_class_name;
 use crate::query_chain::use_aliases::UseAliases;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The `Illuminate\Support\Facades` namespace every built-in facade lives in.
 /// Used both to seed the default alias map and as the marker that identifies a
@@ -265,6 +265,240 @@ pub fn facade_accessor(facade_fqcn: &str, root: &Path) -> Option<String> {
     let file = crate::class_locator::find_php_class_file_in_app_or_vendor(facade_fqcn, root)?;
     let source = std::fs::read_to_string(&file).ok()?;
     parse_facade_accessor(&source)
+}
+
+/// Follow a facade method the bound concrete doesn't declare directly to its
+/// real declaration site, the way Laravel surfaces manager methods.
+///
+/// `Auth::check()` resolves the receiver to `Illuminate\Auth\AuthManager`, but
+/// `check` isn't declared there — `AuthManager` forwards unknown calls via
+/// `__call` and documents the surface with
+/// `@mixin \Illuminate\Contracts\Auth\Guard`. We chase that statically: a method
+/// declared on the concrete wins; otherwise each `@mixin` type (resolved through
+/// the concrete file's `use` aliases) is searched recursively; otherwise a
+/// matching `@method` tag's own line in the concrete's class docblock. Returns
+/// `(file, 0-based decl line)`, or `None` to let the caller fall back to the
+/// concrete class line.
+pub fn facade_method_decl(
+    concrete_fqcn: &str,
+    member: &str,
+    root: &Path,
+) -> Option<(PathBuf, u32)> {
+    let (file, line, on_interface) = facade_method_decl_inner(concrete_fqcn, member, root, 0)?;
+    if !on_interface {
+        return Some((file, line));
+    }
+    // The chase landed on an *interface* method (`AuthManager` forwards `check`
+    // to the `Guard` contract). Go to the implementation: a manager instantiates
+    // its concrete drivers (`new SessionGuard(...)`), so chase the member into
+    // those to land on the real body (`GuardHelpers::check`). Fall back to the
+    // interface declaration when no implementation turns up.
+    manager_concrete_impl(concrete_fqcn, member, root).or(Some((file, line)))
+}
+
+/// Bound on chase recursion — guards documentation/inheritance cycles and keeps
+/// an interactive goto cheap.
+const MAX_FACADE_MIXIN_DEPTH: u32 = 4;
+
+/// Returns `(file, 0-based decl line, on_interface)` — `on_interface` is `true`
+/// when the declaration was found on an `interface` (a signature, not a body),
+/// the signal the public wrapper uses to switch to implementation lookup.
+fn facade_method_decl_inner(
+    concrete_fqcn: &str,
+    member: &str,
+    root: &Path,
+    depth: u32,
+) -> Option<(PathBuf, u32, bool)> {
+    if depth > MAX_FACADE_MIXIN_DEPTH {
+        return None;
+    }
+    let file = crate::class_locator::find_php_class_file_in_app_or_vendor(concrete_fqcn, root)?;
+    let source = std::fs::read_to_string(&file).ok()?;
+    let tree = crate::parser::parse_php(&source).ok()?;
+    let structure = crate::laravel_introspector::walker::extract_php_structure_from_tree(
+        &tree,
+        source.as_bytes(),
+    );
+    let short = concrete_fqcn.rsplit('\\').next().unwrap_or(concrete_fqcn);
+    let class = structure.structures.iter().find(|s| s.name == short)?;
+
+    // 1. Declared directly on this class (the concrete, a trait/parent we
+    //    recursed into, or an interface) — its own declaration line.
+    if let Some(m) = class.methods.iter().find(|m| m.name == member) {
+        let on_interface =
+            class.kind == crate::laravel_introspector::walker::PhpStructureKind::Interface;
+        return Some((file, m.start_line, on_interface));
+    }
+
+    let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &source);
+    let namespace = structure.namespace.as_deref();
+    let qualify = |raw: &str| qualify_doc_type(raw, &aliases, namespace);
+
+    // 2. Composed traits — the implementation frequently lives in a trait
+    //    (`Connection::beginTransaction` is declared in the `ManagesTransactions`
+    //    trait, not on `Connection` itself).
+    for raw in &class.trait_uses {
+        if let Some(hit) = facade_method_decl_inner(&qualify(raw), member, root, depth + 1) {
+            return Some(hit);
+        }
+    }
+
+    // 3. Parent class.
+    if let Some(parent) = &class.extends_raw {
+        if let Some(hit) = facade_method_decl_inner(&qualify(parent), member, root, depth + 1) {
+            return Some(hit);
+        }
+    }
+
+    // 4. `@mixin` types — how a manager documents the surface it forwards to via
+    //    `__call`: `AuthManager`'s `@mixin \…\Guard` is where `check` lives, and
+    //    `DatabaseManager`'s `@mixin \…\Connection` leads to `beginTransaction`.
+    let docblock = class_docblock(&source, class.start_line);
+    if let Some((_, doc_text)) = &docblock {
+        for raw in doc_tag_values(doc_text, "@mixin") {
+            if let Some(hit) = facade_method_decl_inner(&qualify(&raw), member, root, depth + 1) {
+                return Some(hit);
+            }
+        }
+    }
+
+    // 5. Implemented interfaces — the signature declaration, when no concrete
+    //    impl turned up above.
+    for raw in &class.implements_raw {
+        if let Some(hit) = facade_method_decl_inner(&qualify(raw), member, root, depth + 1) {
+            return Some(hit);
+        }
+    }
+
+    // 6. `@method` tag on this class's own docblock — a virtual method with no
+    //    body; land on the tag's line (still a declaration, not the class line).
+    if let Some((doc_start_line, doc_text)) = &docblock {
+        if let Some(rel) = method_tag_offset(doc_text, member) {
+            return Some((file, *doc_start_line + rel, false));
+        }
+    }
+
+    None
+}
+
+/// Find a concrete implementation of `member` by way of the driver classes the
+/// manager instantiates. A Laravel manager builds its drivers with `new …` in
+/// `create*Driver()` methods (`AuthManager` → `new SessionGuard(...)`), so the
+/// `new`-expressions in its source name the concrete types behind the contract.
+/// We chase `member` into each and return the first that resolves to a real
+/// (non-interface) declaration — for `check`, every guard reaches the shared
+/// `GuardHelpers::check`, so the targets collapse to that one body.
+fn manager_concrete_impl(manager_fqcn: &str, member: &str, root: &Path) -> Option<(PathBuf, u32)> {
+    let file = crate::class_locator::find_php_class_file_in_app_or_vendor(manager_fqcn, root)?;
+    let source = std::fs::read_to_string(&file).ok()?;
+    let tree = crate::parser::parse_php(&source).ok()?;
+    let structure = crate::laravel_introspector::walker::extract_php_structure_from_tree(
+        &tree,
+        source.as_bytes(),
+    );
+    let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &source);
+    let namespace = structure.namespace.as_deref();
+    let bytes = source.as_bytes();
+
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "object_creation_expression" {
+            if let Some(raw) = new_class_name(node, bytes) {
+                let fqcn = qualify_doc_type(&raw, &aliases, namespace);
+                if seen.insert(fqcn.clone(), ()).is_none() {
+                    // Only accept a real (non-interface) declaration.
+                    if let Some((f, l, false)) = facade_method_decl_inner(&fqcn, member, root, 0) {
+                        return Some((f, l));
+                    }
+                }
+            }
+        }
+        // Push children reversed so the LIFO stack yields document (pre-)order —
+        // a deterministic goto that prefers the first-declared driver.
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    None
+}
+
+/// The class-name text of a `new X(...)` (`object_creation_expression`) — its
+/// `name` / `qualified_name` / `relative_name` child. `None` for anonymous
+/// classes (`new class {…}`).
+fn new_class_name(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    let name = node
+        .named_children(&mut cursor)
+        .find(|c| matches!(c.kind(), "name" | "qualified_name" | "relative_name"))?;
+    name.utf8_text(bytes).ok().map(str::to_string)
+}
+
+/// The `/** … */` block immediately preceding the class declaration starting at
+/// `class_start_line` (0-based). Returns `(first-line index, raw text)`.
+/// Line-based to dodge fragile tree-sitter comment-sibling navigation; skips
+/// blank and `#[attribute]` lines between the docblock and the class.
+fn class_docblock(source: &str, class_start_line: u32) -> Option<(u32, String)> {
+    let lines: Vec<&str> = source.lines().collect();
+    if class_start_line == 0 || class_start_line as usize > lines.len() {
+        return None;
+    }
+    let mut end = class_start_line as i64 - 1;
+    while end >= 0 {
+        let t = lines[end as usize].trim();
+        if t.is_empty() || t.starts_with("#[") {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    if end < 0 || !lines[end as usize].trim_end().ends_with("*/") {
+        return None;
+    }
+    let mut start = end;
+    while start >= 0 && !lines[start as usize].trim_start().starts_with("/**") {
+        start -= 1;
+    }
+    if start < 0 {
+        return None;
+    }
+    let text = lines[start as usize..=end as usize].join("\n");
+    Some((start as u32, text))
+}
+
+/// Values of a docblock tag across all lines, e.g. `@mixin \Foo\Bar` →
+/// `["\Foo\Bar"]`.
+fn doc_tag_values(doc: &str, tag: &str) -> Vec<String> {
+    doc.lines()
+        .filter_map(|line| {
+            let line = line.trim_start().trim_start_matches('*').trim_start();
+            let rest = line.strip_prefix(tag)?;
+            rest.split_whitespace().next().map(str::to_string)
+        })
+        .collect()
+}
+
+/// 0-based line offset within `doc` of the `@method … name(` tag for `member`.
+fn method_tag_offset(doc: &str, member: &str) -> Option<u32> {
+    let needle = format!("{member}(");
+    doc.lines().enumerate().find_map(|(i, line)| {
+        let line = line.trim_start().trim_start_matches('*').trim_start();
+        let rest = line.strip_prefix("@method")?;
+        rest.contains(&needle).then_some(i as u32)
+    })
+}
+
+/// Resolve a docblock type reference to an FQCN: a leading-`\` or imported type
+/// resolves via the file's `use` aliases (which strip the `\`); a still-bare
+/// name is qualified against the file namespace.
+fn qualify_doc_type(raw: &str, aliases: &UseAliases, namespace: Option<&str>) -> String {
+    let resolved = resolve_class_name(raw, aliases);
+    match namespace {
+        Some(ns) if !resolved.contains('\\') => format!("{ns}\\{resolved}"),
+        _ => resolved,
+    }
 }
 
 /// Read the string a facade's `getFacadeAccessor()` returns from source.

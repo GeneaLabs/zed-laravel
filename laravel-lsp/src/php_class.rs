@@ -483,23 +483,80 @@ pub fn extract_class_fqn(path: &std::path::Path) -> Option<String> {
 /// statements that precede the class declaration. Returns the single line
 /// containing the `class` keyword, trimmed.
 ///
-/// Used by the Livewire hover to show the component's class signature so
-/// the reader sees the type at a glance — same vibe as intelephense's
-/// hover showing a class signature line in a `php` code block.
+/// Used by the class/component/Livewire/facade hovers to show the class at a
+/// glance — same vibe as intelephense's hover showing a class signature in a
+/// `php` code block.
 ///
-/// Recognises `final class Foo`, `abstract class Foo`, `readonly class Foo`,
-/// and combinations. Anchored at start-of-line so `class` substrings inside
-/// string literals or comments don't trigger false matches.
+/// Returns the class declaration (`class Foo extends Bar implements Baz`,
+/// including `final`/`abstract`/`readonly` modifiers) and, when the class
+/// composes traits, the leading `use Trait1, Trait2, …;` block that follows it
+/// — wrapped in `{ … }` — so the card shows the traits the class pulls in:
+///
+/// ```text
+/// class User extends Authenticatable implements MustVerifyEmail
+/// {
+///     use HasApiTokens, HasFactory, Notifiable;
+/// }
+/// ```
+///
+/// A class with no in-body trait imports yields just the declaration line.
+/// Tree-sitter-driven so a `class` substring in a string/comment can't trigger
+/// a false match.
 pub fn extract_class_signature(path: &std::path::Path) -> Option<String> {
-    use lazy_static::lazy_static;
-    use regex::Regex;
-    lazy_static! {
-        static ref CLASS_RE: Regex =
-            Regex::new(r"(?m)^\s*(?:(?:final|abstract|readonly)\s+)*class\s+\w+[^{\n]*").unwrap();
-    }
     let content = std::fs::read_to_string(path).ok()?;
-    let m = CLASS_RE.find(&content)?;
-    Some(m.as_str().trim().to_string())
+    let tree = crate::parser::parse_php(&content).ok()?;
+    let class = first_class_node(tree.root_node())?;
+
+    let mut cursor = class.walk();
+    let body = class
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "declaration_list");
+
+    // Header: the declaration up to (but excluding) the body's opening `{`.
+    let header_end = body.map_or(class.end_byte(), |b| b.start_byte());
+    let header = content.get(class.start_byte()..header_end)?.trim();
+
+    // Append the leading trait-`use` block verbatim from source, when present.
+    if let Some(body) = body {
+        if let Some(last_use_end) = leading_trait_use_end(body) {
+            let block = content.get(class.start_byte()..last_use_end)?;
+            return Some(format!("{}\n}}", block.trim_end()));
+        }
+    }
+    Some(header.to_string())
+}
+
+/// First `class_declaration` node anywhere in the tree, in document order.
+fn first_class_node(root: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "class_declaration" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    None
+}
+
+/// End byte of the last LEADING trait `use_declaration` in a class body, or
+/// `None` when the class imports no traits before its first member. Comments
+/// between trait imports don't end the run; the first real member (property /
+/// method / const) does.
+fn leading_trait_use_end(body: tree_sitter::Node) -> Option<usize> {
+    let mut cursor = body.walk();
+    let mut end = None;
+    for child in body.named_children(&mut cursor) {
+        match child.kind() {
+            "use_declaration" => end = Some(child.end_byte()),
+            "comment" => continue,
+            _ => break,
+        }
+    }
+    end
 }
 
 /// Rich information about a property/method declaration extracted from a

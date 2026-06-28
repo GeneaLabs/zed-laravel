@@ -550,6 +550,24 @@ fn extract_class_signature_ignores_class_keyword_in_strings() {
 }
 
 #[test]
+fn extract_class_signature_includes_leading_trait_use_block() {
+    // A class that composes traits renders the declaration PLUS its leading
+    // `use …;` block, wrapped in braces — the rich class card.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("User.php");
+    fs::write(
+        &path,
+        "<?php\nnamespace App\\Models;\n\nuse Illuminate\\Foundation\\Auth\\User as Authenticatable;\n\nclass User extends Authenticatable implements MustVerifyEmail\n{\n    use HasApiTokens, HasFactory, Notifiable;\n\n    protected $fillable = ['name'];\n}\n",
+    )
+    .unwrap();
+    let got = extract_class_signature(&path).expect("should find class");
+    assert_eq!(
+        got,
+        "class User extends Authenticatable implements MustVerifyEmail\n{\n    use HasApiTokens, HasFactory, Notifiable;\n}"
+    );
+}
+
+#[test]
 fn extract_class_signature_returns_none_for_files_without_class() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("helpers.php");
