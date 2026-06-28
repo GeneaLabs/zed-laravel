@@ -369,6 +369,7 @@ fn user_bound_resolver(p: &BladeProject, key: &str) -> crate::member_resolver::S
             key.to_string(),
             "App\\Models\\User".to_string(),
         )])),
+        facade_aliases: Arc::new(crate::facade_resolver::default_facade_aliases()),
     }
 }
 

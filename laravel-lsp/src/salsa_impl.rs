@@ -3682,6 +3682,10 @@ struct ContainerAwareResolver<'a> {
     index: &'a crate::class_hierarchy_index::ClassHierarchyIndex,
     bindings: &'a HashMap<String, BindingRegistrationData>,
     singletons: &'a HashMap<String, BindingRegistrationData>,
+    /// The merged facade alias map (token → facade FQCN), so the live query path
+    /// resolves facade receivers (`Auth::check()`) to their implementation the
+    /// same way the build pass does.
+    facade_aliases: Arc<HashMap<String, String>>,
 }
 
 impl crate::member_resolver::ClassFileResolver for ContainerAwareResolver<'_> {
@@ -3696,6 +3700,9 @@ impl crate::member_resolver::ClassFileResolver for ContainerAwareResolver<'_> {
             .get(key)
             .or_else(|| self.singletons.get(key))
             .map(|b| b.concrete_class.trim_start_matches('\\').to_string())
+    }
+    fn facade_aliases(&self) -> std::borrow::Cow<'_, HashMap<String, String>> {
+        std::borrow::Cow::Borrowed(&self.facade_aliases)
     }
 }
 
@@ -8213,6 +8220,7 @@ impl SalsaActor {
             index: &self.class_hierarchy_index,
             bindings: &self.sp_bindings,
             singletons: &self.sp_singletons,
+            facade_aliases: self.build_facade_alias_snapshot(),
         }
     }
 

@@ -497,6 +497,7 @@ fn snapshot_resolver_answers_class_file_and_binding() {
     let r = SnapshotResolver {
         class_files,
         bindings,
+        facade_aliases: Arc::new(crate::facade_resolver::default_facade_aliases()),
     };
     assert_eq!(
         r.class_file("App\\Models\\Tenant"),
@@ -526,11 +527,160 @@ fn snapshot_resolver_resolves_app_binding_through_engine() {
     let resolver = SnapshotResolver {
         class_files,
         bindings,
+        facade_aliases: Arc::new(crate::facade_resolver::default_facade_aliases()),
     };
     let caller = "<?php $x = app('currentTenant')->logo;";
     let r = resolve_with(&resolver, &p.root, caller, "logo").expect("resolves");
     assert_eq!(r.kind, MagicMemberKind::Accessor);
     assert_eq!(r.declaring_fqcn, "App\\Models\\Tenant");
+}
+
+// ─── Facade receivers: Auth::check() → AuthManager (all three forms) ───────
+//
+// A facade is a thin static proxy whose own class carries only `@method`
+// docblocks. The interception in the `name`/`qualified_name` arm walks the
+// facade to its real implementation — facade FQCN → accessor key → bound
+// concrete — and returns that concrete as the receiver type so the member
+// classifies against the real class. These tests prove the whole chain
+// end-to-end (token → FQCN → accessor → priority-0 vendor binding → concrete →
+// member classification), not merely the seam, for each facade-call form.
+
+/// Laravel's `AuthManager` as it lives in vendor — the concrete the framework's
+/// `auth` container binding resolves to, with a `check()` the facade forwards.
+const AUTH_MANAGER: &str = r#"<?php
+namespace Illuminate\Auth;
+class AuthManager {
+    public function check() { return true; }
+    public function user() { return null; }
+}
+"#;
+
+/// Project with the vendor `AuthManager` indexed, plus a `SnapshotResolver`
+/// binding the framework's `auth` key to it (the priority-0 vendor binding the
+/// `AuthServiceProvider` registers at runtime). `facade_aliases` is the built-in
+/// seed — `Auth` is a default facade, no user config needed.
+fn auth_facade_project() -> (Project, SnapshotResolver) {
+    let p = project(
+        "vendor/laravel/framework/src/Illuminate/Auth/AuthManager.php",
+        AUTH_MANAGER,
+    );
+    let class_files = Arc::new(HashMap::from([(
+        "Illuminate\\Auth\\AuthManager".to_string(),
+        p.index
+            .class_file("Illuminate\\Auth\\AuthManager")
+            .expect("AuthManager indexed"),
+    )]));
+    let bindings = Arc::new(HashMap::from([(
+        "auth".to_string(),
+        "Illuminate\\Auth\\AuthManager".to_string(),
+    )]));
+    let resolver = SnapshotResolver {
+        class_files,
+        bindings,
+        facade_aliases: Arc::new(crate::facade_resolver::default_facade_aliases()),
+    };
+    (p, resolver)
+}
+
+/// Resolve a static call `<scope>::{member}()` in `caller` against `resolver`,
+/// classifying as a `StaticCall`. Mirrors [`resolve_with`] but targets the
+/// `scope` of a `scoped_call_expression` (the facade token) rather than a
+/// `->`-access object.
+fn resolve_static_call(
+    resolver: &impl ClassFileResolver,
+    root: &std::path::Path,
+    caller: &str,
+    member: &str,
+) -> Option<ResolvedMemberAccess> {
+    let tree = parse_php(caller).expect("parse caller");
+    let bytes = caller.as_bytes();
+    let aliases = extract_use_aliases(&tree, caller);
+    // Find the `scoped_call_expression` whose name is `member`, return its scope.
+    let mut stack = vec![tree.root_node()];
+    let mut scope = None;
+    while let Some(n) = stack.pop() {
+        if n.kind() == "scoped_call_expression"
+            && n.child_by_field_name("name")
+                .and_then(|nm| nm.utf8_text(bytes).ok())
+                == Some(member)
+        {
+            scope = n.child_by_field_name("scope");
+            break;
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    let mut cache = ClassViewCache::new();
+    resolve_and_classify(
+        scope?,
+        member,
+        AccessForm::StaticCall,
+        bytes,
+        &aliases,
+        resolver,
+        &mut cache,
+        root,
+        None,
+    )
+}
+
+#[test]
+fn facade_imported_resolves_to_concrete_through_binding() {
+    // Imported / inline form: `use …\Facades\Auth; Auth::check();`. The receiver
+    // resolves into the Facades namespace via the `use`, so it's a facade — we
+    // walk to `AuthManager` (the `auth` binding's concrete) and classify
+    // `check()` against IT, not the empty proxy.
+    let (p, resolver) = auth_facade_project();
+    let caller = r#"<?php
+use Illuminate\Support\Facades\Auth;
+Auth::check();
+"#;
+    let r = resolve_static_call(&resolver, &p.root, caller, "check").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::PlainMember);
+    assert_eq!(r.confidence, Confidence::High);
+    assert_eq!(r.declaring_fqcn, "Illuminate\\Auth\\AuthManager");
+}
+
+#[test]
+fn facade_global_alias_resolves_to_concrete() {
+    // Root-namespace alias form: `\Auth::check()`. No `use` import — PHP's
+    // global `Facade::defaultAliases()` registration makes the leading-`\` token
+    // resolve, and our seed alias maps it to the facade FQCN, then on to the
+    // concrete. Intelephense resolves this nowhere; we own it.
+    let (p, resolver) = auth_facade_project();
+    let caller = "<?php \\Auth::check();";
+    let r = resolve_static_call(&resolver, &p.root, caller, "check").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::PlainMember);
+    assert_eq!(r.declaring_fqcn, "Illuminate\\Auth\\AuthManager");
+}
+
+#[test]
+fn facade_inline_fully_qualified_resolves_to_concrete() {
+    // Inline fully-qualified form: `\Illuminate\Support\Facades\Auth::check()`
+    // with no `use`. The written-out path lands directly in the Facades
+    // namespace, so it's recognized as a facade and walked to the concrete.
+    let (p, resolver) = auth_facade_project();
+    let caller = "<?php \\Illuminate\\Support\\Facades\\Auth::check();";
+    let r = resolve_static_call(&resolver, &p.root, caller, "check").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::PlainMember);
+    assert_eq!(r.declaring_fqcn, "Illuminate\\Auth\\AuthManager");
+}
+
+#[test]
+fn facade_bare_token_in_namespaced_file_without_import_does_not_resolve() {
+    // Bare `Auth::check()` inside a namespaced file with NO facade import: PHP's
+    // class-name rule resolves `Auth` against the CURRENT namespace
+    // (`App\Http\Auth`), not the global facade alias. We must not emit a wrong
+    // goto — resolution drops to None (the would-be `App\Http\Auth` isn't a
+    // facade and isn't indexed).
+    let (p, resolver) = auth_facade_project();
+    let caller = r#"<?php
+namespace App\Http;
+Auth::check();
+"#;
+    assert!(resolve_static_call(&resolver, &p.root, caller, "check").is_none());
 }
 
 #[test]

@@ -3071,6 +3071,10 @@ async fn build_magic_member_entries(
     // Container-binding snapshot, paired with `class_files` in a `SnapshotResolver`
     // so `app('key')->member` accesses resolve to the bound model during the build.
     let bindings = salsa.snapshot_bindings().await.unwrap_or_default();
+    // Facade alias snapshot, also fed into the `SnapshotResolver` so facade
+    // receivers (`Auth::check()`) resolve to their bound implementation during
+    // the build exactly as they do on the live query path.
+    let facade_aliases = salsa.snapshot_facade_aliases().await.unwrap_or_default();
     let root = root.to_path_buf();
 
     // ── Pass 1: build the view-variable index ────────────────────────────
@@ -3157,6 +3161,7 @@ async fn build_magic_member_entries(
         let permit_owner = magic_sem.clone();
         let class_files = class_files.clone();
         let bindings = bindings.clone();
+        let facade_aliases = facade_aliases.clone();
         let root = root.clone();
         magic_handles.push(tokio::spawn(async move {
             let _permit = permit_owner.acquire_owned().await.ok()?;
@@ -3167,6 +3172,7 @@ async fn build_magic_member_entries(
                 let resolver = laravel_lsp::member_resolver::SnapshotResolver {
                     class_files,
                     bindings,
+                    facade_aliases,
                 };
                 let mut entries = laravel_lsp::member_resolver::resolve_member_access_entries(
                     &source,
@@ -3237,6 +3243,7 @@ async fn build_magic_member_entries(
             let permit_owner = blade_sem.clone();
             let class_files = class_files.clone();
             let bindings = bindings.clone();
+            let facade_aliases = facade_aliases.clone();
             let view_var_index = view_var_index.clone();
             let view_paths = view_paths.clone();
             let root = root.clone();
@@ -3249,6 +3256,7 @@ async fn build_magic_member_entries(
                     let resolver = laravel_lsp::member_resolver::SnapshotResolver {
                         class_files,
                         bindings,
+                        facade_aliases,
                     };
                     // A Volt component (own front-matter, or an MFC template
                     // referencing `$this->`) needs the file source — for property
@@ -6132,9 +6140,15 @@ impl LaravelLanguageServer {
         // the early returns and before any view-var read guard — so the await is
         // safe.
         let bindings = self.salsa.snapshot_bindings().await.unwrap_or_default();
+        let facade_aliases = self
+            .salsa
+            .snapshot_facade_aliases()
+            .await
+            .unwrap_or_default();
         let resolver = laravel_lsp::member_resolver::SnapshotResolver {
             class_files: class_files.clone(),
             bindings,
+            facade_aliases,
         };
         let mut entries = if is_volt {
             let prop_types = laravel_lsp::view_var_index::volt_property_types(

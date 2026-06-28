@@ -1004,6 +1004,7 @@ fn container_aware_resolver_prefers_bindings_and_normalizes() {
         index: &index,
         bindings: &bindings,
         singletons: &singletons,
+        facade_aliases: std::sync::Arc::new(crate::facade_resolver::default_facade_aliases()),
     };
 
     // Singleton-only key resolves; leading backslash normalized.

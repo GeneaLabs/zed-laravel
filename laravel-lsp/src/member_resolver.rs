@@ -50,6 +50,26 @@ pub trait ClassFileResolver {
     fn binding_concrete(&self, _key: &str) -> Option<String> {
         None
     }
+
+    /// The facade alias map — token (`Auth`) → facade FQCN
+    /// (`Illuminate\Support\Facades\Auth`) — for resolving a facade static-call
+    /// receiver to its real implementation.
+    ///
+    /// Defaulted to the built-in [`default_facade_aliases`] seed so implementors
+    /// that don't model user aliases (the bare class index, test stubs) resolve
+    /// the framework facades with no changes. The binding-aware resolvers on the
+    /// salsa and main sides override it with the merged map (seed +
+    /// `config/app.php` `aliases` + `bootstrap/app.php` `withAliases`), so a user
+    /// alias for an existing token wins and new tokens are seen. Rides the
+    /// resolver exactly as [`binding_concrete`](Self::binding_concrete) does — no
+    /// extra argument threaded through the receiver-resolution call graph.
+    ///
+    /// Returns a [`Cow`] so the default yields an owned seed while overrides
+    /// borrow their cached `Arc`-shared map without cloning the dozens of entries
+    /// on every receiver resolution.
+    fn facade_aliases(&self) -> std::borrow::Cow<'_, HashMap<String, String>> {
+        std::borrow::Cow::Owned(crate::facade_resolver::default_facade_aliases())
+    }
 }
 
 impl ClassFileResolver for ClassHierarchyIndex {
@@ -73,6 +93,10 @@ impl ClassFileResolver for HashMap<String, PathBuf> {
 pub struct SnapshotResolver {
     pub class_files: Arc<HashMap<String, PathBuf>>,
     pub bindings: Arc<HashMap<String, String>>,
+    /// The merged facade alias map (token → facade FQCN), snapshotted from the
+    /// actor alongside `bindings` so the build pass resolves facade receivers
+    /// (`Auth::check()`) the same way the live query path does.
+    pub facade_aliases: Arc<HashMap<String, String>>,
 }
 
 impl ClassFileResolver for SnapshotResolver {
@@ -81,6 +105,9 @@ impl ClassFileResolver for SnapshotResolver {
     }
     fn binding_concrete(&self, key: &str) -> Option<String> {
         self.bindings.get(key).cloned()
+    }
+    fn facade_aliases(&self) -> std::borrow::Cow<'_, HashMap<String, String>> {
+        std::borrow::Cow::Borrowed(&self.facade_aliases)
     }
 }
 
@@ -718,6 +745,33 @@ fn resolve_receiver(
         // unresolved rather than guessed.
         "name" | "qualified_name" => {
             let raw = receiver.utf8_text(bytes).ok()?;
+
+            // Facade interception, checked first: `Auth::check()`,
+            // `\Auth::check()`, `\Illuminate\Support\Facades\Auth::check()`. A
+            // facade is a thin static proxy — its own class only carries
+            // `@method` docblocks, not the real members — so when the receiver
+            // resolves to a facade we walk to the concrete implementation the
+            // calls forward to (facade FQCN → accessor key → bound concrete) and
+            // return THAT as the receiver type, so the member classifies against
+            // the real class (`Auth::check` → `AuthManager`). This runs before
+            // the plain class-index lookup below: the facade class itself may be
+            // indexed (vendor), and resolving to it would classify against the
+            // empty proxy instead of the implementation.
+            let is_namespaced = file_namespace(receiver, bytes).is_some();
+            if let Some(facade_fqcn) = crate::facade_resolver::resolve_facade_fqcn(
+                raw,
+                aliases,
+                &resolver.facade_aliases(),
+                is_namespaced,
+            ) {
+                if let Some(concrete) =
+                    crate::facade_resolver::facade_accessor(&facade_fqcn, project_root)
+                        .and_then(|accessor| resolver.binding_concrete(&accessor))
+                {
+                    return Some((concrete, Confidence::High));
+                }
+            }
+
             let fqcn = qualify_fqcn(resolve_class_name(raw, aliases), receiver, bytes);
             if resolver.class_file(&fqcn).is_some() {
                 Some((fqcn, Confidence::High))
