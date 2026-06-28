@@ -36,6 +36,7 @@ pub mod config_lookup;
 pub mod database;
 pub mod document_symbols;
 pub mod env_key_locator;
+pub mod facade_resolver;
 pub mod file_watcher;
 pub mod folio_discovery;
 pub mod hover;
