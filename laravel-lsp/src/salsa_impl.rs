@@ -4054,6 +4054,9 @@ impl crate::member_resolver::ClassFileResolver for ContainerAwareResolver<'_> {
     fn has_macro_host(&self, receiver_fqcn: &str) -> bool {
         self.macros.keys().any(|(host, _)| host == receiver_fqcn)
     }
+    fn implementers_of(&self, interface_fqcn: &str) -> Vec<String> {
+        self.index.implementers_of(interface_fqcn).to_vec()
+    }
 }
 
 /// Environment variable data for transfer across async boundaries
@@ -4683,6 +4686,14 @@ pub enum SalsaRequest {
     /// it does on the live query path. Mirrors [`Self::SnapshotBindings`].
     SnapshotMacros {
         reply: oneshot::Sender<Arc<std::collections::HashMap<(String, String), (PathBuf, u32)>>>,
+    },
+    /// Snapshot the interface→implementors reverse map — `interface FQCN` →
+    /// directly implementing class FQCNs — for the same out-of-actor build, so a
+    /// contract-returning helper / method-return chain (`view()->make()->
+    /// render()`) resolves to the concrete implementor while indexing exactly as
+    /// it does on the live query path. Mirrors [`Self::SnapshotBindings`].
+    SnapshotImplementers {
+        reply: oneshot::Sender<Arc<std::collections::HashMap<String, Vec<String>>>>,
     },
     /// Snapshot every indexed class grouped by file, so warming can persist
     /// the hierarchy to the disk cache.
@@ -5390,6 +5401,22 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::SnapshotMacros { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Snapshot the interface→implementors reverse map — `interface FQCN` →
+    /// directly implementing class FQCNs — for the out-of-actor magic-member
+    /// build. Mirrors [`Self::snapshot_bindings`].
+    pub async fn snapshot_implementers(
+        &self,
+    ) -> Result<Arc<std::collections::HashMap<String, Vec<String>>>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SnapshotImplementers { reply: reply_tx })
             .await
             .map_err(|_| "Salsa actor disconnected")?;
         reply_rx
@@ -6631,6 +6658,14 @@ impl SalsaActor {
                         map.insert(key.clone(), (data.decl_file.clone(), data.decl_line));
                     }
                     let _ = reply.send(Arc::new(map));
+                }
+                SalsaRequest::SnapshotImplementers { reply } => {
+                    // A cheap clone of the interface→implementors reverse map the
+                    // build-pass resolver consults for contract→concrete chains;
+                    // it changes only when a class's `implements` clause changes,
+                    // so building fresh each call is fine (it numbers in the
+                    // hundreds, not the tens of thousands).
+                    let _ = reply.send(Arc::new(self.class_hierarchy_index.implementers_map()));
                 }
                 SalsaRequest::SnapshotHierarchyNodes { reply } => {
                     let _ = reply.send(self.class_hierarchy_index.nodes_by_file());
@@ -8433,7 +8468,10 @@ impl SalsaActor {
                             &member_ref.member,
                             &project_root,
                         ) {
-                            Some((f, l)) => (Some(f), Some(l), None),
+                            // Chased to the real declaration — carry its end line
+                            // so the hover slices the full method (signature +
+                            // docblock + body), matching Intelephense's depth.
+                            Some((f, start, end)) => (Some(f), Some(start), Some(end)),
                             None => (Some(node.file_path.clone()), Some(node.start_line), None),
                         }
                     } else {
@@ -8448,7 +8486,9 @@ impl SalsaActor {
                         &member_ref.member,
                         &project_root,
                     )
-                    .map(|(f, l)| (Some(f), Some(l), None))
+                    // Carry the end line through the vendor-not-in-index branch
+                    // too, so its hover gets the same full-declaration snippet.
+                    .map(|(f, start, end)| (Some(f), Some(start), Some(end)))
                     .unwrap_or((None, None, None))
                 }
                 None => (None, None, None),

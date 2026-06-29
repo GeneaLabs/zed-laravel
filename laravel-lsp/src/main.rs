@@ -3079,6 +3079,11 @@ async fn build_magic_member_entries(
     // registered macro/mixin member (`Str::uuid7()`) classifies during the build
     // exactly as it does on the live query path.
     let macros = salsa.snapshot_macros().await.unwrap_or_default();
+    // Interface→implementors snapshot, fed into the `SnapshotResolver` so a
+    // contract-returning helper / method-return chain (`view()->make()->render()`)
+    // resolves to its concrete implementor during the build exactly as it does on
+    // the live query path.
+    let implementers = salsa.snapshot_implementers().await.unwrap_or_default();
     let root = root.to_path_buf();
 
     // ── Pass 1: build the view-variable index ────────────────────────────
@@ -3167,6 +3172,7 @@ async fn build_magic_member_entries(
         let bindings = bindings.clone();
         let facade_aliases = facade_aliases.clone();
         let macros = macros.clone();
+        let implementers = implementers.clone();
         let root = root.clone();
         magic_handles.push(tokio::spawn(async move {
             let _permit = permit_owner.acquire_owned().await.ok()?;
@@ -3179,6 +3185,7 @@ async fn build_magic_member_entries(
                     bindings,
                     facade_aliases,
                     macros,
+                    implementers,
                 };
                 let mut entries = laravel_lsp::member_resolver::resolve_member_access_entries(
                     &source,
@@ -3251,6 +3258,7 @@ async fn build_magic_member_entries(
             let bindings = bindings.clone();
             let facade_aliases = facade_aliases.clone();
             let macros = macros.clone();
+            let implementers = implementers.clone();
             let view_var_index = view_var_index.clone();
             let view_paths = view_paths.clone();
             let root = root.clone();
@@ -3265,6 +3273,7 @@ async fn build_magic_member_entries(
                         bindings,
                         facade_aliases,
                         macros,
+                        implementers,
                     };
                     // A Volt component (own front-matter, or an MFC template
                     // referencing `$this->`) needs the file source — for property
@@ -6154,11 +6163,13 @@ impl LaravelLanguageServer {
             .await
             .unwrap_or_default();
         let macros = self.salsa.snapshot_macros().await.unwrap_or_default();
+        let implementers = self.salsa.snapshot_implementers().await.unwrap_or_default();
         let resolver = laravel_lsp::member_resolver::SnapshotResolver {
             class_files: class_files.clone(),
             bindings,
             facade_aliases,
             macros,
+            implementers,
         };
         let mut entries = if is_volt {
             let prop_types = laravel_lsp::view_var_index::volt_property_types(
@@ -17644,14 +17655,36 @@ return [
             Ok(Some(d)) => d,
             _ => return String::new(),
         };
-        // Method-backed member (relationship / scope / accessor): read the
-        // declaring file (usually a different file — the model) off the async
-        // side and slice its source for the hover snippet.
+        // Method-backed member (relationship / scope / accessor / facade method):
+        // read the declaring file (usually a different file — the model, or a
+        // vendor class) off the async side and slice its source for the hover
+        // snippet — a docblock-free signature+body slice for every kind.
+        //
+        // For a FacadeMethod we additionally mine the declaration's leading
+        // PHPDoc (a tree-sitter sibling sitting just above the signature):
+        // its summary becomes the card's description line, and its `@return`
+        // type is folded into the signature when source has no native return
+        // type. The docblock never enters the code block itself.
+        let is_facade = matches!(
+            data.kind,
+            laravel_lsp::salsa_impl::MagicMemberKind::FacadeMethod
+        );
+        let mut facade_description: Option<String> = None;
         let definition = match (&data.decl_file, data.decl_line, data.decl_end_line) {
             (Some(f), Some(start), Some(end)) => tokio::fs::read_to_string(f)
                 .await
                 .ok()
-                .map(|src| hover::extract_member_snippet(&src, start, end))
+                .map(|src| {
+                    let snippet = hover::extract_member_snippet(&src, start, end);
+                    if is_facade {
+                        let docblock = hover::extract_leading_docblock(&src, start);
+                        facade_description = docblock.as_deref().and_then(hover::docblock_summary);
+                        let return_type = docblock.as_deref().and_then(hover::docblock_return_type);
+                        hover::fold_return_type(&snippet, return_type.as_deref())
+                    } else {
+                        snippet
+                    }
+                })
                 .filter(|s| !s.is_empty()),
             _ => None,
         };
@@ -17703,6 +17736,7 @@ return [
             data.confidence,
             definition.as_deref(),
             type_hint.as_deref(),
+            facade_description.as_deref(),
             link.as_deref(),
         )
     }

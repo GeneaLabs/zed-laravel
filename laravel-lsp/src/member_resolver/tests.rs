@@ -499,6 +499,7 @@ fn snapshot_resolver_answers_class_file_and_binding() {
         bindings,
         facade_aliases: Arc::new(crate::facade_resolver::default_facade_aliases()),
         macros: Default::default(),
+        implementers: Default::default(),
     };
     assert_eq!(
         r.class_file("App\\Models\\Tenant"),
@@ -530,6 +531,7 @@ fn snapshot_resolver_resolves_app_binding_through_engine() {
         bindings,
         facade_aliases: Arc::new(crate::facade_resolver::default_facade_aliases()),
         macros: Default::default(),
+        implementers: Default::default(),
     };
     let caller = "<?php $x = app('currentTenant')->logo;";
     let r = resolve_with(&resolver, &p.root, caller, "logo").expect("resolves");
@@ -581,6 +583,7 @@ fn auth_facade_project() -> (Project, SnapshotResolver) {
         bindings,
         facade_aliases: Arc::new(crate::facade_resolver::default_facade_aliases()),
         macros: Default::default(),
+        implementers: Default::default(),
     };
     (p, resolver)
 }
@@ -708,6 +711,351 @@ Auth::guard();
     assert_eq!(r.confidence, Confidence::High);
 }
 
+// ─── Helper-chain receivers: view()->make(), cache()->get() (#253) ────────
+//
+// A zero-arg Laravel helper (`view()`, `cache()`, `session()`, …) returns a
+// container service. `resolve_helper_receiver` maps the helper name to the
+// SAME container binding key its facade proxies, resolves it to the concrete
+// FQCN through the binding registry, and (mirroring the facade path) tags the
+// chained method `FacadeMethod` so goto/hover chase the real declaration. These
+// tests mirror the `app('key')` / facade tests "one indirection over".
+
+/// Vendor `Illuminate\View\Factory`, the concrete the `view` binding resolves
+/// to. `make()` returns the `View` *contract* (the real Laravel shape), so the
+/// second hop must fall through the implementors scan to the concrete `View`.
+const VIEW_FACTORY: &str = r#"<?php
+namespace Illuminate\View;
+use Illuminate\Contracts\View\View as ViewContract;
+class Factory {
+    public function make($view): ViewContract { }
+    public function exists($view): bool { return true; }
+}
+"#;
+
+/// The `View` contract `Factory::make()` declares as its return type.
+const VIEW_CONTRACT: &str = r#"<?php
+namespace Illuminate\Contracts\View;
+interface View {
+    public function render(): string;
+}
+"#;
+
+/// The concrete `Illuminate\View\View` implementing the contract — the
+/// implementors scan's target for `make()->render()`.
+const VIEW_CONCRETE: &str = r#"<?php
+namespace Illuminate\View;
+use Illuminate\Contracts\View\View as ViewContract;
+class View implements ViewContract {
+    public function render(): string { return ''; }
+}
+"#;
+
+/// A multi-file project: writes each `(rel_path, src)` and indexes it.
+struct MultiProject {
+    _dir: TempDir,
+    index: ClassHierarchyIndex,
+    root: PathBuf,
+}
+
+fn multi_project(files: &[(&str, &str)]) -> MultiProject {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(
+        root.join("composer.json"),
+        r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#,
+    )
+    .unwrap();
+    let mut index = ClassHierarchyIndex::default();
+    for (rel, src) in files {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, src).unwrap();
+        index.insert_file(&path, classes_in_file(&path, src));
+    }
+    MultiProject {
+        _dir: dir,
+        index,
+        root,
+    }
+}
+
+/// A resolver pairing a multi-file index with a binding map — the helper-chain
+/// analogue of `WithBindings`, also wiring `implementers_of` through to the
+/// index so contract→concrete resolution works.
+struct WithBindingsMulti<'a> {
+    index: &'a ClassHierarchyIndex,
+    bindings: HashMap<String, String>,
+}
+
+impl ClassFileResolver for WithBindingsMulti<'_> {
+    fn class_file(&self, fqcn: &str) -> Option<PathBuf> {
+        self.index.class_file(fqcn)
+    }
+    fn binding_concrete(&self, key: &str) -> Option<String> {
+        self.bindings.get(key).cloned()
+    }
+    fn implementers_of(&self, interface_fqcn: &str) -> Vec<String> {
+        ClassHierarchyIndex::implementers_of(self.index, interface_fqcn).to_vec()
+    }
+}
+
+/// Find the receiver (object) node of the first call-form `…->{member}(...)`.
+fn call_receiver_of<'t>(
+    tree: &'t tree_sitter::Tree,
+    bytes: &[u8],
+    member: &str,
+) -> Option<tree_sitter::Node<'t>> {
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if matches!(
+            n.kind(),
+            "member_call_expression" | "nullsafe_member_call_expression"
+        ) {
+            if let Some(name) = n.child_by_field_name("name") {
+                if name.utf8_text(bytes).ok() == Some(member) {
+                    return n.child_by_field_name("object");
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    None
+}
+
+/// Resolve a call-form `…->{member}()` in `caller` against `resolver`.
+fn resolve_call_member(
+    resolver: &impl ClassFileResolver,
+    root: &std::path::Path,
+    caller: &str,
+    member: &str,
+) -> Option<ResolvedMemberAccess> {
+    let tree = parse_php(caller).expect("parse caller");
+    let bytes = caller.as_bytes();
+    let aliases = extract_use_aliases(&tree, caller);
+    let receiver = call_receiver_of(&tree, bytes, member)?;
+    let mut cache = ClassViewCache::new();
+    resolve_and_classify(
+        receiver,
+        member,
+        AccessForm::InstanceCall,
+        bytes,
+        &aliases,
+        resolver,
+        &mut cache,
+        root,
+        None,
+    )
+}
+
+#[test]
+fn helper_view_make_resolves_to_concrete_factory() {
+    // `view()->make(...)` — `make` is declared on the concrete `Factory` the
+    // `view` binding resolves to. The helper resolves the receiver to that
+    // concrete, and `make` classifies as a `FacadeMethod` pointing at it.
+    let p = multi_project(&[(
+        "vendor/laravel/framework/src/Illuminate/View/Factory.php",
+        VIEW_FACTORY,
+    )]);
+    let resolver = WithBindingsMulti {
+        index: &p.index,
+        bindings: HashMap::from([("view".to_string(), "Illuminate\\View\\Factory".to_string())]),
+    };
+    let caller = "<?php view()->make('welcome');";
+    let r = resolve_call_member(&resolver, &p.root, caller, "make").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::FacadeMethod);
+    assert_eq!(r.declaring_fqcn, "Illuminate\\View\\Factory");
+    assert_eq!(r.confidence, Confidence::High);
+}
+
+#[test]
+fn helper_cache_get_resolves_to_concrete() {
+    // `cache()->get(...)` resolves through the `cache` binding to its concrete.
+    const CACHE_REPO: &str = r#"<?php
+namespace Illuminate\Cache;
+class Repository {
+    public function get($key) { return null; }
+}
+"#;
+    let p = multi_project(&[(
+        "vendor/laravel/framework/src/Illuminate/Cache/Repository.php",
+        CACHE_REPO,
+    )]);
+    let resolver = WithBindingsMulti {
+        index: &p.index,
+        bindings: HashMap::from([(
+            "cache".to_string(),
+            "Illuminate\\Cache\\Repository".to_string(),
+        )]),
+    };
+    let caller = "<?php cache()->get('k');";
+    let r = resolve_call_member(&resolver, &p.root, caller, "get").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::FacadeMethod);
+    assert_eq!(r.declaring_fqcn, "Illuminate\\Cache\\Repository");
+}
+
+#[test]
+fn helper_session_put_resolves_to_concrete() {
+    const SESSION_STORE: &str = r#"<?php
+namespace Illuminate\Session;
+class Store {
+    public function put($key, $value) { }
+}
+"#;
+    let p = multi_project(&[(
+        "vendor/laravel/framework/src/Illuminate/Session/Store.php",
+        SESSION_STORE,
+    )]);
+    let resolver = WithBindingsMulti {
+        index: &p.index,
+        bindings: HashMap::from([(
+            "session".to_string(),
+            "Illuminate\\Session\\Store".to_string(),
+        )]),
+    };
+    let caller = "<?php session()->put('k', 1);";
+    let r = resolve_call_member(&resolver, &p.root, caller, "put").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::FacadeMethod);
+    assert_eq!(r.declaring_fqcn, "Illuminate\\Session\\Store");
+}
+
+#[test]
+fn unmapped_helper_does_not_resolve() {
+    // A function that isn't a modeled helper falls through cleanly — no false
+    // target, no panic.
+    let p = multi_project(&[(
+        "vendor/laravel/framework/src/Illuminate/View/Factory.php",
+        VIEW_FACTORY,
+    )]);
+    let resolver = WithBindingsMulti {
+        index: &p.index,
+        bindings: HashMap::from([("view".to_string(), "Illuminate\\View\\Factory".to_string())]),
+    };
+    let caller = "<?php totallyNotAHelper()->make('x');";
+    assert!(resolve_call_member(&resolver, &p.root, caller, "make").is_none());
+}
+
+#[test]
+fn mapped_helper_with_no_concrete_returns_none() {
+    // `view` is a modeled helper, but with no binding registered its key has no
+    // concrete — resolution drops to None rather than a phantom target.
+    let p = multi_project(&[(
+        "vendor/laravel/framework/src/Illuminate/View/Factory.php",
+        VIEW_FACTORY,
+    )]);
+    let resolver = WithBindingsMulti {
+        index: &p.index,
+        bindings: HashMap::new(),
+    };
+    let caller = "<?php view()->make('x');";
+    assert!(resolve_call_member(&resolver, &p.root, caller, "make").is_none());
+}
+
+#[test]
+fn helper_auth_check_resolves_through_helper_map() {
+    // `auth()->check()` (a non-`user()` chain) resolves through the `auth`
+    // binding, NOT the special-cased user-model exit `auth()->user()` takes.
+    const AUTH_MGR: &str = r#"<?php
+namespace Illuminate\Auth;
+class AuthManager {
+    public function check() { return true; }
+}
+"#;
+    let p = multi_project(&[(
+        "vendor/laravel/framework/src/Illuminate/Auth/AuthManager.php",
+        AUTH_MGR,
+    )]);
+    let resolver = WithBindingsMulti {
+        index: &p.index,
+        bindings: HashMap::from([(
+            "auth".to_string(),
+            "Illuminate\\Auth\\AuthManager".to_string(),
+        )]),
+    };
+    let caller = "<?php auth()->check();";
+    let r = resolve_call_member(&resolver, &p.root, caller, "check").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::FacadeMethod);
+    assert_eq!(r.declaring_fqcn, "Illuminate\\Auth\\AuthManager");
+}
+
+// ─── Part B: deep chains + contract→concrete (resolve_method_return) ───────
+
+#[test]
+fn method_return_surfaces_concrete_for_second_hop() {
+    // `view()->make()->render()` — TWO hops. `make()` returns the `View`
+    // contract; the implementors scan lands the receiver of `render` on the
+    // concrete `Illuminate\View\View`, where `render` is declared.
+    let p = multi_project(&[
+        (
+            "vendor/laravel/framework/src/Illuminate/View/Factory.php",
+            VIEW_FACTORY,
+        ),
+        (
+            "vendor/laravel/framework/src/Illuminate/Contracts/View/View.php",
+            VIEW_CONTRACT,
+        ),
+        (
+            "vendor/laravel/framework/src/Illuminate/View/View.php",
+            VIEW_CONCRETE,
+        ),
+    ]);
+    let resolver = WithBindingsMulti {
+        index: &p.index,
+        bindings: HashMap::from([("view".to_string(), "Illuminate\\View\\Factory".to_string())]),
+    };
+    let caller = "<?php view()->make('welcome')->render();";
+    let r = resolve_call_member(&resolver, &p.root, caller, "render").expect("resolves");
+    // `render` IS declared on the concrete `View`, so it classifies as a plain
+    // member pointing at THAT declaration — the AC's "lands on concrete
+    // `Illuminate\View\View::render()`, not the contract" is the declaring_fqcn.
+    assert_eq!(r.declaring_fqcn, "Illuminate\\View\\View");
+    assert_eq!(r.kind, MagicMemberKind::PlainMember);
+}
+
+#[test]
+fn interface_return_with_single_implementer_resolves_to_concrete() {
+    // A method declaring a concrete (non-contract) return type surfaces it
+    // directly: `Factory::exists()` returns `bool` (no class) → None, but a
+    // method returning an indexed concrete resolves. Here we prove the
+    // implementors-scan branch: a contract with exactly one implementer.
+    let p = multi_project(&[
+        (
+            "vendor/laravel/framework/src/Illuminate/Contracts/View/View.php",
+            VIEW_CONTRACT,
+        ),
+        (
+            "vendor/laravel/framework/src/Illuminate/View/View.php",
+            VIEW_CONCRETE,
+        ),
+    ]);
+    let resolver = WithBindingsMulti {
+        index: &p.index,
+        bindings: HashMap::new(),
+    };
+    assert_eq!(
+        resolver.implementers_of("Illuminate\\Contracts\\View\\View"),
+        vec!["Illuminate\\View\\View".to_string()]
+    );
+}
+
+#[test]
+fn deep_chain_unresolvable_return_yields_none() {
+    // `view()->exists()->whatever()` — `exists` returns `bool`, not a class, so
+    // the second-hop receiver can't be typed: None, no crash, no false target.
+    let p = multi_project(&[(
+        "vendor/laravel/framework/src/Illuminate/View/Factory.php",
+        VIEW_FACTORY,
+    )]);
+    let resolver = WithBindingsMulti {
+        index: &p.index,
+        bindings: HashMap::from([("view".to_string(), "Illuminate\\View\\Factory".to_string())]),
+    };
+    let caller = "<?php view()->exists('x')->whatever();";
+    assert!(resolve_call_member(&resolver, &p.root, caller, "whatever").is_none());
+}
+
 // ─── Macro receivers: Str::macro('foo', …) classification (commit 1) ──────
 //
 // A runtime-registered macro on a Macroable host (the dominant host being the
@@ -730,6 +1078,7 @@ fn macros_resolver(host: &str, name: &str, decl: (PathBuf, u32)) -> SnapshotReso
             (host.to_string(), name.to_string()),
             decl,
         )])),
+        implementers: Default::default(),
     }
 }
 
@@ -1235,9 +1584,11 @@ class C {
 }
 
 #[test]
-fn explicit_class_return_type_is_not_resolved() {
-    // Out of scope: an arbitrary class return type is written in the
-    // declaring file's namespace, which the caller context can't re-qualify.
+fn explicit_class_return_type_surfaces_concrete() {
+    // #253 Part B: a concrete class return type IS surfaced now. The return
+    // type is written in the DECLARING file's namespace (`App\Models`), so
+    // `makeProfile(): Profile` re-qualifies to `App\Models\Profile`, and the
+    // second-hop `->bio` classifies as a column on it.
     let user = r#"<?php
 namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
@@ -1258,7 +1609,9 @@ class C {
     }
 }
 "#;
-    assert!(resolve_in(&p, caller, "bio").is_none());
+    let r = resolve_in(&p, caller, "bio").expect("concrete return type resolves");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\Profile");
 }
 
 #[test]

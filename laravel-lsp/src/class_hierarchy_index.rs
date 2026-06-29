@@ -299,6 +299,15 @@ impl ClassHierarchyIndex {
         map
     }
 
+    /// A cheap owned clone of the whole interface→implementors reverse map.
+    /// The out-of-actor magic build (M4) can't borrow the actor-owned index, so
+    /// it snapshots this to drive contract→concrete resolution for helper /
+    /// method-return chains the same way the live query path does — mirrors
+    /// [`Self::fqcn_file_map`].
+    pub fn implementers_map(&self) -> std::collections::HashMap<String, Vec<String>> {
+        self.implementers.clone()
+    }
+
     /// Classes that directly implement `fqcn` (an interface).
     pub fn implementers_of(&self, fqcn: &str) -> &[String] {
         self.implementers

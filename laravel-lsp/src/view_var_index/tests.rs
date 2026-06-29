@@ -371,6 +371,7 @@ fn user_bound_resolver(p: &BladeProject, key: &str) -> crate::member_resolver::S
         )])),
         facade_aliases: Arc::new(crate::facade_resolver::default_facade_aliases()),
         macros: Default::default(),
+        implementers: Default::default(),
     }
 }
 

@@ -3970,6 +3970,13 @@ async fn assert_facade_method_resolves(caller_body: &str, member: &str) -> Magic
         data.decl_file.is_some() && data.decl_line.is_some(),
         "facade goto must have a decl site, got {data:?}"
     );
+    // The chased declaration carries an end line so the hover can slice the full
+    // method (signature + body) for its rich source snippet — never `None` for a
+    // method that was actually located.
+    assert!(
+        data.decl_end_line.is_some(),
+        "facade method decl must carry an end line for the hover snippet, got {data:?}"
+    );
     data
 }
 
@@ -4113,6 +4120,315 @@ async fn facade_e2e_undeclared_method_degrades_to_class_never_none() {
     // still a real target.
     assert!(data.decl_file.is_some());
     assert_eq!(data.decl_line, Some(2));
+}
+
+// ─── Rich FacadeMethod hover card (description summary + typed signature) ────
+//
+// The decl site a facade method resolves to must carry an END line. From the
+// declaring file we build the two enriched card pieces the way `main.rs` does:
+// the leading PHPDoc summary becomes the card's DESCRIPTION line, and the code
+// block is the docblock-free signature+body with the `@return` type folded into
+// the signature (the `AuthManager::check()` fixture has only `@return bool`, no
+// native return type, so the fold is exercised). Covered for BOTH the static-
+// facade form (`\Auth::check()`) and the helper-chain form (`auth()->check()`),
+// since both tag `FacadeMethod`.
+
+/// `AuthManager` whose `check()` carries a real PHPDoc block — the source the
+/// rich hover snippet is sliced from. Kept separate from `VENDOR_AUTH_MANAGER_SRC`
+/// so the `decl_line == Some(3)` assertions on the lean stub stay valid.
+const VENDOR_AUTH_MANAGER_DOCBLOCK_SRC: &str = r#"<?php
+namespace Illuminate\Auth;
+class AuthManager {
+    /**
+     * Determine if the current user is authenticated.
+     *
+     * @return bool
+     */
+    public function check()
+    {
+        return true;
+    }
+}
+"#;
+
+/// Provider binding `auth → AuthManager` for the docblock variant. Identical
+/// shape to `VENDOR_AUTH_PROVIDER_SRC`; named distinctly for clarity.
+const VENDOR_AUTH_PROVIDER_DOCBLOCK_SRC: &str = VENDOR_AUTH_PROVIDER_SRC;
+
+/// Resolve `member` at its position in `caller_body` against an `AuthManager`
+/// whose `check()` has a docblock, then build the two enriched FacadeMethod card
+/// pieces the production `hover_for_magic_member` does. Returns
+/// `(description, code)`: the docblock summary that feeds the card's description
+/// line, and the docblock-free signature+body code block with the `@return` type
+/// folded into the signature.
+async fn facade_method_rich_snippet(caller_body: &str, member: &str) -> (Option<String>, String) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let manager_path = root.join("vendor/laravel/framework/src/Illuminate/Auth/AuthManager.php");
+    std::fs::create_dir_all(manager_path.parent().unwrap()).unwrap();
+    std::fs::write(&manager_path, VENDOR_AUTH_MANAGER_DOCBLOCK_SRC).unwrap();
+    let provider_path =
+        root.join("vendor/laravel/framework/src/Illuminate/Auth/AuthServiceProvider.php");
+    std::fs::write(&provider_path, VENDOR_AUTH_PROVIDER_DOCBLOCK_SRC).unwrap();
+
+    let caller_src = format!(
+        r#"<?php
+namespace App\Http\Controllers;
+
+class AboutController {{
+    public function show() {{
+        {caller_body}
+    }}
+}}
+"#
+    );
+    let caller_path = root.join("app/Http/Controllers/AboutController.php");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
+    std::fs::write(&caller_path, &caller_src).unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .register_service_provider_source(
+            provider_path,
+            VENDOR_AUTH_PROVIDER_DOCBLOCK_SRC.to_string(),
+            0,
+            root.clone(),
+        )
+        .await
+        .unwrap();
+    register_parsed_bindings_into_registry(&handle).await;
+    handle
+        .update_file(caller_path.clone(), 1, caller_src.clone())
+        .await
+        .unwrap();
+    handle.get_patterns(manager_path).await.unwrap();
+    handle.get_patterns(caller_path.clone()).await.unwrap();
+
+    let (line, col) = position_of(&caller_src, member);
+    let data = handle
+        .resolve_magic_member_at(caller_path, line, col)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("`{caller_body}` must resolve to a facade method, got None"));
+    assert_eq!(data.kind, MagicMemberKind::FacadeMethod);
+
+    let decl_file = data.decl_file.expect("decl file");
+    let start = data.decl_line.expect("decl start line");
+    let end = data
+        .decl_end_line
+        .expect("decl end line must be present for the rich snippet");
+    let src = std::fs::read_to_string(&decl_file).unwrap();
+    let snippet = crate::hover::extract_member_snippet(&src, start, end);
+    let docblock = crate::hover::extract_leading_docblock(&src, start);
+    let description = docblock.as_deref().and_then(crate::hover::docblock_summary);
+    let return_type = docblock
+        .as_deref()
+        .and_then(crate::hover::docblock_return_type);
+    let code = crate::hover::fold_return_type(&snippet, return_type.as_deref());
+    (description, code)
+}
+
+#[tokio::test]
+async fn facade_static_check_hover_card_has_summary_description_and_typed_signature() {
+    // Static facade form: `\Auth::check()`.
+    let (description, code) = facade_method_rich_snippet(r#"\Auth::check();"#, "check").await;
+    // Summary is promoted to the card description — NOT left in the code block.
+    assert_eq!(
+        description.as_deref(),
+        Some("Determine if the current user is authenticated.")
+    );
+    // The code block is docblock-free and carries the folded `@return` type.
+    assert!(!code.contains("/**"), "docblock leaked into code: {code}");
+    assert!(
+        !code.contains("@return"),
+        "@return leaked into code: {code}"
+    );
+    assert!(
+        code.contains("public function check(): bool"),
+        "return type not folded into signature: {code}"
+    );
+    assert!(code.contains("return true;"), "body missing: {code}");
+}
+
+#[tokio::test]
+async fn facade_helper_chain_check_hover_card_has_summary_description_and_typed_signature() {
+    // Helper-chain form: `auth()->check()`. Same `FacadeMethod` tag, same card —
+    // both paths reach the docblocked `AuthManager::check()`.
+    let (description, code) = facade_method_rich_snippet(r#"auth()->check();"#, "check").await;
+    assert_eq!(
+        description.as_deref(),
+        Some("Determine if the current user is authenticated.")
+    );
+    assert!(!code.contains("/**"), "docblock leaked into code: {code}");
+    assert!(
+        !code.contains("@return"),
+        "@return leaked into code: {code}"
+    );
+    assert!(
+        code.contains("public function check(): bool"),
+        "return type not folded into signature: {code}"
+    );
+    assert!(code.contains("return true;"), "body missing: {code}");
+}
+
+// ─── Helper-chain goto/hover end-to-end (#253) ─────────────────────────────
+//
+// The permanent regression test for the helper-chain feature, driving the REAL
+// request path (`resolve_magic_member_at`). Models a Laravel project where the
+// `view` container binding resolves to `Illuminate\View\Factory`, whose
+// `make()` returns the `View` CONTRACT — so a single-hop `view()->make()`
+// classifies as a `FacadeMethod` on the concrete `Factory`, and a two-hop
+// `view()->make()->render()` resolves the second receiver through the
+// contract→concrete implementors scan to `Illuminate\View\View`.
+
+const VENDOR_VIEW_FACTORY_SRC: &str = r#"<?php
+namespace Illuminate\View;
+use Illuminate\Contracts\View\View as ViewContract;
+class Factory {
+    public function make($view): ViewContract { }
+}
+"#;
+
+const VENDOR_VIEW_CONTRACT_SRC: &str = r#"<?php
+namespace Illuminate\Contracts\View;
+interface View {
+    public function render(): string;
+}
+"#;
+
+const VENDOR_VIEW_CONCRETE_SRC: &str = r#"<?php
+namespace Illuminate\View;
+use Illuminate\Contracts\View\View as ViewContract;
+class View implements ViewContract {
+    public function render(): string { return ''; }
+}
+"#;
+
+/// A vendor `ViewServiceProvider` (in `Factory`'s own namespace) binding `view`
+/// via the bare same-namespace arrow-fn `new` — mirrors the FIX #1 shape the
+/// facade e2e uses, so the parsed concrete is `Factory`, not "Closure".
+const VENDOR_VIEW_PROVIDER_SRC: &str = r#"<?php
+namespace Illuminate\View;
+use Illuminate\Support\ServiceProvider;
+class ViewServiceProvider extends ServiceProvider {
+    public function register(): void {
+        $this->app->singleton('view', fn ($app) => new Factory($app));
+    }
+}
+"#;
+
+/// Spawn an actor over a tempdir project with the vendor View Factory / View /
+/// contract + a `view`-binding provider, and a namespaced caller whose body is
+/// `caller_body`. Returns the caller path + source for positioning.
+async fn view_helper_e2e_project(caller_body: &str) -> (TempDir, SalsaHandle, PathBuf, String) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let base = root.join("vendor/laravel/framework/src/Illuminate");
+    let factory_path = base.join("View/Factory.php");
+    std::fs::create_dir_all(factory_path.parent().unwrap()).unwrap();
+    std::fs::write(&factory_path, VENDOR_VIEW_FACTORY_SRC).unwrap();
+    let contract_path = base.join("Contracts/View/View.php");
+    std::fs::create_dir_all(contract_path.parent().unwrap()).unwrap();
+    std::fs::write(&contract_path, VENDOR_VIEW_CONTRACT_SRC).unwrap();
+    let concrete_path = base.join("View/View.php");
+    std::fs::write(&concrete_path, VENDOR_VIEW_CONCRETE_SRC).unwrap();
+    let provider_path = base.join("View/ViewServiceProvider.php");
+    std::fs::write(&provider_path, VENDOR_VIEW_PROVIDER_SRC).unwrap();
+
+    let caller_src = format!(
+        r#"<?php
+namespace App\Http\Controllers;
+
+class PageController {{
+    public function show() {{
+        {caller_body}
+    }}
+}}
+"#
+    );
+    let caller_path = root.join("app/Http/Controllers/PageController.php");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
+    std::fs::write(&caller_path, &caller_src).unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .register_service_provider_source(
+            provider_path,
+            VENDOR_VIEW_PROVIDER_SRC.to_string(),
+            0,
+            root.clone(),
+        )
+        .await
+        .unwrap();
+    register_parsed_bindings_into_registry(&handle).await;
+    handle
+        .update_file(caller_path.clone(), 1, caller_src.clone())
+        .await
+        .unwrap();
+    // Force the vendor parses so Factory / contract / concrete land in the
+    // class-hierarchy index (the consumer needs their file/line + the
+    // interface→implementors edge for the second hop).
+    handle.get_patterns(factory_path).await.unwrap();
+    handle.get_patterns(contract_path).await.unwrap();
+    handle.get_patterns(concrete_path).await.unwrap();
+    handle.get_patterns(caller_path.clone()).await.unwrap();
+    (dir, handle, caller_path, caller_src)
+}
+
+#[tokio::test]
+async fn helper_chain_e2e_view_make_resolves_to_concrete_factory() {
+    // Single hop: `view()->make('welcome')` — cursor on `make`. Routes through
+    // the real request path to the concrete `Factory` the `view` binding
+    // resolves to, classified as a `FacadeMethod` with a non-None decl site.
+    let (_dir, handle, caller_path, caller_src) =
+        view_helper_e2e_project(r#"view()->make('welcome');"#).await;
+    let (line, col) = position_of(&caller_src, "make");
+    let data = handle
+        .resolve_magic_member_at(caller_path, line, col)
+        .await
+        .unwrap()
+        .expect("`view()->make()` must resolve, not None");
+    assert_eq!(data.kind, MagicMemberKind::FacadeMethod);
+    assert_eq!(data.declaring_fqcn, "Illuminate\\View\\Factory");
+    assert!(
+        data.decl_file.is_some() && data.decl_line.is_some(),
+        "goto must have a decl site, got {data:?}"
+    );
+}
+
+#[tokio::test]
+async fn helper_chain_e2e_two_hop_render_resolves_to_concrete_implementor() {
+    // Two hops: `view()->make('welcome')->render()` — cursor on `render`. The
+    // first hop types the receiver as `Factory`; `make()` returns the `View`
+    // CONTRACT; the implementors scan lands the second receiver on the concrete
+    // `Illuminate\View\View`, where `render` is declared. The decl site must be
+    // inside the concrete implementing class, never the contract.
+    let (_dir, handle, caller_path, caller_src) =
+        view_helper_e2e_project(r#"view()->make('welcome')->render();"#).await;
+    let (line, col) = position_of(&caller_src, "render");
+    let data = handle
+        .resolve_magic_member_at(caller_path, line, col)
+        .await
+        .unwrap()
+        .expect("two-hop `view()->make()->render()` must resolve, not None");
+    assert_eq!(data.declaring_fqcn, "Illuminate\\View\\View");
+    assert!(
+        data.decl_file
+            .as_ref()
+            .is_some_and(|f| f.ends_with("Illuminate/View/View.php")),
+        "render must land inside the concrete View, got {data:?}"
+    );
+    assert!(data.decl_line.is_some());
 }
 
 #[tokio::test]

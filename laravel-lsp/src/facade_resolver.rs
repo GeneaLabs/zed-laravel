@@ -277,38 +277,42 @@ pub fn facade_accessor(facade_fqcn: &str, root: &Path) -> Option<String> {
 /// declared on the concrete wins; otherwise each `@mixin` type (resolved through
 /// the concrete file's `use` aliases) is searched recursively; otherwise a
 /// matching `@method` tag's own line in the concrete's class docblock. Returns
-/// `(file, 0-based decl line)`, or `None` to let the caller fall back to the
-/// concrete class line.
+/// `(file, 0-based decl start line, 0-based decl end line)`, or `None` to let
+/// the caller fall back to the concrete class line. The end line lets the hover
+/// slice the full declaration (signature + body) for its source snippet.
 pub fn facade_method_decl(
     concrete_fqcn: &str,
     member: &str,
     root: &Path,
-) -> Option<(PathBuf, u32)> {
-    let (file, line, on_interface) = facade_method_decl_inner(concrete_fqcn, member, root, 0)?;
+) -> Option<(PathBuf, u32, u32)> {
+    let (file, start, end, on_interface) =
+        facade_method_decl_inner(concrete_fqcn, member, root, 0)?;
     if !on_interface {
-        return Some((file, line));
+        return Some((file, start, end));
     }
     // The chase landed on an *interface* method (`AuthManager` forwards `check`
     // to the `Guard` contract). Go to the implementation: a manager instantiates
     // its concrete drivers (`new SessionGuard(...)`), so chase the member into
     // those to land on the real body (`GuardHelpers::check`). Fall back to the
     // interface declaration when no implementation turns up.
-    manager_concrete_impl(concrete_fqcn, member, root).or(Some((file, line)))
+    manager_concrete_impl(concrete_fqcn, member, root).or(Some((file, start, end)))
 }
 
 /// Bound on chase recursion — guards documentation/inheritance cycles and keeps
 /// an interactive goto cheap.
 const MAX_FACADE_MIXIN_DEPTH: u32 = 4;
 
-/// Returns `(file, 0-based decl line, on_interface)` — `on_interface` is `true`
-/// when the declaration was found on an `interface` (a signature, not a body),
-/// the signal the public wrapper uses to switch to implementation lookup.
+/// Returns `(file, 0-based decl start line, 0-based decl end line, on_interface)`
+/// — `on_interface` is `true` when the declaration was found on an `interface`
+/// (a signature, not a body), the signal the public wrapper uses to switch to
+/// implementation lookup. The end line bounds the full declaration so the hover
+/// can slice signature + body.
 fn facade_method_decl_inner(
     concrete_fqcn: &str,
     member: &str,
     root: &Path,
     depth: u32,
-) -> Option<(PathBuf, u32, bool)> {
+) -> Option<(PathBuf, u32, u32, bool)> {
     if depth > MAX_FACADE_MIXIN_DEPTH {
         return None;
     }
@@ -327,7 +331,7 @@ fn facade_method_decl_inner(
     if let Some(m) = class.methods.iter().find(|m| m.name == member) {
         let on_interface =
             class.kind == crate::laravel_introspector::walker::PhpStructureKind::Interface;
-        return Some((file, m.start_line, on_interface));
+        return Some((file, m.start_line, m.end_line, on_interface));
     }
 
     let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &source);
@@ -372,9 +376,11 @@ fn facade_method_decl_inner(
 
     // 6. `@method` tag on this class's own docblock — a virtual method with no
     //    body; land on the tag's line (still a declaration, not the class line).
+    //    A one-line tag, so start == end.
     if let Some((doc_start_line, doc_text)) = &docblock {
         if let Some(rel) = method_tag_offset(doc_text, member) {
-            return Some((file, *doc_start_line + rel, false));
+            let tag_line = *doc_start_line + rel;
+            return Some((file, tag_line, tag_line, false));
         }
     }
 
@@ -387,8 +393,13 @@ fn facade_method_decl_inner(
 /// `new`-expressions in its source name the concrete types behind the contract.
 /// We chase `member` into each and return the first that resolves to a real
 /// (non-interface) declaration — for `check`, every guard reaches the shared
-/// `GuardHelpers::check`, so the targets collapse to that one body.
-fn manager_concrete_impl(manager_fqcn: &str, member: &str, root: &Path) -> Option<(PathBuf, u32)> {
+/// `GuardHelpers::check`, so the targets collapse to that one body. Returns
+/// `(file, 0-based decl start line, 0-based decl end line)`.
+fn manager_concrete_impl(
+    manager_fqcn: &str,
+    member: &str,
+    root: &Path,
+) -> Option<(PathBuf, u32, u32)> {
     let file = crate::class_locator::find_php_class_file_in_app_or_vendor(manager_fqcn, root)?;
     let source = std::fs::read_to_string(&file).ok()?;
     let tree = crate::parser::parse_php(&source).ok()?;
@@ -408,8 +419,10 @@ fn manager_concrete_impl(manager_fqcn: &str, member: &str, root: &Path) -> Optio
                 let fqcn = qualify_doc_type(&raw, &aliases, namespace);
                 if seen.insert(fqcn.clone(), ()).is_none() {
                     // Only accept a real (non-interface) declaration.
-                    if let Some((f, l, false)) = facade_method_decl_inner(&fqcn, member, root, 0) {
-                        return Some((f, l));
+                    if let Some((f, start, end, false)) =
+                        facade_method_decl_inner(&fqcn, member, root, 0)
+                    {
+                        return Some((f, start, end));
                     }
                 }
             }

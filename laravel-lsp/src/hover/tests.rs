@@ -212,6 +212,7 @@ fn magic_member_card_relationship_high_confidence() {
         Confidence::High,
         None,
         None,
+        None,
         Some("[app/Models/User.php:12](file:///p/app/Models/User.php#L12)"),
     );
     assert_eq!(
@@ -228,6 +229,7 @@ fn magic_member_card_with_definition_renders_php_code_block() {
         "App\\Models\\User",
         Confidence::High,
         Some("public function account()\n{\n    return $this->belongsTo(Account::class);\n}"),
+        None,
         None,
         None,
     );
@@ -248,6 +250,7 @@ fn magic_member_card_labels_each_kind() {
             "x",
             "App\\Models\\User",
             Confidence::High,
+            None,
             None,
             None,
             None,
@@ -274,6 +277,7 @@ fn magic_member_card_plain_member_is_empty() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(out, "");
 }
@@ -288,6 +292,7 @@ fn magic_member_card_medium_confidence_adds_inferred_trailer() {
         None,
         None,
         None,
+        None,
     );
     assert!(out.ends_with("*receiver type inferred*"), "got: {out}");
 }
@@ -299,6 +304,7 @@ fn magic_member_card_high_confidence_has_no_trailer() {
         "active",
         "App\\Models\\User",
         Confidence::High,
+        None,
         None,
         None,
         None,
@@ -353,6 +359,131 @@ fn extract_member_snippet_caps_long_bodies() {
     assert!(snippet.ends_with("// …"));
 }
 
+// ─── docblock mining: leading-block extraction, summary, @return, fold ──────
+
+#[test]
+fn extract_leading_docblock_returns_the_block_above_a_declaration() {
+    // Method at line 6 (0-based), with a 3-line `/** … */` block immediately
+    // above at lines 2..=5. The extractor returns the raw block, no dedent.
+    let src = "<?php\nclass Guard {\n    /**\n     * Determine if the user is authenticated.\n     * @return bool\n     */\n    public function check()\n    { return true; }\n}\n";
+    let block = extract_leading_docblock(src, 6).expect("docblock present");
+    assert!(block.contains("/**"), "opening missing: {block}");
+    assert!(
+        block.contains("Determine if the user is authenticated."),
+        "summary line missing: {block}"
+    );
+    assert!(block.contains("@return bool"), "@return missing: {block}");
+}
+
+#[test]
+fn extract_leading_docblock_skips_attributes() {
+    // A `#[Foo]` attribute line sits between the docblock and the declaration —
+    // the upward scan must skip it and still find the docblock.
+    let src = "<?php\nclass X {\n    /** Summary. */\n    #[Override]\n    public function run(): void\n    {}\n}\n";
+    let block = extract_leading_docblock(src, 4).expect("docblock present");
+    assert!(block.contains("Summary."), "docblock missing: {block}");
+}
+
+#[test]
+fn extract_leading_docblock_is_none_without_phpdoc() {
+    // No docblock above the declaration → None.
+    let src = "<?php\nclass User {\n    public function account()\n    {\n        return $this->belongsTo(Account::class);\n    }\n}\n";
+    assert_eq!(extract_leading_docblock(src, 2), None);
+}
+
+#[test]
+fn docblock_summary_collapses_multiline_prose_before_first_tag() {
+    let block =
+        "/**\n * Determine if the current user\n * is authenticated.\n *\n * @return bool\n */";
+    assert_eq!(
+        docblock_summary(block).as_deref(),
+        Some("Determine if the current user is authenticated.")
+    );
+}
+
+#[test]
+fn docblock_summary_handles_inline_block() {
+    assert_eq!(
+        docblock_summary("/** Get the guard instance. */").as_deref(),
+        Some("Get the guard instance.")
+    );
+}
+
+#[test]
+fn docblock_summary_is_none_when_only_tags() {
+    // No prose before the first `@tag` → no summary.
+    assert_eq!(docblock_summary("/**\n * @return bool\n */"), None);
+    assert_eq!(docblock_summary("/**\n */"), None);
+}
+
+#[test]
+fn docblock_return_type_extracts_first_token() {
+    assert_eq!(
+        docblock_return_type("/**\n * @return bool\n */").as_deref(),
+        Some("bool")
+    );
+    // Description after the type is dropped; the type token is kept as-written.
+    assert_eq!(
+        docblock_return_type("/**\n * @return Collection<int, User> the users\n */").as_deref(),
+        Some("Collection<int,")
+    );
+    // Union / nullable kept verbatim (no normalization).
+    assert_eq!(
+        docblock_return_type("/**\n * @return ?User\n */").as_deref(),
+        Some("?User")
+    );
+}
+
+#[test]
+fn docblock_return_type_is_none_without_tag() {
+    assert_eq!(docblock_return_type("/**\n * Just a summary.\n */"), None);
+    // `@return` with no type token → None.
+    assert_eq!(docblock_return_type("/**\n * @return\n */"), None);
+}
+
+#[test]
+fn fold_return_type_appends_when_signature_is_bare() {
+    // Body brace on the signature line → `: bool` inserted before the `{`.
+    let snippet = "public function check()\n{\n    return true;\n}";
+    assert_eq!(
+        fold_return_type(snippet, Some("bool")),
+        "public function check(): bool\n{\n    return true;\n}"
+    );
+}
+
+#[test]
+fn fold_return_type_appends_when_brace_on_next_line() {
+    // No body opener on the signature line → append the type to the line.
+    let snippet = "public function check()";
+    assert_eq!(
+        fold_return_type(snippet, Some("bool")),
+        "public function check(): bool"
+    );
+}
+
+#[test]
+fn fold_return_type_folds_into_abstract_signature() {
+    // Interface / abstract method: `;` is the "body opener".
+    let snippet = "public function check();";
+    assert_eq!(
+        fold_return_type(snippet, Some("bool")),
+        "public function check(): bool;"
+    );
+}
+
+#[test]
+fn fold_return_type_leaves_native_return_type_untouched() {
+    // Signature already declares `: bool` in source → no double-append.
+    let snippet = "public function check(): bool\n{\n    return true;\n}";
+    assert_eq!(fold_return_type(snippet, Some("bool")), snippet);
+}
+
+#[test]
+fn fold_return_type_without_type_is_identity() {
+    let snippet = "public function check()\n{\n}";
+    assert_eq!(fold_return_type(snippet, None), snippet);
+}
+
 #[test]
 fn magic_member_card_without_link_omits_source_section() {
     let out = magic_member_card(
@@ -360,6 +491,7 @@ fn magic_member_card_without_link_omits_source_section() {
         "email",
         "App\\Models\\User",
         Confidence::High,
+        None,
         None,
         None,
         None,
@@ -375,10 +507,97 @@ fn magic_member_card_without_link_omits_source_section() {
         None,
         Some("string"),
         None,
+        None,
     );
     assert_eq!(
         typed,
         "**Database column**\n\n`email` on `App\\Models\\User`\n\nType `string`"
+    );
+}
+
+#[test]
+fn facade_method_card_promotes_summary_to_description_and_keeps_docblock_out_of_code() {
+    // The rich FacadeMethod card: header + detail line + a DESCRIPTION line
+    // carrying the chased declaration's docblock summary, then a docblock-free
+    // PHP code block whose signature already carries the folded return type.
+    // (`main.rs` does the docblock mining; the card just renders the pieces.)
+    let definition = "public function check(): bool\n{\n    return ! is_null($this->user());\n}";
+    let out = magic_member_card(
+        MagicMemberKind::FacadeMethod,
+        "check",
+        "Illuminate\\Auth\\AuthManager",
+        Confidence::High,
+        Some(definition),
+        None,
+        Some("Determine if the current user is authenticated."),
+        None,
+    );
+    assert!(
+        out.starts_with("**Facade method**"),
+        "header missing: {out}"
+    );
+    assert!(
+        out.contains("`check` on `Illuminate\\Auth\\AuthManager`"),
+        "detail line missing: {out}"
+    );
+    // Summary is the DESCRIPTION line — between the detail and the code block.
+    assert!(
+        out.contains(
+            "`check` on `Illuminate\\Auth\\AuthManager`\n\nDetermine if the current user is authenticated.\n\n```php"
+        ),
+        "summary not promoted to description line: {out}"
+    );
+    // The code block is docblock-free with a typed signature and the body.
+    assert!(out.contains("```php"), "code block missing: {out}");
+    assert!(!out.contains("/**"), "docblock leaked into code: {out}");
+    assert!(!out.contains("@return"), "@return leaked into code: {out}");
+    assert!(
+        out.contains("public function check(): bool"),
+        "typed signature missing: {out}"
+    );
+    assert!(
+        out.contains("return ! is_null($this->user());"),
+        "body missing: {out}"
+    );
+}
+
+#[test]
+fn facade_method_card_without_summary_omits_description_line() {
+    // No docblock summary → no description line; just header, detail, code.
+    let out = magic_member_card(
+        MagicMemberKind::FacadeMethod,
+        "check",
+        "Illuminate\\Auth\\AuthManager",
+        Confidence::High,
+        Some("public function check(): bool\n{\n}"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        out,
+        "**Facade method**\n\n`check` on `Illuminate\\Auth\\AuthManager`\n\n```php\n<?php\npublic function check(): bool\n{\n}\n```"
+    );
+}
+
+#[test]
+fn facade_method_card_keeps_inferred_trailer_for_medium_confidence() {
+    // A helper-chain receiver type is inferred → Medium confidence keeps the
+    // `*receiver type inferred*` trailer alongside the rich code block.
+    let out = magic_member_card(
+        MagicMemberKind::FacadeMethod,
+        "make",
+        "Illuminate\\View\\Factory",
+        Confidence::Medium,
+        Some("public function make($view)\n{\n}"),
+        None,
+        None,
+        None,
+    );
+    assert!(out.contains("```php"), "code block missing: {out}");
+    assert!(
+        out.contains("*receiver type inferred*"),
+        "Medium-confidence trailer missing: {out}"
     );
 }
 

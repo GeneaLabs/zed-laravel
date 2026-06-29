@@ -102,11 +102,32 @@ pub trait ClassFileResolver {
     fn has_macro_host(&self, _receiver_fqcn: &str) -> bool {
         false
     }
+
+    /// Classes that directly implement `interface_fqcn`.
+    ///
+    /// The contract→concrete fallback for helper / method-return chains: a
+    /// method whose declared return type is an interface (`view()->make()`
+    /// returns `Illuminate\Contracts\View\View`) can't classify against the
+    /// contract's empty surface, so resolution falls back to the interface's
+    /// concrete implementor(s). Rides the resolver exactly as
+    /// [`binding_concrete`](Self::binding_concrete) does — no extra argument
+    /// threaded through the receiver-resolution call graph.
+    ///
+    /// Defaulted to an empty slice so implementors that don't model the class
+    /// hierarchy (the bare class index, the `HashMap<String, PathBuf>` test
+    /// stub) need no changes; the [`ClassHierarchyIndex`]-backed resolvers
+    /// override it with the real reverse-edge map.
+    fn implementers_of(&self, _interface_fqcn: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 impl ClassFileResolver for ClassHierarchyIndex {
     fn class_file(&self, fqcn: &str) -> Option<PathBuf> {
         self.get(fqcn).map(|node| node.file_path.clone())
+    }
+    fn implementers_of(&self, interface_fqcn: &str) -> Vec<String> {
+        ClassHierarchyIndex::implementers_of(self, interface_fqcn).to_vec()
     }
 }
 
@@ -134,6 +155,12 @@ pub struct SnapshotResolver {
     /// runtime-registered macro/mixin members the same way the live query path
     /// does.
     pub macros: Arc<HashMap<(String, String), (PathBuf, u32)>>,
+    /// The interface→implementors reverse map — `interface FQCN` → directly
+    /// implementing class FQCNs — snapshotted from the class-hierarchy index so
+    /// the build pass resolves contract-returning helper / method-return chains
+    /// (`view()->make()->render()`) to the concrete implementor the same way the
+    /// live query path does.
+    pub implementers: Arc<HashMap<String, Vec<String>>>,
 }
 
 impl ClassFileResolver for SnapshotResolver {
@@ -153,6 +180,12 @@ impl ClassFileResolver for SnapshotResolver {
     }
     fn has_macro_host(&self, receiver_fqcn: &str) -> bool {
         self.macros.keys().any(|(host, _)| host == receiver_fqcn)
+    }
+    fn implementers_of(&self, interface_fqcn: &str) -> Vec<String> {
+        self.implementers
+            .get(interface_fqcn)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -428,7 +461,19 @@ pub fn resolve_and_classify(
         None
     };
 
-    let (fqcn, confidence, via_facade) = match facade_concrete {
+    // A helper-chain receiver (`view()->make()`, `cache()->get()`) is the facade
+    // case "one indirection over": the resolved concrete is a service whose
+    // surface is largely forwarded via interfaces / `__call`, so its members are
+    // tagged `FacadeMethod` too — that routes the goto/hover through
+    // `facade_method_decl`'s contract-chase rather than dropping to Intelephense.
+    // Checked only when facade interception didn't already fire.
+    let helper_concrete = if facade_concrete.is_none() {
+        resolve_helper_receiver(receiver, bytes, resolver)
+    } else {
+        None
+    };
+
+    let (fqcn, confidence, via_facade) = match facade_concrete.or(helper_concrete) {
         Some((fqcn, confidence)) => (fqcn, confidence, true),
         None => {
             let (fqcn, confidence) = match resolve_receiver(
@@ -854,6 +899,15 @@ fn resolve_receiver(
         return Some(resolved);
     }
 
+    // Helper-chain receivers (`view()->make()`, `cache()->get()`, …) resolve the
+    // zero-arg helper's container service to its concrete class — the facade
+    // resolution "one indirection over" (a global function rather than a static
+    // proxy). Checked here, alongside the container case, before the generic
+    // match the helper-call shape isn't modeled by.
+    if let Some(resolved) = resolve_helper_receiver(receiver, bytes, resolver) {
+        return Some(resolved);
+    }
+
     match receiver.kind() {
         "variable_name" => {
             let raw = receiver.utf8_text(bytes).ok()?;
@@ -1002,6 +1056,165 @@ fn resolve_container_receiver(
     let key = single_string_argument(receiver, bytes)?;
     let concrete = resolver.binding_concrete(&key)?;
     Some((concrete, Confidence::High))
+}
+
+/// Laravel global helpers that return a container-resolved service when called
+/// with no positional argument, mapped to the container binding key that service
+/// is registered under — the receiver-resolution analogue of a facade's
+/// `getFacadeAccessor()`. Each entry is `(helper_name, binding_key)`.
+///
+/// Every key here is the *string* key the framework's service providers register
+/// (the same keys the facades in [`crate::facade_resolver`] proxy), so it
+/// resolves through the parsed binding registry via
+/// [`ClassFileResolver::binding_concrete`] exactly like `app('key')`. The two
+/// exceptions are noted inline:
+///
+/// - `response` is bound under a *contract* (`Illuminate\Contracts\Routing\
+///   ResponseFactory`), never a string literal — the registry only stores
+///   string-literal keys, so `binding_concrete` misses it. [`resolve_helper_receiver`]
+///   detects the contract-shaped key and falls back to the interface→implementors
+///   scan, which lands on the concrete `Illuminate\Routing\ResponseFactory`.
+/// - `validator` is bound under the string `'validator'` (concrete
+///   `Illuminate\Validation\Factory`), so it rides the registry like the rest.
+///
+/// Covered helpers: `view`, `cache`, `session`, `response`, `redirect`,
+/// `cookie`, `config`, `validator`, `auth`.
+const HELPER_BINDINGS: &[(&str, &str)] = &[
+    ("view", "view"),
+    ("cache", "cache"),
+    ("session", "session"),
+    // The `response()` helper resolves `ResponseFactory::class` from the
+    // container; it has no string binding key, so this contract FQCN routes
+    // through the implementors scan rather than the registry.
+    (
+        "response",
+        "Illuminate\\Contracts\\Routing\\ResponseFactory",
+    ),
+    ("redirect", "redirect"),
+    ("cookie", "cookie"),
+    ("config", "config"),
+    ("validator", "validator"),
+    // `auth()->check()` / `auth()->guard()` etc. — the non-`user()` chains.
+    // `resolve_auth_user_receiver` keeps its special-cased `->user()` exit
+    // (it maps to the configured user MODEL, not the auth manager); every other
+    // member on `auth()` classifies against the `auth` binding's concrete.
+    ("auth", "auth"),
+];
+
+/// The binding key a zero-arg Laravel helper resolves its service under, if the
+/// helper is one we model. `None` for an unmapped helper name.
+fn helper_binding_key(helper: &str) -> Option<&'static str> {
+    HELPER_BINDINGS
+        .iter()
+        .find(|(name, _)| *name == helper)
+        .map(|(_, key)| *key)
+}
+
+/// Resolve a zero-argument Laravel helper receiver — `view()`, `cache()`,
+/// `session()`, … — to the concrete class its container service resolves to,
+/// the receiver-resolution analogue of [`resolve_facade_receiver`] "one
+/// indirection over": where a facade proxies a binding through a static class,
+/// the helper proxies the *same* binding through a global function call.
+///
+/// The helper's name maps to a container binding key ([`HELPER_BINDINGS`]); the
+/// key resolves to its concrete FQCN through the parsed binding registry
+/// ([`ClassFileResolver::binding_concrete`]) — a HIGH-confidence, explicit
+/// registration — exactly as `app('key')` does. A contract-shaped key (only
+/// `response`'s today) the string-keyed registry can't hold falls back to the
+/// interface→implementors scan via [`resolve_interface_concrete`].
+///
+/// Only the zero-arg call form is handled: `view('welcome')` (the one-arg form)
+/// renders a view rather than returning the factory, so a member access on it
+/// (`view('welcome')->method()`) is the same factory receiver and resolves the
+/// same way — the argument count is not gated here, only that the function is a
+/// known helper. An unmapped helper, or a mapped helper whose binding has no
+/// concrete, returns `None` so the caller falls through cleanly.
+fn resolve_helper_receiver(
+    receiver: Node,
+    bytes: &[u8],
+    resolver: &impl ClassFileResolver,
+) -> Option<(String, Confidence)> {
+    if receiver.kind() != "function_call_expression" {
+        return None;
+    }
+    let func = receiver
+        .child_by_field_name("function")?
+        .utf8_text(bytes)
+        .ok()?
+        .trim_start_matches('\\');
+    let key = helper_binding_key(func)?;
+    // A string-literal binding key resolves through the registry; a
+    // contract-shaped key (carries a `\` — `response`'s `ResponseFactory`) the
+    // registry never holds resolves through the implementors scan instead.
+    if key.contains('\\') {
+        resolve_interface_concrete(key, resolver).map(|c| (c, Confidence::High))
+    } else {
+        resolver
+            .binding_concrete(key)
+            .map(|c| (c, Confidence::High))
+    }
+}
+
+/// Resolve an interface/contract FQCN to the single concrete class that
+/// implements it, for the contract→concrete fallback shared by the helper-chain
+/// (`response()`) and method-return (`view()->make()->render()`) paths.
+///
+/// Disambiguation rule:
+/// - **single implementer** → that concrete (HIGH-confidence resolution; the
+///   choice is unambiguous).
+/// - **multiple implementers** → pick the highest package-priority one if that
+///   is unambiguous; otherwise return `None`. We never fabricate a target by
+///   guessing among equals.
+/// - **no implementer** → `None`.
+///
+/// Package priority follows the project-wide convention (App=2 > Package=1 >
+/// Framework=0): a project's own implementation of a framework contract wins
+/// over the vendor default. The priority is read from the resolved file path
+/// (`vendor/` segment ⇒ Framework/Package, otherwise App) since the
+/// [`ClassFileResolver`] seam carries file paths, not parsed package metadata.
+fn resolve_interface_concrete(
+    interface_fqcn: &str,
+    resolver: &impl ClassFileResolver,
+) -> Option<String> {
+    let impls = resolver.implementers_of(interface_fqcn);
+    match impls.as_slice() {
+        [] => None,
+        [single] => Some(single.clone()),
+        many => {
+            // Multiple implementers: prefer a single highest-priority one. An
+            // app-level (non-`vendor/`) implementation outranks a vendor one;
+            // ties (more than one at the top priority) are ambiguous → `None`.
+            let mut ranked: Vec<(u8, &String)> = many
+                .iter()
+                .map(|fqcn| (impl_priority(fqcn, resolver), fqcn))
+                .collect();
+            ranked.sort_by_key(|r| std::cmp::Reverse(r.0));
+            let top = ranked[0].0;
+            let top_count = ranked.iter().filter(|(p, _)| *p == top).count();
+            if top_count == 1 {
+                Some(ranked[0].1.clone())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Package priority of an implementing class for disambiguation: App=2 (the
+/// project's own code) outranks vendor code=0. Derived from the resolved file
+/// path — a `vendor/` segment marks framework/package code. An unresolvable
+/// file (not in the index) is treated as lowest priority.
+fn impl_priority(fqcn: &str, resolver: &impl ClassFileResolver) -> u8 {
+    match resolver.class_file(fqcn) {
+        Some(path) => {
+            if path.components().any(|c| c.as_os_str() == "vendor") {
+                0
+            } else {
+                2
+            }
+        }
+        None => 0,
+    }
 }
 
 /// The sole string-literal argument of a call — `'currentTenant'` in
@@ -1194,15 +1407,27 @@ fn resolve_auth_user_receiver(
     }
 }
 
-/// Resolve a `$obj->method()` receiver via the called method's return type.
+/// Resolve a `$obj->method()` receiver via the called method's return type —
+/// the second hop of a chain like `view()->make()->render()`.
 ///
-/// Scoped to `self` / `static` return types — the canonical fluent /
-/// return-`$this` shape (`$user->activated()->email`) — which resolve to the
-/// object's own class. Arbitrary class return types are not resolved here:
-/// the return type is written in the *declaring* file's namespace, which this
-/// caller-side context can't reliably re-qualify. Vendor methods (`fresh`,
-/// `refresh`) aren't covered either — the ClassView walk stops at
-/// `Eloquent\Model`. Return-type inference is indirect → [`Confidence::Medium`].
+/// Handled cases (return-type inference is indirect → [`Confidence::Medium`]):
+/// - **`self` / `static`** — the canonical fluent / return-`$this` shape
+///   (`$user->activated()->email`) resolves to the object's own class.
+/// - **A concrete class return type** — surfaced so a second-hop receiver
+///   classifies against it (`Illuminate\View\Factory::make()` declares
+///   `: View`, so `make()->render()` types as `Illuminate\View\View`). The
+///   declared name is normalized against the *declaring* file's namespace and
+///   `use` aliases (the type is written in that file's namespace, not the
+///   caller's), then accepted only if the class graph knows it.
+/// - **An interface / contract return type** — falls back to the concrete
+///   implementor via [`resolve_interface_concrete`] (the binding registry only
+///   stores string-literal keys, never `Contract::class`, so a contract return
+///   resolves through the implementors scan, never the registry). A contract
+///   with a single implementer resolves; ambiguous multi-implementer contracts
+///   return `None` rather than fabricating a target.
+///
+/// Vendor methods whose return types live outside the indexed graph (or that
+/// the ClassView walk can't see — it stops at `Eloquent\Model`) drop to `None`.
 fn resolve_method_return(
     call: Node,
     bytes: &[u8],
@@ -1222,10 +1447,45 @@ fn resolve_method_return(
     let file_path = resolver.class_file(&obj_fqcn)?;
     let view = classviews.get_or_build(&obj_fqcn, &file_path, project_root)?;
     let ret = method_return_type(&view, method)?;
-    match normalize_type(&ret)?.as_str() {
-        "self" | "static" => Some((obj_fqcn, Confidence::Medium)),
-        _ => None,
+    let normalized = normalize_type(&ret)?;
+    if matches!(normalized.as_str(), "self" | "static") {
+        return Some((obj_fqcn, Confidence::Medium));
     }
+    // A named return type: re-qualify it in the DECLARING file's namespace —
+    // the type is written there, not in the caller's context — then surface the
+    // concrete it denotes.
+    let candidate = qualify_return_type(&normalized, &view);
+    // Interface/contract first: an indexed interface with implementor(s) resolves
+    // to its concrete implementor (the binding registry can't hold a
+    // `Contract::class` key, so this scan is the only path). A concrete class the
+    // graph knows is surfaced directly.
+    if let Some(concrete) = resolve_interface_concrete(&candidate, resolver) {
+        return Some((concrete, Confidence::Medium));
+    }
+    if resolver.class_file(&candidate).is_some() {
+        return Some((candidate, Confidence::Medium));
+    }
+    None
+}
+
+/// Re-qualify a method's declared return-type name in the namespace of the
+/// class that declares it. The return type is written in the *declaring* file's
+/// namespace with that file's `use` imports, so a bare `View` in
+/// `Illuminate\View\Factory` means `Illuminate\View\View` (its import), not the
+/// caller's `View`. Reads the declaring file once (cached transitively by the
+/// caller's `ClassView` build) to recover its aliases + namespace.
+fn qualify_return_type(name: &str, view: &ClassView) -> String {
+    let aliases = std::fs::read_to_string(&view.file_path)
+        .ok()
+        .map(|content| crate::laravel_introspector::model_metadata::extract_use_aliases(&content))
+        .unwrap_or_default();
+    crate::laravel_introspector::model_metadata::resolve_to_fqcn(
+        name,
+        view.namespace.as_deref(),
+        &aliases,
+    )
+    .trim_start_matches('\\')
+    .to_string()
 }
 
 /// The declared return type of `method` on `view` (raw form preferred so

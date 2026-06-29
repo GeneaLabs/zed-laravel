@@ -222,9 +222,15 @@ fn leaf_segment(key: &str) -> &str {
 /// `$user->email` a column). `source_link` is a pre-built markdown link to the
 /// declaring class, or `None` if it couldn't be located.
 ///
+/// `description` populates the card's description line (third row). It's used by
+/// the FacadeMethod kind to surface the chased declaration's PHPDoc summary; a
+/// Column's resolved `type_hint` takes precedence over it when both are present
+/// (the kinds are mutually exclusive in practice).
+///
 /// Returns an empty string for [`MagicMemberKind::PlainMember`] — a generic
 /// property is Intelephense's job, and duplicating it would just add noise (the
 /// multi-LSP dedup policy: suppress at the source).
+#[allow(clippy::too_many_arguments)]
 pub fn magic_member_card(
     kind: crate::salsa_impl::MagicMemberKind,
     member: &str,
@@ -232,6 +238,7 @@ pub fn magic_member_card(
     confidence: crate::salsa_impl::Confidence,
     definition: Option<&str>,
     type_hint: Option<&str>,
+    description: Option<&str>,
     source_link: Option<&str>,
 ) -> String {
     use crate::salsa_impl::{Confidence, MagicMemberKind};
@@ -250,8 +257,13 @@ pub fn magic_member_card(
         MagicMemberKind::PlainMember => return String::new(),
     };
     let detail = format!("`{member}` on `{declaring_fqcn}`");
-    // For a column, the resolved PHP type (cast-aware) from the DB schema.
+    // The description line. For a Column it's the resolved PHP type (cast-aware)
+    // from the DB schema; for a FacadeMethod it's the chased declaration's
+    // PHPDoc summary (passed in via `description`). The two kinds are mutually
+    // exclusive, so `type_hint` takes precedence and `description` fills in
+    // otherwise — neither set → no description line.
     let type_desc = type_hint.map(|t| format!("Type `{t}`"));
+    let desc_line = type_desc.as_deref().or(description);
     // A MEDIUM-confidence resolution leaned on an inferred receiver type — flag
     // it so the reader knows it's a best-effort, not a static guarantee.
     let trailer = match confidence {
@@ -261,7 +273,7 @@ pub fn magic_member_card(
     render(&HoverContent {
         header: Some(kind_label),
         detail: Some(&detail),
-        description: type_desc.as_deref(),
+        description: desc_line,
         // The declaring method's source — for a relationship this reveals the
         // target model (`$this->belongsTo(Account::class)`), for a scope its
         // query body, for an accessor what it computes.
@@ -506,6 +518,149 @@ pub fn extract_member_snippet(source: &str, start_line: u32, end_line: u32) -> S
         out.push("// …".to_string());
     }
     out.join("\n")
+}
+
+/// Return the raw text of the PHPDoc block immediately preceding a declaration,
+/// or `None` when none is present.
+///
+/// The declaration's `start_line` (0-based) points at the `function`/visibility
+/// keyword; the `/** … */` docblock is a tree-sitter *sibling* sitting just
+/// above. We scan up from `start_line - 1`, skipping blank and `#[attribute]`
+/// lines, and when the run ends at a line closing with `*/` we walk back to its
+/// opening `/**` and return everything in between (line ranges are inclusive,
+/// joined with `\n`, no dedent — callers parse it line-by-line).
+///
+/// This replaces the old `extract_member_snippet_with_docblock`: instead of
+/// gluing the docblock onto the code block, the FacadeMethod card now lifts the
+/// docblock's *summary* into the card description and folds its `@return` into
+/// the signature, keeping the code block itself docblock-free.
+pub fn extract_leading_docblock(source: &str, start_line: u32) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let start = start_line as usize;
+    if start == 0 || start >= lines.len() {
+        return None;
+    }
+    // Walk up past blank / `#[attr]` lines to the first line of real content.
+    let mut above = start as i64 - 1;
+    while above >= 0 {
+        let t = lines[above as usize].trim();
+        if t.is_empty() || t.starts_with("#[") {
+            above -= 1;
+        } else {
+            break;
+        }
+    }
+    // That content line must close a docblock (`*/`); otherwise there's none.
+    if above < 0 || !lines[above as usize].trim_end().ends_with("*/") {
+        return None;
+    }
+    // Walk back to the docblock's opening `/**`.
+    let mut doc_start = above;
+    while doc_start >= 0 && !lines[doc_start as usize].trim_start().starts_with("/**") {
+        doc_start -= 1;
+    }
+    if doc_start < 0 {
+        return None;
+    }
+    Some(lines[doc_start as usize..=above as usize].join("\n"))
+}
+
+/// Strip the PHPDoc framing (`/**`, ` * `, ` */`) from one docblock line,
+/// returning the bare content. `" * Determine if …"` → `"Determine if …"`,
+/// `"/** Inline. */"` → `"Inline."`.
+fn strip_docblock_line(line: &str) -> &str {
+    let t = line.trim();
+    let t = t.strip_prefix("/**").unwrap_or(t);
+    let t = t.strip_prefix("/*").unwrap_or(t);
+    let t = t.strip_suffix("*/").unwrap_or(t);
+    // Leading ` * ` (or a bare `*`) on continuation lines.
+    let t = t.trim();
+    let t = t.strip_prefix('*').unwrap_or(t);
+    t.trim()
+}
+
+/// Parse the summary paragraph from a raw PHPDoc block: the description text
+/// before the first `@tag`, with multi-line prose collapsed onto one line.
+/// Returns `None` when the block has no prose summary (tags only, or empty).
+pub fn docblock_summary(docblock: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for line in docblock.lines() {
+        let content = strip_docblock_line(line);
+        // The summary ends at the first `@tag` line.
+        if content.starts_with('@') {
+            break;
+        }
+        if !content.is_empty() {
+            parts.push(content.to_string());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+/// Parse the type token from a `@return <type> [description]` tag in a raw
+/// PHPDoc block. Returns the first whitespace-delimited token after `@return`
+/// verbatim (unions/nullables kept as-written), or `None` when there's no
+/// `@return` tag or it carries no type.
+pub fn docblock_return_type(docblock: &str) -> Option<String> {
+    for line in docblock.lines() {
+        let content = strip_docblock_line(line);
+        if let Some(rest) = content.strip_prefix("@return") {
+            let token = rest.split_whitespace().next()?;
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+/// Fold a docblock `@return` type into a method-signature snippet when the
+/// source carries no *native* return type.
+///
+/// Display-only: edits the rendered string, not the source. The signature line
+/// is the first line of `snippet` (the plain signature+body slice from
+/// [`extract_member_snippet`]). If it already declares a native return type —
+/// a `: type` between the parameter list's closing `)` and the body's `{`/`;`
+/// — the snippet is returned unchanged. Otherwise `: <return_type>` is inserted
+/// just before the `{` (or `;` for an abstract/interface method), or appended
+/// when the body opens on a later line. `None` return type → unchanged.
+pub fn fold_return_type(snippet: &str, return_type: Option<&str>) -> String {
+    let Some(ret) = return_type else {
+        return snippet.to_string();
+    };
+    let mut lines: Vec<String> = snippet.lines().map(str::to_string).collect();
+    let Some(sig) = lines.first().cloned() else {
+        return snippet.to_string();
+    };
+    // Find the parameter list's closing `)`. Everything after it on the line is
+    // the return-type / body region we inspect.
+    let Some(close_paren) = sig.rfind(')') else {
+        return snippet.to_string();
+    };
+    let after = &sig[close_paren + 1..];
+    // A native return type shows as a `:` before the body opener on this line.
+    let body_start = after.find(['{', ';']).unwrap_or(after.len());
+    if after[..body_start].contains(':') {
+        // Already typed in source — keep as-is, don't double-append.
+        return snippet.to_string();
+    }
+    let new_sig = if body_start < after.len() {
+        // Body opener (`{`/`;`) is on the signature line — insert `: ret` before it.
+        let insert_at = close_paren + 1 + body_start;
+        let (head, tail) = sig.split_at(insert_at);
+        let tail = tail.trim_start();
+        // `{` body keeps a space (`(): bool {`); a `;`-terminated abstract /
+        // interface method abuts (`(): bool;`).
+        let sep = if tail.starts_with(';') { "" } else { " " };
+        format!("{}: {}{}{}", head.trim_end(), ret, sep, tail)
+    } else {
+        // No body opener on this line (brace on the next) — append to the line.
+        format!("{}: {}", sig.trim_end(), ret)
+    };
+    lines[0] = new_sig;
+    lines.join("\n")
 }
 
 // ============================================================================
