@@ -157,6 +157,10 @@ jobs:
     needs: update-version
     runs-on: ${{ matrix.os }}
     strategy:
+      # One target's flaky toolchain download must not cancel the artifacts that
+      # already built. Each job uploads an independent release asset, so a single
+      # failure should fail only itself.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -194,63 +198,32 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+      # All four Linux targets (gnu/musl × x64/arm64) cross-compile through
+      # cargo-zigbuild. Zig bundles the cross-linker and a C compiler — the cc
+      # crate (build.rs compiles the tree-sitter C grammar) and the Rust linker
+      # both use it — so no apt cross-toolchains, no ~/.cargo linker hacks, and
+      # no downloads from single-maintainer mirrors like musl.cc.
+      - name: Set up Zig (Linux cross-compilation)
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
 
-      - name: Configure cross-compilation (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml << EOF
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-          EOF
-
-      - name: Install musl cross-compilation tools (Linux x64 musl)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          # The cc crate (build.rs compiles the tree-sitter C grammar) and the
-          # Rust linker both need to target musl, not the host glibc.
-          mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml << EOF
-          [target.x86_64-unknown-linux-musl]
-          linker = "musl-gcc"
-          EOF
-          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> $GITHUB_ENV
-
-      - name: Install musl cross-compilation tools (Linux ARM64 musl)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          # musl.cc ships a complete aarch64 musl cross toolchain; the cc crate
-          # and the Rust linker both pick it up from PATH / the env below.
-          curl -fL --retry 3 --retry-delay 5 \
-            https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/aarch64-musl-cross.tgz
-          # Pin the tarball: musl.cc is an unsigned single-maintainer mirror and
-          # this toolchain compiles a published release binary, so verify a
-          # known-good sha256 before extracting. A MITM'd, compromised, or
-          # silently-rebuilt tarball then fails the build loudly instead of
-          # backdooring the shipped arm64-musl binary. Update this hash if the
-          # upstream toolchain is intentionally rebuilt.
-          echo "c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38  /tmp/aarch64-musl-cross.tgz" \
-            | sha256sum -c -
-          sudo tar -xzf /tmp/aarch64-musl-cross.tgz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
-          mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml << EOF
-          [target.aarch64-unknown-linux-musl]
-          linker = "aarch64-linux-musl-gcc"
-          EOF
-          echo "CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc" >> $GITHUB_ENV
+      - name: Install cargo-zigbuild (Linux cross-compilation)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: Build LSP Server
+        shell: bash
         run: |
           cd laravel-lsp
-          cargo build --release --target ${{ matrix.target }}
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Prepare binary
         shell: bash
