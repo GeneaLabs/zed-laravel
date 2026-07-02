@@ -158,15 +158,15 @@ impl LaravelExtension {
     /// Get platform-specific binary name
     fn get_platform_binary_name() -> String {
         let (os, arch) = zed::current_platform();
-        Self::platform_binary_name(os, arch, Self::is_musl_libc())
+        Self::platform_binary_name(os, arch)
     }
 
     /// Map a platform triple to the published release-asset binary name.
     ///
-    /// `is_musl` only changes the Linux variants: musl-based distros (Alpine,
-    /// etc.) need the `-musl` binary because the glibc-linked build fails to
-    /// spawn against musl's loader.
-    fn platform_binary_name(os: zed::Os, arch: zed::Architecture, is_musl: bool) -> String {
+    /// The Linux assets are statically-linked musl builds, so a single
+    /// binary per arch runs on glibc distros, musl distros (Alpine), and
+    /// loader-less setups (NixOS) alike — no libc detection needed.
+    fn platform_binary_name(os: zed::Os, arch: zed::Architecture) -> String {
         match (os, arch) {
             (zed::Os::Windows, zed::Architecture::X8664) => {
                 "laravel-lsp-windows-x64.exe".to_string()
@@ -178,41 +178,10 @@ impl LaravelExtension {
             (zed::Os::Mac, zed::Architecture::Aarch64) => "laravel-lsp-macos-arm64".to_string(),
             (zed::Os::Mac, zed::Architecture::X8664) => "laravel-lsp-macos-x64".to_string(),
             (zed::Os::Mac, _) => "laravel-lsp".to_string(),
-            (zed::Os::Linux, zed::Architecture::X8664) if is_musl => {
-                "laravel-lsp-linux-x64-musl".to_string()
-            }
-            (zed::Os::Linux, zed::Architecture::Aarch64) if is_musl => {
-                "laravel-lsp-linux-arm64-musl".to_string()
-            }
             (zed::Os::Linux, zed::Architecture::X8664) => "laravel-lsp-linux-x64".to_string(),
             (zed::Os::Linux, zed::Architecture::Aarch64) => "laravel-lsp-linux-arm64".to_string(),
-            // Defensive fallback for any future Linux arch the SDK adds: still
-            // honor musl so we never serve a glibc binary to a musl host.
-            (zed::Os::Linux, _) if is_musl => "laravel-lsp-musl".to_string(),
             (zed::Os::Linux, _) => "laravel-lsp".to_string(),
         }
-    }
-
-    /// Detect a musl-based Linux host (Alpine and friends).
-    ///
-    /// Extensions run as WASM but `std::fs` reads resolve against the host the
-    /// LSP will run on — including a remote/devcontainer — so we probe for
-    /// musl's dynamic loaders and Alpine's release marker.
-    fn is_musl_libc() -> bool {
-        Self::detect_musl(|path| fs::metadata(path).is_ok())
-    }
-
-    /// Pure musl probe: returns true if any musl/Alpine marker path exists,
-    /// per the injected existence check. Split out so it is unit-testable
-    /// without touching the real filesystem.
-    fn detect_musl(path_exists: impl Fn(&str) -> bool) -> bool {
-        [
-            "/lib/ld-musl-x86_64.so.1",
-            "/lib/ld-musl-aarch64.so.1",
-            "/etc/alpine-release",
-        ]
-        .iter()
-        .any(|path| path_exists(path))
     }
 }
 
@@ -222,65 +191,35 @@ mod tests {
     use zed::{Architecture, Os};
 
     #[test]
-    fn linux_gnu_names_unchanged() {
+    fn linux_names() {
         assert_eq!(
-            LaravelExtension::platform_binary_name(Os::Linux, Architecture::X8664, false),
+            LaravelExtension::platform_binary_name(Os::Linux, Architecture::X8664),
             "laravel-lsp-linux-x64"
         );
         assert_eq!(
-            LaravelExtension::platform_binary_name(Os::Linux, Architecture::Aarch64, false),
+            LaravelExtension::platform_binary_name(Os::Linux, Architecture::Aarch64),
             "laravel-lsp-linux-arm64"
         );
     }
 
     #[test]
-    fn linux_musl_names_get_suffix() {
+    fn mac_and_windows_names() {
         assert_eq!(
-            LaravelExtension::platform_binary_name(Os::Linux, Architecture::X8664, true),
-            "laravel-lsp-linux-x64-musl"
+            LaravelExtension::platform_binary_name(Os::Mac, Architecture::Aarch64),
+            "laravel-lsp-macos-arm64"
         );
         assert_eq!(
-            LaravelExtension::platform_binary_name(Os::Linux, Architecture::Aarch64, true),
-            "laravel-lsp-linux-arm64-musl"
+            LaravelExtension::platform_binary_name(Os::Mac, Architecture::X8664),
+            "laravel-lsp-macos-x64"
         );
-    }
-
-    #[test]
-    fn non_linux_ignores_musl_flag() {
-        for is_musl in [true, false] {
-            assert_eq!(
-                LaravelExtension::platform_binary_name(Os::Mac, Architecture::Aarch64, is_musl),
-                "laravel-lsp-macos-arm64"
-            );
-            assert_eq!(
-                LaravelExtension::platform_binary_name(Os::Mac, Architecture::X8664, is_musl),
-                "laravel-lsp-macos-x64"
-            );
-            assert_eq!(
-                LaravelExtension::platform_binary_name(Os::Windows, Architecture::X8664, is_musl),
-                "laravel-lsp-windows-x64.exe"
-            );
-            assert_eq!(
-                LaravelExtension::platform_binary_name(Os::Windows, Architecture::Aarch64, is_musl),
-                "laravel-lsp-windows-arm64.exe"
-            );
-        }
-    }
-
-    #[test]
-    fn detect_musl_true_when_any_marker_present() {
-        assert!(LaravelExtension::detect_musl(|p| p == "/etc/alpine-release"));
-        assert!(LaravelExtension::detect_musl(
-            |p| p == "/lib/ld-musl-x86_64.so.1"
-        ));
-        assert!(LaravelExtension::detect_musl(
-            |p| p == "/lib/ld-musl-aarch64.so.1"
-        ));
-    }
-
-    #[test]
-    fn detect_musl_false_when_no_marker_present() {
-        assert!(!LaravelExtension::detect_musl(|_| false));
+        assert_eq!(
+            LaravelExtension::platform_binary_name(Os::Windows, Architecture::X8664),
+            "laravel-lsp-windows-x64.exe"
+        );
+        assert_eq!(
+            LaravelExtension::platform_binary_name(Os::Windows, Architecture::Aarch64),
+            "laravel-lsp-windows-arm64.exe"
+        );
     }
 }
 
