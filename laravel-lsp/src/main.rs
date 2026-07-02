@@ -45,6 +45,15 @@ use laravel_lsp::salsa_impl::{
     UrlReferenceData, ViewReferenceData,
 };
 
+// The Linux release binaries are static musl builds; musl's default
+// allocator collapses under multithreaded allocation load (global-lock
+// contention), which is exactly this server's profile — tokio workers +
+// Salsa parsing tens of thousands of files. See laravel-lsp/Cargo.toml
+// for the dependency rationale.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // ============================================================================
 // PART 1: Core Language Server Implementation
 // ============================================================================

@@ -68,6 +68,16 @@ arc-swap = "1.9"
 # SalsaActor::pattern_cache for context.
 dashmap = "6"
 
+# The release binaries for Linux are statically-linked musl builds (one
+# binary runs on glibc distros, Alpine, and NixOS alike), but musl's
+# default allocator serializes multithreaded allocation behind a global
+# lock — documented 7-20x regressions for parse-heavy tokio workloads
+# like ours. mimalloc restores glibc-parity allocation performance.
+# Gated to musl so glibc/macOS/Windows builds keep their known-good
+# system allocators (ripgrep's model).
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"
+
 [build-dependencies]
 # For downloading grammar from GitHub
 ureq = "3"
