@@ -99,6 +99,14 @@ tempfile = "3.27"
 name = "route_cache"
 harness = false
 
+# Magic-member resolution benchmark — reproduces the O(n²) fresh-cache-per-file
+# pass vs a single shared ClassViewCache across N referencing files. Same custom
+# timing harness (no criterion dependency); run with
+# `cargo bench --bench magic_members`.
+[[bench]]
+name = "magic_members"
+harness = false
+
 [profile.release]
 lto = true
 opt-level = 3
