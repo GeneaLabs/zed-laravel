@@ -651,3 +651,133 @@ class Portfolio {
     assert!(map.contains_key("id"));
     assert!(map.contains_key("created_at"));
 }
+
+// ---- Parsed-class-file memo (Part 3) -----------------------------------
+
+#[test]
+fn parsed_class_file_reuses_cached_parse_for_same_stamp() {
+    reset_parsed_file_cache();
+    // Two lookups of an unchanged file return the *same* Arc — proof the
+    // second didn't re-read + re-parse (the ancestor re-parse this memo kills).
+    let (_dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {}
+"#,
+    );
+    let first = parsed_class_file(&path).expect("parses once");
+    let second = parsed_class_file(&path).expect("cache hit");
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "an unchanged file must serve the cached parse, not re-parse"
+    );
+}
+
+#[test]
+fn parsed_class_file_re_parses_on_same_mtime_changed_size() {
+    reset_parsed_file_cache();
+    // CON1/CON4: freshness is (mtime AND size), so a content change that the
+    // filesystem records with the SAME mtime (a coarse-granularity same-tick
+    // rewrite, or an mtime-preserving `cp -p`) is still caught by the size
+    // dimension. Here we pin the mtime to the exact prior value and change the
+    // byte length — the memo must re-parse, not serve stale.
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+class Portfolio { public function alpha() {} }
+"#,
+    );
+    let before = parsed_class_file(&path).expect("first parse");
+    let pinned_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert!(before.structure.structures[0]
+        .methods
+        .iter()
+        .any(|m| m.name == "alpha"));
+
+    // Rewrite with DIFFERENT-LENGTH content, then force the mtime back to its
+    // exact previous value — mtime alone would now (falsely) say "unchanged".
+    fs::write(
+        &path,
+        r#"<?php
+namespace App\Models;
+class Portfolio { public function beta() {} public function gamma() {} }
+"#,
+    )
+    .unwrap();
+    filetime_set(&path, pinned_mtime);
+    // Sanity: the mtime really is identical, so only size differs.
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        pinned_mtime,
+        "test precondition: mtime must be pinned identical"
+    );
+
+    let after = parsed_class_file(&path).expect("re-parse after same-mtime edit");
+    assert!(
+        after.structure.structures[0]
+            .methods
+            .iter()
+            .any(|m| m.name == "beta"),
+        "a same-mtime, changed-size edit must be re-parsed (size closes the hole)"
+    );
+    let _ = dir;
+}
+
+#[test]
+fn parsed_class_file_repicks_up_edits_via_mtime() {
+    reset_parsed_file_cache();
+    // An edit changes the file's mtime, so the memo must re-read and reflect
+    // the new content — read-current semantics, no manual invalidation.
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+class Portfolio { public function alpha() {} }
+"#,
+    );
+    let before = parsed_class_file(&path).expect("first parse");
+    assert!(before.structure.structures[0]
+        .methods
+        .iter()
+        .any(|m| m.name == "alpha"));
+
+    // Rewrite with a different method. Bump the mtime explicitly — some
+    // filesystems have coarse mtime resolution, so a same-second rewrite could
+    // otherwise share the previous timestamp and mask the change.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    fs::write(
+        &path,
+        r#"<?php
+namespace App\Models;
+class Portfolio { public function beta() {} }
+"#,
+    )
+    .unwrap();
+    let new_mtime = std::time::SystemTime::now();
+    filetime_set(&path, new_mtime);
+
+    let after = parsed_class_file(&path).expect("re-parse after edit");
+    assert!(
+        !std::sync::Arc::ptr_eq(&before, &after),
+        "a changed mtime must invalidate the cached parse"
+    );
+    assert!(
+        after.structure.structures[0]
+            .methods
+            .iter()
+            .any(|m| m.name == "beta"),
+        "the re-parse must reflect the edited content"
+    );
+    let _ = dir;
+}
+
+/// Force a file's mtime forward without pulling in the `filetime` crate — set
+/// it via a fresh write timestamp by touching through `File::set_modified`
+/// (stable since Rust 1.75), so the test's mtime bump is deterministic.
+fn filetime_set(path: &std::path::Path, when: std::time::SystemTime) {
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for mtime bump");
+    f.set_modified(when).expect("set mtime");
+}

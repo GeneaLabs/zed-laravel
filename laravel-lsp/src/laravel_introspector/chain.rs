@@ -37,12 +37,17 @@
 //! (microseconds per file) that this hasn't been a bottleneck.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
+
+use lru::LruCache;
 
 use crate::class_locator::find_php_class_file;
 use crate::laravel_introspector::walker::{
-    extract_php_structure, PhpMethodInfo, PhpPropertyInfo, PhpStructure, PhpStructureKind,
-    PhpVisibility,
+    extract_php_structure, PhpFileStructure, PhpMethodInfo, PhpPropertyInfo, PhpStructure,
+    PhpStructureKind, PhpVisibility,
 };
 use crate::query_chain::extract_use_aliases;
 
@@ -50,6 +55,127 @@ use crate::query_chain::extract_use_aliases;
 /// by the previous separate walkers; protects against pathological
 /// trait composition graphs.
 const MAX_DEPTH: usize = 10;
+
+/// Upper bound on parsed class files held in the memo. Bounded so the cache
+/// can't grow without limit for the process lifetime — a 31k-file vendor tree
+/// would otherwise retain every parsed structure (each holding every method's
+/// full `body_source`). 2048 comfortably covers a project's live ancestor set
+/// (base models, common traits, the models under active edit) while capping
+/// worst-case footprint; the LRU evicts the coldest entries past that.
+const PARSED_CACHE_CAP: usize = 2048;
+
+/// A file's identity for cache freshness: its last-modified time **and** byte
+/// size. mtime alone is not enough — an mtime-preserving rewrite (`cp -p`,
+/// `rsync --times`) or two saves within one filesystem mtime tick (1s
+/// granularity on some filesystems) would leave mtime unchanged while the
+/// content differs. Pairing size closes those holes cheaply: `metadata` already
+/// returns both in one stat, and a content change that keeps the exact same
+/// byte length *and* the same mtime is vanishingly unlikely for source edits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    mtime: SystemTime,
+    size: u64,
+}
+
+impl FileStamp {
+    /// Stat `path` for its (mtime, size). `None` when the file can't be stat'd
+    /// or has no modified time — such a file is parsed fresh every call (correct,
+    /// just uncached) rather than risking a stale hit.
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(FileStamp {
+            mtime: meta.modified().ok()?,
+            size: meta.len(),
+        })
+    }
+}
+
+/// One class file parsed once: its structural outline plus its `use`-alias map.
+/// Not a `*Data` transfer type — it never crosses the Salsa async boundary; it's
+/// a purely in-process memo entry.
+struct ParsedClassFile {
+    structure: PhpFileStructure,
+    aliases: HashMap<String, String>,
+}
+
+/// Process-wide memo of parsed class files, keyed by path and revalidated by
+/// (mtime, size).
+///
+/// # Why
+///
+/// The inheritance walker re-reads and re-parses each ancestor (a base `Model`,
+/// common traits) once per analysis, and every referencing file triggers an
+/// analysis — so the shared ancestors were parsed over and over during the index
+/// build. Worse, each site parsed *twice* (once for the structure, once for the
+/// use-aliases). This memo reads + parses a file once and hands back both from a
+/// single tree, shared as an `Arc`.
+///
+/// Freshness: the cached entry stores the file's [`FileStamp`] (mtime **and**
+/// size); a lookup re-stats and rebuilds when either differs, so an edit — even
+/// an mtime-preserving one — is picked up on the next analysis. No manual
+/// invalidation, no TTL: read-current semantics preserved.
+///
+/// Bounded: an `LruCache` capped at [`PARSED_CACHE_CAP`] so the memo can't grow
+/// unbounded over a long session. `Mutex` because `lru::LruCache` mutates on
+/// read (it promotes the touched entry to most-recently-used), and `analyze`
+/// runs on the parallel `spawn_blocking` index workers — the lock is held only
+/// for the O(1) get/put, never across the parse.
+type ParsedCache = Mutex<LruCache<PathBuf, (FileStamp, Arc<ParsedClassFile>)>>;
+fn parsed_file_cache() -> &'static ParsedCache {
+    static CACHE: OnceLock<ParsedCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(LruCache::new(NonZeroUsize::new(PARSED_CACHE_CAP).unwrap())))
+}
+
+/// Clear the parsed-file memo. Test/bench only — lets a benchmark measure the
+/// cold vs warm cost of this optimization in isolation, and keeps global state
+/// from leaking between tests that assert on cache behavior.
+#[doc(hidden)]
+pub fn reset_parsed_file_cache() {
+    parsed_file_cache().lock().unwrap().clear();
+}
+
+/// Read + parse `path` once (structure + use-aliases), memoized and revalidated
+/// by (mtime, size). Returns `None` only when the file can't be read.
+///
+/// The stamp is read up front; if it matches the cached entry we return the
+/// shared `Arc` without touching the file contents. On a miss (or a changed
+/// stamp) we read + parse once and cache.
+fn parsed_class_file(path: &Path) -> Option<Arc<ParsedClassFile>> {
+    let stamp = FileStamp::of(path);
+    if let Some(stamp) = stamp {
+        // Scope the lock to the O(1) lookup — never held across the parse below.
+        if let Some((cached_stamp, parsed)) = parsed_file_cache().lock().unwrap().get(path) {
+            if *cached_stamp == stamp {
+                return Some(parsed.clone());
+            }
+        }
+    }
+    // Miss, changed stamp, or unstattable file — read + parse once. A single
+    // parse feeds both the structure and the use-aliases (previously two parses).
+    let content = std::fs::read_to_string(path).ok()?;
+    let tree = crate::parser::parse_php(&content).ok();
+    let structure = match &tree {
+        Some(t) => crate::laravel_introspector::walker::extract_php_structure_from_tree(
+            t,
+            content.as_bytes(),
+        ),
+        // Parse failure yields the same empty structure `extract_php_structure`
+        // would — callers already treat that as "no classes here".
+        None => PhpFileStructure::default(),
+    };
+    let aliases = match &tree {
+        Some(t) => extract_use_aliases(t, &content),
+        None => HashMap::new(),
+    };
+    let parsed = Arc::new(ParsedClassFile { structure, aliases });
+    if let Some(stamp) = stamp {
+        parsed_file_cache()
+            .lock()
+            .unwrap()
+            .put(path.to_path_buf(), (stamp, parsed.clone()));
+    }
+    Some(parsed)
+}
 
 /// Fully-qualified Laravel base classes / attributes referenced during
 /// classification. Centralised so version-bumps to Laravel that move
@@ -375,9 +501,10 @@ fn analyze_from_prefixed(content: &str) -> Option<ClassView> {
 /// any class — empty class bodies still yield a view (with empty
 /// surfaces).
 pub fn analyze(file_path: &Path, project_root: &Path) -> Option<ClassView> {
-    let content = std::fs::read_to_string(file_path).ok()?;
-    let structure = extract_php_structure(&content);
-    let aliases = parse_use_aliases(&content);
+    // Read + parse once via the mtime-revalidated memo (structure + aliases).
+    let parsed = parsed_class_file(file_path)?;
+    let structure = &parsed.structure;
+    let aliases = &parsed.aliases;
 
     // Pick the first class declaration; most Laravel files have exactly
     // one. Interfaces/traits/enums aren't classified as Laravel "class"
@@ -423,9 +550,9 @@ pub fn analyze(file_path: &Path, project_root: &Path) -> Option<ClassView> {
     // (the test fixture `Orphan extends SomeVendorClass` declares
     // `$table = 'orphans'`). The caller asked about a specific file;
     // surface whatever Laravel patterns it carries.
-    let scopes = compute_scopes(&all_methods, &aliases, &namespace);
+    let scopes = compute_scopes(&all_methods, aliases, &namespace);
     let accessors = compute_accessors(&all_methods);
-    let relationships = compute_relationships(&all_methods, &aliases, namespace.as_deref());
+    let relationships = compute_relationships(&all_methods, aliases, namespace.as_deref());
     let casts = compute_casts(&all_methods, &all_properties);
     let table_name = compute_table_name(&all_properties);
     let column_surface = compute_column_surface(&all_methods, &all_properties, &casts);
@@ -479,11 +606,11 @@ fn walk_class_chain(
         return;
     }
 
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Some(parsed) = parsed_class_file(path) else {
         return;
     };
-    let structure = extract_php_structure(&content);
-    let aliases = parse_use_aliases(&content);
+    let structure = &parsed.structure;
+    let aliases = &parsed.aliases;
     let namespace = structure.namespace.clone();
 
     for class in &structure.structures {
@@ -523,7 +650,7 @@ fn walk_class_chain(
         // Recurse into composed traits at this depth (traits compose
         // INTO the class; they're not "deeper" inheritance).
         for trait_name in &class.trait_uses {
-            let fqcn = resolve_to_fqcn(trait_name, namespace.as_deref(), &aliases);
+            let fqcn = resolve_to_fqcn(trait_name, namespace.as_deref(), aliases);
             if let Some(trait_path) = find_php_class_file(&fqcn, project_root) {
                 walk_class_chain(
                     &trait_path,
@@ -541,7 +668,7 @@ fn walk_class_chain(
         // Builder __callStatic surface (separate concern); we don't
         // pull them in here as "inherited" on user models.
         if let Some(parent_raw) = &class.extends_raw {
-            let parent_fqcn = resolve_to_fqcn(parent_raw, namespace.as_deref(), &aliases);
+            let parent_fqcn = resolve_to_fqcn(parent_raw, namespace.as_deref(), aliases);
             if parent_fqcn != ELOQUENT_MODEL_FQCN {
                 if let Some(parent_path) = find_php_class_file(&parent_fqcn, project_root) {
                     walk_class_chain(
@@ -597,11 +724,11 @@ pub fn extends_eloquent_model(file_path: &Path, project_root: &Path) -> bool {
         if !visited.insert(canonical) {
             return false;
         }
-        let Ok(content) = std::fs::read_to_string(&p) else {
+        let Some(parsed) = parsed_class_file(&p) else {
             return false;
         };
-        let structure = extract_php_structure(&content);
-        let aliases = parse_use_aliases(&content);
+        let structure = &parsed.structure;
+        let aliases = &parsed.aliases;
         let Some(class) = structure
             .structures
             .iter()
@@ -612,7 +739,7 @@ pub fn extends_eloquent_model(file_path: &Path, project_root: &Path) -> bool {
         let Some(parent_raw) = class.extends_raw.as_deref() else {
             return false;
         };
-        let parent_fqcn = resolve_to_fqcn(parent_raw, structure.namespace.as_deref(), &aliases);
+        let parent_fqcn = resolve_to_fqcn(parent_raw, structure.namespace.as_deref(), aliases);
         let resolved_basename = parent_fqcn.rsplit('\\').next().unwrap_or(&parent_fqcn);
         if resolved_basename == "Model" {
             return true;
