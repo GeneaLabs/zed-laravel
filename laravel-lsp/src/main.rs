@@ -21338,6 +21338,15 @@ impl LanguageServer for LaravelLanguageServer {
         // after disk-level changes. Saves no longer trigger this (#80);
         // external edits are the one remaining caller.
         if created_or_changed + deleted > 0 {
+            // Drop the FQCN→file resolution cache for this project so a
+            // watched create/delete is reflected immediately (a new class
+            // becomes resolvable, a removed one stops resolving). This covers
+            // the watched paths (controllers, views, livewire, vendor);
+            // unwatched app paths (e.g. `app/Models/`) rely on the locator's
+            // negative-entry TTL instead — see the Fork-2 note in class_locator.
+            if let Some(root) = self.initialized_root.read().await.clone() {
+                laravel_lsp::class_locator::invalidate_project(&root);
+            }
             self.schedule_magic_rebuild().await;
         }
     }
