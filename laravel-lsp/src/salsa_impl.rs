@@ -2642,13 +2642,13 @@ fn resolve_closure_concrete(
     };
 
     let resolver = ProviderBindingResolver { root };
-    let mut classviews = crate::member_resolver::ClassViewCache::new();
+    let classviews = crate::member_resolver::ClassViewCache::new();
     let (fqcn, confidence) = crate::member_resolver::resolve_expression_type(
         expr,
         bytes,
         aliases,
         &resolver,
-        &mut classviews,
+        &classviews,
         root,
     )?;
     if !matches!(confidence, Confidence::High | Confidence::Medium) {
@@ -8300,7 +8300,7 @@ impl SalsaActor {
         // that. Needs the receiver node (located by byte range — valid for PHP;
         // Blade-embedded refs may not locate, which is fine — the component
         // fallback below is text-based).
-        let mut classviews = crate::member_resolver::ClassViewCache::new();
+        let classviews = crate::member_resolver::ClassViewCache::new();
         let resolver = self.container_aware_resolver();
         if let Some(receiver) = tree
             .root_node()
@@ -8313,7 +8313,7 @@ impl SalsaActor {
                 bytes,
                 &aliases,
                 &resolver,
-                &mut classviews,
+                &classviews,
                 &project_root,
                 None, // query-time path — no dependency recording
             ) {
@@ -8370,7 +8370,7 @@ impl SalsaActor {
         let bytes = text.as_bytes();
         let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &text);
 
-        let mut classviews = crate::member_resolver::ClassViewCache::new();
+        let classviews = crate::member_resolver::ClassViewCache::new();
         let resolver = self.container_aware_resolver();
         let receiver = tree.root_node().descendant_for_byte_range(
             member_ref.receiver_byte_start,
@@ -8389,7 +8389,7 @@ impl SalsaActor {
                 bytes,
                 &aliases,
                 &resolver,
-                &mut classviews,
+                &classviews,
                 &project_root,
                 None, // query-time path — no dependency recording
             ) {
@@ -8406,7 +8406,7 @@ impl SalsaActor {
                         bytes,
                         &aliases,
                         &resolver,
-                        &mut classviews,
+                        &classviews,
                         &project_root,
                     )?;
                     if !matches!(confidence, Confidence::High | Confidence::Medium) {
@@ -8604,7 +8604,7 @@ impl SalsaActor {
         let bytes = text.as_bytes();
         let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &text);
 
-        let mut classviews = crate::member_resolver::ClassViewCache::new();
+        let classviews = crate::member_resolver::ClassViewCache::new();
         let resolver = self.container_aware_resolver();
         let receiver = tree.root_node().descendant_for_byte_range(
             member_ref.receiver_byte_start,
@@ -8617,7 +8617,7 @@ impl SalsaActor {
             bytes,
             &aliases,
             &resolver,
-            &mut classviews,
+            &classviews,
             &project_root,
             None, // query-time path — no dependency recording
         )?;

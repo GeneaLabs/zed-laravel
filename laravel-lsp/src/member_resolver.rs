@@ -304,9 +304,31 @@ pub struct ResolvedMemberAccess {
 /// Per-FQCN [`ClassView`] memo so resolving a project's member-access firehose
 /// analyzes each model file once, not once per access site. Caches misses too
 /// (a `None`) so an unreadable / class-less file isn't re-analyzed repeatedly.
+///
+/// # Why interior mutability (`DashMap`) instead of `&mut HashMap`
+///
+/// The whole-project index build fans every referencing file out across
+/// `spawn_blocking` workers. Before, each worker built its *own* cache, so a
+/// class referenced from N files was analyzed N times — the O(n²) this type
+/// exists to kill. To share **one** cache across all those parallel workers it
+/// has to be `Send + Sync` and mutate through a shared `&` (a `&mut` can't be
+/// held by many threads at once). [`dashmap::DashMap`] gives exactly that: a
+/// sharded concurrent map whose `entry`/`get` take `&self`, so every method
+/// here takes `&self` and the build wraps the cache in one `Arc` cloned into
+/// each worker. Single-threaded callers (the live query paths) are unaffected —
+/// they just pay a negligible shard lock per lookup.
+///
+/// `ClassView` and everything it owns is plain data (`Send + Sync`), so
+/// `Arc<ClassView>` crosses the `spawn_blocking` boundary freely.
 #[derive(Default)]
 pub struct ClassViewCache {
-    cache: HashMap<String, Option<Arc<ClassView>>>,
+    cache: dashmap::DashMap<String, Option<Arc<ClassView>>>,
+    /// Instrumentation: cache hits and misses (a "miss" is a first-time build
+    /// of an FQCN, hit or fail). The magic-build log and the once-per-FQCN
+    /// regression test read these to prove the sharing actually collapses work.
+    /// `AtomicUsize` so they update through `&self` alongside the map.
+    hits: std::sync::atomic::AtomicUsize,
+    misses: std::sync::atomic::AtomicUsize,
 }
 
 impl ClassViewCache {
@@ -316,18 +338,42 @@ impl ClassViewCache {
 
     /// Return the cached `ClassView` for `fqcn`, building it from `file_path`
     /// on first request.
+    ///
+    /// Concurrency: `DashMap::entry` holds the FQCN's shard lock for the
+    /// duration of the build. That's intentional — it dedupes two workers
+    /// racing to build the *same* FQCN (the second waits and reuses the first's
+    /// result), which is precisely the redundant analysis we're removing.
+    /// `analyze` never re-enters this cache, so holding the shard lock across it
+    /// can't deadlock; other FQCNs live on other shards and proceed in parallel.
     pub fn get_or_build(
-        &mut self,
+        &self,
         fqcn: &str,
         file_path: &Path,
         project_root: &Path,
     ) -> Option<Arc<ClassView>> {
-        if let Some(cached) = self.cache.get(fqcn) {
-            return cached.clone();
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.cache.entry(fqcn.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(e) => {
+                self.hits.fetch_add(1, Relaxed);
+                e.get().clone()
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                self.misses.fetch_add(1, Relaxed);
+                let view = analyze(file_path, project_root).map(Arc::new);
+                slot.insert(view.clone());
+                view
+            }
         }
-        let view = analyze(file_path, project_root).map(Arc::new);
-        self.cache.insert(fqcn.to_string(), view.clone());
-        view
+    }
+
+    /// Number of lookups served from the cache without a rebuild. Test/log only.
+    pub fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of first-time builds (distinct FQCNs analyzed). Test/log only.
+    pub fn misses(&self) -> usize {
+        self.misses.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -353,7 +399,7 @@ pub fn resolve_member_access_entries(
     source: &str,
     member_refs: &[Arc<MemberAccessReferenceData>],
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
     mut deps: Option<&mut HashSet<String>>,
 ) -> Vec<MagicMemberEntry> {
@@ -440,7 +486,7 @@ pub fn resolve_and_classify(
     bytes: &[u8],
     aliases: &UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
     mut deps: Option<&mut HashSet<String>>,
 ) -> Option<ResolvedMemberAccess> {
@@ -572,7 +618,7 @@ fn classify_against(
     confidence: Confidence,
     via_facade: bool,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<ResolvedMemberAccess> {
     // A class the index knows: classify against its real surfaces first.
@@ -658,7 +704,7 @@ fn resolve_call_chain_receiver(
     bytes: &[u8],
     aliases: &UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<(String, Confidence)> {
     let root = chain_root(receiver);
@@ -861,7 +907,7 @@ pub fn resolve_expression_type(
     bytes: &[u8],
     aliases: &UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<(String, Confidence)> {
     flow::resolve_expression(expr, bytes, aliases)
@@ -880,7 +926,7 @@ fn resolve_receiver(
     bytes: &[u8],
     aliases: &UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<(String, Confidence)> {
     // Auth-helper receivers (`auth()->user()`, `Auth::user()`, `request()->
@@ -1433,7 +1479,7 @@ fn resolve_method_return(
     bytes: &[u8],
     aliases: &UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<(String, Confidence)> {
     let object = call.child_by_field_name("object")?;

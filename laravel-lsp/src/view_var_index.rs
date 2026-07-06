@@ -201,7 +201,7 @@ pub fn resolve_blade_member_accesses(
     view_index: &ViewVarIndex,
     blade_loops: &[BladeLoopVar],
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
     mut deps: Option<&mut HashSet<String>>,
 ) -> Vec<MagicMemberEntry> {
@@ -302,7 +302,7 @@ fn classify_fqcn_member(
     member: &str,
     form: AccessForm,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<ClassifiedMember> {
     let file = resolver.class_file(fqcn)?;
@@ -320,7 +320,7 @@ fn resolve_chain_receiver(
     member: &str,
     form: AccessForm,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
     deps: Option<&mut HashSet<String>>,
 ) -> Option<ClassifiedMember> {
@@ -518,7 +518,7 @@ pub fn resolve_component_member_accesses(
 pub fn volt_property_types(
     source: &str,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> HashMap<String, String> {
     let Some(front) = volt_frontmatter(source) else {
@@ -680,7 +680,7 @@ fn computed_assignment(
     bytes: &[u8],
     aliases: &UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<(String, String)> {
     let var = plain_variable_name(assign.child_by_field_name("left")?, bytes)?;
@@ -711,7 +711,7 @@ fn render_method_vars(
     bytes: &[u8],
     aliases: &UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> HashMap<String, String> {
     let Some(ret) = function_return_expr(method) else {
@@ -787,7 +787,7 @@ fn function_return_expr(func: Node) -> Option<Node> {
 pub fn mfc_volt_property_types(
     blade_path: &Path,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<HashMap<String, String>> {
     let sibling = crate::livewire_resolver::mfc_sibling(blade_path)?;
@@ -810,7 +810,7 @@ pub fn resolve_volt_member_accesses(
     prop_types: &HashMap<String, String>,
     blade_loops: &[BladeLoopVar],
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
     mut deps: Option<&mut HashSet<String>>,
 ) -> Vec<MagicMemberEntry> {
@@ -1094,7 +1094,7 @@ fn clean_type(raw: &str) -> Option<String> {
 pub fn view_renders_in_file(
     source: &str,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Vec<ViewRender> {
     let Ok(tree) = parse_php(source) else {
@@ -1129,7 +1129,7 @@ fn render_from_view_call(
     bytes: &[u8],
     aliases: &crate::query_chain::use_aliases::UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<ViewRender> {
     let args = call.child_by_field_name("arguments")?;
@@ -1172,7 +1172,7 @@ fn collect_vars(
     bytes: &[u8],
     aliases: &crate::query_chain::use_aliases::UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
     vars: &mut HashMap<String, String>,
 ) {
@@ -1229,7 +1229,7 @@ fn collect_with_chain(
     bytes: &[u8],
     aliases: &crate::query_chain::use_aliases::UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
     vars: &mut HashMap<String, String>,
 ) {

@@ -3095,6 +3095,16 @@ async fn build_magic_member_entries(
     let implementers = salsa.snapshot_implementers().await.unwrap_or_default();
     let root = root.to_path_buf();
 
+    // One `ClassViewCache` shared across every worker in all three passes.
+    // Before, each `spawn_blocking` built its own, so a class referenced from N
+    // files was analyzed N times (O(n²) — Eloquent `Model`, base controllers,
+    // common traits paid over and over). The cache is now a concurrent
+    // (`DashMap`-backed) memo, so one `Arc` cloned into each worker means each
+    // FQCN is analyzed once *total* for the whole build. Lifetime = this build
+    // pass: it's dropped when the function returns, so the next rebuild starts
+    // cold (edit-freshness across builds is byte-identical to before).
+    let classviews = Arc::new(laravel_lsp::member_resolver::ClassViewCache::new());
+
     // ── Pass 1: build the view-variable index ────────────────────────────
     // Scan non-vendor controllers (PHP with `view()` calls) for render sites,
     // resolving each passed variable's type so Blade accesses can be typed.
@@ -3115,16 +3125,16 @@ async fn build_magic_member_entries(
         for path in view_targets {
             let permit_owner = vv_sem.clone();
             let class_files = class_files.clone();
+            let classviews = classviews.clone();
             let root = root.clone();
             vv_handles.push(tokio::spawn(async move {
                 let _permit = permit_owner.acquire_owned().await.ok()?;
                 tokio::task::spawn_blocking(move || {
                     let source = std::fs::read_to_string(&path).ok()?;
-                    let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
                     let renders = laravel_lsp::view_var_index::view_renders_in_file(
                         &source,
                         &*class_files,
-                        &mut classviews,
+                        &classviews,
                         &root,
                     );
                     (!renders.is_empty()).then_some((path, renders))
@@ -3182,12 +3192,12 @@ async fn build_magic_member_entries(
         let facade_aliases = facade_aliases.clone();
         let macros = macros.clone();
         let implementers = implementers.clone();
+        let classviews = classviews.clone();
         let root = root.clone();
         magic_handles.push(tokio::spawn(async move {
             let _permit = permit_owner.acquire_owned().await.ok()?;
             tokio::task::spawn_blocking(move || {
                 let source = std::fs::read_to_string(&path).ok()?;
-                let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
                 let mut deps = HashSet::new();
                 let resolver = laravel_lsp::member_resolver::SnapshotResolver {
                     class_files,
@@ -3200,7 +3210,7 @@ async fn build_magic_member_entries(
                     &source,
                     &data.member_access_refs,
                     &resolver,
-                    &mut classviews,
+                    &classviews,
                     &root,
                     Some(&mut deps),
                 );
@@ -3270,11 +3280,11 @@ async fn build_magic_member_entries(
             let implementers = implementers.clone();
             let view_var_index = view_var_index.clone();
             let view_paths = view_paths.clone();
+            let classviews = classviews.clone();
             let root = root.clone();
             blade_handles.push(tokio::spawn(async move {
                 let _permit = permit_owner.acquire_owned().await.ok()?;
                 tokio::task::spawn_blocking(move || {
-                    let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
                     // Container-aware resolver so `app('key')->member` accesses in
                     // Blade/Volt resolve to the bound model during indexing.
                     let resolver = laravel_lsp::member_resolver::SnapshotResolver {
@@ -3308,7 +3318,7 @@ async fn build_magic_member_entries(
                             laravel_lsp::view_var_index::volt_property_types(
                                 src,
                                 &resolver,
-                                &mut classviews,
+                                &classviews,
                                 &root,
                             )
                         })
@@ -3316,7 +3326,7 @@ async fn build_magic_member_entries(
                         laravel_lsp::view_var_index::mfc_volt_property_types(
                             &path,
                             &resolver,
-                            &mut classviews,
+                            &classviews,
                             &root,
                         )
                     } else {
@@ -3330,7 +3340,7 @@ async fn build_magic_member_entries(
                             &prop_types,
                             &data.blade_loops,
                             &resolver,
-                            &mut classviews,
+                            &classviews,
                             &root,
                             Some(&mut deps),
                         )
@@ -3343,7 +3353,7 @@ async fn build_magic_member_entries(
                             &view_var_index,
                             &data.blade_loops,
                             &resolver,
-                            &mut classviews,
+                            &classviews,
                             &root,
                             Some(&mut deps),
                         )
@@ -3374,6 +3384,16 @@ async fn build_magic_member_entries(
             }
         }
     }
+
+    // Cache effectiveness: `misses` is the number of distinct FQCNs analyzed
+    // for the whole build; `hits` is every lookup that reused a prior analysis.
+    // A high hit ratio is the shared cache doing its job — an ancestor class /
+    // model is analyzed once total instead of once per referencing file.
+    info!(
+        "🪄 magic build ClassViewCache: {} distinct classes analyzed, {} cache hits",
+        classviews.misses(),
+        classviews.hits(),
+    );
 
     laravel_lsp::magic_disk_cache::MagicCacheData {
         entries: magic_entries,
@@ -6116,11 +6136,11 @@ impl LaravelLanguageServer {
                 .map(|vv| vv.renders_for(path).is_some())
                 .unwrap_or(false);
             if !patterns.views.is_empty() || had_renders {
-                let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+                let classviews = laravel_lsp::member_resolver::ClassViewCache::new();
                 let renders = laravel_lsp::view_var_index::view_renders_in_file(
                     content,
                     &*class_files,
-                    &mut classviews,
+                    &classviews,
                     &root,
                 );
                 if let Ok(mut vv) = self.view_vars.write() {
@@ -6159,7 +6179,7 @@ impl LaravelLanguageServer {
         let is_volt =
             is_blade && laravel_lsp::livewire_resolver::source_contains_volt_signature(content);
 
-        let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+        let classviews = laravel_lsp::member_resolver::ClassViewCache::new();
         let mut deps: HashSet<String> = HashSet::new();
         // Container-aware resolver shared by all three resolution paths so
         // `app('key')->member` resolves to the bound model. Fetched here — after
@@ -6184,7 +6204,7 @@ impl LaravelLanguageServer {
             let prop_types = laravel_lsp::view_var_index::volt_property_types(
                 content,
                 &resolver,
-                &mut classviews,
+                &classviews,
                 &root,
             );
             laravel_lsp::view_var_index::resolve_volt_member_accesses(
@@ -6192,7 +6212,7 @@ impl LaravelLanguageServer {
                 &prop_types,
                 &patterns.blade_loops,
                 &resolver,
-                &mut classviews,
+                &classviews,
                 &root,
                 Some(&mut deps),
             )
@@ -6215,7 +6235,7 @@ impl LaravelLanguageServer {
                         &vv,
                         &patterns.blade_loops,
                         &resolver,
-                        &mut classviews,
+                        &classviews,
                         &root,
                         Some(&mut deps),
                     ),
@@ -6228,7 +6248,7 @@ impl LaravelLanguageServer {
                 content,
                 &patterns.member_access_refs,
                 &resolver,
-                &mut classviews,
+                &classviews,
                 &root,
                 Some(&mut deps),
             )

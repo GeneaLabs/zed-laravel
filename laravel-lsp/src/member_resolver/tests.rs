@@ -337,7 +337,7 @@ fn resolve_in(p: &Project, caller: &str, member: &str) -> Option<ResolvedMemberA
     let bytes = caller.as_bytes();
     let aliases = extract_use_aliases(&tree, caller);
     let receiver = receiver_of(&tree, bytes, member)?;
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     resolve_and_classify(
         receiver,
         member,
@@ -345,7 +345,7 @@ fn resolve_in(p: &Project, caller: &str, member: &str) -> Option<ResolvedMemberA
         bytes,
         &aliases,
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     )
@@ -396,7 +396,7 @@ fn resolve_with(
     let bytes = caller.as_bytes();
     let aliases = extract_use_aliases(&tree, caller);
     let receiver = receiver_of(&tree, bytes, member)?;
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     resolve_and_classify(
         receiver,
         member,
@@ -404,7 +404,7 @@ fn resolve_with(
         bytes,
         &aliases,
         resolver,
-        &mut cache,
+        &cache,
         root,
         None,
     )
@@ -618,7 +618,7 @@ fn resolve_static_call(
             stack.push(ch);
         }
     }
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     resolve_and_classify(
         scope?,
         member,
@@ -626,7 +626,7 @@ fn resolve_static_call(
         bytes,
         &aliases,
         resolver,
-        &mut cache,
+        &cache,
         root,
         None,
     )
@@ -836,7 +836,7 @@ fn resolve_call_member(
     let bytes = caller.as_bytes();
     let aliases = extract_use_aliases(&tree, caller);
     let receiver = call_receiver_of(&tree, bytes, member)?;
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     resolve_and_classify(
         receiver,
         member,
@@ -844,7 +844,7 @@ fn resolve_call_member(
         bytes,
         &aliases,
         resolver,
-        &mut cache,
+        &cache,
         root,
         None,
     )
@@ -1288,7 +1288,7 @@ function show(User $user) {
 fn classview_cache_reuses_built_view() {
     // Two resolutions against the same FQCN must reuse one ClassView build.
     let p = project("app/Models/User.php", USER_MODEL);
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let node = p.index.get("App\\Models\\User").expect("indexed");
     let v1 = cache.get_or_build("App\\Models\\User", &node.file_path, &p.root);
     let v2 = cache.get_or_build("App\\Models\\User", &node.file_path, &p.root);
@@ -1697,7 +1697,7 @@ class C {
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -1726,7 +1726,7 @@ function show($mystery) {
         caller,
         &member_refs_of(caller),
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -1753,7 +1753,7 @@ class C {
         caller,
         &member_refs_of(caller),
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -1764,7 +1764,7 @@ class C {
 fn population_empty_refs_is_empty() {
     let p = project("app/Models/User.php", USER_MODEL);
     let entries =
-        resolve_member_access_entries("", &[], &p.index, &mut ClassViewCache::new(), &p.root, None);
+        resolve_member_access_entries("", &[], &p.index, &ClassViewCache::new(), &p.root, None);
     assert!(entries.is_empty());
 }
 
@@ -1814,7 +1814,7 @@ class User extends Model {
         src,
         &data.member_access_refs,
         &snapshot,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         dir.path(),
         None,
     );
@@ -1893,7 +1893,7 @@ class User extends Authenticatable {
         src,
         &refs,
         &snapshot,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         dir.path(),
         None,
     );
@@ -1999,7 +1999,7 @@ fn resolve_auth_caller(
         caller,
         &refs,
         index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         dir.path(),
         None,
     )
@@ -2147,7 +2147,7 @@ class C {
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2174,7 +2174,7 @@ class C {
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2201,7 +2201,7 @@ class C {
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2228,7 +2228,7 @@ class C {
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2256,7 +2256,7 @@ class C {
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2291,7 +2291,7 @@ class C {
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2314,7 +2314,7 @@ $slug = Str::slug('Laravel');
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2340,7 +2340,7 @@ class Order extends Model {
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2372,7 +2372,7 @@ class C {
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2411,7 +2411,7 @@ class User extends Model {
         model,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2442,7 +2442,7 @@ class User extends Model {
         model,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2467,7 +2467,7 @@ $x = Str::of('laravel')->upper();
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2491,7 +2491,7 @@ class C {
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2525,7 +2525,7 @@ class UserTest {
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2556,7 +2556,7 @@ class User extends Model {
         model,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2595,7 +2595,7 @@ class User extends Model {
         model,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2636,7 +2636,7 @@ class C {
         caller,
         &refs,
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         None,
     );
@@ -2667,7 +2667,7 @@ class C {
         caller,
         &member_refs_of(caller),
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         Some(&mut deps),
     );
@@ -2694,7 +2694,7 @@ class C {
         caller,
         &member_refs_of(caller),
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         Some(&mut deps),
     );
@@ -2718,7 +2718,7 @@ function show($mystery) {
         caller,
         &member_refs_of(caller),
         &p.index,
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         &p.root,
         Some(&mut deps),
     );
@@ -2772,4 +2772,220 @@ class AppServiceProvider extends ServiceProvider {
     let r = resolve_with(&resolver, &p.root, caller, "logo").expect("resolves");
     assert_eq!(r.kind, MagicMemberKind::Accessor);
     assert_eq!(r.declaring_fqcn, "App\\Models\\Tenant");
+}
+
+// ─── Shared ClassViewCache: correctness + once-per-FQCN ───────────────────
+//
+// The whole-project build shares ONE `ClassViewCache` across every parallel
+// worker so each class is analyzed once total (not once per referencing file).
+// These prove the two invariants that keep that safe and worth it:
+//   1. equivalence — a cold cache-per-file run and a shared-cache run resolve
+//      byte-identical entries AND deps (sharing is pure memoization);
+//   2. once-per-FQCN — N files referencing the same model analyze it once.
+
+/// A project with a shared base model + shared trait and N caller files, each
+/// reading members off a typed receiver. Callers reuse a small model pool so
+/// the shared cache has something to collapse.
+struct SharedProject {
+    _dir: TempDir,
+    index: ClassHierarchyIndex,
+    root: PathBuf,
+    /// (source, captured refs) per caller — ready to feed into resolution.
+    callers: Vec<(String, Vec<Arc<MemberAccessReferenceData>>)>,
+}
+
+/// Build a shared-ancestor project: `BaseModel` (extends Eloquent Model, uses a
+/// trait) + `Auditable` trait + `pool` concrete models, and `n_callers` callers
+/// each targeting `Model{i % pool}`.
+fn shared_project(pool: usize, n_callers: usize) -> SharedProject {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(
+        root.join("composer.json"),
+        r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#,
+    )
+    .unwrap();
+    let mut index = ClassHierarchyIndex::default();
+
+    let write = |index: &mut ClassHierarchyIndex, rel: &str, body: &str| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
+        index.insert_file(&path, classes_in_file(&path, body));
+    };
+
+    // Shared ancestors — the classes the sharing must analyze once, not N times.
+    write(
+        &mut index,
+        "app/Concerns/Auditable.php",
+        r#"<?php
+namespace App\Concerns;
+trait Auditable {
+    public function scopeAudited($query) { return $query; }
+    public function getAuditedAtAttribute() { return $this->updated_at; }
+}
+"#,
+    );
+    write(
+        &mut index,
+        "app/Models/BaseModel.php",
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+use App\Concerns\Auditable;
+class BaseModel extends Model {
+    use Auditable;
+    protected $fillable = ['id'];
+}
+"#,
+    );
+    for i in 0..pool {
+        write(
+            &mut index,
+            &format!("app/Models/Model{i}.php"),
+            &format!(
+                r#"<?php
+namespace App\Models;
+class Model{i} extends BaseModel {{
+    protected $fillable = ['name{i}'];
+    public function scopeActive{i}($query) {{ return $query; }}
+}}
+"#
+            ),
+        );
+    }
+
+    let callers = (0..n_callers)
+        .map(|c| {
+            let m = c % pool;
+            // Read one own column, one own scope, one inherited-trait accessor,
+            // and one inherited-trait scope — so the full receiver chain
+            // (Model{m} → BaseModel → Auditable) must be built to classify all.
+            let source = format!(
+                r#"<?php
+namespace App\Http\Controllers;
+use App\Models\Model{m};
+class Controller{c} {{
+    public function show(Model{m} $x) {{
+        $a = $x->name{m};
+        $b = $x->active{m}();
+        $d = $x->auditedAt;
+        $e = $x->audited();
+        return [$a, $b, $d, $e];
+    }}
+}}
+"#
+            );
+            let refs = member_refs_of(&source);
+            (source, refs)
+        })
+        .collect();
+
+    SharedProject {
+        _dir: dir,
+        index,
+        root,
+        callers,
+    }
+}
+
+/// Resolve every caller, sorting each file's entries so the comparison is order-
+/// independent (worker order differs between the two regimes). Also collects the
+/// per-file dep sets. `shared` picks one cache for all files vs a fresh one each.
+fn resolve_all(p: &SharedProject, shared: bool) -> (Vec<Vec<MagicMemberEntry>>, Vec<Vec<String>>) {
+    let one = ClassViewCache::new();
+    let mut all_entries = Vec::new();
+    let mut all_deps = Vec::new();
+    for (source, refs) in &p.callers {
+        let fresh = ClassViewCache::new();
+        let cache = if shared { &one } else { &fresh };
+        let mut deps = HashSet::new();
+        let mut entries =
+            resolve_member_access_entries(source, refs, &p.index, cache, &p.root, Some(&mut deps));
+        // Deterministic order for comparison — the resolver's output order can
+        // depend on capture order, which is stable, but sorting is belt-and-braces.
+        entries.sort_by(|a, b| {
+            (a.fqcn.as_str(), a.member.as_str(), a.line, a.column).cmp(&(
+                b.fqcn.as_str(),
+                b.member.as_str(),
+                b.line,
+                b.column,
+            ))
+        });
+        let mut dep_vec: Vec<String> = deps.into_iter().collect();
+        dep_vec.sort();
+        all_entries.push(entries);
+        all_deps.push(dep_vec);
+    }
+    (all_entries, all_deps)
+}
+
+#[test]
+fn shared_cache_resolves_identically_to_cold_cache() {
+    // The correctness gate: sharing one cache across all files must produce
+    // byte-identical resolved entries AND deps as a fresh-cache-per-file run.
+    let p = shared_project(4, 20);
+    let (cold_entries, cold_deps) = resolve_all(&p, false);
+    let (shared_entries, shared_deps) = resolve_all(&p, true);
+    assert_eq!(
+        cold_entries, shared_entries,
+        "shared-cache entries diverged from cold-cache — sharing must be pure memoization"
+    );
+    assert_eq!(
+        cold_deps, shared_deps,
+        "shared-cache deps diverged from cold-cache — sharing must be pure memoization"
+    );
+    // Sanity: the fixture actually resolved something (a green all-empty run
+    // would pass the equivalence trivially).
+    assert!(
+        cold_entries.iter().any(|e| !e.is_empty()),
+        "fixture resolved no entries — test would be vacuous"
+    );
+}
+
+#[test]
+fn shared_cache_analyzes_each_receiver_once() {
+    // 12 callers funnel through 3 distinct models. With ONE shared cache, each
+    // referenced FQCN is analyzed exactly once — misses == distinct classes,
+    // and the remaining lookups are all hits.
+    let p = shared_project(3, 12);
+    let cache = ClassViewCache::new();
+    for (source, refs) in &p.callers {
+        resolve_member_access_entries(source, refs, &p.index, &cache, &p.root, None);
+    }
+
+    // Only the 3 distinct Model FQCNs are analyzed — every other lookup for the
+    // same model across the 12 callers is a cache hit. (Ancestors BaseModel /
+    // Auditable are walked *inside* analyze(Model{i}), not keyed here, so the
+    // cache miss count is exactly the distinct receiver classes.)
+    assert_eq!(
+        cache.misses(),
+        3,
+        "expected 3 distinct receiver classes analyzed once each, got {} misses / {} hits",
+        cache.misses(),
+        cache.hits(),
+    );
+    // 12 callers × the same 3 models → 9 of them are repeat lookups (hits).
+    assert!(
+        cache.hits() >= 9,
+        "expected the repeated receivers to hit the cache, got {} hits",
+        cache.hits(),
+    );
+}
+
+#[test]
+fn shared_cache_single_receiver_analyzed_exactly_once() {
+    // The tightest statement of the win: N callers all referencing the SAME
+    // model analyze it exactly once total.
+    let p = shared_project(1, 25);
+    let cache = ClassViewCache::new();
+    for (source, refs) in &p.callers {
+        resolve_member_access_entries(source, refs, &p.index, &cache, &p.root, None);
+    }
+    assert_eq!(
+        cache.misses(),
+        1,
+        "one model referenced by 25 callers must analyze once, got {} misses",
+        cache.misses(),
+    );
 }

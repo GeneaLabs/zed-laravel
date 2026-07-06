@@ -12,7 +12,7 @@ fn renders(controller: &str) -> Vec<ViewRender> {
     view_renders_in_file(
         controller,
         &ClassHierarchyIndex::default(),
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         Path::new("/proj"),
     )
 }
@@ -296,14 +296,14 @@ fn blade_var_resolves_via_view_index() {
 
     // `{{ $user->email }}` captured at line 3, col 15.
     let refs = vec![member_ref("$user", "email", 3, 15)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.show",
         &idx,
         &[],
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -325,14 +325,14 @@ fn blade_unknown_member_is_dropped() {
     );
     // `nope` is not a column/accessor/relationship/property on User → dropped.
     let refs = vec![member_ref("$user", "nope", 1, 0)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.show",
         &idx,
         &[],
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -344,14 +344,14 @@ fn blade_var_with_no_inferred_type_is_dropped() {
     let p = blade_project();
     let idx = ViewVarIndex::new(); // empty — nothing rendered this view
     let refs = vec![member_ref("$user", "email", 1, 0)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.show",
         &idx,
         &[],
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -385,14 +385,14 @@ fn blade_container_binding_receiver_resolves() {
     let idx = ViewVarIndex::new(); // no controller render — type comes from the binding
     let resolver = user_bound_resolver(&p, "currentUser");
     let refs = vec![member_ref("app('currentUser')", "email", 5, 12)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.show",
         &idx,
         &[],
         &resolver,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -410,14 +410,14 @@ fn blade_container_binding_unknown_key_is_dropped() {
     let idx = ViewVarIndex::new();
     let resolver = user_bound_resolver(&p, "someOtherKey");
     let refs = vec![member_ref("app('currentUser')", "email", 1, 0)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.show",
         &idx,
         &[],
         &resolver,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -434,14 +434,14 @@ fn blade_relationship_resolves() {
     );
     // `{{ $user->posts }}` — relationship read as a property.
     let refs = vec![member_ref("$user", "posts", 2, 4)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.show",
         &idx,
         &[],
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -459,7 +459,7 @@ fn volt_types(src: &str) -> HashMap<String, String> {
     volt_property_types(
         src,
         &ClassHierarchyIndex::default(),
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         Path::new("/proj"),
     )
 }
@@ -650,9 +650,8 @@ fn volt_resolves_this_property_access() {
 
     // `{{ $this->user->email }}` — receiver captured as `$this->user`.
     let refs = vec![member_ref("$this->user", "email", 5, 18)];
-    let mut cache = ClassViewCache::new();
-    let entries =
-        resolve_volt_member_accesses(&refs, &types, &[], &p.index, &mut cache, &p.root, None);
+    let cache = ClassViewCache::new();
+    let entries = resolve_volt_member_accesses(&refs, &types, &[], &p.index, &cache, &p.root, None);
     assert_eq!(entries.len(), 1, "got {entries:?}");
     assert_eq!(entries[0].fqcn, "App\\Models\\User");
     assert_eq!(entries[0].member, "email");
@@ -666,9 +665,8 @@ fn volt_resolves_bare_public_property_access() {
 
     // Public properties are also readable bare in the template: `{{ $user->email }}`.
     let refs = vec![member_ref("$user", "email", 1, 0)];
-    let mut cache = ClassViewCache::new();
-    let entries =
-        resolve_volt_member_accesses(&refs, &types, &[], &p.index, &mut cache, &p.root, None);
+    let cache = ClassViewCache::new();
+    let entries = resolve_volt_member_accesses(&refs, &types, &[], &p.index, &cache, &p.root, None);
     assert_eq!(entries.len(), 1, "got {entries:?}");
     assert_eq!(entries[0].fqcn, "App\\Models\\User");
 }
@@ -678,9 +676,8 @@ fn volt_unknown_property_is_dropped() {
     let p = blade_project();
     let types = HashMap::new(); // nothing inferred
     let refs = vec![member_ref("$this->user", "email", 1, 0)];
-    let mut cache = ClassViewCache::new();
-    let entries =
-        resolve_volt_member_accesses(&refs, &types, &[], &p.index, &mut cache, &p.root, None);
+    let cache = ClassViewCache::new();
+    let entries = resolve_volt_member_accesses(&refs, &types, &[], &p.index, &cache, &p.root, None);
     assert!(entries.is_empty(), "got {entries:?}");
 }
 
@@ -724,9 +721,9 @@ fn volt_foreach_loop_var_resolves_from_this_computed() {
         end_line: 20,
     }];
     let refs = vec![member_ref("$user", "email", 7, 40)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries =
-        resolve_volt_member_accesses(&refs, &types, &loops, &p.index, &mut cache, &p.root, None);
+        resolve_volt_member_accesses(&refs, &types, &loops, &p.index, &cache, &p.root, None);
     assert_eq!(entries.len(), 1, "got {entries:?}");
     assert_eq!(entries[0].fqcn, "App\\Models\\User");
     assert_eq!(entries[0].member, "email");
@@ -749,14 +746,14 @@ fn blade_foreach_loop_var_resolves_from_view_var() {
         end_line: 10,
     }];
     let refs = vec![member_ref("$user", "email", 4, 12)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.index",
         &idx,
         &loops,
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -777,9 +774,9 @@ fn loop_var_outside_loop_range_is_dropped() {
     }];
     // Access on line 30 — outside the loop body → no resolution.
     let refs = vec![member_ref("$user", "email", 30, 0)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries =
-        resolve_volt_member_accesses(&refs, &types, &loops, &p.index, &mut cache, &p.root, None);
+        resolve_volt_member_accesses(&refs, &types, &loops, &p.index, &cache, &p.root, None);
     assert!(entries.is_empty(), "got {entries:?}");
 }
 
@@ -870,7 +867,7 @@ fn blade_deps_record_attempted_var_types_even_on_unknown_member() {
 
     // `notAColumn` doesn't classify — the dependency must still register.
     let refs = vec![member_ref("$user", "notAColumn", 3, 15)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let mut deps = HashSet::new();
     let entries = resolve_blade_member_accesses(
         &refs,
@@ -878,7 +875,7 @@ fn blade_deps_record_attempted_var_types_even_on_unknown_member() {
         &idx,
         &[],
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         Some(&mut deps),
     );
@@ -893,14 +890,14 @@ fn volt_deps_record_attempted_prop_types_even_on_unknown_member() {
     types.insert("user".to_string(), "App\\Models\\User".to_string());
 
     let refs = vec![member_ref("$this->user", "notAColumn", 1, 0)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let mut deps = HashSet::new();
     let entries = resolve_volt_member_accesses(
         &refs,
         &types,
         &[],
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         Some(&mut deps),
     );
