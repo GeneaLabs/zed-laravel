@@ -62,10 +62,14 @@ use std::time::{Duration, Instant};
 use laravel_lsp::class_hierarchy_index::{classes_in_file, ClassHierarchyIndex};
 use laravel_lsp::class_locator::reset_locator_cache;
 use laravel_lsp::laravel_introspector::chain::reset_parsed_file_cache;
-use laravel_lsp::member_resolver::{resolve_member_access_entries, ClassViewCache};
+use laravel_lsp::member_capture::capture_member_context;
+use laravel_lsp::member_resolver::{
+    resolve_member_access_entries, resolve_member_access_entries_with_context, ClassViewCache,
+};
 use laravel_lsp::parser::{language_php, parse_php};
 use laravel_lsp::queries::extract_all_php_patterns;
-use laravel_lsp::salsa_impl::{Confidence, MemberAccessReferenceData};
+use laravel_lsp::salsa_impl::{Confidence, MemberAccessReferenceData, MemberContextData};
+use laravel_lsp::symbol_index::MagicMemberEntry;
 
 /// Member accesses each caller file reads off its typed receiver.
 const ACCESSES_PER_CALLER: usize = 6;
@@ -197,10 +201,12 @@ class Controller{caller_idx}
 }
 
 /// Pre-captured caller input: source (the resolver re-parses the live tree) plus
-/// its captured `->member` reference sites.
+/// its captured `->member` reference sites and a synthetic file path (the M1
+/// capture keys vendor/Blade decisions off it).
 struct CallerInput {
     source: String,
     refs: Vec<Arc<MemberAccessReferenceData>>,
+    path: PathBuf,
 }
 
 /// An on-disk synthetic project plus the pre-captured caller inputs and the
@@ -316,7 +322,8 @@ class LegacyBase extends Model {
         .map(|i| {
             let source = caller_php(i, i % pool);
             let refs = capture_refs(&source);
-            CallerInput { source, refs }
+            let path = root.join(format!("app/Http/Controllers/Controller{i}.php"));
+            CallerInput { source, refs, path }
         })
         .collect();
 
@@ -452,6 +459,110 @@ fn p2_persistent(corpus: &Corpus) -> (Duration, usize) {
     (start.elapsed(), total)
 }
 
+// ─── M1: single-parse capture (tree re-parse vs captured context) ──────────
+
+/// Build the parse-time context for every caller, timed separately — this is
+/// the ONE-TIME capture cost the resolve passes trade the per-file re-parse
+/// for. Runs on the same corpus the M1 resolve regimes use.
+fn m1_capture_contexts(corpus: &Corpus) -> (Vec<MemberContextData>, Duration) {
+    let start = Instant::now();
+    let contexts: Vec<MemberContextData> = corpus
+        .callers
+        .iter()
+        .map(|c| {
+            let tree = parse_php(&c.source).expect("parse caller");
+            capture_member_context(&c.path, &c.source, Some(&tree), &c.refs, false)
+                .expect("caller with member refs captures context")
+        })
+        .collect();
+    (contexts, start.elapsed())
+}
+
+/// M1 disabled: today's re-parse path — each caller is re-parsed from source at
+/// resolve time (`resolve_member_access_entries` parses `source` internally).
+fn m1_tree_reparse(corpus: &Corpus) -> (Duration, usize) {
+    reset_all_global_caches();
+    let cache = ClassViewCache::new();
+    let start = Instant::now();
+    let mut total = 0;
+    for c in &corpus.callers {
+        let entries = resolve_member_access_entries(
+            &c.source,
+            &c.refs,
+            &corpus.index,
+            &cache,
+            &corpus.root,
+            None,
+        );
+        total += black_box(entries).len();
+    }
+    (start.elapsed(), total)
+}
+
+/// Assert the two M1 paths resolve the SAME entries — canonicalized
+/// (fqcn, member, line, column, end_column) and sorted, so a divergence in an
+/// FQCN or position can't slip past a matching count. Runs before the timed
+/// regimes; panics on divergence so a broken capture fails the bench loudly.
+fn m1_assert_entries_equivalent(corpus: &Corpus, contexts: &[MemberContextData]) {
+    let canon = |v: Vec<MagicMemberEntry>| -> Vec<(String, String, u32, u32, u32)> {
+        v.into_iter()
+            .map(|e| (e.fqcn, e.member, e.line, e.column, e.end_column))
+            .collect()
+    };
+    let cache = ClassViewCache::new();
+    let mut tree: Vec<(String, String, u32, u32, u32)> = Vec::new();
+    let mut captured: Vec<(String, String, u32, u32, u32)> = Vec::new();
+    for (c, ctx) in corpus.callers.iter().zip(contexts.iter()) {
+        tree.extend(canon(resolve_member_access_entries(
+            &c.source,
+            &c.refs,
+            &corpus.index,
+            &cache,
+            &corpus.root,
+            None,
+        )));
+        captured.extend(canon(resolve_member_access_entries_with_context(
+            ctx,
+            &c.refs,
+            &corpus.index,
+            &cache,
+            &corpus.root,
+            None,
+        )));
+    }
+    tree.sort();
+    captured.sort();
+    assert!(
+        tree == captured,
+        "M1: captured entries diverge from the tree path (canonical fqcn/member/pos): \
+         {} tree vs {} captured",
+        tree.len(),
+        captured.len()
+    );
+}
+
+/// M1 enabled: resolve from the captured context — NO re-parse at resolve time.
+/// `contexts` were built once by [`m1_capture_contexts`] (its cost is reported
+/// separately); this measures only the resolve half.
+fn m1_captured(corpus: &Corpus, contexts: &[MemberContextData]) -> (Duration, usize) {
+    reset_all_global_caches();
+    let cache = ClassViewCache::new();
+    let start = Instant::now();
+    let mut total = 0;
+    for (c, ctx) in corpus.callers.iter().zip(contexts.iter()) {
+        let entries = resolve_member_access_entries_with_context(
+            ctx,
+            &c.refs,
+            &corpus.index,
+            &cache,
+            &corpus.root,
+            None,
+        );
+        total += black_box(entries).len();
+    }
+    (start.elapsed(), total)
+}
+
 // ─── Reporting ─────────────────────────────────────────────────────────────
 
 fn report(part: &str, n: usize, off: (Duration, usize), on: (Duration, usize)) {
@@ -537,6 +648,28 @@ fn main() {
             n,
             p2_reset_per_file(&miss_corpus),
             p2_persistent(&miss_corpus),
+        );
+
+        // M1 — single-parse capture. Same corpus as P1's n/10 pool (the real
+        // app shape). Disabled = today's re-parse-at-resolve; enabled = resolve
+        // from context captured at parse. The capture cost is reported on its
+        // OWN line — it is paid ONCE at parse (amortized across every later
+        // resolve: warm rebuild, save-refresh, find-references), not per resolve.
+        println!("--------------------------------------------------------");
+        let (contexts, capture_cost) = m1_capture_contexts(&pool_corpus);
+        // Canonical-entry equivalence (fqcn/member/pos, sorted) BEFORE timing —
+        // a matching count alone must not pass as equal.
+        m1_assert_entries_equivalent(&pool_corpus, &contexts);
+        report(
+            "M1 single-parse capture, n/10 pool",
+            n,
+            m1_tree_reparse(&pool_corpus),
+            m1_captured(&pool_corpus, &contexts),
+        );
+        println!(
+            "    capture  : {:>10.2?}  ({:.2} us/caller, paid once at parse)",
+            capture_cost,
+            per_file_us(capture_cost, n)
         );
     }
 

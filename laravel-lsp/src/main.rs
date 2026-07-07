@@ -3118,21 +3118,22 @@ async fn build_magic_member_entries(
     // ── Pass 1: build the view-variable index ────────────────────────────
     // Scan non-vendor controllers (PHP with `view()` calls) for render sites,
     // resolving each passed variable's type so Blade accesses can be typed.
-    let view_targets: Vec<PathBuf> = pattern_cache
-        .iter()
-        .filter(|e| {
-            !e.key().components().any(|c| c.as_os_str() == "vendor")
-                && !e.key().to_string_lossy().ends_with(".blade.php")
-                && !e.value().1.views.is_empty()
-        })
-        .map(|e| e.key().clone())
-        .collect();
+    let view_targets: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> =
+        pattern_cache
+            .iter()
+            .filter(|e| {
+                !e.key().components().any(|c| c.as_os_str() == "vendor")
+                    && !e.key().to_string_lossy().ends_with(".blade.php")
+                    && !e.value().1.views.is_empty()
+            })
+            .map(|e| (e.key().clone(), e.value().1.clone()))
+            .collect();
     let mut view_var_index = laravel_lsp::view_var_index::ViewVarIndex::new();
     let mut view_renders: Vec<(PathBuf, Vec<laravel_lsp::view_var_index::ViewRender>)> = Vec::new();
     {
         let vv_sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
         let mut vv_handles = Vec::with_capacity(view_targets.len());
-        for path in view_targets {
+        for (path, data) in view_targets {
             let permit_owner = vv_sem.clone();
             let class_files = class_files.clone();
             let classviews = classviews.clone();
@@ -3140,13 +3141,31 @@ async fn build_magic_member_entries(
             vv_handles.push(tokio::spawn(async move {
                 let _permit = permit_owner.acquire_owned().await.ok()?;
                 tokio::task::spawn_blocking(move || {
-                    let source = std::fs::read_to_string(&path).ok()?;
-                    let renders = laravel_lsp::view_var_index::view_renders_in_file(
-                        &source,
-                        &*class_files,
-                        &classviews,
-                        &root,
-                    );
+                    // Evaluate the view-render plans captured at parse — no file
+                    // read. The resolver is the bare class→file map, exactly as
+                    // the tree path passed it (renders never consult the
+                    // container/facade snapshots).
+                    let renders = match data.member_context.as_ref() {
+                        Some(ctx) => laravel_lsp::view_var_index::evaluate_render_plans(
+                            &ctx.view_renders,
+                            &ctx.aliases,
+                            &*class_files,
+                            &classviews,
+                            &root,
+                        ),
+                        // Fallback — not expected for a non-vendor file post-v11
+                        // (capture always runs); re-read + re-parse to stay
+                        // correct if a context is ever absent.
+                        None => {
+                            let source = std::fs::read_to_string(&path).ok()?;
+                            laravel_lsp::view_var_index::view_renders_in_file(
+                                &source,
+                                &*class_files,
+                                &classviews,
+                                &root,
+                            )
+                        }
+                    };
                     (!renders.is_empty()).then_some((path, renders))
                 })
                 .await
@@ -3207,7 +3226,6 @@ async fn build_magic_member_entries(
         magic_handles.push(tokio::spawn(async move {
             let _permit = permit_owner.acquire_owned().await.ok()?;
             tokio::task::spawn_blocking(move || {
-                let source = std::fs::read_to_string(&path).ok()?;
                 let mut deps = HashSet::new();
                 let resolver = laravel_lsp::member_resolver::SnapshotResolver {
                     class_files,
@@ -3216,23 +3234,53 @@ async fn build_magic_member_entries(
                     macros,
                     implementers,
                 };
-                let mut entries = laravel_lsp::member_resolver::resolve_member_access_entries(
-                    &source,
-                    &data.member_access_refs,
-                    &resolver,
-                    &classviews,
-                    &root,
-                    Some(&mut deps),
-                );
-                // Volt SFC `.php` components: index `$this->member` reads under
-                // the component's synthetic key (no-op for plain/model .php).
-                entries.extend(
-                    laravel_lsp::view_var_index::resolve_component_member_accesses(
-                        &path,
-                        &source,
-                        &data.member_access_refs,
-                    ),
-                );
+                // Resolve from the context captured at parse — no file read.
+                let entries = match data.member_context.as_ref() {
+                    Some(ctx) => {
+                        let mut e =
+                            laravel_lsp::member_resolver::resolve_member_access_entries_with_context(
+                                ctx,
+                                &data.member_access_refs,
+                                &resolver,
+                                &classviews,
+                                &root,
+                                Some(&mut deps),
+                            );
+                        // Volt SFC `.php` components: index `$this->member`
+                        // reads under the captured synthetic key.
+                        if let Some(comp) = &ctx.component {
+                            e.extend(
+                                laravel_lsp::view_var_index::resolve_component_member_accesses_with_context(
+                                    comp,
+                                    &path,
+                                    &data.member_access_refs,
+                                ),
+                            );
+                        }
+                        e
+                    }
+                    // Fallback — not expected for a non-vendor file post-v11;
+                    // re-read + re-parse to stay correct if context is absent.
+                    None => {
+                        let source = std::fs::read_to_string(&path).ok()?;
+                        let mut e = laravel_lsp::member_resolver::resolve_member_access_entries(
+                            &source,
+                            &data.member_access_refs,
+                            &resolver,
+                            &classviews,
+                            &root,
+                            Some(&mut deps),
+                        );
+                        e.extend(
+                            laravel_lsp::view_var_index::resolve_component_member_accesses(
+                                &path,
+                                &source,
+                                &data.member_access_refs,
+                            ),
+                        );
+                        e
+                    }
+                };
                 // Keep dep-only files: a file whose every classification
                 // failed still *depends* on those classes — dropping it here
                 // would blind the incremental save flow to exactly the
@@ -3304,11 +3352,8 @@ async fn build_magic_member_entries(
                         macros,
                         implementers,
                     };
-                    // A Volt component (own front-matter, or an MFC template
-                    // referencing `$this->`) needs the file source — for property
-                    // typing AND for keying `$this->member` component references.
-                    // Files with no `$this->` (e.g. the ~58k published icon
-                    // templates) read nothing and resolve via the view-var index.
+                    // `$this->…` usage: same test as before (drives MFC prop
+                    // typing) but now off the captured refs, no file read.
                     let uses_this = data
                         .member_access_refs
                         .iter()
@@ -3317,69 +3362,149 @@ async fn build_magic_member_entries(
                             .blade_loops
                             .iter()
                             .any(|l| l.iterable.starts_with("$this->"));
-                    let source = if data.is_volt || uses_this {
-                        std::fs::read_to_string(&path).ok()
-                    } else {
-                        None
-                    };
-
-                    let volt_props = if data.is_volt {
-                        source.as_deref().map(|src| {
-                            laravel_lsp::view_var_index::volt_property_types(
-                                src,
-                                &resolver,
-                                &classviews,
-                                &root,
-                            )
-                        })
-                    } else if uses_this {
-                        laravel_lsp::view_var_index::mfc_volt_property_types(
-                            &path,
-                            &resolver,
-                            &classviews,
-                            &root,
-                        )
-                    } else {
-                        None
-                    };
 
                     let mut deps = HashSet::new();
-                    let mut entries = if let Some(prop_types) = volt_props {
-                        laravel_lsp::view_var_index::resolve_volt_member_accesses(
-                            &data.member_access_refs,
-                            &prop_types,
-                            &data.blade_loops,
-                            &resolver,
-                            &classviews,
-                            &root,
-                            Some(&mut deps),
-                        )
-                    } else {
-                        let view_name =
-                            laravel_lsp::view_var_index::view_name_for_path(&path, &view_paths)?;
-                        laravel_lsp::view_var_index::resolve_blade_member_accesses(
-                            &data.member_access_refs,
-                            &view_name,
-                            &view_var_index,
-                            &data.blade_loops,
-                            &resolver,
-                            &classviews,
-                            &root,
-                            Some(&mut deps),
-                        )
+                    // Resolve from captured context when present (the target Blade
+                    // file is NEVER read — only cross-file MFC sibling `.php`
+                    // reads remain, which the spec keeps at resolve). A missing
+                    // context is not expected for a non-vendor Blade file post-v11
+                    // (capture always runs), but — symmetric with Pass 1/2 — we
+                    // re-read + re-parse rather than silently drop the file.
+                    //
+                    // Routing (BOTH branches, mirroring the save-refresh path):
+                    //   is_volt  → ALWAYS the Volt resolver, with an empty prop
+                    //              map when there's no `<?php` front-matter. Never
+                    //              fall to the Blade resolver for an is_volt file:
+                    //              `is_volt` is a raw-byte needle scan, so a stray
+                    //              `computed(`/`form(` in a plain template with no
+                    //              PHP block would otherwise route to Blade here
+                    //              while the save path routes to Volt — and the
+                    //              Blade branch's `view_name_for_path?` could drop
+                    //              the whole file.
+                    //   uses_this→ MFC template: type from the sibling `.php`.
+                    //   else     → controller-rendered Blade (view-var index).
+                    let entries = match data.member_context.as_ref() {
+                        Some(ctx) => {
+                            let volt_props = if data.is_volt {
+                                Some(
+                                    ctx.volt_surface
+                                        .as_ref()
+                                        .map(|s| {
+                                            laravel_lsp::view_var_index::evaluate_volt_surface(
+                                                s,
+                                                &resolver,
+                                                &classviews,
+                                                &root,
+                                            )
+                                        })
+                                        .unwrap_or_default(),
+                                )
+                            } else if uses_this {
+                                laravel_lsp::view_var_index::mfc_volt_property_types(
+                                    &path,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                )
+                            } else {
+                                None
+                            };
+                            let mut e = if let Some(prop_types) = volt_props {
+                                laravel_lsp::view_var_index::resolve_volt_member_accesses_with_context(
+                                    ctx,
+                                    &data.member_access_refs,
+                                    &prop_types,
+                                    &data.blade_loops,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                    Some(&mut deps),
+                                )
+                            } else {
+                                let view_name = laravel_lsp::view_var_index::view_name_for_path(
+                                    &path,
+                                    &view_paths,
+                                )?;
+                                laravel_lsp::view_var_index::resolve_blade_member_accesses_with_context(
+                                    ctx,
+                                    &data.member_access_refs,
+                                    &view_name,
+                                    &view_var_index,
+                                    &data.blade_loops,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                    Some(&mut deps),
+                                )
+                            };
+                            // Component `$this->member` refs (SFC own class from
+                            // the captured members, or MFC sibling read). Additive.
+                            if let Some(comp) = &ctx.component {
+                                e.extend(
+                                    laravel_lsp::view_var_index::resolve_component_member_accesses_with_context(
+                                        comp,
+                                        &path,
+                                        &data.member_access_refs,
+                                    ),
+                                );
+                            }
+                            e
+                        }
+                        None => {
+                            let source = std::fs::read_to_string(&path).ok()?;
+                            let volt_props = if data.is_volt {
+                                Some(laravel_lsp::view_var_index::volt_property_types(
+                                    &source,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                ))
+                            } else if uses_this {
+                                laravel_lsp::view_var_index::mfc_volt_property_types(
+                                    &path,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                )
+                            } else {
+                                None
+                            };
+                            let mut e = if let Some(prop_types) = volt_props {
+                                laravel_lsp::view_var_index::resolve_volt_member_accesses(
+                                    &data.member_access_refs,
+                                    &prop_types,
+                                    &data.blade_loops,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                    Some(&mut deps),
+                                )
+                            } else {
+                                let view_name = laravel_lsp::view_var_index::view_name_for_path(
+                                    &path,
+                                    &view_paths,
+                                )?;
+                                laravel_lsp::view_var_index::resolve_blade_member_accesses(
+                                    &data.member_access_refs,
+                                    &view_name,
+                                    &view_var_index,
+                                    &data.blade_loops,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                    Some(&mut deps),
+                                )
+                            };
+                            e.extend(
+                                laravel_lsp::view_var_index::resolve_component_member_accesses(
+                                    &path,
+                                    &source,
+                                    &data.member_access_refs,
+                                ),
+                            );
+                            e
+                        }
                     };
-                    // Component `$this->member` references (SFC own class, or MFC
-                    // sibling). Additive — these are component-self refs, not
-                    // model/view-var resolutions.
-                    if let Some(src) = &source {
-                        entries.extend(
-                            laravel_lsp::view_var_index::resolve_component_member_accesses(
-                                &path,
-                                src,
-                                &data.member_access_refs,
-                            ),
-                        );
-                    }
                     // Dep-only files stay — see the pass-2 comment.
                     (!entries.is_empty() || !deps.is_empty()).then_some((path, entries, deps))
                 })
@@ -6245,12 +6370,24 @@ impl LaravelLanguageServer {
                 .unwrap_or(false);
             if !patterns.views.is_empty() || had_renders {
                 let classviews = laravel_lsp::member_resolver::ClassViewCache::new();
-                let renders = laravel_lsp::view_var_index::view_renders_in_file(
-                    content,
-                    &*class_files,
-                    &classviews,
-                    &root,
-                );
+                // Evaluate the captured render plans; fall back to a re-parse for
+                // a vendor save (no captured context) — see the resolution
+                // fallback below for the vendor rationale.
+                let renders = match patterns.member_context.as_ref() {
+                    Some(ctx) => laravel_lsp::view_var_index::evaluate_render_plans(
+                        &ctx.view_renders,
+                        &ctx.aliases,
+                        &*class_files,
+                        &classviews,
+                        &root,
+                    ),
+                    None => laravel_lsp::view_var_index::view_renders_in_file(
+                        content,
+                        &*class_files,
+                        &classviews,
+                        &root,
+                    ),
+                };
                 if let Ok(mut vv) = self.view_vars.write() {
                     let old = vv.renders_for(path).map(|r| r.to_vec()).unwrap_or_default();
                     if old != renders {
@@ -6308,67 +6445,149 @@ impl LaravelLanguageServer {
             macros,
             implementers,
         };
-        let mut entries = if is_volt {
-            let prop_types = laravel_lsp::view_var_index::volt_property_types(
-                content,
-                &resolver,
-                &classviews,
-                &root,
-            );
-            laravel_lsp::view_var_index::resolve_volt_member_accesses(
-                &patterns.member_access_refs,
-                &prop_types,
-                &patterns.blade_loops,
-                &resolver,
-                &classviews,
-                &root,
-                Some(&mut deps),
-            )
-        } else if is_blade {
-            // Controller-rendered Blade: resolve against the persistent
-            // view-var index. The read guard spans only this sync call —
-            // no awaits while held.
-            let view_paths = self
-                .cached_config
+        // Controller-rendered Blade needs the view paths (an await), fetched
+        // here at the async top level so both the captured-context and the
+        // vendor fallback branches below can use it without re-awaiting.
+        let view_paths = if is_blade && !is_volt {
+            self.cached_config
                 .read()
                 .await
                 .as_ref()
                 .map(|c| c.view_paths.clone())
-                .unwrap_or_default();
-            match laravel_lsp::view_var_index::view_name_for_path(path, &view_paths) {
-                Some(view_name) => match self.view_vars.read() {
-                    Ok(vv) => laravel_lsp::view_var_index::resolve_blade_member_accesses(
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // Resolve from the context captured at parse when present. The ONLY
+        // no-context case is a VENDOR save: the build passes skip vendor, so
+        // vendor files carry no `member_context` — fall back to the original
+        // re-parse-over-`content` path so a vendor edit still refreshes
+        // correctly. (Both paths read the SAME `content` the patterns were
+        // parsed from, so per-file resolution is self-consistent — the
+        // build-path's former disk-vs-buffer skew doesn't apply here.)
+        let mut entries = match patterns.member_context.as_ref() {
+            Some(ctx) => {
+                if is_volt {
+                    let prop_types = ctx
+                        .volt_surface
+                        .as_ref()
+                        .map(|s| {
+                            laravel_lsp::view_var_index::evaluate_volt_surface(
+                                s,
+                                &resolver,
+                                &classviews,
+                                &root,
+                            )
+                        })
+                        .unwrap_or_default();
+                    laravel_lsp::view_var_index::resolve_volt_member_accesses_with_context(
+                        ctx,
                         &patterns.member_access_refs,
-                        &view_name,
-                        &vv,
+                        &prop_types,
                         &patterns.blade_loops,
                         &resolver,
                         &classviews,
                         &root,
                         Some(&mut deps),
-                    ),
-                    Err(_) => Vec::new(),
-                },
-                None => Vec::new(),
+                    )
+                } else if is_blade {
+                    match laravel_lsp::view_var_index::view_name_for_path(path, &view_paths) {
+                        Some(view_name) => match self.view_vars.read() {
+                            Ok(vv) => {
+                                laravel_lsp::view_var_index::resolve_blade_member_accesses_with_context(
+                                    ctx,
+                                    &patterns.member_access_refs,
+                                    &view_name,
+                                    &vv,
+                                    &patterns.blade_loops,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                    Some(&mut deps),
+                                )
+                            }
+                            Err(_) => Vec::new(),
+                        },
+                        None => Vec::new(),
+                    }
+                } else {
+                    laravel_lsp::member_resolver::resolve_member_access_entries_with_context(
+                        ctx,
+                        &patterns.member_access_refs,
+                        &resolver,
+                        &classviews,
+                        &root,
+                        Some(&mut deps),
+                    )
+                }
             }
-        } else {
-            laravel_lsp::member_resolver::resolve_member_access_entries(
-                content,
-                &patterns.member_access_refs,
-                &resolver,
-                &classviews,
-                &root,
-                Some(&mut deps),
-            )
+            None => {
+                if is_volt {
+                    let prop_types = laravel_lsp::view_var_index::volt_property_types(
+                        content,
+                        &resolver,
+                        &classviews,
+                        &root,
+                    );
+                    laravel_lsp::view_var_index::resolve_volt_member_accesses(
+                        &patterns.member_access_refs,
+                        &prop_types,
+                        &patterns.blade_loops,
+                        &resolver,
+                        &classviews,
+                        &root,
+                        Some(&mut deps),
+                    )
+                } else if is_blade {
+                    match laravel_lsp::view_var_index::view_name_for_path(path, &view_paths) {
+                        Some(view_name) => match self.view_vars.read() {
+                            Ok(vv) => laravel_lsp::view_var_index::resolve_blade_member_accesses(
+                                &patterns.member_access_refs,
+                                &view_name,
+                                &vv,
+                                &patterns.blade_loops,
+                                &resolver,
+                                &classviews,
+                                &root,
+                                Some(&mut deps),
+                            ),
+                            Err(_) => Vec::new(),
+                        },
+                        None => Vec::new(),
+                    }
+                } else {
+                    laravel_lsp::member_resolver::resolve_member_access_entries(
+                        content,
+                        &patterns.member_access_refs,
+                        &resolver,
+                        &classviews,
+                        &root,
+                        Some(&mut deps),
+                    )
+                }
+            }
         };
         // Component `$this->member` references (Volt SFC `.php` or Blade SFC).
-        entries.extend(
-            laravel_lsp::view_var_index::resolve_component_member_accesses(
-                path,
-                content,
-                &patterns.member_access_refs,
+        match patterns.member_context.as_ref() {
+            Some(ctx) => {
+                if let Some(comp) = &ctx.component {
+                    entries.extend(
+                        laravel_lsp::view_var_index::resolve_component_member_accesses_with_context(
+                            comp,
+                            path,
+                            &patterns.member_access_refs,
+                        ),
+                    );
+                }
+            }
+            None => entries.extend(
+                laravel_lsp::view_var_index::resolve_component_member_accesses(
+                    path,
+                    content,
+                    &patterns.member_access_refs,
+                ),
             ),
-        );
+        }
 
         if let Err(e) = self
             .salsa

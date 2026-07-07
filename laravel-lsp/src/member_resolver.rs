@@ -1915,5 +1915,731 @@ pub fn dynamic_finder_column(member: &str) -> Option<String> {
     Some(pascal_to_snake(rest))
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// M1 single-parse capture — compile (parse time) + eval (resolve time)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The functions below let the whole-project magic build stop re-reading and
+// re-parsing each target file. `capture_*` runs at PARSE (tree in hand) and
+// compiles each site's INTRA-file receiver resolution into a small owned
+// `ReceiverRecipeData`; `eval_*` / `resolve_member_access_entries_with_context`
+// run at RESOLVE and finish the CROSS-file half against snapshots + memos,
+// mirroring `resolve_and_classify` / `resolve_receiver` branch-for-branch so
+// the resolved entries + deps are byte-identical to the re-parse path. The
+// tree functions above stay the live-query path AND the equivalence baseline.
+
+use crate::salsa_impl::{
+    ChainRecipeData, ChainRootData, MemberContextData, ReceiverRecipeData, SiteContextData,
+    ValueExprPlanData,
+};
+use tree_sitter::Tree;
+
+// ─── Compile: PHP member-access sites ──────────────────────────────────────
+
+/// Compile every PHP member-access site into its captured [`SiteContextData`],
+/// positionally parallel to `refs`. Receivers are located by the SAME byte
+/// range the resolve pass uses, so node identity matches by construction.
+pub(crate) fn capture_php_sites(
+    source: &str,
+    tree: &Tree,
+    refs: &[Arc<MemberAccessReferenceData>],
+    aliases: &UseAliases,
+) -> Vec<SiteContextData> {
+    let bytes = source.as_bytes();
+    let root = tree.root_node();
+    refs.iter()
+        .map(|m| {
+            let Some(receiver) =
+                root.descendant_for_byte_range(m.receiver_byte_start, m.receiver_byte_end)
+            else {
+                return SiteContextData {
+                    recipe: ReceiverRecipeData::Unresolvable,
+                    chain: None,
+                    enclosing_class_fqcn: None,
+                    is_scope_param_receiver: false,
+                };
+            };
+            let recipe = compile_receiver(receiver, bytes, aliases);
+            // The builder-chain fallback + retry are call-form-only, so only
+            // call-form sites pay to capture them.
+            let (chain, enclosing, is_scope_param) = if m.form.is_call() {
+                (
+                    compile_chain(receiver, bytes, aliases),
+                    enclosing_class_fqcn(receiver, bytes),
+                    is_scope_param_receiver(receiver, bytes),
+                )
+            } else {
+                (None, None, false)
+            };
+            SiteContextData {
+                recipe,
+                chain,
+                enclosing_class_fqcn: enclosing,
+                is_scope_param_receiver: is_scope_param,
+            }
+        })
+        .collect()
+}
+
+/// Compile a Blade receiver expression (from its `<?php {receiver};` snippet)
+/// into a recipe — the parse-time form of `resolve_chain_receiver`'s
+/// `resolve_expression_type`. Bare `$var` / `$this->prop` receivers compile to
+/// `Unresolvable` (they resolve from the view-var / Volt-prop maps by text at
+/// eval, never through the recipe).
+pub(crate) fn compile_blade_site(receiver_text: &str) -> SiteContextData {
+    let recipe = compile_blade_receiver(receiver_text);
+    SiteContextData {
+        recipe,
+        chain: None,
+        enclosing_class_fqcn: None,
+        is_scope_param_receiver: false,
+    }
+}
+
+fn compile_blade_receiver(receiver_text: &str) -> ReceiverRecipeData {
+    let snippet = format!("<?php {receiver_text};");
+    let Ok(tree) = parse_php(&snippet) else {
+        return ReceiverRecipeData::Unresolvable;
+    };
+    let bytes = snippet.as_bytes();
+    let aliases = extract_use_aliases(&tree, &snippet);
+    let Some(expr) = first_snippet_expression(&tree) else {
+        return ReceiverRecipeData::Unresolvable;
+    };
+    // Mirror `resolve_expression_type`: flow classifier first, receiver second.
+    match flow::resolve_expression(expr, bytes, &aliases) {
+        Some((fqcn, confidence)) => ReceiverRecipeData::Resolved { fqcn, confidence },
+        None => compile_receiver(expr, bytes, &aliases),
+    }
+}
+
+/// The expression of the first `expression_statement` in a `<?php <expr>;`
+/// snippet — the receiver node. (Mirrors `view_var_index::first_expression`.)
+fn first_snippet_expression(tree: &Tree) -> Option<Node<'_>> {
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "expression_statement" {
+            let mut c = n.walk();
+            return n.named_children(&mut c).next();
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    None
+}
+
+/// Compile a value expression (a `view()`-data or Volt value) — the parse-time
+/// form of `resolve_expression_type`: flow classifier → `Resolved`, else the
+/// receiver recipe.
+pub(crate) fn compile_value_expr(
+    expr: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+) -> ValueExprPlanData {
+    match flow::resolve_expression(expr, bytes, aliases) {
+        Some((fqcn, confidence)) => ValueExprPlanData::Resolved { fqcn, confidence },
+        None => ValueExprPlanData::Recipe(compile_receiver(expr, bytes, aliases)),
+    }
+}
+
+/// Compile a `flow::resolve`-typed value (the `compact('x')` case, which types
+/// purely intra-file) into a plan — always `Resolved` or omitted by the caller.
+pub(crate) fn compile_flow_var(
+    node: Node,
+    bytes: &[u8],
+    var: &str,
+    aliases: &UseAliases,
+) -> Option<ValueExprPlanData> {
+    flow::resolve_with_confidence(node, bytes, var, aliases)
+        .map(|(fqcn, confidence)| ValueExprPlanData::Resolved { fqcn, confidence })
+}
+
+/// Compile a receiver node into a recipe — the intra-file half of
+/// [`resolve_receiver`]. `resolve_and_classify` checks auth BEFORE the shape
+/// match, and an auth miss falls through to the rest of `resolve_receiver`, so
+/// the auth recipe carries that fallthrough as its `fallback`.
+fn compile_receiver(receiver: Node, bytes: &[u8], aliases: &UseAliases) -> ReceiverRecipeData {
+    if auth_user_receiver_shape(receiver, bytes) {
+        return ReceiverRecipeData::AuthUser {
+            fallback: Box::new(compile_receiver_after_auth(receiver, bytes, aliases)),
+        };
+    }
+    compile_receiver_after_auth(receiver, bytes, aliases)
+}
+
+/// The rest of [`resolve_receiver`] after the auth check: container → helper →
+/// the node-kind match.
+fn compile_receiver_after_auth(
+    receiver: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+) -> ReceiverRecipeData {
+    if let Some(key) = container_receiver_key(receiver, bytes) {
+        return ReceiverRecipeData::ContainerKey(key);
+    }
+    if let Some(name) = helper_receiver_name(receiver, bytes) {
+        return ReceiverRecipeData::HelperBinding(name);
+    }
+    match receiver.kind() {
+        "variable_name" => {
+            let Ok(raw) = receiver.utf8_text(bytes) else {
+                return ReceiverRecipeData::Unresolvable;
+            };
+            let var = raw.trim_start_matches('$');
+            if var == "this" {
+                match enclosing_class_fqcn(receiver, bytes) {
+                    Some(fqcn) => ReceiverRecipeData::Resolved {
+                        fqcn,
+                        confidence: Confidence::High,
+                    },
+                    None => ReceiverRecipeData::Unresolvable,
+                }
+            } else if let Some((fqcn, confidence)) =
+                flow::resolve_with_confidence(receiver, bytes, var, aliases)
+                    .or_else(|| resolve_foreach_var(receiver, bytes, var, aliases))
+            {
+                ReceiverRecipeData::Resolved { fqcn, confidence }
+            } else if is_gate_closure_user_shape(receiver, bytes) {
+                ReceiverRecipeData::GateClosureUser
+            } else {
+                ReceiverRecipeData::Unresolvable
+            }
+        }
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            match resolve_typed_property(receiver, bytes, aliases) {
+                Some((fqcn, confidence)) => ReceiverRecipeData::Resolved { fqcn, confidence },
+                None => ReceiverRecipeData::Unresolvable,
+            }
+        }
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            // `resolve_method_return` requires a plain `name` method node.
+            let Some(name_node) = receiver.child_by_field_name("name") else {
+                return ReceiverRecipeData::Unresolvable;
+            };
+            if name_node.kind() != "name" {
+                return ReceiverRecipeData::Unresolvable;
+            }
+            let (Ok(method), Some(object)) = (
+                name_node.utf8_text(bytes),
+                receiver.child_by_field_name("object"),
+            ) else {
+                return ReceiverRecipeData::Unresolvable;
+            };
+            ReceiverRecipeData::MethodReturn {
+                object: Box::new(compile_receiver(object, bytes, aliases)),
+                method: method.to_string(),
+            }
+        }
+        "name" | "qualified_name" => {
+            let Ok(raw) = receiver.utf8_text(bytes) else {
+                return ReceiverRecipeData::Unresolvable;
+            };
+            ReceiverRecipeData::StaticName {
+                raw: raw.to_string(),
+                qualified: qualify_fqcn(resolve_class_name(raw, aliases), receiver, bytes),
+                is_namespaced: file_namespace(receiver, bytes).is_some(),
+            }
+        }
+        "relative_scope" | "self" | "static" | "parent" => {
+            let Ok(raw) = receiver.utf8_text(bytes) else {
+                return ReceiverRecipeData::Unresolvable;
+            };
+            match enclosing_class_fqcn(receiver, bytes) {
+                Some(fqcn) => match raw {
+                    "self" => ReceiverRecipeData::Resolved {
+                        fqcn,
+                        confidence: Confidence::High,
+                    },
+                    "static" => ReceiverRecipeData::Resolved {
+                        fqcn,
+                        confidence: Confidence::Medium,
+                    },
+                    _ => ReceiverRecipeData::Unresolvable,
+                },
+                None => ReceiverRecipeData::Unresolvable,
+            }
+        }
+        _ => ReceiverRecipeData::Unresolvable,
+    }
+}
+
+/// Compile the builder-chain fallback — the parse-time form of
+/// [`resolve_call_chain_receiver`]. `None` when the receiver roots in itself
+/// (no chain to walk).
+fn compile_chain(receiver: Node, bytes: &[u8], aliases: &UseAliases) -> Option<ChainRecipeData> {
+    let root = chain_root(receiver);
+    let links = chain_link_names(receiver, bytes);
+    if root.kind() == "scoped_call_expression" {
+        let scope = root.child_by_field_name("scope")?;
+        let (qualified, confidence) = match scope.kind() {
+            "name" | "qualified_name" => {
+                let raw = scope.utf8_text(bytes).ok()?;
+                (
+                    qualify_fqcn(resolve_class_name(raw, aliases), scope, bytes),
+                    Confidence::High,
+                )
+            }
+            "relative_scope" => {
+                let raw = scope.utf8_text(bytes).ok()?;
+                let fqcn = enclosing_class_fqcn(receiver, bytes)?;
+                match raw {
+                    "self" => (fqcn, Confidence::High),
+                    "static" => (fqcn, Confidence::Medium),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let first_method = root
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())?
+            .to_string();
+        return Some(ChainRecipeData {
+            root: ChainRootData::StaticScope {
+                qualified,
+                confidence,
+                first_method,
+            },
+            links,
+        });
+    }
+    if root.id() != receiver.id() {
+        return Some(ChainRecipeData {
+            root: ChainRootData::Var(Box::new(compile_receiver(root, bytes, aliases))),
+            links,
+        });
+    }
+    None
+}
+
+/// The member names walked from `receiver` toward (but not including) the chain
+/// root — the input to the relation-hop bail (see [`has_relationship_link`]).
+fn chain_link_names(receiver: Node, bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = receiver;
+    while matches!(
+        cur.kind(),
+        "member_call_expression"
+            | "nullsafe_member_call_expression"
+            | "member_access_expression"
+            | "nullsafe_member_access_expression"
+    ) {
+        if let Some(name) = cur.child_by_field_name("name") {
+            if let Ok(text) = name.utf8_text(bytes) {
+                out.push(text.to_string());
+            }
+        }
+        match cur.child_by_field_name("object") {
+            Some(o) => cur = o,
+            None => break,
+        }
+    }
+    out
+}
+
+// ─── Compile: intra-file SHAPE predicates ──────────────────────────────────
+// The shape half of the cross-file `resolve_*_receiver` functions — "does this
+// receiver look like X?" without doing the cross-file resolution. Kept in
+// lockstep with the resolvers they mirror.
+
+/// The shape of [`resolve_auth_user_receiver`] — `Auth::user()`,
+/// `auth()->user()`, `request()->user()` — without the auth-model lookup.
+fn auth_user_receiver_shape(receiver: Node, bytes: &[u8]) -> bool {
+    match receiver.kind() {
+        "scoped_call_expression" => {
+            let Some(name) = receiver
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(bytes).ok())
+            else {
+                return false;
+            };
+            if name != "user" {
+                return false;
+            }
+            receiver
+                .child_by_field_name("scope")
+                .and_then(|s| s.utf8_text(bytes).ok())
+                .map(|scope| scope.rsplit('\\').next().unwrap_or(scope) == "Auth")
+                .unwrap_or(false)
+        }
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            let Some(name) = receiver
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(bytes).ok())
+            else {
+                return false;
+            };
+            if name != "user" {
+                return false;
+            }
+            let Some(object) = receiver.child_by_field_name("object") else {
+                return false;
+            };
+            object.kind() == "function_call_expression"
+                && matches!(
+                    object
+                        .child_by_field_name("function")
+                        .and_then(|f| f.utf8_text(bytes).ok()),
+                    Some("auth") | Some("request")
+                )
+        }
+        _ => false,
+    }
+}
+
+/// The container-binding key of [`resolve_container_receiver`] — the `'key'` in
+/// `app('key')` / `resolve('key')`.
+fn container_receiver_key(receiver: Node, bytes: &[u8]) -> Option<String> {
+    if receiver.kind() != "function_call_expression" {
+        return None;
+    }
+    let func = receiver
+        .child_by_field_name("function")?
+        .utf8_text(bytes)
+        .ok()?
+        .trim_start_matches('\\');
+    if !matches!(func, "app" | "resolve") {
+        return None;
+    }
+    single_string_argument(receiver, bytes)
+}
+
+/// The helper name of [`resolve_helper_receiver`] — a zero-arg helper whose
+/// container binding we model (`view`, `cache`, …).
+fn helper_receiver_name(receiver: Node, bytes: &[u8]) -> Option<String> {
+    if receiver.kind() != "function_call_expression" {
+        return None;
+    }
+    let func = receiver
+        .child_by_field_name("function")?
+        .utf8_text(bytes)
+        .ok()?
+        .trim_start_matches('\\');
+    helper_binding_key(func).map(|_| func.to_string())
+}
+
+/// The shape of [`resolve_gate_closure_user`] — a variable that is a Gate
+/// ability closure's first parameter — without the auth-model lookup.
+fn is_gate_closure_user_shape(var_node: Node, bytes: &[u8]) -> bool {
+    let Ok(raw) = var_node.utf8_text(bytes) else {
+        return false;
+    };
+    let var = raw.trim_start_matches('$');
+    let Some(closure) = enclosing_closure(var_node) else {
+        return false;
+    };
+    is_first_param(closure, bytes, var) && is_gate_ability_closure(closure, bytes)
+}
+
+// ─── Eval: resolve captured context against snapshots ──────────────────────
+
+/// Pass-2 replacement: resolve captured PHP member sites without re-reading or
+/// re-parsing the target file. Byte-identical to
+/// [`resolve_member_access_entries`] for the same input.
+pub fn resolve_member_access_entries_with_context(
+    ctx: &MemberContextData,
+    member_refs: &[Arc<MemberAccessReferenceData>],
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+    mut deps: Option<&mut HashSet<String>>,
+) -> Vec<MagicMemberEntry> {
+    debug_assert_eq!(
+        ctx.sites.len(),
+        member_refs.len(),
+        "captured sites must be positionally parallel to member_access_refs"
+    );
+    let mut out = Vec::new();
+    for (m, site) in member_refs.iter().zip(ctx.sites.iter()) {
+        let Some(resolved) = resolve_recipe_and_classify(
+            site,
+            &ctx.aliases,
+            &m.member,
+            m.form,
+            resolver,
+            classviews,
+            project_root,
+            deps.as_deref_mut(),
+        ) else {
+            continue;
+        };
+        // find-references gate: HIGH + MEDIUM (mirrors the tree path).
+        if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
+            continue;
+        }
+        if m.form.is_call()
+            && matches!(
+                resolved.kind,
+                MagicMemberKind::PlainMember | MagicMemberKind::FacadeMethod
+            )
+        {
+            continue;
+        }
+        out.push(MagicMemberEntry {
+            fqcn: resolved.declaring_fqcn,
+            member: m.member.clone(),
+            line: m.line,
+            column: m.column,
+            end_column: m.end_column,
+        });
+    }
+    out
+}
+
+/// The captured-context port of [`resolve_and_classify`], branch-for-branch.
+#[allow(clippy::too_many_arguments)]
+fn resolve_recipe_and_classify(
+    site: &SiteContextData,
+    aliases: &UseAliases,
+    member: &str,
+    form: AccessForm,
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+    mut deps: Option<&mut HashSet<String>>,
+) -> Option<ResolvedMemberAccess> {
+    // Outer facade interception — a static-name receiver only.
+    let facade_concrete = match &site.recipe {
+        ReceiverRecipeData::StaticName {
+            raw, is_namespaced, ..
+        } => eval_facade(raw, *is_namespaced, aliases, resolver, project_root),
+        _ => None,
+    };
+    // Outer helper interception, only when facade didn't fire.
+    let helper_concrete = if facade_concrete.is_none() {
+        match &site.recipe {
+            ReceiverRecipeData::HelperBinding(name) => eval_helper(name, resolver),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let (fqcn, confidence, via_facade) = match facade_concrete.or(helper_concrete) {
+        Some((fqcn, confidence)) => (fqcn, confidence, true),
+        None => {
+            let (fqcn, confidence) =
+                match eval_receiver(&site.recipe, aliases, resolver, classviews, project_root) {
+                    Some(r) => r,
+                    None if form.is_call() => {
+                        let chain = site.chain.as_ref()?;
+                        eval_chain(chain, aliases, resolver, classviews, project_root)?
+                    }
+                    None => return None,
+                };
+            (fqcn, confidence, false)
+        }
+    };
+
+    if let Some(d) = deps.as_deref_mut() {
+        d.insert(fqcn.clone());
+    }
+
+    if let Some(resolved) = classify_against(
+        &fqcn,
+        member,
+        form,
+        confidence,
+        via_facade,
+        resolver,
+        classviews,
+        project_root,
+    ) {
+        return Some(resolved);
+    }
+
+    // Builder retry (see [`resolve_and_classify`]): captured `is_scope_param`
+    // gate + captured enclosing class.
+    if form.is_call() && is_eloquent_builder(&fqcn) && site.is_scope_param_receiver {
+        let model = site.enclosing_class_fqcn.clone()?;
+        if let Some(d) = deps {
+            d.insert(model.clone());
+        }
+        return classify_against(
+            &model,
+            member,
+            form,
+            Confidence::Medium,
+            false,
+            resolver,
+            classviews,
+            project_root,
+        );
+    }
+    None
+}
+
+/// The captured-context port of [`resolve_receiver`].
+pub(crate) fn eval_receiver(
+    recipe: &ReceiverRecipeData,
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+) -> Option<(String, Confidence)> {
+    match recipe {
+        ReceiverRecipeData::Resolved { fqcn, confidence } => Some((fqcn.clone(), *confidence)),
+        ReceiverRecipeData::AuthUser { fallback } => auth_model_fqcn(project_root)
+            .map(|m| (m, Confidence::High))
+            .or_else(|| eval_receiver(fallback, aliases, resolver, classviews, project_root)),
+        ReceiverRecipeData::GateClosureUser => {
+            auth_model_fqcn(project_root).map(|m| (m, Confidence::High))
+        }
+        ReceiverRecipeData::ContainerKey(key) => resolver
+            .binding_concrete(key)
+            .map(|c| (c, Confidence::High)),
+        ReceiverRecipeData::HelperBinding(name) => eval_helper(name, resolver),
+        ReceiverRecipeData::StaticName {
+            raw,
+            qualified,
+            is_namespaced,
+        } => eval_facade(raw, *is_namespaced, aliases, resolver, project_root).or_else(|| {
+            if resolver.class_file(qualified).is_some() || resolver.has_macro_host(qualified) {
+                Some((qualified.clone(), Confidence::High))
+            } else {
+                None
+            }
+        }),
+        ReceiverRecipeData::MethodReturn { object, method } => {
+            eval_method_return(object, method, aliases, resolver, classviews, project_root)
+        }
+        ReceiverRecipeData::Unresolvable => None,
+    }
+}
+
+/// Eval a [`ValueExprPlanData`] — the captured-context port of
+/// [`resolve_expression_type`].
+pub(crate) fn eval_value_expr(
+    plan: &ValueExprPlanData,
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+) -> Option<(String, Confidence)> {
+    match plan {
+        ValueExprPlanData::Resolved { fqcn, confidence } => Some((fqcn.clone(), *confidence)),
+        ValueExprPlanData::Recipe(recipe) => {
+            eval_receiver(recipe, aliases, resolver, classviews, project_root)
+        }
+    }
+}
+
+/// The captured-context port of [`resolve_facade_receiver`].
+fn eval_facade(
+    raw: &str,
+    is_namespaced: bool,
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    project_root: &Path,
+) -> Option<(String, Confidence)> {
+    let facade_fqcn = crate::facade_resolver::resolve_facade_fqcn(
+        raw,
+        aliases,
+        &resolver.facade_aliases(),
+        is_namespaced,
+    )?;
+    let concrete = crate::facade_resolver::facade_accessor(&facade_fqcn, project_root)
+        .and_then(|accessor| resolver.binding_concrete(&accessor))?;
+    Some((concrete, Confidence::High))
+}
+
+/// The captured-context port of [`resolve_helper_receiver`]'s tail.
+fn eval_helper(name: &str, resolver: &impl ClassFileResolver) -> Option<(String, Confidence)> {
+    let key = helper_binding_key(name)?;
+    if key.contains('\\') {
+        resolve_interface_concrete(key, resolver).map(|c| (c, Confidence::High))
+    } else {
+        resolver
+            .binding_concrete(key)
+            .map(|c| (c, Confidence::High))
+    }
+}
+
+/// The captured-context port of [`resolve_call_chain_receiver`].
+fn eval_chain(
+    chain: &ChainRecipeData,
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+) -> Option<(String, Confidence)> {
+    match &chain.root {
+        ChainRootData::StaticScope {
+            qualified,
+            confidence,
+            first_method,
+        } => {
+            let file = resolver.class_file(qualified)?;
+            let view = classviews.get_or_build(qualified, &file, project_root)?;
+            let first_is_forwarding =
+                crate::query_chain::methods::is_eloquent_static_starter(first_method)
+                    || matches!(
+                        classify_call(&view, first_method).map(|c| c.kind),
+                        Some(MagicMemberKind::Scope) | Some(MagicMemberKind::DynamicFinder)
+                    );
+            if !first_is_forwarding {
+                return None;
+            }
+            if chain_links_hit_relationship(&chain.links, &view) {
+                return None;
+            }
+            Some((qualified.clone(), *confidence))
+        }
+        ChainRootData::Var(obj_recipe) => {
+            let (fqcn, confidence) =
+                eval_receiver(obj_recipe, aliases, resolver, classviews, project_root)?;
+            if let Some(file) = resolver.class_file(&fqcn) {
+                if let Some(view) = classviews.get_or_build(&fqcn, &file, project_root) {
+                    if chain_links_hit_relationship(&chain.links, &view) {
+                        return None;
+                    }
+                }
+            }
+            let capped = match confidence {
+                Confidence::High => Confidence::Medium,
+                other => other,
+            };
+            Some((fqcn, capped))
+        }
+    }
+}
+
+/// Does any captured chain link name a relationship on `view`? The
+/// captured-context form of [`has_relationship_link`].
+fn chain_links_hit_relationship(links: &[String], view: &ClassView) -> bool {
+    links
+        .iter()
+        .any(|l| view.relationships.iter().any(|r| r.method_name == *l))
+}
+
+/// The captured-context port of [`resolve_method_return`].
+fn eval_method_return(
+    object: &ReceiverRecipeData,
+    method: &str,
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+) -> Option<(String, Confidence)> {
+    let (obj_fqcn, _) = eval_receiver(object, aliases, resolver, classviews, project_root)?;
+    let file_path = resolver.class_file(&obj_fqcn)?;
+    let view = classviews.get_or_build(&obj_fqcn, &file_path, project_root)?;
+    let ret = method_return_type(&view, method)?;
+    let normalized = normalize_type(&ret)?;
+    if matches!(normalized.as_str(), "self" | "static") {
+        return Some((obj_fqcn, Confidence::Medium));
+    }
+    let candidate = qualify_return_type(&normalized, &view);
+    if let Some(concrete) = resolve_interface_concrete(&candidate, resolver) {
+        return Some((concrete, Confidence::Medium));
+    }
+    if resolver.class_file(&candidate).is_some() {
+        return Some((candidate, Confidence::Medium));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests;

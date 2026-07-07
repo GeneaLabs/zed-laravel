@@ -204,3 +204,51 @@ fn blade_directive_attribute_param_member_access_is_captured() {
         data.member_access_refs
     );
 }
+
+// ─── M1 single-parse capture: member_context gating via THIS constructor ──
+//
+// The vendor gate + zero-cost `None` behaviour must hold through the real
+// `parse_owned_with_hierarchy` path (the parallel warm constructor), not just
+// the `capture_member_context` helper. The v11 disk invariant depends on
+// vendor files carrying no context.
+
+#[test]
+fn parse_owned_captures_context_for_a_member_reader() {
+    let path = PathBuf::from("/proj/app/Http/Controllers/C.php");
+    let src = "<?php\nnamespace App;\nclass C { public function f(\\App\\Models\\User $u) { return $u->email; } }\n";
+    let (data, _) = parse_owned_with_hierarchy(&path, src);
+    let ctx = data
+        .member_context
+        .as_ref()
+        .expect("a non-vendor member reader must capture context");
+    assert_eq!(
+        ctx.sites.len(),
+        data.member_access_refs.len(),
+        "sites must stay positionally parallel to member_access_refs"
+    );
+}
+
+#[test]
+fn parse_owned_skips_capture_for_vendor() {
+    // Same source, under a `vendor/` path → NO context (the build passes skip
+    // vendor, so capturing there is wasted; the disk cache relies on this).
+    let path = PathBuf::from("/proj/vendor/acme/pkg/src/C.php");
+    let src = "<?php\nnamespace Acme;\nclass C { public function f(\\App\\Models\\User $u) { return $u->email; } }\n";
+    let (data, _) = parse_owned_with_hierarchy(&path, src);
+    assert!(
+        !data.member_access_refs.is_empty(),
+        "the file DOES have a member access (proving the gate, not the parse, drops context)"
+    );
+    assert!(
+        data.member_context.is_none(),
+        "a vendor file must capture no context"
+    );
+}
+
+#[test]
+fn parse_owned_no_context_for_pattern_free_file() {
+    let path = PathBuf::from("/proj/app/Widget.php");
+    let src = "<?php\nnamespace App;\nclass Widget { public function noop() {} }\n";
+    let (data, _) = parse_owned_with_hierarchy(&path, src);
+    assert!(data.member_context.is_none());
+}

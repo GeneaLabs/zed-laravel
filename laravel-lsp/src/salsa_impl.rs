@@ -3377,6 +3377,204 @@ pub struct MemberAccessReferenceData {
     pub confidence: Confidence,
 }
 
+// ─── M1 single-parse capture: per-file resolution context ──────────────────
+//
+// Captured at PARSE time (tree in hand) so the whole-project magic-member
+// resolve passes never re-read or re-parse a target file. Each site's `recipe`
+// encodes the INTRA-file half of receiver resolution as a small owned value;
+// the cross-file half (class→file lookup, `ClassView` analysis, facade
+// accessor, container binding registry, auth model) is completed at resolve
+// against the actor snapshots + memos. The engine that consumes this lives in
+// `member_resolver` (PHP sites) and `view_var_index` (view renders + Volt); it
+// mirrors the tree engine's control flow branch-for-branch so the resolved
+// entries + deps stay byte-identical to the re-parse path.
+//
+// Grows `ParsedPatternsData`, so `pattern_disk_cache::SCHEMA_VERSION` is bumped
+// (10 → 11): the bincode envelope is non-self-describing, so stale slim entries
+// must re-parse rather than mis-decode.
+
+/// A receiver expression's compiled resolution recipe — the intra-file half of
+/// [`member_resolver`]'s `resolve_receiver`. Cross-file completion happens at
+/// eval; each variant names exactly what stays deferred.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ReceiverRecipeData {
+    /// Fully resolved intra-file: flow-tracked variable, `$this`, typed
+    /// `$this->prop`, `foreach` element, or `self`/`static`. The final answer —
+    /// no cross-file work remains.
+    Resolved {
+        fqcn: String,
+        confidence: Confidence,
+    },
+    /// `auth()->user()` / `Auth::user()` / `request()->user()`. Resolves to the
+    /// configured auth model at eval; `fallback` is what the tree resolver would
+    /// try next when no auth model is configured (auth is checked BEFORE the
+    /// shape match, so its miss falls through to the rest of `resolve_receiver`).
+    AuthUser { fallback: Box<ReceiverRecipeData> },
+    /// A Gate-ability closure's first parameter — resolves to the auth model at
+    /// eval, or `None` (terminal: the variable arm tries nothing else).
+    GateClosureUser,
+    /// `app('key')` / `resolve('key')` — the container binding key. Concrete
+    /// looked up in the binding registry at eval.
+    ContainerKey(String),
+    /// A zero-arg Laravel helper (`view()`, `cache()`, …) — the helper name.
+    /// Concrete looked up via the helper→binding map at eval.
+    HelperBinding(String),
+    /// A static class-name receiver (`User::…`, `Auth::…`). `qualified` is the
+    /// namespace-resolved FQCN (computed at parse from the file aliases +
+    /// namespace); at eval the facade interception runs first (needs the facade
+    /// alias snapshot), then the class-index / macro-host gate.
+    StaticName {
+        raw: String,
+        qualified: String,
+        is_namespaced: bool,
+    },
+    /// `$obj->method()` — resolve `object`, then the method's declared return
+    /// type (read from the DECLARING class's file at eval — legitimately
+    /// cross-file).
+    MethodReturn {
+        object: Box<ReceiverRecipeData>,
+        method: String,
+    },
+    /// Nothing resolvable intra-file (the tree resolver returned `None`).
+    Unresolvable,
+}
+
+/// Per-site captured context, positionally parallel to
+/// `ParsedPatternsData.member_access_refs`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SiteContextData {
+    /// The receiver's compiled recipe.
+    pub recipe: ReceiverRecipeData,
+    /// The call-form builder-chain fallback recipe, present only when the direct
+    /// recipe might fail and the receiver roots in a resolvable chain
+    /// (`User::query()->active()`, `$user->posts()->active()`).
+    pub chain: Option<ChainRecipeData>,
+    /// The lexically enclosing class FQCN — per SITE (a file may hold several
+    /// classes, or an anonymous Volt class). Feeds the builder→enclosing-model
+    /// retry.
+    pub enclosing_class_fqcn: Option<String>,
+    /// Whether this receiver roots in the enclosing `scope*` method's parameter
+    /// — the gate for the builder retry.
+    pub is_scope_param_receiver: bool,
+}
+
+/// A call-form receiver's builder-chain fallback — the compiled form of
+/// `resolve_call_chain_receiver`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChainRecipeData {
+    pub root: ChainRootData,
+    /// Member names walked from the receiver toward the root — checked against
+    /// the resolved class's relationships at eval for the relation-hop bail.
+    pub links: Vec<String>,
+}
+
+/// The root of a builder chain: an explicit static scope, or a nested receiver
+/// recipe for a variable/other root.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ChainRootData {
+    StaticScope {
+        qualified: String,
+        confidence: Confidence,
+        first_method: String,
+    },
+    Var(Box<ReceiverRecipeData>),
+}
+
+/// A `view()`-data value expression's compiled typing — either resolved
+/// intra-file (flow classifier hit) or a recipe to finish cross-file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ValueExprPlanData {
+    /// The flow expression classifier resolved it (pure intra-file) — final.
+    Resolved {
+        fqcn: String,
+        confidence: Confidence,
+    },
+    /// Flow missed; the receiver resolver finishes it at eval.
+    Recipe(ReceiverRecipeData),
+}
+
+/// One `view('name', […])` render site's compiled plan (pass 1). `items` are in
+/// traversal order so the resolve replay reproduces last-wins map semantics.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ViewRenderPlanData {
+    pub view_name: String,
+    pub items: Vec<(String, ValueExprPlanData)>,
+}
+
+/// A Volt front-matter property plan, replayed in declaration order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VoltPropPlanData {
+    /// Typed public property — authoritative, overwrites (`insert`).
+    TypedProp { name: String, fqcn: String },
+    /// A single direct `or_insert` value (a `mount()` `$this->prop = $param`
+    /// assignment, or a `$x = computed(...)` binding). Writes straight into the
+    /// surface with `or_insert` — first write per key wins, both within and
+    /// across these items (the tree engine's `out.entry(k).or_insert(...)`).
+    OrInsert {
+        name: String,
+        plan: ValueExprPlanData,
+    },
+    /// ONE `with()`/`state()`/`render()` HANDLER's ordered value items. The tree
+    /// engine resolves each into a temp map with `insert` — so WITHIN the
+    /// handler it is last-RESOLVING-wins (an unresolvable later value does NOT
+    /// overwrite an earlier resolved one) — then folds the temp into the surface
+    /// with `or_insert` (first-HANDLER-wins). Because resolvability is cross-file
+    /// (eval-time only), the items are kept in ORDER here and gated at eval; they
+    /// are NOT pre-deduped at capture.
+    OrInsertGroup(Vec<(String, ValueExprPlanData)>),
+    /// `#[Computed]` method — prefer the body-inferred type, else the declared
+    /// return type; `or_insert`.
+    Computed {
+        name: String,
+        body: Option<ValueExprPlanData>,
+        declared: Option<String>,
+    },
+}
+
+/// The Volt component's compiled front-matter surface (item 8).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VoltSurfaceData {
+    pub items: Vec<VoltPropPlanData>,
+    /// The front-matter block's own `use` aliases — the surface's value recipes
+    /// resolve facades against THESE (not the file-level, empty-for-Blade map).
+    pub aliases: HashMap<String, String>,
+}
+
+/// A Livewire/Volt component's identity + declared member names, when both are
+/// capturable intra-file. `members` is `None` for a multi-file-component Blade
+/// TEMPLATE, whose class lives in a sibling `.php` (read at eval — legitimately
+/// cross-file).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ComponentContextData {
+    pub key: String,
+    pub members: Option<Vec<String>>,
+}
+
+/// Everything the resolve passes need from a file's own source, captured once at
+/// parse. `None` on `ParsedPatternsData` for files with nothing to resolve
+/// (icon Blade templates, vendor files) — a single tag byte, honoring the
+/// zero-added-cost budget for pattern-free files.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct MemberContextData {
+    /// File `use`-alias map (alias → FQCN), persisted once instead of the two
+    /// per-file re-derivations the resolve + hierarchy passes did. Empty for
+    /// Blade files (their chain receivers compile from `use`-less snippets).
+    /// The only eval-time consumer is facade resolution on a `StaticName`
+    /// recipe; namespace-qualification is baked into each recipe at compile (so
+    /// the file's `namespace …;` needs no separate field — it survives as each
+    /// `StaticName`'s `qualified` + `is_namespaced`).
+    pub aliases: HashMap<String, String>,
+    /// One entry per `member_access_refs` element, in the SAME order — the
+    /// positionally-parallel invariant the resolve pass relies on.
+    pub sites: Vec<SiteContextData>,
+    /// `view('name', […])` render structure per controller (pass 1).
+    pub view_renders: Vec<ViewRenderPlanData>,
+    /// Volt front-matter surface (item 8).
+    pub volt_surface: Option<VoltSurfaceData>,
+    /// Livewire/Volt component identity + member names (item 8).
+    pub component: Option<ComponentContextData>,
+}
+
 /// Hover payload for a resolved magic member (M6). Crosses the Salsa async
 /// boundary, so it owns plain data (no lifetimes / borrows). `decl_file` /
 /// `decl_line` locate the declaration for a source link — `None` when the
@@ -4273,6 +4471,18 @@ pub struct ParsedPatternsData {
     /// (source in hand). Empty for `.php` files.
     #[serde(default)]
     pub blade_loops: Vec<BladeLoopVar>,
+    /// M1 single-parse capture: the file's own-source resolution context —
+    /// per-site receiver recipes, view-render plans, and the Volt surface —
+    /// compiled once at parse so the magic-member resolve passes never re-read
+    /// or re-parse this file. `None` for files with nothing to resolve (icon
+    /// Blade templates, vendor files): a single tag byte, so pattern-free files
+    /// pay ~zero. `member_context.sites` is positionally parallel to
+    /// `member_access_refs` when present. `#[serde(default)]` keeps older
+    /// disk-cache entries decodable in principle, but the growth of this struct
+    /// is guarded by the `pattern_disk_cache` SCHEMA_VERSION bump (10 → 11) —
+    /// bincode is non-self-describing, so stale slim entries re-parse.
+    #[serde(default)]
+    pub member_context: Option<Box<MemberContextData>>,
     /// Sorted index of all patterns by (line, column) for O(log n) lookup.
     /// Skipped during (de)serialization — when loading from the on-disk
     /// cache, the caller must invoke `build_position_index()` to rebuild
@@ -7332,11 +7542,20 @@ impl SalsaActor {
             .path(&self.db)
             .to_string_lossy()
             .ends_with(".blade.php");
-        if !path_is_blade {
-            if let Ok(tree) = parse_php(text) {
+        // Parse the full-file PHP tree ONCE and keep it — the M1 capture below
+        // reuses it (no second tree-sitter pass) to compile per-site receiver
+        // recipes. `None` for Blade (parsing a `.blade.php` as PHP is
+        // pathologically slow — see `pattern_indexer`).
+        let php_tree = if !path_is_blade {
+            parse_php(text).ok()
+        } else {
+            None
+        };
+        if let Some(tree) = &php_tree {
+            {
                 let lang = language_php();
 
-                if let Ok(php_patterns) = extract_all_php_patterns(&tree, text, &lang) {
+                if let Ok(php_patterns) = extract_all_php_patterns(tree, text, &lang) {
                     for r in php_patterns.route_calls {
                         route_refs.push(Arc::new(RouteReferenceData {
                             name: r.route_name.to_string(),
@@ -7419,7 +7638,7 @@ impl SalsaActor {
                 // Extract Eloquent / DB query builder chains from the same
                 // parsed tree. No second parse — we reuse the `tree` already
                 // produced above for route/url/action/feature extraction.
-                for chain in crate::query_chain::extract_chains(&tree, text) {
+                for chain in crate::query_chain::extract_chains(tree, text) {
                     chains.push(Arc::new(chain));
                 }
 
@@ -7429,7 +7648,7 @@ impl SalsaActor {
                 // already cached — without this, an open/edited model's own
                 // class is absent from the hierarchy, so magic-member
                 // resolution (`$this->email` → its declaring class) fails.
-                let nodes = crate::class_hierarchy_index::classes_from_tree(path, &tree, text);
+                let nodes = crate::class_hierarchy_index::classes_from_tree(path, tree, text);
                 // Invalidate the cached class→file snapshot only when this
                 // file's set of declared FQCNs actually changed — a method-body
                 // edit leaves it intact, keeping the next snapshot O(1).
@@ -7442,7 +7661,7 @@ impl SalsaActor {
                     self.class_files_snapshot = None;
                 }
             }
-        } // end if !path_is_blade
+        } // end if let Some(tree) = &php_tree  (non-Blade full-file PHP)
 
         // Blade-embedded PHP: extract route/url/action/feature from every
         // `{{ }}` / `{!! !!}` / `@php` region. Mirrors the Salsa-cached
@@ -7672,8 +7891,29 @@ impl SalsaActor {
             } else {
                 Vec::new()
             },
+            // Populated below once `data` is in hand — capture needs the final
+            // `member_access_refs` (parallel `sites`) and reuses the PHP tree.
+            member_context: None,
             sorted_positions: Vec::new(),
         };
+
+        // M1 single-parse capture: compile this file's own-source resolution
+        // context now, while the tree/source are in hand, so the whole-project
+        // magic build never re-reads or re-parses it. Non-vendor only — the
+        // build passes all skip vendor, so capturing there would be wasted
+        // memory. `.php` reuses `php_tree`; Blade compiles from receiver-text
+        // snippets + front-matter (there's no full-file PHP tree for Blade).
+        let is_vendor = path.components().any(|c| c.as_os_str() == "vendor");
+        if !is_vendor {
+            data.member_context = crate::member_capture::capture_member_context(
+                path,
+                text,
+                php_tree.as_ref(),
+                &data.member_access_refs,
+                data.is_volt,
+            )
+            .map(Box::new);
+        }
 
         // Build the sorted position index for O(log n) lookups
         data.build_position_index();

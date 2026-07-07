@@ -91,7 +91,15 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        re-parse. The envelope SHAPE didn't change — only the extraction
 ///        OUTPUT — which is exactly why an output-affecting change must
 ///        bump this even when serde would happily decode the old bytes.
-const SCHEMA_VERSION: u32 = 10;
+///   v11 — M1 single-parse capture: `ParsedPatternsData` grew a
+///        `member_context` (per-site receiver recipes + view-render plans +
+///        Volt surface), compiled at parse so the magic build stops re-reading
+///        target files. bincode is non-self-describing, so a v10 entry lacks
+///        those bytes entirely — stale slim entries must re-parse rather than
+///        mis-decode. The bump also guarantees every restored non-vendor entry
+///        carries context, so no "refs present but context missing" state can
+///        exist on the resolve path.
+const SCHEMA_VERSION: u32 = 11;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 

@@ -2989,3 +2989,398 @@ fn shared_cache_single_receiver_analyzed_exactly_once() {
         cache.misses(),
     );
 }
+
+// ─── M1 single-parse capture: capture-vs-live equivalence ─────────────────
+//
+// The hard M1 guarantee: resolving PHP member accesses from context captured at
+// parse must produce byte-identical entries AND deps to today's re-parse path,
+// on a fixture that exercises every receiver shape — aliased imports, `$this`,
+// typed + constructor-promoted props, multi-hop flow, foreach, `app('key')`
+// container bindings, `auth()->user()`, static + `::query()->…` chains,
+// self/static, and a multi-class file (per-site enclosing class).
+
+use crate::salsa_impl::MemberContextData;
+
+/// Build a `MemberContextData` for a `.php` file exactly as the parse-time
+/// capture does (aliases + per-site recipes off one parse).
+fn php_member_context(source: &str, refs: &[Arc<MemberAccessReferenceData>]) -> MemberContextData {
+    let tree = parse_php(source).expect("parse");
+    let aliases = extract_use_aliases(&tree, source);
+    let sites = super::capture_php_sites(source, &tree, refs, &aliases);
+    MemberContextData {
+        aliases,
+        sites,
+        view_renders: Vec::new(),
+        volt_surface: None,
+        component: None,
+    }
+}
+
+/// Resolve a caller's member accesses BOTH ways (tree path, captured-context
+/// path) against `resolver`/`root`, returning `(entries, deps)` sorted for an
+/// order-independent comparison.
+fn resolve_both_ways(
+    resolver: &impl ClassFileResolver,
+    root: &std::path::Path,
+    caller: &str,
+) -> (
+    (Vec<MagicMemberEntry>, Vec<String>),
+    (Vec<MagicMemberEntry>, Vec<String>),
+) {
+    let refs = member_refs_of(caller);
+
+    let sort_entries = |mut e: Vec<MagicMemberEntry>| {
+        e.sort_by(|a, b| {
+            (a.fqcn.as_str(), a.member.as_str(), a.line, a.column).cmp(&(
+                b.fqcn.as_str(),
+                b.member.as_str(),
+                b.line,
+                b.column,
+            ))
+        });
+        e
+    };
+    let sort_deps = |d: HashSet<String>| {
+        let mut v: Vec<String> = d.into_iter().collect();
+        v.sort();
+        v
+    };
+
+    let tree = {
+        let cache = ClassViewCache::new();
+        let mut deps = HashSet::new();
+        let e =
+            resolve_member_access_entries(caller, &refs, resolver, &cache, root, Some(&mut deps));
+        (sort_entries(e), sort_deps(deps))
+    };
+    let captured = {
+        let ctx = php_member_context(caller, &refs);
+        let cache = ClassViewCache::new();
+        let mut deps = HashSet::new();
+        let e = resolve_member_access_entries_with_context(
+            &ctx,
+            &refs,
+            resolver,
+            &cache,
+            root,
+            Some(&mut deps),
+        );
+        (sort_entries(e), sort_deps(deps))
+    };
+    (tree, captured)
+}
+
+/// A class index + auth-configured project root for the rich equivalence
+/// fixture. Each test builds its own `WithBindings` resolver borrowing the
+/// index (with a `tenant` container binding).
+fn rich_equivalence_project() -> (ClassHierarchyIndex, PathBuf, TempDir) {
+    let mut index = ClassHierarchyIndex::default();
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(
+        root.join("composer.json"),
+        r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("config")).unwrap();
+    fs::write(
+        root.join("config/auth.php"),
+        r#"<?php
+use App\Models\User;
+return ['providers' => ['users' => ['model' => User::class]]];
+"#,
+    )
+    .unwrap();
+
+    let write = |index: &mut ClassHierarchyIndex, rel: &str, body: &str| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
+        index.insert_file(&path, classes_in_file(&path, body));
+    };
+    write(
+        &mut index,
+        "app/Models/User.php",
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+class User extends Model {
+    protected $fillable = ['email', 'name'];
+    public function scopeActive($query) { return $query->where('active', true); }
+    public function getFullNameAttribute(): string { return ''; }
+    public function posts(): HasMany { return $this->hasMany(Post::class); }
+}
+"#,
+    );
+    write(
+        &mut index,
+        "app/Models/Post.php",
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Post extends Model {
+    protected $fillable = ['title'];
+}
+"#,
+    );
+    write(
+        &mut index,
+        "app/Models/Tenant.php",
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Tenant extends Model {
+    protected $fillable = ['name'];
+    public function getLogoAttribute(): string { return ''; }
+}
+"#,
+    );
+
+    (index, root, dir)
+}
+
+/// A `WithBindings` resolver borrowing `index`, with a `tenant` container
+/// binding (matching the fixture's `app('tenant')`).
+fn rich_resolver(index: &ClassHierarchyIndex) -> WithBindings<'_> {
+    let mut bindings = HashMap::new();
+    bindings.insert("tenant".to_string(), "App\\Models\\Tenant".to_string());
+    WithBindings { index, bindings }
+}
+
+#[test]
+fn captured_context_resolves_identically_to_tree_path() {
+    let (index, root, _dir) = rich_equivalence_project();
+    let resolver = rich_resolver(&index);
+
+    // A controller-shaped caller exercising the receiver-shape zoo, plus a
+    // SECOND class in the same file so per-site enclosing-class capture is
+    // tested. Aliases: `User as U`, plain `Post`, `Tenant`.
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+
+use App\Models\User as U;
+use App\Models\Post;
+use App\Models\Tenant;
+
+class ShowController {
+    private U $currentUser;
+
+    public function __construct(private Tenant $tenant) {}
+
+    public function show(U $u) {
+        $email = $u->email;            // typed param → column
+        $name = $u->fullName;          // accessor
+        $posts = $u->posts;            // relationship (property)
+        $scope = $u->active();         // scope (instance call)
+        $finder = $u->whereName('x');  // dynamic finder (instance call)
+
+        $mine = $this->currentUser->email;   // typed prop → column
+        $logo = $this->tenant->logo;         // promoted prop → accessor
+        $nope = $this->missingThing;         // $this = controller, no member → dropped
+
+        $s1 = U::active();                    // static scope
+        $s2 = U::query()->active();           // static builder chain
+        $s3 = U::whereEmail('a@b.c');         // static dynamic finder
+
+        $all = U::all();
+        foreach ($all as $one) {
+            $e2 = $one->email;                // foreach element → column
+        }
+
+        $auth = auth()->user()->email;        // auth model → column
+        $t = app('tenant')->name;             // container binding → column
+
+        return [$email, $name, $posts, $scope, $finder, $mine, $logo, $nope,
+                $s1, $s2, $s3, $e2, $auth, $t];
+    }
+}
+
+class Helper {
+    public function go(U $u) {
+        return $u->email;   // second class: per-site enclosing class
+    }
+}
+"#;
+
+    let (tree, captured) = resolve_both_ways(&resolver, &root, caller);
+    assert_eq!(
+        tree.0, captured.0,
+        "captured-context entries diverged from the tree path"
+    );
+    assert_eq!(
+        tree.1, captured.1,
+        "captured-context deps diverged from the tree path"
+    );
+    // Guard against a vacuous green: the fixture must resolve real entries.
+    assert!(
+        tree.0.len() >= 8,
+        "fixture under-resolved ({} entries) — equivalence would be near-vacuous",
+        tree.0.len()
+    );
+}
+
+#[test]
+fn captured_context_member_serde_round_trips() {
+    // The captured context must survive the bincode disk-cache round trip and
+    // re-resolve identically — the property the pattern-cache v11 bump relies on.
+    let (index, root, _dir) = rich_equivalence_project();
+    let resolver = rich_resolver(&index);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $u) {
+        $a = $u->email;
+        $b = $u->active();
+        $c = auth()->user()->email;
+        $d = app('tenant')->name;
+        return [$a, $b, $c, $d];
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let ctx = php_member_context(caller, &refs);
+
+    let bytes = bincode::serde::encode_to_vec(&ctx, bincode::config::standard()).unwrap();
+    let (decoded, _): (MemberContextData, _) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+    assert_eq!(
+        ctx, decoded,
+        "context did not survive the bincode round trip"
+    );
+
+    let resolve = |c: &MemberContextData| {
+        let cache = ClassViewCache::new();
+        let mut deps = HashSet::new();
+        let mut e = resolve_member_access_entries_with_context(
+            c,
+            &refs,
+            &resolver,
+            &cache,
+            &root,
+            Some(&mut deps),
+        );
+        e.sort_by(|a, b| a.member.cmp(&b.member));
+        e
+    };
+    assert_eq!(
+        resolve(&ctx),
+        resolve(&decoded),
+        "re-resolving the decoded context diverged from the original"
+    );
+    assert!(!resolve(&ctx).is_empty(), "fixture resolved nothing");
+}
+
+/// A project exercising the four recipe/chain variants the first fixture left
+/// uncovered: `GateClosureUser`, `HelperBinding`-as-receiver, `MethodReturn`,
+/// and `ChainRootData::Var`. Auth model + a `cache` helper binding are set up.
+fn variant_project() -> (ClassHierarchyIndex, PathBuf, TempDir) {
+    let mut index = ClassHierarchyIndex::default();
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(
+        root.join("composer.json"),
+        r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("config")).unwrap();
+    fs::write(
+        root.join("config/auth.php"),
+        r#"<?php
+use App\Models\User;
+return ['providers' => ['users' => ['model' => User::class]]];
+"#,
+    )
+    .unwrap();
+    let write = |index: &mut ClassHierarchyIndex, rel: &str, body: &str| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
+        index.insert_file(&path, classes_in_file(&path, body));
+    };
+    write(
+        &mut index,
+        "app/Models/User.php",
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $fillable = ['email'];
+    public function scopeActive($query) { return $query->where('active', true); }
+}
+"#,
+    );
+    write(
+        &mut index,
+        "app/Repositories/Repo.php",
+        r#"<?php
+namespace App\Repositories;
+use App\Models\User;
+class Repo {
+    public function currentUser(): User { return new User(); }
+}
+"#,
+    );
+    write(
+        &mut index,
+        "app/Support/Cache.php",
+        r#"<?php
+namespace App\Support;
+class Cache {
+    public string $prefix = '';
+}
+"#,
+    );
+    (index, root, dir)
+}
+
+#[test]
+fn captured_context_covers_remaining_receiver_variants() {
+    let (index, root, _dir) = variant_project();
+    let mut bindings = HashMap::new();
+    bindings.insert("cache".to_string(), "App\\Support\\Cache".to_string());
+    let resolver = WithBindings {
+        index: &index,
+        bindings,
+    };
+
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+use App\Repositories\Repo;
+class C {
+    public function show(User $u, Repo $repo) {
+        // ChainRootData::Var — $u->fresh() has no in-view return type, so the
+        // direct method-return fails and the chain fallback roots at the $u var.
+        $a = $u->fresh()->active();
+        // MethodReturn — currentUser(): User, then a column read on the result.
+        $b = $repo->currentUser()->email;
+        // HelperBinding as a receiver — cache() → the bound Cache concrete.
+        $c = cache()->prefix;
+        // GateClosureUser — the Gate ability closure's first param is the model.
+        \Gate::define('viewThing', function ($user) { return $user->email; });
+        return [$a, $b, $c];
+    }
+}
+"#;
+
+    let (tree, captured) = resolve_both_ways(&resolver, &root, caller);
+    assert_eq!(
+        tree.0, captured.0,
+        "captured-context entries diverged on the remaining variants"
+    );
+    assert_eq!(
+        tree.1, captured.1,
+        "captured-context deps diverged on the remaining variants"
+    );
+    // Each of the four variants must resolve a real entry (not just agree on
+    // dropping everything) — assert the members that only these paths produce.
+    let members: Vec<&str> = tree.0.iter().map(|e| e.member.as_str()).collect();
+    for expected in ["active", "email", "prefix"] {
+        assert!(
+            members.contains(&expected),
+            "variant fixture missing `{expected}` — got {members:?}"
+        );
+    }
+}

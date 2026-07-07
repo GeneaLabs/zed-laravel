@@ -60,12 +60,12 @@ pub fn parse_owned_with_hierarchy(
         data.is_volt = crate::livewire_resolver::source_contains_volt_signature(text);
         // Capture `@foreach` loops so the magic build can type loop variables
         // (`{{ $user->email }}` in `@foreach($users as $user)`) without a read.
+        // The `@foreach`-iterable member accesses are pushed AFTER the embedded
+        // PHP regions below, so `member_access_refs` ends in the SAME order the
+        // actor's `handle_get_patterns` produces (region accesses, then
+        // iterable accesses) — otherwise a file's emitted entry order would
+        // depend on which constructor built it (warm build vs save-refresh).
         data.blade_loops = crate::salsa_impl::blade_loop_vars(text);
-        // Capture member accesses inside `@foreach` iterables (`$this->entities`)
-        // — directive args the `{{ }}`/PHP capture below would otherwise miss.
-        for m in crate::salsa_impl::blade_loop_iterable_accesses(text) {
-            data.member_access_refs.push(std::sync::Arc::new(m));
-        }
         let lang = language_blade();
         if let Ok(tree) = parse_blade(text) {
             if let Ok(bp) = extract_all_blade_patterns(&tree, text, &lang) {
@@ -129,6 +129,13 @@ pub fn parse_owned_with_hierarchy(
             };
             push_php_patterns(&snippet, &mut data, Some((region.row, region.column)));
         }
+
+        // Member accesses inside `@foreach` iterables (`$this->entities`) —
+        // directive args the `{{ }}`/PHP region capture above misses. Pushed
+        // LAST to match the actor constructor's order (see the blade_loops note).
+        for m in crate::salsa_impl::blade_loop_iterable_accesses(text) {
+            data.member_access_refs.push(std::sync::Arc::new(m));
+        }
     }
 
     // Full-file PHP parse. ONLY for .php files.
@@ -147,15 +154,39 @@ pub fn parse_owned_with_hierarchy(
     // All Blade-embedded PHP extraction happens above via
     // `extract_php_regions` + `<?php `-wrapped per-region parsing,
     // which is fast and accurate.
-    if !is_blade {
+    // Full-file PHP parse kept so the M1 capture below reuses it (no second
+    // tree-sitter pass). `None` for Blade — see the note above on why parsing a
+    // `.blade.php` as PHP is pathologically slow.
+    let php_tree = if !is_blade {
+        parse_php(text).ok()
+    } else {
+        None
+    };
+    if let Some(tree) = &php_tree {
         let lang_php = language_php();
-        if let Ok(tree) = parse_php(text) {
-            if let Ok(patterns) = extract_all_php_patterns(&tree, text, &lang_php) {
-                push_php_patterns(&patterns, &mut data, None);
-            }
-            // Class-hierarchy nodes share this same PHP parse.
-            nodes = classes_from_tree(path, &tree, text);
+        if let Ok(patterns) = extract_all_php_patterns(tree, text, &lang_php) {
+            push_php_patterns(&patterns, &mut data, None);
         }
+        // Class-hierarchy nodes share this same PHP parse.
+        nodes = classes_from_tree(path, tree, text);
+    }
+
+    // M1 single-parse capture: compile this file's own-source resolution
+    // context now (tree/source in hand) so the whole-project magic build never
+    // re-reads or re-parses it. Non-vendor only — the build passes all skip
+    // vendor, so capturing there would be wasted memory. Runs after the
+    // `member_access_refs` above are final so `sites` stays positionally
+    // parallel to them.
+    let is_vendor = path.components().any(|c| c.as_os_str() == "vendor");
+    if !is_vendor {
+        data.member_context = crate::member_capture::capture_member_context(
+            path,
+            text,
+            php_tree.as_ref(),
+            &data.member_access_refs,
+            data.is_volt,
+        )
+        .map(Box::new);
     }
 
     data.build_position_index();
