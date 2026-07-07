@@ -126,10 +126,20 @@ fn parsed_file_cache() -> &'static ParsedCache {
     CACHE.get_or_init(|| Mutex::new(LruCache::new(NonZeroUsize::new(PARSED_CACHE_CAP).unwrap())))
 }
 
-/// Clear the parsed-file memo. Test/bench only — lets a benchmark measure the
-/// cold vs warm cost of this optimization in isolation, and keeps global state
-/// from leaking between tests that assert on cache behavior.
-#[doc(hidden)]
+/// Clear the parsed-file memo.
+///
+/// Drops every cached `(FileStamp, Arc<ParsedClassFile>)` from the
+/// process-global parsed-file cache. Two production callers rely on this:
+///
+/// * The `laravel.reindexProject` command, which resets all process-global
+///   memos before a cold rebuild so a stale parse can't survive the reindex.
+/// * The isolation benchmarks/tests, which clear the memo between passes to
+///   measure the cold vs. warm cost of this optimization, and to keep global
+///   state from leaking between tests that assert on cache behavior.
+///
+/// The memo is otherwise self-freshening — each lookup re-stats the file and
+/// rebuilds on a changed [`FileStamp`] — so this full reset is only needed
+/// when the caller wants a guaranteed-clean slate.
 pub fn reset_parsed_file_cache() {
     parsed_file_cache().lock().unwrap().clear();
 }

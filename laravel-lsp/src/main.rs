@@ -1938,6 +1938,16 @@ struct LaravelLanguageServer {
     /// warning, flooding the Problems panel.
     warm_complete: Arc<std::sync::atomic::AtomicBool>,
 
+    /// `true` while an indexing pass (initial warm OR a `laravel.reindexProject`
+    /// reindex) is running. Guards against concurrent passes: both the startup
+    /// warm and the reindex command claim it via
+    /// [`laravel_lsp::reindex::IndexingFlightGuard`], and a reindex triggered
+    /// while another pass holds it no-ops instead of running two warming
+    /// pipelines over the same shared caches (which would race the
+    /// full-replace magic-member import). The guard clears it on drop, so a
+    /// panicking warming task can't leave it stuck raised.
+    indexing_in_flight: Arc<std::sync::atomic::AtomicBool>,
+
     /// Project-wide index of column/table definitions parsed from
     /// `database/migrations/*.php`. Powers goto-definition on chain literals
     /// (column → migration line, table → create-table migration). Built at init
@@ -4151,6 +4161,7 @@ impl LaravelLanguageServer {
             database_diagnostic_shown: Arc::new(RwLock::new(false)),
             route_index: Arc::new(RwLock::new(None)),
             warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            indexing_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_index: Arc::new(RwLock::new(None)),
             command_index: Arc::new(RwLock::new(None)),
             vendor_translation_namespaces: Arc::new(RwLock::new(None)),
@@ -4366,6 +4377,88 @@ impl LaravelLanguageServer {
         }
     }
 
+    /// Run a full cold reindex in response to the `laravel.reindexProject`
+    /// command (dispatched by the "Laravel: Reindex project" code action).
+    ///
+    /// "Cold" means every cached artifact is thrown away and rebuilt from
+    /// source, in this order:
+    ///
+    /// 1. **Claim the indexing-flight guard.** If another pass — the startup
+    ///    warm or a prior reindex — already holds it, this trigger no-ops:
+    ///    two warming pipelines over the same shared caches would race the
+    ///    full-replace magic-member import. The guard releases on drop, so
+    ///    the flag can't stick if a warming task panics.
+    /// 2. **Wipe the on-disk caches** (pattern, magic, command, config,
+    ///    vendor) so the warming pass restores nothing and re-parses all.
+    /// 3. **Reset the process-global memos** (class locator, parsed-file) so
+    ///    no stale walk result or parse survives the rebuild.
+    /// 4. **Clear the in-memory indexes** (pattern cache, symbol index, class
+    ///    hierarchy, per-file LRU caches) so warming re-parses every file.
+    /// 5. **Re-run the standard registration + warming pipeline** with a
+    ///    work-done progress bar, holding the guard until warming completes.
+    ///
+    /// Reuses the existing warming pipeline ([`Self::register_project_files_with_salsa`])
+    /// rather than duplicating the parse/build logic.
+    async fn trigger_reindex(&self) {
+        // 1. Serialize against any other indexing pass.
+        let Some(guard) =
+            laravel_lsp::reindex::IndexingFlightGuard::try_acquire(self.indexing_in_flight.clone())
+        else {
+            info!("🔁 Reindex requested but an indexing pass is already running — ignoring");
+            return;
+        };
+
+        let Some(root) = self.root_path.read().await.clone() else {
+            info!("🔁 Reindex requested but no project root is set — ignoring");
+            return; // guard drops here, releasing the flag
+        };
+
+        info!("🔁 Reindex: full cold rebuild of {:?}", root);
+
+        // Suppress the unused-symbol diagnostic while the reference indexes are
+        // torn down and rebuilt — the warming task flips this back to `true`
+        // when it finishes (mirrors the startup gate). Without this, a
+        // diagnostics pass during the rebuild would see an empty index and
+        // flag every lensed symbol as unused.
+        self.warm_complete
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // 2. Disk caches — blocking filesystem I/O, so off the async runtime.
+        let root_for_clear = root.clone();
+        match tokio::task::spawn_blocking(move || {
+            laravel_lsp::cache_manager::clear_disk_caches(&root_for_clear)
+        })
+        .await
+        {
+            Ok(Ok(())) => info!("🔁 Reindex: disk caches cleared"),
+            Ok(Err(e)) => warn!("🔁 Reindex: clearing disk caches failed: {}", e),
+            Err(e) => warn!("🔁 Reindex: disk-cache clear task panicked: {}", e),
+        }
+
+        // 3. Process-global memos (both promoted from test-only to production
+        // callers for exactly this reset).
+        laravel_lsp::class_locator::reset_locator_cache();
+        laravel_lsp::laravel_introspector::chain::reset_parsed_file_cache();
+
+        // 4. In-memory actor indexes — one message for an atomic wipe.
+        if let Err(e) = self.salsa.clear_reindex_state().await {
+            warn!("🔁 Reindex: clearing in-memory indexes failed: {}", e);
+        }
+
+        // 5. Re-run the standard pipeline with progress, handing the guard to
+        // the warming task so the flag stays raised until warming completes.
+        let progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
+            self.client.clone(),
+            laravel_lsp::indexing_progress::INDEXING_TOKEN,
+            "Laravel",
+            "Reindexing project…",
+            Some(0),
+        )
+        .await;
+        self.register_project_files_with_salsa(&root, progress, Some(guard))
+            .await;
+    }
+
     /// Register project files with Salsa for reference finding
     ///
     /// This scans key directories (controllers, views, Livewire, routes) and
@@ -4376,10 +4469,19 @@ impl LaravelLanguageServer {
     /// "Discovering files" → "Indexing X of N" → "Indexed" status-bar updates;
     /// pass `None` from any code path that just needs the registration done
     /// without UI (e.g. re-registration after a config change).
+    ///
+    /// `guard`, when present, is the [`laravel_lsp::reindex::IndexingFlightGuard`]
+    /// claimed by the caller (startup warm or the reindex command). It's moved
+    /// into the spawned warming task and dropped when warming completes, so the
+    /// "indexing in flight" flag stays raised for the whole pass — not just the
+    /// synchronous registration prefix — and a concurrent reindex trigger
+    /// no-ops until warming finishes. Callers that don't serialize (the
+    /// config-change re-register) pass `None`.
     async fn register_project_files_with_salsa(
         &self,
         root_path: &Path,
         progress: Option<laravel_lsp::indexing_progress::IndexingProgress>,
+        guard: Option<laravel_lsp::reindex::IndexingFlightGuard>,
     ) {
         let config = match self.get_cached_config().await {
             Some(c) => c,
@@ -4542,6 +4644,12 @@ impl LaravelLanguageServer {
             // `progress` moves into this task — when warming finishes (or
             // hits an early return) we call `end` to clear the status bar.
             let mut progress = progress;
+            // The indexing-flight guard (if any) moves in too and is dropped
+            // when this task returns — by any path, including the early
+            // returns below — releasing the "indexing in flight" flag only
+            // once warming has actually completed. `_` because we never touch
+            // it; we just tie its lifetime to the task.
+            let _indexing_guard = guard;
             let started_at = std::time::Instant::now();
 
             // Defensively prewarm the global query cache on this thread
@@ -6679,8 +6787,11 @@ impl LaravelLanguageServer {
                 // mid-session config change, where flashing a status-bar
                 // entry for a re-index would feel surprising. The
                 // user-facing first-load progress is wired into
-                // `initialized()` instead.
-                self.register_project_files_with_salsa(&discovered_root, None)
+                // `initialized()` instead. No flight guard: this re-register
+                // isn't a user-triggered reindex, and the reindex command
+                // guards itself against the passes that matter (startup + a
+                // second reindex).
+                self.register_project_files_with_salsa(&discovered_root, None, None)
                     .await;
 
                 // Re-validate all open documents since config changed (view paths, component paths, etc.)
@@ -16043,6 +16154,7 @@ return [
             database_diagnostic_shown: self.database_diagnostic_shown.clone(),
             route_index: self.route_index.clone(),
             warm_complete: self.warm_complete.clone(),
+            indexing_in_flight: self.indexing_in_flight.clone(),
             migration_index: self.migration_index.clone(),
             command_index: self.command_index.clone(),
             vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
@@ -20512,7 +20624,16 @@ impl LanguageServer for LaravelLanguageServer {
                 }),
 
                 // ✅ Code actions for quick fixes (create missing views, etc.)
+                // and the always-available "Laravel: Reindex project" action
+                // (a `source`-kind action carrying the reindex command).
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+
+                // ✅ Execute-command provider — the server-side commands a
+                // client may invoke via `workspace/executeCommand`. Currently
+                // just `laravel.reindexProject`, which the reindex code action
+                // dispatches. Declared from the reindex module so the
+                // capability and the `execute_command` handler can't drift.
+                execute_command_provider: Some(laravel_lsp::reindex::execute_command_options()),
 
                 // ✅ Document symbol provider — populates outline panels
                 // (Zed outline, Helix symbol picker, Neovim aerial, etc.) with
@@ -20731,8 +20852,17 @@ impl LanguageServer for LaravelLanguageServer {
                     ),
                 }
 
+                // Claim the indexing-flight guard for the startup warm so a
+                // `laravel.reindexProject` triggered while first-load is still
+                // running no-ops instead of racing it. At startup the flag is
+                // free, so this normally succeeds; if it somehow doesn't, we
+                // pass `None` and warming proceeds unguarded (the pre-existing
+                // behavior) rather than skipping the initial index.
+                let startup_guard = laravel_lsp::reindex::IndexingFlightGuard::try_acquire(
+                    server.indexing_in_flight.clone(),
+                );
                 server
-                    .register_project_files_with_salsa(&root, progress.take())
+                    .register_project_files_with_salsa(&root, progress.take(), startup_guard)
                     .await;
             } else {
                 info!("Config not available for project file registration");
@@ -22987,18 +23117,21 @@ impl LanguageServer for LaravelLanguageServer {
         let uri = &params.text_document.uri;
         let context = &params.context;
 
-        // Early return if no diagnostics in context
-        if context.diagnostics.is_empty() {
-            return Ok(None);
-        }
-
         info!(
             "🔧 code_action called for {} with {} diagnostics",
             uri,
             context.diagnostics.len()
         );
 
-        let mut actions = Vec::new();
+        // The "Laravel: Reindex project" action is always offered for PHP/Blade
+        // files (subject to the request's `only` filter), independent of cursor
+        // position and diagnostics — that's how a Zed extension exposes a global
+        // command. Seed the response with it, then append the diagnostic-driven
+        // quick-fixes below. Unlike those, this action needs no project root or
+        // diagnostics, so it survives the "no diagnostics" case that used to
+        // early-return.
+        let mut actions =
+            laravel_lsp::reindex::global_code_actions(uri.path(), context.only.as_deref());
 
         // Get root path for Livewire (needs to calculate view path)
         let root_guard = self.root_path.read().await;
@@ -23060,6 +23193,24 @@ impl LanguageServer for LaravelLanguageServer {
             info!("🔧 Returning {} code actions", actions.len());
             Ok(Some(actions))
         }
+    }
+
+    /// Handle `workspace/executeCommand`. The only command we declare is
+    /// `laravel.reindexProject` (see `execute_command_provider` in
+    /// `initialize`), dispatched by the "Laravel: Reindex project" code action.
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> jsonrpc::Result<Option<serde_json::Value>> {
+        info!("⚙️  execute_command: {}", params.command);
+        if params.command == laravel_lsp::reindex::REINDEX_COMMAND {
+            self.trigger_reindex().await;
+        } else {
+            warn!("execute_command: unknown command {}", params.command);
+        }
+        // No result payload — the reindex runs in the background and reports
+        // progress via the status bar, not a command return value.
+        Ok(None)
     }
 
     async fn completion(

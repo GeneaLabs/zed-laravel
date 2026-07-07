@@ -4589,6 +4589,11 @@ pub enum SalsaRequest {
     /// handlers, processed lazily on next query.
     BuildSymbolIndex { reply: oneshot::Sender<usize> },
 
+    /// Wipe every in-memory reference index for a cold reindex (pattern
+    /// cache, symbol index, class hierarchy, per-file LRU caches, class-files
+    /// snapshot). See `SalsaHandle::clear_reindex_state`.
+    ClearReindexState { reply: oneshot::Sender<()> },
+
     // === Config Management ===
     /// Register configuration files for the project
     RegisterConfigFiles {
@@ -5097,6 +5102,26 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::BuildSymbolIndex { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Wipe every in-memory reference index in one actor turn, for the
+    /// `laravel.reindexProject` cold rebuild. Clears the pattern cache, the
+    /// inverted symbol index, the class-hierarchy index, the per-file LRU
+    /// caches, and the class-files snapshot. Doing it in a single message
+    /// keeps the wipe atomic against concurrent actor reads, and emptying the
+    /// pattern cache is what forces the following warming pass to re-parse
+    /// every file instead of reusing a stale cached entry. The categorized
+    /// file lists are left alone — `register_project_files` re-walks and
+    /// replaces them next.
+    pub async fn clear_reindex_state(&self) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ClearReindexState { reply: reply_tx })
             .await
             .map_err(|_| "Salsa actor disconnected")?;
         reply_rx
@@ -6509,6 +6534,22 @@ impl SalsaActor {
                     }
                     let count = self.symbol_index.entry_count();
                     let _ = reply.send(count);
+                }
+
+                SalsaRequest::ClearReindexState { reply } => {
+                    // Cold-reindex wipe. Emptying pattern_cache is the load-
+                    // bearing part: the warming pass skips any path already in
+                    // it, so a stale entry would otherwise never be re-parsed.
+                    // The rest are dropped so no since-deleted file's symbols,
+                    // hierarchy node, or cached parse can survive the rebuild.
+                    self.pattern_cache.clear();
+                    self.symbol_index.clear();
+                    self.class_hierarchy_index.clear();
+                    self.loop_blocks_cache.clear();
+                    self.php_assignments_cache.clear();
+                    self.document_symbols_cache.clear();
+                    self.class_files_snapshot = None;
+                    let _ = reply.send(());
                 }
 
                 // === Config Handlers ===

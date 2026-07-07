@@ -86,8 +86,21 @@ fn locator_cache() -> &'static LocatorCache {
     CACHE.get_or_init(|| Mutex::new(LruCache::new(NonZeroUsize::new(LOCATOR_CACHE_CAP).unwrap())))
 }
 
-/// Clear the walk-result memo. Test/bench only.
-#[doc(hidden)]
+/// Clear the walk-result memo.
+///
+/// Drops every entry (positive and negative) from the process-global
+/// class-locator cache. Two production callers rely on this:
+///
+/// * The `laravel.reindexProject` command, which resets all process-global
+///   memos before a cold rebuild so a stale walk result can't survive the
+///   reindex.
+/// * The isolation benchmarks/tests, which clear the memo between passes to
+///   measure (or assert on) cold vs. warm behavior.
+///
+/// The memo is otherwise self-freshening (positive hits are revalidated with
+/// `exists()` + [`path_within_root`]; negatives expire after [`NEGATIVE_TTL`];
+/// watched `.php` create/delete calls [`invalidate_project`]), so this full
+/// reset is only needed when the caller wants a guaranteed-clean slate.
 pub fn reset_locator_cache() {
     locator_cache().lock().unwrap().clear();
 }

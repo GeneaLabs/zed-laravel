@@ -66,6 +66,7 @@ pub mod php_variable_rename;
 pub mod queries;
 pub mod query_chain;
 pub mod references;
+pub mod reindex;
 pub mod rename;
 pub mod route_binding;
 pub mod route_chain;
