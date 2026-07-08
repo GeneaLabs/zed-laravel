@@ -11,7 +11,7 @@ fn watchers_cover_all_four_indexed_directories() {
     let root = PathBuf::from("/projects/laravel-app");
     let view_paths = vec![root.join("resources/views")];
     let livewire = root.join("app/Livewire");
-    let watchers = build_watchers(&root, &view_paths, Some(&livewire));
+    let watchers = build_watchers(&root, &view_paths, Some(&livewire), &[]);
 
     let globs: Vec<String> = watchers
         .iter()
@@ -56,7 +56,7 @@ fn watchers_cover_all_four_indexed_directories() {
 fn watchers_omit_livewire_when_not_configured() {
     let root = PathBuf::from("/projects/no-livewire-app");
     let view_paths = vec![root.join("resources/views")];
-    let watchers = build_watchers(&root, &view_paths, None);
+    let watchers = build_watchers(&root, &view_paths, None, &[]);
 
     let has_livewire = watchers.iter().any(|w| match &w.glob_pattern {
         GlobPattern::String(s) => s.contains("Livewire"),
@@ -78,7 +78,7 @@ fn watchers_register_each_configured_view_path() {
         root.join("themes/dark/views"),
         root.join("themes/light/views"),
     ];
-    let watchers = build_watchers(&root, &view_paths, None);
+    let watchers = build_watchers(&root, &view_paths, None, &[]);
 
     for view_path in &view_paths {
         let has_blade = watchers.iter().any(|w| match &w.glob_pattern {
@@ -94,7 +94,7 @@ fn watchers_register_each_configured_view_path() {
 #[test]
 fn watchers_request_create_change_and_delete_events() {
     let root = PathBuf::from("/projects/test");
-    let watchers = build_watchers(&root, &[root.join("resources/views")], None);
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &[]);
 
     let all_three = WatchKind::Create | WatchKind::Change | WatchKind::Delete;
     for w in &watchers {
@@ -109,7 +109,7 @@ fn watchers_request_create_change_and_delete_events() {
 #[test]
 fn registration_has_correct_method_and_id() {
     let root = PathBuf::from("/projects/test");
-    let reg = build_registration(&root, &[root.join("resources/views")], None);
+    let reg = build_registration(&root, &[root.join("resources/views")], None, &[]);
     assert_eq!(reg.method, METHOD);
     assert_eq!(reg.id, REGISTRATION_ID);
     assert!(reg.register_options.is_some(), "options must be serialized");
@@ -120,7 +120,7 @@ fn registration_options_round_trip_through_serde() {
     let root = PathBuf::from("/projects/test");
     let view_paths = vec![root.join("resources/views")];
     let livewire = root.join("app/Livewire");
-    let reg = build_registration(&root, &view_paths, Some(&livewire));
+    let reg = build_registration(&root, &view_paths, Some(&livewire), &[]);
 
     // The client deserializes our register_options into
     // DidChangeWatchedFilesRegistrationOptions. Verify the value we
@@ -145,7 +145,7 @@ fn watchers_include_inertia_page_globs() {
     // #10) — one watcher glob per supported extension so external page
     // create/delete invalidates the existence cache.
     let root = PathBuf::from("/projects/laravel-app");
-    let watchers = build_watchers(&root, &[root.join("resources/views")], None);
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &[]);
 
     let globs: Vec<String> = watchers
         .iter()
@@ -169,7 +169,7 @@ fn watchers_include_inertia_page_globs() {
 #[test]
 fn watchers_include_vendor_php_and_blade_globs() {
     let root = PathBuf::from("/projects/laravel-app");
-    let watchers = build_watchers(&root, &[root.join("resources/views")], None);
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &[]);
 
     let globs: Vec<String> = watchers
         .iter()
@@ -192,5 +192,78 @@ fn watchers_include_vendor_php_and_blade_globs() {
             .any(|g| g.contains("/vendor/") && g.ends_with("*.blade.php")),
         "missing vendor blade glob: {:?}",
         globs
+    );
+}
+
+fn globs_of(watchers: &[FileSystemWatcher]) -> Vec<String> {
+    watchers
+        .iter()
+        .map(|w| match &w.glob_pattern {
+            GlobPattern::String(s) => s.clone(),
+            GlobPattern::Relative(_) => unreachable!("we always emit absolute"),
+        })
+        .collect()
+}
+
+#[test]
+fn watchers_include_a_recursive_glob_per_psr4_root() {
+    // Each first-party PSR-4 source root (M2) gets its own recursive `**/*.php`
+    // glob so an external edit anywhere under it converges the magic index.
+    let root = PathBuf::from("/projects/laravel-app");
+    let psr4 = vec![root.join("app"), root.join("src")];
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &psr4);
+
+    let globs = globs_of(&watchers);
+    for src in &psr4 {
+        let expected = format!("{}/**/*.php", src.display());
+        assert!(
+            globs.iter().any(|g| g == &expected),
+            "missing PSR-4 glob {expected}: {globs:?}"
+        );
+    }
+}
+
+#[test]
+fn psr4_glob_that_exactly_duplicates_an_existing_one_is_skipped() {
+    // A PSR-4 root whose recursive glob is byte-identical to one already
+    // emitted must not produce a duplicate watcher. The Inertia pages dir
+    // isn't `*.php`, and the fixed globs are all more specific, so the only
+    // way to collide is to hand in a root that reproduces a fixed glob — here
+    // we prove the dedup by counting: two identical roots yield one glob.
+    let root = PathBuf::from("/projects/laravel-app");
+    let psr4 = vec![root.join("app"), root.join("app")];
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &psr4);
+
+    let expected = format!("{}/app/**/*.php", root.display());
+    let count = globs_of(&watchers)
+        .into_iter()
+        .filter(|g| g == &expected)
+        .count();
+    assert_eq!(count, 1, "duplicate PSR-4 roots must collapse to one glob");
+}
+
+#[test]
+fn overlapping_psr4_glob_coexists_with_fixed_controllers_glob() {
+    // `app/**/*.php` overlaps — but is not byte-identical to — the fixed
+    // `app/Http/Controllers/**/*.php`. Both must be present: the overlap is
+    // harmless (the watched-files handler is idempotent), and dropping the
+    // fixed one would narrow coverage on a project whose composer.json we
+    // couldn't read.
+    let root = PathBuf::from("/projects/laravel-app");
+    let psr4 = vec![root.join("app")];
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &psr4);
+
+    let globs = globs_of(&watchers);
+    assert!(
+        globs
+            .iter()
+            .any(|g| g == &format!("{}/app/**/*.php", root.display())),
+        "missing widened app glob: {globs:?}"
+    );
+    assert!(
+        globs
+            .iter()
+            .any(|g| g == &format!("{}/app/Http/Controllers/**/*.php", root.display())),
+        "fixed controllers glob must survive alongside the widened app glob: {globs:?}"
     );
 }

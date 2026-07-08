@@ -1844,6 +1844,41 @@ fn get_laravel_validation_rules() -> Vec<ValidationRuleInfo> {
     ]
 }
 
+/// One accumulated external (watched-file) `.php` change, awaiting the
+/// debounced incremental magic-member batch (M2). Snapshotted at event time so
+/// the batch can run the same pre/post surface diff `did_save` runs, without a
+/// project-size gate.
+///
+/// `old_surfaces` / `old_render_views` are the file's fqcn→surface-signature
+/// map and rendered view names *before* the change — captured on the first
+/// event for a path in a burst (first-event-wins: a later event must not
+/// overwrite the true pre-state, since an interleaved query may already have
+/// re-parsed the hierarchy). For a deleted path they're snapshotted *before*
+/// `remove_file` tears the hierarchy nodes down. `deleted` is only an advisory
+/// hint: whether the file actually exists is decided by re-reading it *at drain*
+/// (see `run_magic_batch_once`), because two overlapping notifications for the
+/// same path with opposite existence can leave this flag stale.
+#[derive(Debug, Clone, Default)]
+struct PendingWatchedChange {
+    old_surfaces: std::collections::HashMap<String, u64>,
+    old_render_views: Vec<String>,
+    deleted: bool,
+}
+
+/// Shared state for the debounced watched-files magic batch (M2). The pending
+/// map and the `running` flag live under ONE mutex on purpose: it makes the
+/// scheduler's "a task is live → don't spawn" decision and the task's "map
+/// empty → relinquish liveness and exit" decision atomic against each other.
+/// Splitting them (a separate pending lock + a `JoinHandle::is_finished`
+/// liveness check) reintroduces a lost-wakeup race — a producer can record an
+/// event and see the not-yet-returned task as live, skip spawning, and strand
+/// the event with no task to drain it. One lock closes that window.
+#[derive(Default)]
+struct WatchedBatchState {
+    pending: HashMap<PathBuf, PendingWatchedChange>,
+    running: bool,
+}
+
 /// The main Laravel Language Server struct
 /// This holds all the state for our LSP
 #[derive(Clone)]
@@ -1868,10 +1903,20 @@ struct LaravelLanguageServer {
     pending_rescans: Arc<RwLock<HashSet<RescanType>>>,
     /// Handle for the rescan debounce timer
     rescan_debounce_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
-    /// Handle for the debounced full magic-member index rebuild. Coalesces
-    /// rapid edits into one project-wide reconverge (the "full" half of the
-    /// hybrid incremental refresh; the per-file refresh is the "instant" half).
+    /// Handle for the debounced watched-files magic-member batch task (M2),
+    /// kept solely so the handler tests can await the task to observe
+    /// convergence. Liveness (spawn-vs-skip) is NOT decided from this handle —
+    /// that would race the task's exit — but from `WatchedBatchState::running`
+    /// under the state mutex. Coalesces an external-edit burst (git pull,
+    /// formatter, branch switch) into one dependency-tracked incremental
+    /// reconverge; a batch already draining is never aborted.
     magic_rebuild_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Accumulated external `.php` changes + the batch task's liveness flag,
+    /// under one mutex (see [`WatchedBatchState`]). Producer:
+    /// `did_change_watched_files` records events and spawns a task iff none is
+    /// running. Consumer: the batch task drains it and clears `running` when it
+    /// finds the map empty — both decisions serialized on this one lock.
+    magic_batch_state: Arc<tokio::sync::Mutex<WatchedBatchState>>,
     /// File existence cache with TTL (path -> (exists, cached_at))
     /// This avoids blocking I/O in async context for file_exists checks
     file_exists_cache: Arc<RwLock<HashMap<PathBuf, (bool, Instant)>>>,
@@ -4269,6 +4314,7 @@ impl LaravelLanguageServer {
             pending_rescans: Arc::new(RwLock::new(HashSet::new())),
             rescan_debounce_handle: Arc::new(RwLock::new(None)),
             magic_rebuild_handle: Arc::new(RwLock::new(None)),
+            magic_batch_state: Arc::new(tokio::sync::Mutex::new(WatchedBatchState::default())),
             file_exists_cache: Arc::new(RwLock::new(HashMap::new())),
             cached_config: Arc::new(RwLock::new(None)),
             cached_livewire: Arc::new(RwLock::new(None)),
@@ -6207,11 +6253,15 @@ impl LaravelLanguageServer {
             return; // body-only edit — nothing beyond this file can change
         }
 
-        // The ripple runs in the background so did_save returns promptly.
+        // The ripple runs in the background so did_save returns promptly. The
+        // saved file was already refreshed by the per-file pass above, so it's
+        // the sole exclusion here.
         let server = self.clone_for_spawn();
+        let mut already_refreshed = HashSet::new();
+        already_refreshed.insert(path.clone());
         tokio::spawn(async move {
             server
-                .refresh_magic_dependents(&path, changed_classes, changed_views)
+                .refresh_magic_dependents(&already_refreshed, changed_classes, changed_views)
                 .await;
         });
     }
@@ -6225,9 +6275,14 @@ impl LaravelLanguageServer {
     /// semaphore keeps CPU bounded throughout. (An earlier revision fell
     /// back to the full rebuild above 500 dependents; on a real project
     /// that fallback *was* the long re-index it existed to prevent.)
+    ///
+    /// `already_refreshed` are the files the caller has *itself* re-resolved
+    /// this pass (the saved file on the save path; every changed present file
+    /// on the watched-batch path) — they're removed from the work set so a
+    /// file already converged isn't parsed twice.
     async fn refresh_magic_dependents(
         &self,
-        saved: &Path,
+        already_refreshed: &HashSet<PathBuf>,
         changed_classes: Vec<String>,
         changed_views: Vec<String>,
     ) {
@@ -6269,7 +6324,9 @@ impl LaravelLanguageServer {
             }
         }
 
-        work.remove(saved); // already refreshed by the per-file pass
+        for p in already_refreshed {
+            work.remove(p); // already refreshed by the caller's per-file pass
+        }
         if work.is_empty() {
             return;
         }
@@ -6292,27 +6349,7 @@ impl LaravelLanguageServer {
             let permit_owner = sem.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = permit_owner.acquire_owned().await.ok()?;
-                let buffered = match Url::from_file_path(&dep) {
-                    Ok(url) => server
-                        .documents
-                        .read()
-                        .await
-                        .get(&url)
-                        .map(|(content, _)| content.clone()),
-                    Err(()) => None,
-                };
-                let content = match buffered {
-                    Some(c) => c,
-                    None => {
-                        let dep_for_read = dep.clone();
-                        tokio::task::spawn_blocking(move || {
-                            std::fs::read_to_string(&dep_for_read).ok()
-                        })
-                        .await
-                        .ok()
-                        .flatten()?
-                    }
-                };
+                let content = server.read_file_for_magic(&dep).await?;
                 server.refresh_file_magic(&dep, &content).await;
                 Some(())
             }));
@@ -6676,72 +6713,259 @@ impl LaravelLanguageServer {
         }
     }
 
-    /// Schedule the debounced project-wide magic-member reconverge. No longer
-    /// part of the per-save path (#80 — saves use the dependency-tracked
-    /// incremental refresh); this remains the reconverge after external
-    /// (watched-file) changes, whose ripples the save-time diff never saw.
-    /// The debounce coalesces bursts (git checkout touching hundreds of
-    /// files) into one rebuild.
+    /// Schedule the debounced watched-files magic-member batch (M2). Coalesces
+    /// an external-edit burst (git pull, formatter, branch switch) into one
+    /// dependency-tracked incremental reconverge, whose ripples the save-time
+    /// diff never saw. No longer part of the per-save path (#80 — saves use the
+    /// dependency-tracked incremental refresh directly).
+    ///
+    /// **Non-aborting, self-extending, single-lock liveness.** The producer
+    /// (`did_change_watched_files`) has already recorded its snapshots into
+    /// `magic_batch_state.pending` before calling this. Under the *same* state
+    /// mutex the task uses to decide its exit, we check `running`: if a task is
+    /// already live it will observe the just-recorded events itself (the map is
+    /// the signal), so we skip; otherwise we set `running = true` and spawn.
+    ///
+    /// Serializing the spawn decision and the task's exit decision on one lock
+    /// is what closes the lost-wakeup race: a task only clears `running` while
+    /// holding this lock *and* having just seen the map empty, so any event a
+    /// producer records is either visible to that in-lock emptiness check (task
+    /// loops and drains it) or recorded after `running` was cleared (this
+    /// producer sees `running == false` and spawns). Never aborting a running
+    /// task also means a batch already draining can't lose its snapshots.
     async fn schedule_magic_rebuild(&self) {
-        if let Some(handle) = self.magic_rebuild_handle.write().await.take() {
-            handle.abort();
+        {
+            let mut state = self.magic_batch_state.lock().await;
+            if state.running {
+                return; // a live task will observe the recorded events itself
+            }
+            state.running = true;
         }
         let server = self.clone_for_spawn();
         let handle = tokio::spawn(async move {
-            sleep(Duration::from_millis(MAGIC_REBUILD_DEBOUNCE_MS)).await;
-            server.rebuild_magic_index_full().await;
+            server.run_magic_watched_batch().await;
         });
+        // Stored only so the handler tests can await convergence; liveness is
+        // `state.running`, never `handle.is_finished()` (which would race exit).
         *self.magic_rebuild_handle.write().await = Some(handle);
     }
 
-    /// Re-resolve the whole project's magic-member reverse index from the
-    /// current pattern cache. Reuses the exact warm-build passes via
-    /// [`build_magic_member_entries`]; `build_symbol_index` clears the index
-    /// first (literals + magic) so the append below can't duplicate.
+    /// The watched-files incremental batch task (M2). Debounces, then drains
+    /// `magic_batch_state.pending` and converges the magic-member index for
+    /// exactly the changed files plus their dependency blast radius — work
+    /// proportional to the change, never to project size, so there is no size
+    /// gate. Loops while the burst keeps arriving inside the debounce window,
+    /// and re-loops if the map refilled while a drain was in flight, so nothing
+    /// is dropped. Relinquishes liveness (`running = false`) only under the
+    /// state lock, having just observed the map empty in the same critical
+    /// section — the other half of the invariant in `schedule_magic_rebuild`.
+    async fn run_magic_watched_batch(&self) {
+        loop {
+            // Quiet-period debounce: sleep, and if more events landed during the
+            // sleep, sleep again — coalescing the whole burst into one drain.
+            sleep(Duration::from_millis(MAGIC_REBUILD_DEBOUNCE_MS)).await;
+            loop {
+                let count = self.magic_batch_state.lock().await.pending.len();
+                if count == 0 {
+                    break; // nothing accumulated — fall through to the exit check
+                }
+                let before = count;
+                sleep(Duration::from_millis(MAGIC_REBUILD_DEBOUNCE_MS)).await;
+                if self.magic_batch_state.lock().await.pending.len() == before {
+                    break; // no new events during the last window — drain now
+                }
+            }
+
+            // Drain-or-exit, atomic under the state lock: if the map is empty we
+            // clear `running` and return *inside* the critical section, so a
+            // producer can't observe us as live-but-about-to-exit. Otherwise we
+            // take the batch (leaving `running == true`) and process it.
+            let batch = {
+                let mut state = self.magic_batch_state.lock().await;
+                if state.pending.is_empty() {
+                    state.running = false;
+                    return;
+                }
+                std::mem::take(&mut state.pending)
+            };
+            self.run_magic_batch_once(batch).await;
+            // Loop: any events that refilled the map while we drained are picked
+            // up by the next debounce, never a rival task (`running` is still
+            // true, so `schedule_magic_rebuild` skips spawning).
+        }
+    }
+
+    /// Converge the magic-member index for one drained batch of watched changes.
+    /// Mirrors the save path's pre/post surface diff (`refresh_magic_on_save` →
+    /// `refresh_magic_dependents`), but over a set of externally-changed files
+    /// instead of one saved buffer:
     ///
-    /// Gated on project size: on very large projects the full reconverge is too
-    /// heavy to run per edit-settle, so it is skipped and the per-file refresh
-    /// remains the only incremental path there.
-    async fn rebuild_magic_index_full(&self) {
-        let Some(root) = self.root_path.read().await.clone() else {
-            return;
-        };
-        let view_paths = match self.cached_config.read().await.as_ref() {
-            Some(c) => c.view_paths.clone(),
-            None => return,
-        };
-        let pattern_cache = self.salsa.pattern_cache();
+    /// Existence is decided **at drain**, by re-reading the file — not from the
+    /// recorded `deleted` flag, which two overlapping notifications for one path
+    /// can leave stale. `read_file_for_magic` returning `None` means the file is
+    /// gone *right now*, so it takes the delete path regardless of the flag:
+    ///
+    /// - **present, non-vendor** files are re-resolved in full
+    ///   (`refresh_file_magic`) — own contribution + per-file changed views —
+    ///   exactly as a save would;
+    /// - **present, vendor** files get a surfaces-only pass (parse + hierarchy
+    ///   update via `get_patterns`, no own-contribution resolution) so a vendor
+    ///   base-class change still ripples to app subclasses, without eagerly
+    ///   indexing vendor usage sites the build passes deliberately skip;
+    /// - **gone** files (a real delete, or a flag-race present-but-missing)
+    ///   contribute their pre-change surface FQCNs and render views to the blast
+    ///   radius, and are purged from `magic_deps` / `view_vars` (the
+    ///   watched-delete path previously leaked both — only the Salsa
+    ///   `RemoveFile` symbol/hierarchy eviction ran).
+    ///
+    /// The unioned `changed_classes` / `changed_views` then drive the same
+    /// `refresh_magic_dependents` blast radius as a save, excluding the present
+    /// files already refreshed here.
+    async fn run_magic_batch_once(&self, batch: HashMap<PathBuf, PendingWatchedChange>) {
+        let mut changed_classes: HashSet<String> = HashSet::new();
+        let mut changed_views: HashSet<String> = HashSet::new();
+        let mut refreshed: HashSet<PathBuf> = HashSet::new();
 
-        const MAX_FULL_REBUILD_FILES: usize = 15_000;
-        if pattern_cache.len() > MAX_FULL_REBUILD_FILES {
-            debug!(
-                "🪄 Project too large ({} files) — skipping debounced full magic rebuild; per-file refresh only",
-                pattern_cache.len()
-            );
-            return;
+        for (path, pending) in batch {
+            let is_vendor = path.components().any(|c| c.as_os_str() == "vendor");
+
+            // Authoritative existence check: read the file NOW. `None` = gone,
+            // whatever the advisory `deleted` flag says (a flag-race across
+            // overlapping notifications can leave it present-but-missing).
+            let content = self.read_file_for_magic(&path).await;
+
+            let Some(content) = content else {
+                // Gone: post-change surface is empty, so every pre-change FQCN is
+                // a changed class and every rendered view a changed view. Purge
+                // the file's own dep + render contributions (Salsa RemoveFile
+                // only evicts symbol/hierarchy — this closes the leak). Applies
+                // to vendor too: purge is a no-op there (build passes skip vendor
+                // usage sites), and the old surfaces still ripple to subclasses.
+                changed_classes.extend(pending.old_surfaces.into_keys());
+                changed_views.extend(pending.old_render_views);
+                if let Ok(mut deps) = self.magic_deps.write() {
+                    deps.remove_file(&path);
+                }
+                if let Ok(mut vv) = self.view_vars.write() {
+                    vv.remove_file(&path);
+                }
+                continue;
+            };
+
+            if is_vendor {
+                // Surfaces-only: parse to refresh the hierarchy node, then diff
+                // the surface so a vendor base-class change ripples to app
+                // subclasses. No own-contribution resolution, no place in the
+                // dependent work set (preserve the build-pass vendor exclusion).
+                let _ = self.salsa.get_patterns(path.clone()).await;
+                let new_surfaces = self
+                    .salsa
+                    .file_class_surfaces(path.clone())
+                    .await
+                    .unwrap_or_default();
+                changed_classes.extend(laravel_lsp::class_hierarchy_index::surface_map_diff(
+                    &pending.old_surfaces,
+                    &new_surfaces,
+                ));
+                continue;
+            }
+
+            // Present, non-vendor: full per-file refresh, same as a save.
+            let views = self.refresh_file_magic(&path, &content).await;
+            let new_surfaces = self
+                .salsa
+                .file_class_surfaces(path.clone())
+                .await
+                .unwrap_or_default();
+            changed_classes.extend(laravel_lsp::class_hierarchy_index::surface_map_diff(
+                &pending.old_surfaces,
+                &new_surfaces,
+            ));
+            changed_views.extend(views);
+            refreshed.insert(path);
         }
 
-        if let Err(e) = self.salsa.build_symbol_index().await {
-            debug!("Symbol index rebuild failed: {}", e);
+        // The per-file passes above already mutated the live indexes — keep the
+        // disk cache converging regardless of ripple size.
+        self.schedule_magic_cache_save().await;
+
+        if changed_classes.is_empty() && changed_views.is_empty() {
             return;
         }
-        let data = build_magic_member_entries(
-            &self.salsa,
-            &pattern_cache,
-            &root,
-            &view_paths,
-            MAX_CONCURRENT_MAGIC_PARSES,
-            None, // save-refresh path has no first-load progress UI
-            &self.view_vars,
+        self.refresh_magic_dependents(
+            &refreshed,
+            changed_classes.into_iter().collect(),
+            changed_views.into_iter().collect(),
         )
         .await;
-        match import_magic_data(&self.salsa, &self.magic_deps, data.entries).await {
-            Ok(n) => info!("🪄 Magic-member index reconverged: {} entries", n),
-            Err(e) => debug!("Magic reconverge failed: {}", e),
+    }
+
+    /// Read a file's authoritative content for a magic refresh: the open editor
+    /// buffer if the file is open (its unsaved content is authoritative), else
+    /// the on-disk bytes read on the blocking pool. `None` if neither is
+    /// available (the file was deleted between the watched event and the drain).
+    async fn read_file_for_magic(&self, path: &Path) -> Option<String> {
+        if let Ok(url) = Url::from_file_path(path) {
+            if let Some((content, _)) = self.documents.read().await.get(&url) {
+                return Some(content.clone());
+            }
         }
-        // Counts changed — ask the client to re-resolve code lenses.
-        let _ = self.client.code_lens_refresh().await;
-        self.schedule_magic_cache_save().await;
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(&path).ok())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Record one external `.php` change into `magic_batch_state.pending` for
+    /// the debounced batch (M2), capturing the file's pre-change surface
+    /// snapshot.
+    ///
+    /// **First-event-wins for the snapshot.** If the path is already pending,
+    /// only its `deleted` hint is updated — the original pre-change surfaces are
+    /// kept, because by now an interleaved query may have re-parsed the
+    /// hierarchy and a fresh snapshot would no longer be the true pre-state. The
+    /// double-check on re-lock closes the window between computing the snapshot
+    /// and inserting it. (`deleted` is only advisory; the batch decides real
+    /// existence by re-reading at drain — see `run_magic_batch_once`.)
+    ///
+    /// The caller MUST invoke this *before* the arm's Salsa mutation — in
+    /// particular before `remove_file`, which eagerly tears down the very
+    /// hierarchy nodes the surface snapshot reads.
+    async fn record_watched_change(&self, path: &Path, deleted: bool) {
+        {
+            let mut state = self.magic_batch_state.lock().await;
+            if let Some(entry) = state.pending.get_mut(path) {
+                entry.deleted = deleted;
+                return;
+            }
+        }
+        // First event for this path — snapshot the pre-change surface + renders.
+        let old_surfaces = self
+            .salsa
+            .file_class_surfaces(path.to_path_buf())
+            .await
+            .unwrap_or_default();
+        let old_render_views = self
+            .view_vars
+            .read()
+            .ok()
+            .and_then(|vv| {
+                vv.renders_for(path)
+                    .map(|rs| rs.iter().map(|r| r.view_name.clone()).collect::<Vec<_>>())
+            })
+            .unwrap_or_default();
+        self.magic_batch_state
+            .lock()
+            .await
+            .pending
+            .entry(path.to_path_buf())
+            .or_insert(PendingWatchedChange {
+                old_surfaces,
+                old_render_views,
+                deleted,
+            })
+            .deleted = deleted;
     }
 
     /// Execute all pending rescans
@@ -16356,6 +16580,7 @@ return [
             pending_rescans: self.pending_rescans.clone(),
             rescan_debounce_handle: self.rescan_debounce_handle.clone(),
             magic_rebuild_handle: self.magic_rebuild_handle.clone(),
+            magic_batch_state: self.magic_batch_state.clone(),
             file_exists_cache: self.file_exists_cache.clone(),
             cached_config: self.cached_config.clone(),
             cached_livewire: self.cached_livewire.clone(),
@@ -21054,16 +21279,25 @@ impl LanguageServer for LaravelLanguageServer {
                 // We use dynamic registration (not declared in
                 // `initialize`) because the view paths and livewire
                 // path depend on project config we only just loaded.
+                // First-party PSR-4 source roots (M2) widen the watcher beyond
+                // the hardcoded controllers path so an external edit to any
+                // source dir converges the magic-member index. The autoload is
+                // process-cached, already loaded by resolution paths this run.
+                let psr4_roots =
+                    laravel_lsp::composer_autoload::ComposerAutoload::for_project(&root)
+                        .project_source_roots();
                 let registration = laravel_lsp::file_watcher::build_registration(
                     &root,
                     &config.view_paths,
                     config.livewire_path.as_deref(),
+                    &psr4_roots,
                 );
                 match server.client.register_capability(vec![registration]).await {
                     Ok(_) => info!(
-                        "🛡️  Registered file watcher: {} view paths, livewire={}",
+                        "🛡️  Registered file watcher: {} view paths, livewire={}, {} PSR-4 source root(s)",
                         config.view_paths.len(),
-                        config.livewire_path.is_some()
+                        config.livewire_path.is_some(),
+                        psr4_roots.len()
                     ),
                     Err(e) => debug!(
                         "File watcher registration failed (client may not support it): {}",
@@ -21547,6 +21781,9 @@ impl LanguageServer for LaravelLanguageServer {
         let mut skipped_open = 0usize;
         let mut migrations_changed = false;
         let mut commands_changed = false;
+        // Did this batch record any `.php` magic change? Gates the debounced
+        // incremental batch — an Inertia-only burst does no magic work.
+        let mut magic_dirty = false;
 
         for change in params.changes {
             if open_docs.contains(&change.uri) {
@@ -21582,6 +21819,16 @@ impl LanguageServer for LaravelLanguageServer {
             }
             if !migrations_changed && path.to_string_lossy().contains("database/migrations") {
                 migrations_changed = true;
+            }
+            // Snapshot the file's pre-change surface for the incremental magic
+            // batch (M2) BEFORE the arm's Salsa mutation runs — critically,
+            // before a DELETE's `remove_file` tears down the hierarchy nodes the
+            // snapshot reads. `.php` covers `.blade.php` too. First-event-wins
+            // is enforced inside `record_watched_change`.
+            if path.to_string_lossy().ends_with(".php") {
+                let is_delete = matches!(change.typ, FileChangeType::DELETED);
+                self.record_watched_change(&path, is_delete).await;
+                magic_dirty = true;
             }
             match change.typ {
                 FileChangeType::CREATED => {
@@ -21679,23 +21926,29 @@ impl LanguageServer for LaravelLanguageServer {
             }
         }
 
-        // External PHP changes (git pull, formatter outside Zed) bypass the
-        // save-time incremental refresh entirely — their surface diffs were
-        // never computed, so the dependency-tracked path can't see their
-        // ripples. The debounced full reconverge (still gated on project
-        // size) restores the old guarantee that the magic index converges
-        // after disk-level changes. Saves no longer trigger this (#80);
-        // external edits are the one remaining caller.
+        // A watched create/delete changes which FQCNs resolve to a file, so
+        // drop the FQCN→file resolution cache for this project (a new class
+        // becomes resolvable, a removed one stops). This covers the watched
+        // paths (controllers, PSR-4 source roots, views, livewire, vendor);
+        // any still-unwatched path relies on the locator's negative-entry TTL
+        // — see the Fork-2 note in class_locator. Inertia-only bursts count
+        // here too (a new/removed page file), hence the counter gate rather
+        // than `magic_dirty`.
         if created_or_changed + deleted > 0 {
-            // Drop the FQCN→file resolution cache for this project so a
-            // watched create/delete is reflected immediately (a new class
-            // becomes resolvable, a removed one stops resolving). This covers
-            // the watched paths (controllers, views, livewire, vendor);
-            // unwatched app paths (e.g. `app/Models/`) rely on the locator's
-            // negative-entry TTL instead — see the Fork-2 note in class_locator.
             if let Some(root) = self.initialized_root.read().await.clone() {
                 laravel_lsp::class_locator::invalidate_project(&root);
             }
+        }
+
+        // External PHP changes (git pull, formatter outside Zed) bypass the
+        // save-time incremental refresh entirely — their surface diffs were
+        // never computed, so the dependency-tracked path can't see their
+        // ripples. Their pre-change surfaces are now recorded in
+        // `magic_batch_state.pending`; the debounced incremental batch (M2)
+        // diffs pre/post per file and re-resolves only the actual blast radius,
+        // scaling with change size rather than project size — so no size gate.
+        // Saves no longer trigger this (#80); external edits are the one caller.
+        if magic_dirty {
             self.schedule_magic_rebuild().await;
         }
     }

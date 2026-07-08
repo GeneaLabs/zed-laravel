@@ -9,11 +9,16 @@
 //! Design choices, in case they need revisiting later:
 //!
 //! 1. **Glob-scoped, not project-wide.** We only ask the client to
-//!    notify us about files under the four Laravel directories we
-//!    actually index: `app/Http/Controllers`, the configured view
-//!    paths, the Livewire path (if any), and `routes/`. A
-//!    `composer install` that rewrites thousands of files in
-//!    `vendor/` produces zero notifications.
+//!    notify us about files we actually index: the project's PSR-4
+//!    source roots (from `composer.json` — `app/`, `src/`, any custom
+//!    `Modules\` mapping), the configured view paths, the Livewire path
+//!    (if any), `routes/`, `database/migrations/`, `vendor/`, and the
+//!    Inertia pages dir. The PSR-4 roots (M2) are what make an external
+//!    edit to *any* first-party source dir — not just the hardcoded
+//!    controllers path — converge the magic-member index. A
+//!    `composer install` that rewrites thousands of files in `vendor/`
+//!    still produces one debounced incremental batch, not a project-wide
+//!    rebuild.
 //!
 //! 2. **Server-initiated dynamic registration.** Zed's view paths and
 //!    Livewire path depend on the project's `config/view.php` and
@@ -28,11 +33,12 @@
 //!    the file pays the parse cost lazily. Spreads work across user-
 //!    driven queries instead of bunching it.
 //!
-//! 4. **No debounce.** Per-event work is ~50µs (a DashMap remove + an
-//!    actor message). Even a 2000-file burst from `git checkout` drains
-//!    in <100ms — invisible. If we ever add eager re-parsing, a quiet-
-//!    period debouncer is the right addition; without it, the work is
-//!    too cheap to coalesce.
+//! 4. **Debounced magic-index convergence.** Per-event pattern-cache
+//!    work is ~50µs (a DashMap remove + an actor message), too cheap to
+//!    coalesce on its own. But since M2 the watched path *also* drives a
+//!    dependency-tracked magic-member reconverge, which IS worth
+//!    coalescing: a `git checkout` burst is collapsed into one debounced
+//!    incremental batch (see `schedule_magic_rebuild` in `main.rs`).
 //!
 //! 5. **Open-document precedence.** If a file is currently open in the
 //!    editor, its in-memory authoritative content is the editor buffer,
@@ -68,10 +74,21 @@ pub const METHOD: &str = "workspace/didChangeWatchedFiles";
 /// `SalsaActor::handle_register_project_files` enumerates, so the
 /// pattern_cache only ever holds entries for files we're also
 /// watching.
+///
+/// `psr4_roots` are the project's first-party PSR-4 source roots
+/// (`ComposerAutoload::project_source_roots`) — each gets a recursive
+/// `**/*.php` glob so an external edit to any first-party source dir
+/// converges the magic-member index (M2). A root whose recursive glob is
+/// already emitted verbatim (an exact string match against an earlier
+/// glob) is skipped; a merely-overlapping glob (`app/**/*.php` over the
+/// fixed `app/Http/Controllers/**/*.php`) is left in place — duplicate
+/// events collapse in the idempotent watched-files handler, so the
+/// overlap is harmless.
 pub fn build_watchers(
     root: &Path,
     view_paths: &[PathBuf],
     livewire_path: Option<&Path>,
+    psr4_roots: &[PathBuf],
 ) -> Vec<FileSystemWatcher> {
     // Watch creates, changes, and deletes — all three matter for
     // keeping the pattern cache aligned with disk. The LSP spec's
@@ -80,12 +97,15 @@ pub fn build_watchers(
     let kind = Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete);
 
     // 5 fixed (controllers, routes, migrations, vendor php + blade) + 4 Inertia
-    // page-extension globs + 1 optional livewire + 2 per view path.
-    let mut watchers = Vec::with_capacity(10 + 2 * view_paths.len());
+    // page-extension globs + 1 optional livewire + 2 per view path + 1 per PSR-4
+    // source root.
+    let mut watchers = Vec::with_capacity(10 + 2 * view_paths.len() + psr4_roots.len());
 
     // Controllers — current default path. If a project moves them, we
     // miss those changes until a future improvement makes this glob
-    // configurable. Acceptable for v1.
+    // configurable. Acceptable for v1. (The PSR-4 roots below usually
+    // cover `app/` too, but this stays as a floor for a project whose
+    // `composer.json` we couldn't read.)
     watchers.push(FileSystemWatcher {
         glob_pattern: GlobPattern::String(format!(
             "{}/app/Http/Controllers/**/*.php",
@@ -164,6 +184,33 @@ pub fn build_watchers(
         });
     }
 
+    // First-party PSR-4 source roots (M2). Each gets a recursive `**/*.php`
+    // glob (which also matches `.blade.php`) so an external edit to any
+    // first-party source dir — `app/`, `src/`, a custom `Modules\` layout —
+    // reaches the watched-files handler and converges the magic-member index.
+    // Skip a root whose glob exactly duplicates one already emitted; a merely
+    // overlapping glob is left in place (the handler is idempotent).
+    let mut existing: std::collections::HashSet<String> = watchers
+        .iter()
+        .filter_map(|w| match &w.glob_pattern {
+            GlobPattern::String(s) => Some(s.clone()),
+            GlobPattern::Relative(_) => None,
+        })
+        .collect();
+    for src_root in psr4_roots {
+        let glob = format!("{}/**/*.php", src_root.display());
+        // Skip a glob already emitted — whether by a fixed watcher or an
+        // earlier PSR-4 root this call (defensive: `project_source_roots`
+        // already dedups, but two identical roots must never double-register).
+        if !existing.insert(glob.clone()) {
+            continue;
+        }
+        watchers.push(FileSystemWatcher {
+            glob_pattern: GlobPattern::String(glob),
+            kind,
+        });
+    }
+
     watchers
 }
 
@@ -174,8 +221,9 @@ pub fn build_registration(
     root: &Path,
     view_paths: &[PathBuf],
     livewire_path: Option<&Path>,
+    psr4_roots: &[PathBuf],
 ) -> Registration {
-    let watchers = build_watchers(root, view_paths, livewire_path);
+    let watchers = build_watchers(root, view_paths, livewire_path, psr4_roots);
     let opts = DidChangeWatchedFilesRegistrationOptions { watchers };
     Registration {
         id: REGISTRATION_ID.to_string(),

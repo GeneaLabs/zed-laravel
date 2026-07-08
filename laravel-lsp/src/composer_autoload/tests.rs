@@ -228,3 +228,149 @@ fn resolve_namespace_dirs_returns_empty_for_unknown_or_nonexistent() {
         .resolve_namespace_dirs("App\\View\\Components")
         .is_empty());
 }
+
+// ── project_source_roots (M2 — file-watcher widening) ──────────────────────
+
+/// Assert a `project_source_roots` result contains a root ending in `suffix`,
+/// path-separator-agnostic.
+fn has_root_ending(roots: &[PathBuf], suffix: &str) -> bool {
+    roots.iter().any(|r| r.ends_with(suffix))
+}
+
+#[test]
+fn source_roots_return_app_and_dev_roots_deduped() {
+    // Both `autoload` (App\ → app/) and `autoload-dev` (Tests\ → tests/) roots
+    // are surfaced; installed.json vendor roots are NOT.
+    let composer = r#"{
+        "autoload": { "psr-4": { "App\\": "app/" } },
+        "autoload-dev": { "psr-4": { "Tests\\": "tests/" } }
+    }"#;
+    let installed = r#"{
+        "packages": [
+            {
+                "name": "acme/pkg",
+                "autoload": { "psr-4": { "Acme\\Pkg\\": "src/" } },
+                "install-path": "../acme/pkg"
+            }
+        ]
+    }"#;
+    let (_dir, root) = project_with_files(&[
+        ("composer.json", composer),
+        ("app/Models/User.php", "<?php"),
+        ("tests/Feature/ExampleTest.php", "<?php"),
+        ("vendor/composer/installed.json", installed),
+        ("vendor/acme/pkg/src/Thing.php", "<?php"),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let roots = autoload.project_source_roots();
+
+    assert!(
+        has_root_ending(&roots, "app"),
+        "app root missing: {roots:?}"
+    );
+    assert!(
+        has_root_ending(&roots, "tests"),
+        "autoload-dev tests root missing: {roots:?}"
+    );
+    assert!(
+        !roots
+            .iter()
+            .any(|r| r.components().any(|c| c.as_os_str() == "vendor")),
+        "vendor package roots must be excluded: {roots:?}"
+    );
+}
+
+#[test]
+fn source_roots_drop_subsumed_nested_root() {
+    // `App\Models\` → app/Models is nested under `App\` → app; only the
+    // shallowest survives, its recursive glob already covers the nested one.
+    let composer = r#"{
+        "autoload": {
+            "psr-4": {
+                "App\\": "app/",
+                "App\\Models\\": "app/Models/"
+            }
+        }
+    }"#;
+    let (_dir, root) = project_with_files(&[
+        ("composer.json", composer),
+        ("app/Models/User.php", "<?php"),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let roots = autoload.project_source_roots();
+
+    assert!(
+        has_root_ending(&roots, "app"),
+        "app root missing: {roots:?}"
+    );
+    assert!(
+        !has_root_ending(&roots, "app/Models"),
+        "nested app/Models root must be subsumed: {roots:?}"
+    );
+}
+
+#[test]
+fn source_roots_skip_root_equal_to_project_and_nonexistent_dirs() {
+    // `Root\\` → "" resolves to the project root itself (whose `**/*.php` would
+    // sweep storage/compiled Blade) — skipped. `Ghost\\` → ghost/ doesn't
+    // exist on disk — skipped. `App\\` → app/ survives.
+    let composer = r#"{
+        "autoload": {
+            "psr-4": {
+                "Root\\": "",
+                "Ghost\\": "ghost/",
+                "App\\": "app/"
+            }
+        }
+    }"#;
+    let (_dir, root) = project_with_files(&[
+        ("composer.json", composer),
+        ("app/Models/User.php", "<?php"),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let roots = autoload.project_source_roots();
+
+    assert_eq!(roots.len(), 1, "only app/ should survive: {roots:?}");
+    assert!(
+        has_root_ending(&roots, "app"),
+        "app root missing: {roots:?}"
+    );
+}
+
+#[test]
+fn source_roots_drop_root_escaping_project_via_containment_guard() {
+    // The fail-closed `path_within_root` guard must drop a PSR-4 value that
+    // escapes the project — even one pointing at a directory that really exists
+    // (so `is_dir` alone wouldn't catch it). `outside` is a sibling tempdir
+    // (absolute, on-disk, outside the project root); a `PathBuf::join` of an
+    // absolute value replaces the base, so `Evil\\` maps straight to it. A
+    // regression removing the containment guard would let it through and fail
+    // this test.
+    let outside = TempDir::new().unwrap();
+    let composer = format!(
+        r#"{{ "autoload": {{ "psr-4": {{ "Evil\\": "{}", "App\\": "app/" }} }} }}"#,
+        outside.path().display()
+    );
+    let (_dir, root) = project_with_files(&[
+        ("composer.json", &composer),
+        ("app/Models/User.php", "<?php"),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let roots = autoload.project_source_roots();
+
+    assert!(
+        has_root_ending(&roots, "app"),
+        "app root missing: {roots:?}"
+    );
+    let outside_canon = outside
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| outside.path().to_path_buf());
+    assert!(
+        !roots.iter().any(|r| {
+            let rc = r.canonicalize().unwrap_or_else(|_| r.clone());
+            rc.starts_with(&outside_canon)
+        }),
+        "an escaping PSR-4 root must be dropped by the containment guard: {roots:?}"
+    );
+}

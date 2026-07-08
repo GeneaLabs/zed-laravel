@@ -45,3 +45,4 @@ mod translation_namespace_navigation;
 mod view_diagnostic_containment;
 mod view_navigation_containment;
 mod vite_completion_context;
+mod watched_files_magic;
