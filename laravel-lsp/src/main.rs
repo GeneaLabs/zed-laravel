@@ -3107,6 +3107,7 @@ const MAX_CONCURRENT_MAGIC_PARSES: usize = 8;
 /// Shared by the warm build and the debounced incremental rebuild so both run
 /// byte-for-byte the same resolution. Returns empty when the class hierarchy
 /// snapshot is empty (nothing to resolve against).
+#[allow(clippy::too_many_arguments)]
 async fn build_magic_member_entries(
     salsa: &SalsaHandle,
     pattern_cache: &Arc<
@@ -3115,12 +3116,16 @@ async fn build_magic_member_entries(
     root: &Path,
     view_paths: &[PathBuf],
     max_concurrent: usize,
-    // First-load progress handle. Drives the "Building semantic index N of M…"
+    // First-load progress handle. Drives the "Resolving members in N of M…"
     // status while PHP member accesses resolve — the slow phase on big projects
     // that previously ran silently (the file-parse loop has nothing to report
     // on a cache-warm start, so the bar otherwise sits frozen). `None` on the
     // incremental save-refresh path, which has no progress UI.
     mut progress: Option<&mut laravel_lsp::indexing_progress::IndexingProgress>,
+    // Where this phase's slice of the unified progress bar starts: reports
+    // map into `progress_base..=100`, continuing from wherever the parse
+    // phase left the bar instead of restarting at 0%.
+    progress_base: u32,
     // Shared persistent view-var index. The pass-1 build publishes into it
     // wholesale so the incremental save flow (#80) can later update single
     // files and resolve Blade accesses without another project pass.
@@ -3346,9 +3351,14 @@ async fn build_magic_member_entries(
         }
         magic_done += 1;
         if let Some(p) = progress.as_deref_mut() {
-            let pct = ((magic_done.saturating_mul(100) / magic_total.max(1)) as u32).min(100);
+            let pct = laravel_lsp::indexing_progress::weighted_pct(
+                magic_done,
+                magic_total,
+                progress_base,
+                100u32.saturating_sub(progress_base),
+            );
             p.report(
-                format!("Indexing {magic_done} of {magic_total} files…"),
+                format!("Resolving members in {magic_done} of {magic_total} files…"),
                 Some(pct),
                 false,
             )
@@ -4637,8 +4647,10 @@ impl LaravelLanguageServer {
     /// cache parsed patterns for efficient reference lookups.
     /// Register the project's PHP/Blade files with Salsa and kick off the
     /// pattern-cache warming task. If `progress` is provided it'll drive the
-    /// "Discovering files" → "Indexing X of N" → "Indexed" status-bar updates;
-    /// pass `None` from any code path that just needs the registration done
+    /// "Discovering files" → "Parsing X of N" → "Resolving members in X of N"
+    /// → "Indexed" status-bar updates (one monotonic 0→100% bar — the two
+    /// per-file loops fill disjoint slices split at `PARSE_SPAN`); pass
+    /// `None` from any code path that just needs the registration done
     /// without UI (e.g. re-registration after a config change).
     ///
     /// `guard`, when present, is the [`laravel_lsp::reindex::IndexingFlightGuard`]
@@ -4838,8 +4850,9 @@ impl LaravelLanguageServer {
             // would otherwise drop it.
             if let Some(p) = progress.as_mut() {
                 // Parse phase transition: still at 0% — the per-file
-                // updates below increment from here to 100.
-                p.report("Indexing project files…", Some(0), true).await;
+                // updates below increment from here to PARSE_SPAN, and
+                // the magic-member resolve continues on to 100.
+                p.report("Parsing project files…", Some(0), true).await;
             }
 
             let paths = match salsa.list_project_files().await {
@@ -4876,6 +4889,11 @@ impl LaravelLanguageServer {
             }
 
             let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
+
+            // Per-phase wall-clock for the summary log below — the
+            // parse/resolve ratio it reports is what PARSE_SPAN (the
+            // progress-bar split) is tuned against.
+            let parse_started = std::time::Instant::now();
 
             // Spawn one task per file we still need to parse. The
             // semaphore ensures we never have more than N parses running
@@ -4977,20 +4995,30 @@ impl LaravelLanguageServer {
                 if let Some(p) = progress.as_mut() {
                     // Progress is over the files we're actually parsing
                     // this session, not the total project size. Showing
-                    // "Indexing 12 of 12 files" after a warm restart
+                    // "Parsing 12 of 12 files" after a warm restart
                     // gives accurate feedback for the work in progress;
                     // the user already saw the cached restore land in
                     // the "Loading cached index…" step before this.
-                    let denom = to_parse.max(1);
-                    let pct = ((completed.saturating_mul(100) / denom) as u32).min(100);
+                    //
+                    // The parse loop owns the 0..=PARSE_SPAN slice of the
+                    // unified bar; the magic-member resolve below continues
+                    // from PARSE_SPAN, so the bar fills 0→100 monotonically
+                    // instead of resetting between the two phases.
+                    let pct = laravel_lsp::indexing_progress::weighted_pct(
+                        completed,
+                        to_parse,
+                        0,
+                        laravel_lsp::indexing_progress::PARSE_SPAN,
+                    );
                     p.report(
-                        format!("Indexing {} of {} files…", completed, to_parse),
+                        format!("Parsing {} of {} files…", completed, to_parse),
                         Some(pct),
                         false,
                     )
                     .await;
                 }
             }
+            let parse_elapsed = parse_started.elapsed();
             // Split the combined parse results: patterns go to the shared
             // cache, class-hierarchy nodes to the actor-owned index. Files
             // with no class declarations contribute no hierarchy entry.
@@ -5065,6 +5093,7 @@ impl LaravelLanguageServer {
             // (~135s on a real app) after any edit-then-restart.
             // Disk read on the blocking pool so it never stalls the async
             // runtime (the file can be large on a big project).
+            let magic_started = std::time::Instant::now();
             let restored = {
                 let root_for_load = root_for_save.clone();
                 tokio::task::spawn_blocking(move || {
@@ -5180,6 +5209,15 @@ impl LaravelLanguageServer {
                 if evicted > 0 {
                     server_for_warm.schedule_magic_cache_save().await;
                 }
+                // The resolve phase (which owns the PARSE_SPAN..=100 slice
+                // of the unified bar) never runs on a restore, so without
+                // this the bar would freeze at PARSE_SPAN% until `end()`.
+                // One forced report walks it to 100 so the bar always
+                // completes, warm or cold.
+                if let Some(p) = progress.as_mut() {
+                    p.report("Restored member index from cache.", Some(100), true)
+                        .await;
+                }
             } else {
                 // Resolve fresh, drive progress (the file-parse loop had nothing
                 // to report on a cache-warm start), persist for next time, then
@@ -5193,6 +5231,7 @@ impl LaravelLanguageServer {
                     &view_paths_for_warm,
                     MAX_CONCURRENT_PARSES,
                     progress.as_mut(),
+                    laravel_lsp::indexing_progress::PARSE_SPAN,
                     &view_vars_for_warm,
                 )
                 .await;
@@ -5226,6 +5265,7 @@ impl LaravelLanguageServer {
                     }
                 }
             }
+            let magic_elapsed = magic_started.elapsed();
             // The reference indexes are built — ask the client to refresh code
             // lenses requested while warming was still in progress (those
             // resolved against an empty index and read 0). Fire-and-forget, so
@@ -5241,8 +5281,8 @@ impl LaravelLanguageServer {
 
             let elapsed = started_at.elapsed();
             info!(
-                "🔥 Laravel: pattern cache warmed ({} newly parsed, {} from disk, total {}, in {:?})",
-                imported, cached_hits, total, elapsed
+                "🔥 Laravel: pattern cache warmed ({} newly parsed, {} from disk, total {}, in {:?}; parse {:?}, magic-resolve {:?})",
+                imported, cached_hits, total, elapsed, parse_elapsed, magic_elapsed
             );
 
             if let Some(p) = progress {

@@ -34,6 +34,30 @@ pub const RENAME_TOKEN: &str = "laravel-lsp/rename";
 /// the user can't see anyway. Slower and the bar feels jumpy.
 const REPORT_THROTTLE: Duration = Duration::from_millis(150);
 
+/// Portion of the unified indexing bar allotted to the parse phase
+/// (per-file tree-sitter parsing). The remainder (`100 - PARSE_SPAN`)
+/// belongs to the magic-member resolve phase, so the two loops fill
+/// disjoint slices of one monotonic 0→100% bar instead of each racing
+/// 0→100 against its own denominator (which made the bar visibly fill
+/// and then reset mid-index). The split is an eyeballed weighting —
+/// tune it against the per-phase timings the warm task logs on a cold
+/// run ("parse …, magic-resolve …").
+pub const PARSE_SPAN: u32 = 75;
+
+/// Map `done / total` into the `base..=base + span` slice of a single
+/// 0–100% progress bar. Multi-phase pipelines give each phase a
+/// disjoint `(base, span)` slice so the combined bar is monotonic —
+/// no per-phase reset to 0%. Saturating and clamped: the result never
+/// exceeds 100, `done > total` pins to the top of the slice, and
+/// `total == 0` (nothing to do in this phase) reports `base`.
+pub fn weighted_pct(done: usize, total: usize, base: u32, span: u32) -> u32 {
+    if total == 0 {
+        return base.min(100);
+    }
+    let filled = (done.min(total) as u64 * u64::from(span) / total as u64) as u32;
+    base.saturating_add(filled).min(100)
+}
+
 /// Active progress handle. `report` is throttled so call sites don't
 /// need to be careful about update frequency. `end` consumes self; drop
 /// without ending also ends (with a fallback message) so a panic in the
@@ -183,5 +207,70 @@ impl Drop for IndexingProgress {
                 })
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phase_one_fills_zero_to_parse_span() {
+        assert_eq!(weighted_pct(0, 40, 0, PARSE_SPAN), 0);
+        assert_eq!(weighted_pct(40, 40, 0, PARSE_SPAN), PARSE_SPAN);
+    }
+
+    #[test]
+    fn phase_two_fills_parse_span_to_one_hundred() {
+        let span = 100 - PARSE_SPAN;
+        assert_eq!(weighted_pct(0, 40, PARSE_SPAN, span), PARSE_SPAN);
+        assert_eq!(weighted_pct(40, 40, PARSE_SPAN, span), 100);
+    }
+
+    /// Walk both phases end-to-end (awkward prime total so integer
+    /// division exercises every rounding step) and assert the unified
+    /// bar never moves backwards — including across the phase hand-off.
+    #[test]
+    fn unified_bar_is_monotonic_non_decreasing() {
+        let total = 137;
+        let mut last = 0;
+        for done in 0..=total {
+            let pct = weighted_pct(done, total, 0, PARSE_SPAN);
+            assert!(pct >= last, "phase 1 regressed at {done}: {pct} < {last}");
+            last = pct;
+        }
+        for done in 0..=total {
+            let pct = weighted_pct(done, total, PARSE_SPAN, 100 - PARSE_SPAN);
+            assert!(pct >= last, "phase 2 regressed at {done}: {pct} < {last}");
+            last = pct;
+        }
+        assert_eq!(last, 100);
+    }
+
+    #[test]
+    fn phase_boundary_is_continuous() {
+        // Phase 1's final report and phase 2's first report meet at
+        // exactly PARSE_SPAN — no gap, no backwards jump at the hand-off.
+        assert_eq!(
+            weighted_pct(9, 9, 0, PARSE_SPAN),
+            weighted_pct(0, 9, PARSE_SPAN, 100 - PARSE_SPAN),
+        );
+    }
+
+    #[test]
+    fn empty_phase_reports_its_base() {
+        assert_eq!(weighted_pct(0, 0, 0, PARSE_SPAN), 0);
+        assert_eq!(weighted_pct(0, 0, PARSE_SPAN, 100 - PARSE_SPAN), PARSE_SPAN);
+    }
+
+    #[test]
+    fn result_is_clamped() {
+        // base + span overshooting 100 clamps.
+        assert_eq!(weighted_pct(10, 10, 90, 20), 100);
+        // done > total pins to the top of the slice, never past it.
+        assert_eq!(weighted_pct(50, 10, 0, PARSE_SPAN), PARSE_SPAN);
+        // An absurd base still clamps to 100 (with and without work).
+        assert_eq!(weighted_pct(0, 5, 150, 10), 100);
+        assert_eq!(weighted_pct(0, 0, 150, 10), 100);
     }
 }
