@@ -25,6 +25,13 @@
 //! feeding synthesized watched-file events through the real notification
 //! handler. The batch is awaited via its `JoinHandle` (which M2 keeps alive and
 //! awaitable precisely so a test can observe convergence deterministically).
+//!
+//! Also here (same harness, same fixtures): the M4 **on-open vendor** lazy
+//! indexing tests at the bottom — `did_open` of a `vendor/` file resolves THAT
+//! file's own magic-member usages into the reverse index (the eager build
+//! skips vendor files as usage sites, so their occurrence lines were missing
+//! from find-references), bounded by `vendor_open_magic_lru` so a session's
+//! vendor browsing can't grow the index monotonically.
 
 use crate::{LaravelLanguageServer, PendingWatchedChange};
 use laravel_lsp::salsa_impl::ParsedPatternsData;
@@ -33,7 +40,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent, Url};
+use tower_lsp::lsp_types::{
+    DidChangeWatchedFilesParams, DidOpenTextDocumentParams, FileChangeType, FileEvent,
+    TextDocumentItem, Url,
+};
 use tower_lsp::{LanguageServer, LspService};
 
 const COMPOSER: &str = r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#;
@@ -503,5 +513,232 @@ async fn drain_treats_present_flagged_but_missing_file_as_delete() {
     assert!(
         !magic_deps_has(&backend, &post),
         "the gone file's dep contribution must be purged, not leaked"
+    );
+}
+
+// === M4: on-open vendor lazy indexing =======================================
+
+/// A vendor consumer reading `$post->headline` off a typed `Post` param —
+/// the same resolution shape as [`CONSUMER`], but under `vendor/`, so the
+/// eager build never resolves it as a usage site.
+const VENDOR_CONSUMER: &str = r#"<?php
+namespace Acme\Blog;
+use App\Models\Post;
+class PostPresenter {
+    public function present(Post $post) {
+        return $post->headline;
+    }
+}
+"#;
+
+/// 0-based (line, column) of a cursor inside `headline` in [`VENDOR_CONSUMER`].
+const VENDOR_USAGE: (u32, u32) = (5, 23);
+/// 0-based (line, column) of a cursor inside `headline` in [`CONSUMER`].
+const APP_USAGE: (u32, u32) = (5, 24);
+
+/// Drive the **real** `did_open` handler for `path` with `src` as the buffer.
+async fn open(backend: &LaravelLanguageServer, path: &Path, src: &str) {
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: Url::from_file_path(path).unwrap(),
+                language_id: "php".to_string(),
+                version: 1,
+                text: src.to_string(),
+            },
+        })
+        .await;
+}
+
+/// Seed the shared app-side fixture — a `Post` model declaring the `headline`
+/// accessor plus an app consumer reading it — both eagerly indexed the way
+/// the build/save paths would. Returns `(post, consumer)` paths.
+async fn seed_app_fixture(backend: &LaravelLanguageServer, root: &Path) -> (PathBuf, PathBuf) {
+    write_file(root, "composer.json", COMPOSER);
+    let post_src = post_with_accessors(&["Headline"]);
+    let post = write_file(root, "app/Models/Post.php", &post_src);
+    let consumer = write_file(root, "app/Http/Controllers/PostController.php", CONSUMER);
+    seed(backend, &post, &post_src).await;
+    seed(backend, &consumer, CONSUMER).await;
+    (post, consumer)
+}
+
+#[tokio::test]
+async fn opening_a_vendor_file_indexes_its_own_usages() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let backend = backend_for(root).await;
+    let (_post, consumer) = seed_app_fixture(&backend, root).await;
+
+    let vendor = write_file(
+        root,
+        "vendor/acme/blog/src/PostPresenter.php",
+        VENDOR_CONSUMER,
+    );
+    // Mirror the eager build's end state: the vendor file is registered in
+    // Salsa (patterns/literals exist) but its usages were never resolved into
+    // the reverse index — vendor is skipped as a usage site.
+    backend
+        .salsa
+        .update_file(vendor.clone(), 1, VENDOR_CONSUMER.to_string())
+        .await
+        .unwrap();
+
+    // THE GAP: before the open, the reference set omits the vendor file's own
+    // occurrence — from a cursor inside the vendor file and from the app
+    // usage site alike.
+    let from_vendor = backend
+        .salsa
+        .find_member_references(vendor.clone(), VENDOR_USAGE.0, VENDOR_USAGE.1)
+        .await
+        .unwrap();
+    assert!(
+        from_vendor.iter().all(|r| r.file_path != vendor),
+        "pre-open: no vendor self-reference; got {from_vendor:?}"
+    );
+    let from_app = backend
+        .salsa
+        .find_member_references(consumer.clone(), APP_USAGE.0, APP_USAGE.1)
+        .await
+        .unwrap();
+    assert!(
+        from_app.iter().any(|r| r.file_path == consumer),
+        "sanity: the app usage itself is indexed; got {from_app:?}"
+    );
+    assert!(
+        from_app.iter().all(|r| r.file_path != vendor),
+        "pre-open: app-site references omit the vendor occurrence"
+    );
+    assert!(
+        member_names(&backend, &vendor).await.is_empty(),
+        "pre-open: the vendor file holds no magic entries"
+    );
+
+    open(&backend, &vendor, VENDOR_CONSUMER).await;
+
+    assert!(
+        member_names(&backend, &vendor).await.contains("headline"),
+        "post-open: the vendor file's own usage is resolved into the index"
+    );
+    let from_app = backend
+        .salsa
+        .find_member_references(consumer.clone(), APP_USAGE.0, APP_USAGE.1)
+        .await
+        .unwrap();
+    assert!(
+        from_app
+            .iter()
+            .any(|r| r.file_path == vendor && r.line == VENDOR_USAGE.0),
+        "post-open: the vendor file's own occurrence line joins the reference set; got {from_app:?}"
+    );
+    assert_eq!(
+        backend.vendor_open_magic_lru.lock().unwrap().len(),
+        1,
+        "the on-open path records the vendor file in the session LRU"
+    );
+}
+
+#[tokio::test]
+async fn reopening_a_vendor_file_replaces_not_duplicates() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let backend = backend_for(root).await;
+    seed_app_fixture(&backend, root).await;
+
+    let vendor = write_file(
+        root,
+        "vendor/acme/blog/src/PostPresenter.php",
+        VENDOR_CONSUMER,
+    );
+    open(&backend, &vendor, VENDOR_CONSUMER).await;
+    let entry_count =
+        |members: &HashMap<PathBuf, Vec<_>>| members.get(&vendor).map(|e| e.len()).unwrap_or(0);
+    let first = entry_count(&backend.salsa.export_magic_members().await.unwrap());
+    assert!(first > 0, "first open indexes the vendor usage");
+
+    // Re-open (references multibuffer, tab churn): the actor's remove-then-
+    // insert must REPLACE the file's entries, never append duplicates — and
+    // the LRU `push` of the same key is a recency touch, not an eviction.
+    open(&backend, &vendor, VENDOR_CONSUMER).await;
+    let second = entry_count(&backend.salsa.export_magic_members().await.unwrap());
+    assert_eq!(first, second, "re-open must replace, not duplicate");
+    assert!(
+        member_names(&backend, &vendor).await.contains("headline"),
+        "re-open keeps the entries alive (same-key push must not evict)"
+    );
+}
+
+#[tokio::test]
+async fn vendor_open_lru_evicts_oldest_contributions_only() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let backend = backend_for(root).await;
+    let (_post, consumer) = seed_app_fixture(&backend, root).await;
+
+    let oldest = write_file(
+        root,
+        "vendor/acme/blog/src/PostPresenter.php",
+        VENDOR_CONSUMER,
+    );
+    open(&backend, &oldest, VENDOR_CONSUMER).await;
+    assert!(
+        member_names(&backend, &oldest).await.contains("headline"),
+        "seed: the oldest vendor open is indexed"
+    );
+    assert!(magic_deps_has(&backend, &oldest), "seed: and records deps");
+
+    // Fill the LRU to capacity with trivial vendor opens (they occupy slots
+    // regardless of whether resolution produced entries)…
+    for i in 0..crate::VENDOR_OPEN_MAGIC_LRU_CAP - 1 {
+        let filler = write_file(root, &format!("vendor/acme/blog/src/F{i}.php"), "<?php\n");
+        open(&backend, &filler, "<?php\n").await;
+    }
+    // …then one more real vendor open pushes past the cap: the oldest evicts.
+    let newest_src = VENDOR_CONSUMER.replace("PostPresenter", "PostSummary");
+    let newest = write_file(root, "vendor/acme/blog/src/PostSummary.php", &newest_src);
+    open(&backend, &newest, &newest_src).await;
+
+    assert!(
+        member_names(&backend, &oldest).await.is_empty(),
+        "overflow evicts the OLDEST opened vendor file's entries"
+    );
+    assert!(
+        !magic_deps_has(&backend, &oldest),
+        "…and purges its recorded receiver deps"
+    );
+    assert!(
+        member_names(&backend, &newest).await.contains("headline"),
+        "a recently opened vendor file's entries survive"
+    );
+    assert!(
+        member_names(&backend, &consumer).await.contains("headline"),
+        "eager app-file entries are never LRU-tracked, so never evicted"
+    );
+}
+
+#[tokio::test]
+async fn app_file_open_does_not_trigger_vendor_refresh() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let backend = backend_for(root).await;
+    write_file(root, "composer.json", COMPOSER);
+
+    // The model exists and is seeded, so resolution WOULD succeed if the
+    // on-open refresh (wrongly) ran for app files.
+    let post_src = post_with_accessors(&["Headline"]);
+    let post = write_file(root, "app/Models/Post.php", &post_src);
+    seed(&backend, &post, &post_src).await;
+
+    let consumer = write_file(root, "app/Http/Controllers/PostController.php", CONSUMER);
+    open(&backend, &consumer, CONSUMER).await;
+
+    assert!(
+        member_names(&backend, &consumer).await.is_empty(),
+        "did_open must not magic-index app files — the eager build owns those"
+    );
+    assert_eq!(
+        backend.vendor_open_magic_lru.lock().unwrap().len(),
+        0,
+        "an app open must not occupy a vendor-LRU slot"
     );
 }

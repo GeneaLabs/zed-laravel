@@ -2070,6 +2070,21 @@ struct LaravelLanguageServer {
     /// schedule call cancels the previous timer, so a burst of saves
     /// produces one disk write after the burst settles.
     magic_cache_save_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+
+    /// Session-only LRU of vendor files whose own magic-member usages were
+    /// lazily indexed on `did_open`. The eager build skips vendor files as
+    /// usage *sites*, so find-references would omit a vendor file's own
+    /// occurrence lines — opening one fills that gap via
+    /// [`Self::refresh_file_magic`]. Because `did_close` deliberately never
+    /// evicts (see the note there), these entries would otherwise accumulate
+    /// monotonically; on overflow the OLDEST opened vendor file's session
+    /// contributions are removed again (see
+    /// [`Self::record_vendor_open_magic`]). Tracks ONLY paths added via the
+    /// on-open path — never eager app files or saved files.
+    /// `std::sync::Mutex`, not `RwLock`: `lru` mutates on read to reorder
+    /// recency, and every critical section is a short map op (same rationale
+    /// as the `class_locator` cache).
+    vendor_open_magic_lru: Arc<std::sync::Mutex<lru::LruCache<PathBuf, ()>>>,
     /// Dominant Inertia page extension (`vue` / `tsx` / `jsx` / `svelte`),
     /// detected once at startup by counting files under `resources/js/Pages/`.
     /// Used as the default for the "create page" code action and to break
@@ -2086,6 +2101,15 @@ struct LaravelLanguageServer {
 
 /// Default Salsa debounce delay in milliseconds
 const DEFAULT_SALSA_DEBOUNCE_MS: u64 = 200;
+
+/// Cap on `vendor_open_magic_lru`: how many opened vendor files keep their
+/// on-open magic-member contributions alive at once. Tunable — raising it
+/// trades memory (entries + receiver deps per file) for a longer-lived
+/// session index; 128 comfortably exceeds the number of vendor files a
+/// session realistically has open or recently browsed, so an evicted file
+/// still sitting open in the editor is practically impossible (and even
+/// then, re-opening or saving it re-indexes it).
+const VENDOR_OPEN_MAGIC_LRU_CAP: usize = 128;
 
 // NOTE: Blade directives are now dynamically discovered via get_all_blade_directives()
 // which scans the Laravel framework, app service providers, and packages.
@@ -4355,6 +4379,9 @@ impl LaravelLanguageServer {
                 laravel_lsp::view_var_index::ViewVarIndex::new(),
             )),
             magic_cache_save_handle: Arc::new(RwLock::new(None)),
+            vendor_open_magic_lru: Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(VENDOR_OPEN_MAGIC_LRU_CAP).unwrap(),
+            ))),
             inertia_default_ext: Arc::new(RwLock::new(None)),
         }
     }
@@ -6678,6 +6705,37 @@ impl LaravelLanguageServer {
         }
 
         changed_views
+    }
+
+    /// Bound the session growth of on-open vendor magic indexing: record
+    /// `path` in `vendor_open_magic_lru` and, on overflow, remove the OLDEST
+    /// previously-opened vendor file's session contributions — the same
+    /// removal a delete performs on the magic side: `reindex_file_magic` with
+    /// empty entries (which keeps the file's literal symbols alive via the
+    /// pattern-cache re-insert) plus its recorded receiver deps. Without this
+    /// bound the entries would accumulate for the whole session, because
+    /// `did_close` deliberately never evicts (references-multibuffer
+    /// rationale — see the note there). With the cap at
+    /// [`VENDOR_OPEN_MAGIC_LRU_CAP`], evicting a file that is *still open* is
+    /// practically impossible; if it ever happens its own-file references
+    /// simply go missing again until the next re-open or save re-indexes it.
+    async fn record_vendor_open_magic(&self, path: &Path) {
+        let evicted = {
+            let mut lru = self.vendor_open_magic_lru.lock().unwrap();
+            // `push` returns the displaced pair: the SAME key on a re-open
+            // (a recency touch — must not evict the entries we just wrote),
+            // or the LRU-oldest entry on overflow.
+            match lru.push(path.to_path_buf(), ()) {
+                Some((old, ())) if old != path => Some(old),
+                _ => None,
+            }
+        };
+        if let Some(old) = evicted {
+            let _ = self.salsa.reindex_file_magic(old.clone(), Vec::new()).await;
+            if let Ok(mut deps) = self.magic_deps.write() {
+                deps.remove_file(&old);
+            }
+        }
     }
 
     /// Schedule the debounced re-save of the magic disk cache. Call after
@@ -16647,6 +16705,7 @@ return [
             magic_deps: self.magic_deps.clone(),
             view_vars: self.view_vars.clone(),
             magic_cache_save_handle: self.magic_cache_save_handle.clone(),
+            vendor_open_magic_lru: self.vendor_open_magic_lru.clone(),
             inertia_default_ext: self.inertia_default_ext.clone(),
         }
     }
@@ -21607,6 +21666,27 @@ impl LanguageServer for LaravelLanguageServer {
                 debug!("Failed to update Salsa database: {}", e);
             }
             info!("   ⏱️  salsa.update_file: {:?}", t2.elapsed());
+
+            // The eager magic build skips vendor files as usage *sites*, so
+            // find-references omits a vendor file's own `$model->member`
+            // occurrence lines (goto/hover already work — only the reference
+            // set is incomplete). Opening the file is the signal to lazily
+            // fill that gap: resolve THIS file's usages and add them to the
+            // reverse index. Runs AFTER `update_file` so the refresh parses
+            // the just-opened buffer; awaited inline (one cheap file) so an
+            // immediate find-references can't race the insert. Session-only:
+            // `refresh_file_magic` never schedules a magic-cache save, so
+            // these entries don't leak into the disk cache or the next cold
+            // start. No dependents/ripple wrapper — opening a file changes no
+            // class surface, so there is nothing to converge.
+            if file_path.components().any(|c| c.as_os_str() == "vendor")
+                && file_path.to_string_lossy().ends_with(".php")
+            {
+                let t = std::time::Instant::now();
+                self.refresh_file_magic(&file_path, &text).await;
+                self.record_vendor_open_magic(&file_path).await;
+                info!("   ⏱️  vendor on-open magic refresh: {:?}", t.elapsed());
+            }
         }
 
         // Validate and publish diagnostics for Blade files
