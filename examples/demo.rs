@@ -19,7 +19,7 @@ fn find_view_calls(php_content: &str) -> Vec<String> {
         if let Some(start_pos) = line.find("view(") {
             let after_view = &line[start_pos + 5..];
 
-            if let Some(quote_start) = after_view.find(|c| c == '\'' || c == '"') {
+            if let Some(quote_start) = after_view.find(['\'', '"']) {
                 let quote_char = after_view.chars().nth(quote_start).unwrap();
                 let after_quote = &after_view[quote_start + 1..];
 
