@@ -3381,10 +3381,12 @@ async fn build_magic_member_entries(
                 progress_base,
                 100u32.saturating_sub(progress_base),
             );
+            // The final report is forced so a sub-throttle finish can't
+            // drop the top-of-slice update and strand the bar mid-slice.
             p.report(
                 format!("Resolving members in {magic_done} of {magic_total} files…"),
                 Some(pct),
-                false,
+                magic_done == magic_total,
             )
             .await;
         }
@@ -4674,10 +4676,13 @@ impl LaravelLanguageServer {
     /// cache parsed patterns for efficient reference lookups.
     /// Register the project's PHP/Blade files with Salsa and kick off the
     /// pattern-cache warming task. If `progress` is provided it'll drive the
-    /// "Discovering files" → "Parsing X of N" → "Resolving members in X of N"
-    /// → "Indexed" status-bar updates (one monotonic 0→100% bar — the two
-    /// per-file loops fill disjoint slices split at `PARSE_SPAN`); pass
-    /// `None` from any code path that just needs the registration done
+    /// "Loading N of M cached entries" → "Parsing X of N" → "Resolving
+    /// members in X of N" → "Indexed" status-bar updates (one monotonic
+    /// 0→100% bar — the phases fill disjoint slices split per branch: cold
+    /// is parse-dominant (`0..PARSE_SPAN..100`), warm is load- and
+    /// re-resolve-dominant (`LOAD_SPAN`, `WARM_PARSE_TOP`,
+    /// `WARM_RESOLVE_BASE`); see the slice map in `indexing_progress`);
+    /// pass `None` from any code path that just needs the registration done
     /// without UI (e.g. re-registration after a config change).
     ///
     /// `guard`, when present, is the [`laravel_lsp::reindex::IndexingFlightGuard`]
@@ -4761,17 +4766,75 @@ impl LaravelLanguageServer {
         let pattern_cache = self.salsa.pattern_cache();
         let root_for_load = root_path.to_path_buf();
         let cache_for_load = pattern_cache.clone();
-        let load_result = tokio::task::spawn_blocking(move || {
-            laravel_lsp::pattern_disk_cache::load_into(&cache_for_load, &root_for_load)
-        })
-        .await
-        .unwrap_or_default();
+        // The load is a sync, parallel (rayon) pass over ~40k cache
+        // entries — a multi-second stall on a cold FS that previously ran
+        // under a single static "Loading cached index…" message and read
+        // as frozen. It publishes live counts into `load_progress`; a
+        // concurrent throttled reporter here renders them into the load
+        // slice (0..LOAD_SPAN) while the blocking task runs. spawn_blocking
+        // keeps the rayon pass off the async runtime; the select loop lets
+        // the reporter fire on a timer without blocking the load.
+        let load_progress = Arc::new(laravel_lsp::pattern_disk_cache::LoadProgress::default());
+        let lp_for_task = load_progress.clone();
+        let mut load_task = tokio::task::spawn_blocking(move || {
+            laravel_lsp::pattern_disk_cache::load_into_reporting(
+                &cache_for_load,
+                &root_for_load,
+                Some(lp_for_task.as_ref()),
+            )
+        });
+        let load_result = loop {
+            tokio::select! {
+                res = &mut load_task => break res.unwrap_or_default(),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {
+                    if let Some(p) = progress.as_mut() {
+                        let total = load_progress.total.load(std::sync::atomic::Ordering::Relaxed);
+                        // total stays 0 until the cache is decoded (and on a
+                        // cold start with no cache it never moves) — only
+                        // report once there's a real denominator.
+                        if total > 0 {
+                            let done =
+                                load_progress.done.load(std::sync::atomic::Ordering::Relaxed);
+                            let pct = laravel_lsp::indexing_progress::weighted_pct(
+                                done,
+                                total,
+                                0,
+                                laravel_lsp::indexing_progress::LOAD_SPAN,
+                            );
+                            p.report(
+                                format!("Loading {done} of {total} cached entries…"),
+                                Some(pct),
+                                false,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        };
         let (restored, dropped) = (load_result.restored, load_result.dropped);
         if restored + dropped > 0 {
             info!(
                 "🗄️  Disk cache: restored {} fresh entries, dropped {} stale",
                 restored, dropped
             );
+        }
+        // Complete the load slice cleanly: the final throttled report above
+        // may have been dropped, and a warm reload's parse phase starts at
+        // LOAD_SPAN — a forced report guarantees the bar reaches the
+        // hand-off. Gated on `restored > 0` (not `restored + dropped`): the
+        // warm parse base is LOAD_SPAN only when entries were restored, so
+        // an all-dropped reload stays a cold start and this must NOT jump
+        // the bar to LOAD_SPAN ahead of a parse phase that begins at 0.
+        if restored > 0 {
+            if let Some(p) = progress.as_mut() {
+                p.report(
+                    format!("Loaded {restored} cached entries."),
+                    Some(laravel_lsp::indexing_progress::LOAD_SPAN),
+                    true,
+                )
+                .await;
+            }
         }
         // Re-import the restored files' class-hierarchy nodes. Without this the
         // hierarchy index is empty on a warm start (no parse runs for
@@ -4850,6 +4913,15 @@ impl LaravelLanguageServer {
         // For the granular restore's per-file re-resolution (it reuses the
         // same machinery as the save-time dependents pass).
         let server_for_warm = self.clone_for_spawn();
+        // Did the disk-cache load slice actually run? True whenever the
+        // cache existed and was scanned — restored OR dropped — because the
+        // load reporter advances the bar over `0..LOAD_SPAN` for every
+        // decoded entry regardless of freshness. The warming task keys its
+        // parse-slice *base* off this (not off `cached_hits`): on an
+        // all-dropped reload the load slice climbed to LOAD_SPAN but
+        // nothing was restored, so parsing must CONTINUE from LOAD_SPAN
+        // rather than snap back to 0.
+        let cache_scanned = restored + dropped > 0;
         tokio::spawn(async move {
             // `progress` moves into this task — when warming finishes (or
             // hits an early return) we call `end` to clear the status bar.
@@ -4871,16 +4943,6 @@ impl LaravelLanguageServer {
             tokio::task::spawn_blocking(laravel_lsp::queries::prewarm_query_cache)
                 .await
                 .ok();
-
-            // Discovery is done — transition to "Indexing" phase. Forced
-            // so the user sees the phase change even if the throttle
-            // would otherwise drop it.
-            if let Some(p) = progress.as_mut() {
-                // Parse phase transition: still at 0% — the per-file
-                // updates below increment from here to PARSE_SPAN, and
-                // the magic-member resolve continues on to 100.
-                p.report("Parsing project files…", Some(0), true).await;
-            }
 
             let paths = match salsa.list_project_files().await {
                 Ok(p) => p,
@@ -4914,6 +4976,25 @@ impl LaravelLanguageServer {
                     cached_hits, to_parse
                 );
             }
+            // Parse slice `parse_base..parse_top` of the unified bar, chosen
+            // from two independent signals (see `parse_slice`): the base
+            // continues the load slice when the cache was scanned (so an
+            // all-dropped reload doesn't snap the bar back to 0), the top
+            // reflects how much is being re-parsed. Three shapes: fully-warm
+            // → LOAD_SPAN..WARM_PARSE_TOP; all-dropped → LOAD_SPAN..PARSE_SPAN;
+            // fully-cold → 0..PARSE_SPAN.
+            let (parse_base, parse_top) =
+                laravel_lsp::indexing_progress::parse_slice(cache_scanned, cached_hits > 0);
+
+            // Discovery is done — transition to the parse phase. Forced so
+            // the user sees the phase change even if the throttle would
+            // drop it. Reported at `parse_base` (not 0) so a warm reload
+            // continues from where the load slice left the bar instead of
+            // resetting to 0%.
+            if let Some(p) = progress.as_mut() {
+                p.report("Parsing project files…", Some(parse_base), true)
+                    .await;
+            }
 
             let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
 
@@ -4922,13 +5003,14 @@ impl LaravelLanguageServer {
             // progress-bar split) is tuned against.
             let parse_started = std::time::Instant::now();
 
-            // Spawn one task per file we still need to parse. The
+            // Spawn one task per file we still need to parse into a
+            // JoinSet, which we drain in COMPLETION order below. The
             // semaphore ensures we never have more than N parses running
             // (or holding parsed-tree memory) at once.
-            let mut handles = Vec::with_capacity(to_parse);
+            let mut parse_set = tokio::task::JoinSet::new();
             for path in paths_to_parse {
                 let permit_owner = semaphore.clone();
-                handles.push(tokio::spawn(async move {
+                parse_set.spawn(async move {
                     let _permit = match permit_owner.acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => return None,
@@ -4994,28 +5076,35 @@ impl LaravelLanguageServer {
                     .ok()
                     .flatten();
                     parsed.map(|(data, nodes)| (path, data, nodes))
-                }));
+                });
             }
 
-            // Collect all parse results into a single buffer, then bulk-
-            // import directly into the shared DashMap-backed pattern cache
-            // via SalsaHandle::bulk_import_patterns. That call bypasses
-            // the actor's mpsc channel entirely — see the comment on
-            // SalsaActor::pattern_cache and SalsaHandle::bulk_import_patterns
+            // Drain the JoinSet in COMPLETION order into a single buffer,
+            // then bulk-import directly into the shared DashMap-backed
+            // pattern cache via SalsaHandle::bulk_import_patterns. That call
+            // bypasses the actor's mpsc channel entirely — see the comment
+            // on SalsaActor::pattern_cache and SalsaHandle::bulk_import_patterns
             // for the architectural why. With this path: warming on a
             // 40k-file project takes ~7s wall (~6.5s parse + ~10ms import).
             //
-            // Progress reports are emitted as each handle completes. The
-            // IndexingProgress helper throttles internally so we don't
-            // need to be careful about emitting every iteration.
+            // `join_next` yields each task AS IT FINISHES, not in spawn
+            // order. This is load-bearing for the progress bar: awaiting the
+            // handles in spawn order stalled `completed` on the first slow
+            // file (this project has 6–23 MB seeder files that parse for
+            // seconds), freezing the bar mid-slice while the fast files
+            // finished invisibly in the background, then draining the
+            // backlog in one jump. Completion-order draining lets every
+            // finished file advance the bar smoothly regardless of size or
+            // spawn position. The buffer still gathers every result (order
+            // doesn't matter — it's bulk-imported as a set).
             let mut buffer: Vec<(
                 PathBuf,
                 Arc<laravel_lsp::salsa_impl::ParsedPatternsData>,
                 Vec<laravel_lsp::class_hierarchy_index::ClassNode>,
             )> = Vec::with_capacity(to_parse);
             let mut completed = 0usize;
-            for h in handles {
-                if let Ok(Some(pair)) = h.await {
+            while let Some(res) = parse_set.join_next().await {
+                if let Ok(Some(pair)) = res {
                     buffer.push(pair);
                 }
                 completed += 1;
@@ -5027,20 +5116,24 @@ impl LaravelLanguageServer {
                     // the user already saw the cached restore land in
                     // the "Loading cached index…" step before this.
                     //
-                    // The parse loop owns the 0..=PARSE_SPAN slice of the
-                    // unified bar; the magic-member resolve below continues
-                    // from PARSE_SPAN, so the bar fills 0→100 monotonically
-                    // instead of resetting between the two phases.
+                    // The parse loop owns the parse_base..parse_top slice of
+                    // the unified bar (branch-weighted above); the phases
+                    // below continue from parse_top, so the bar fills 0→100
+                    // monotonically instead of resetting between phases.
+                    // The final report is forced: a warm reload parses its
+                    // handful of files in a sub-throttle burst, and if the
+                    // `completed == to_parse` report were dropped the bar
+                    // would stick mid-slice for the whole post-parse tail.
                     let pct = laravel_lsp::indexing_progress::weighted_pct(
                         completed,
                         to_parse,
-                        0,
-                        laravel_lsp::indexing_progress::PARSE_SPAN,
+                        parse_base,
+                        parse_top - parse_base,
                     );
                     p.report(
                         format!("Parsing {} of {} files…", completed, to_parse),
                         Some(pct),
-                        false,
+                        completed == to_parse,
                     )
                     .await;
                 }
@@ -5068,27 +5161,63 @@ impl LaravelLanguageServer {
 
             // Persist the entire live pattern_cache (cached restores +
             // freshly parsed entries) so the next LSP startup can skip
-            // most of the work. Runs on the blocking pool because it's
-            // sync I/O — and we don't gate user-visible warming
-            // completion on it; the save just runs and logs its outcome.
-            let cache_for_save = pattern_cache_for_warm.clone();
-            let root_for_save_inner = root_for_save.clone();
-            // Snapshot the (now fully populated: restored + freshly parsed)
-            // hierarchy so it's persisted alongside the patterns and survives
-            // the next warm restart.
-            let hierarchy_for_save = salsa.snapshot_hierarchy_nodes().await.unwrap_or_default();
-            let save_result = tokio::task::spawn_blocking(move || {
-                laravel_lsp::pattern_disk_cache::save_from(
-                    &cache_for_save,
-                    &hierarchy_for_save,
-                    &root_for_save_inner,
-                )
-            })
-            .await;
-            match save_result {
-                Ok(Ok(n)) => info!("🗄️  Disk cache: saved {} entries", n),
-                Ok(Err(e)) => debug!("Disk cache save failed: {}", e),
-                Err(e) => debug!("Disk cache save task panicked: {}", e),
+            // most of the work. Skipped on a no-change reload: when this
+            // session parsed nothing (`to_parse == 0`) and the disk
+            // restore dropped no stale entries (`dropped == 0`), the
+            // in-memory cache is exactly what's already on disk, and the
+            // full stat + clone + encode + rewrite pass would persist
+            // nothing new. Any fresh parse or dropped entry disables the
+            // skip, so real changes are always saved.
+            //
+            // When it runs, the save is SPAWNED fire-and-forget and does
+            // NOT gate completion: on a cold reindex the encode + write of
+            // ~47k M1-inflated entries takes ~42s, and blocking `end()` on
+            // it made the whole index look like it took 96s when the actual
+            // parse + resolve finished in ~54s. The magic phase and `end()`
+            // now proceed immediately; the cache persists in the background.
+            // No progress phase is shown for it — the bar flows parse →
+            // magic → end without a save step.
+            //
+            // Concurrency: two saves can overlap (a reindex fires while a
+            // prior background save is still writing), so `save_from` writes
+            // to a per-call unique temp file and atomically renames it onto
+            // the cache path — last writer wins on a complete, valid file;
+            // neither can observe the other's partial bytes.
+            //
+            // Durability: a process exit mid-save loses that save. That's
+            // fine — the cache is advisory; the next startup just re-parses
+            // what wasn't persisted.
+            if to_parse == 0 && dropped == 0 {
+                info!("🗄️  Disk cache: unchanged since last save, skipping rewrite");
+            } else {
+                let cache_for_save = pattern_cache_for_warm.clone();
+                let root_for_save_inner = root_for_save.clone();
+                // Clone the actor handle into the background task so the
+                // hierarchy snapshot (its only critical-path cost otherwise)
+                // also happens off the warming path.
+                let salsa_for_save = salsa.clone();
+                tokio::spawn(async move {
+                    // Snapshot the (now fully populated: restored + freshly
+                    // parsed) hierarchy so it's persisted alongside the
+                    // patterns and survives the next warm restart.
+                    let hierarchy_for_save = salsa_for_save
+                        .snapshot_hierarchy_nodes()
+                        .await
+                        .unwrap_or_default();
+                    let save_result = tokio::task::spawn_blocking(move || {
+                        laravel_lsp::pattern_disk_cache::save_from(
+                            &cache_for_save,
+                            &hierarchy_for_save,
+                            &root_for_save_inner,
+                        )
+                    })
+                    .await;
+                    match save_result {
+                        Ok(Ok(n)) => info!("🗄️  Disk cache: saved {} entries (background)", n),
+                        Ok(Err(e)) => debug!("Disk cache save failed: {}", e),
+                        Err(e) => debug!("Disk cache save task panicked: {}", e),
+                    }
+                });
             }
 
             // Build the inverted symbol index now that pattern_cache
@@ -5120,6 +5249,15 @@ impl LaravelLanguageServer {
             // (~135s on a real app) after any edit-then-restart.
             // Disk read on the blocking pool so it never stalls the async
             // runtime (the file can be large on a big project).
+            //
+            // The restore (read + decode + prune) is one opaque blocking
+            // op with no per-item hook — a forced phase report at the
+            // parse boundary keeps the bar showing live text instead of
+            // reading as dead while it runs.
+            if let Some(p) = progress.as_mut() {
+                p.report("Restoring member index…", Some(parse_top), true)
+                    .await;
+            }
             let magic_started = std::time::Instant::now();
             let restored = {
                 let root_for_load = root_for_save.clone();
@@ -5139,6 +5277,11 @@ impl LaravelLanguageServer {
                 .flatten()
             };
             if let Some((data, evicted)) = restored {
+                // Warm reload: the granular re-resolve below owns the
+                // rest of the bar. Clamped to the parse slice's actual
+                // top so a cold-parse/warm-magic mix (pattern cache
+                // stale, magic cache fresh) can't jump the bar backwards.
+                let resolve_base = parse_top.max(laravel_lsp::indexing_progress::WARM_RESOLVE_BASE);
                 if evicted > 0 {
                     info!(
                         "🪄 Magic-member restore: evicted {} deleted file(s) from cache",
@@ -5168,6 +5311,13 @@ impl LaravelLanguageServer {
                     .filter(|(path, _)| changed_set.contains(path))
                     .flat_map(|(_, renders)| renders.iter().map(|r| r.view_name.clone()))
                     .collect();
+                // Bulk import is the next opaque op — advance the bar to
+                // the resolve base with a forced phase message so the
+                // hand-off into the re-resolve slice stays visible.
+                if let Some(p) = progress.as_mut() {
+                    p.report("Importing member index…", Some(resolve_base), true)
+                        .await;
+                }
                 match import_magic_data(&salsa, &magic_deps_for_warm, entries).await {
                     Ok(n) => info!("🪄 Magic-member index: {} entries (restored from disk)", n),
                     Err(e) => debug!("Magic-member restore import failed: {}", e),
@@ -5227,7 +5377,11 @@ impl LaravelLanguageServer {
                             "🪄 Granular magic restore: re-resolving {} changed/dependent file(s)",
                             work.len()
                         );
-                        server_for_warm.refresh_files_magic(work).await;
+                        // The dominant warm phase — it drives the
+                        // resolve_base..=100 slice of the unified bar.
+                        server_for_warm
+                            .refresh_files_magic(work, progress.as_mut(), resolve_base)
+                            .await;
                     }
                 }
                 // Deleted files were pruned from the live index above; the
@@ -5236,11 +5390,11 @@ impl LaravelLanguageServer {
                 if evicted > 0 {
                     server_for_warm.schedule_magic_cache_save().await;
                 }
-                // The resolve phase (which owns the PARSE_SPAN..=100 slice
-                // of the unified bar) never runs on a restore, so without
-                // this the bar would freeze at PARSE_SPAN% until `end()`.
-                // One forced report walks it to 100 so the bar always
-                // completes, warm or cold.
+                // Walk the bar to 100 unconditionally: on a no-change
+                // reload the granular re-resolve above has no work (so
+                // nothing else fills the resolve slice), and when it did
+                // run its last throttled report may have been dropped.
+                // One forced report guarantees completion either way.
                 if let Some(p) = progress.as_mut() {
                     p.report("Restored member index from cache.", Some(100), true)
                         .await;
@@ -5258,11 +5412,19 @@ impl LaravelLanguageServer {
                     &view_paths_for_warm,
                     MAX_CONCURRENT_PARSES,
                     progress.as_mut(),
-                    laravel_lsp::indexing_progress::PARSE_SPAN,
+                    parse_top,
                     &view_vars_for_warm,
                 )
                 .await;
                 if !magic_data.entries.is_empty() {
+                    // The resolve loop above filled the bar to 100; the
+                    // save + import below are opaque bulk ops that can
+                    // still take seconds on a big project, so forced
+                    // phase messages keep the (full) bar showing live
+                    // text until `end()`.
+                    if let Some(p) = progress.as_mut() {
+                        p.report("Saving member index…", Some(100), true).await;
+                    }
                     // Persist on the blocking pool (sync I/O), handing the
                     // data back so the import below still owns it — no clone.
                     let root_for_msave = root_for_save.clone();
@@ -5285,6 +5447,9 @@ impl LaravelLanguageServer {
                             Default::default()
                         }
                     };
+                    if let Some(p) = progress.as_mut() {
+                        p.report("Importing member index…", Some(100), true).await;
+                    }
                     match import_magic_data(&salsa, &magic_deps_for_warm, magic_data.entries).await
                     {
                         Ok(n) => info!("🪄 Magic-member index: {} entries", n),
@@ -6401,14 +6566,27 @@ impl LaravelLanguageServer {
             "🪄 Incremental magic refresh: re-resolving {} dependent file(s)",
             work.len()
         );
-        self.refresh_files_magic(work).await;
+        // No progress UI on the incremental path — this runs behind
+        // did_save, not the startup indexing bar.
+        self.refresh_files_magic(work, None, 0).await;
     }
 
     /// Re-resolve a set of files through the per-file magic refresh at
     /// bounded concurrency. Shared by the save-time dependents pass and the
     /// granular startup restore (#80). Open buffers are authoritative;
     /// everything else reads from disk on the blocking pool.
-    async fn refresh_files_magic(&self, work: HashSet<PathBuf>) {
+    ///
+    /// `progress` drives the `progress_base..=100` slice of the unified
+    /// indexing bar on the warm-startup call — the dominant warm phase,
+    /// which previously ran silent and read as a frozen bar. The
+    /// incremental save-refresh callers have no progress UI and pass
+    /// `None` (base then unused).
+    async fn refresh_files_magic(
+        &self,
+        work: HashSet<PathBuf>,
+        mut progress: Option<&mut laravel_lsp::indexing_progress::IndexingProgress>,
+        progress_base: u32,
+    ) {
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MAGIC_PARSES));
         let mut handles = Vec::with_capacity(work.len());
         for dep in work {
@@ -6421,8 +6599,28 @@ impl LaravelLanguageServer {
                 Some(())
             }));
         }
+        let total = handles.len();
+        let mut done = 0usize;
         for h in handles {
             let _ = h.await;
+            done += 1;
+            if let Some(p) = progress.as_deref_mut() {
+                let pct = laravel_lsp::indexing_progress::weighted_pct(
+                    done,
+                    total,
+                    progress_base,
+                    100u32.saturating_sub(progress_base),
+                );
+                // Throttled: the warm caller posts a forced 100% report
+                // right after this returns, so a dropped final update
+                // here can't strand the bar.
+                p.report(
+                    format!("Resolving members in {done} of {total} files…"),
+                    Some(pct),
+                    false,
+                )
+                .await;
+            }
         }
         // Reference counts may have changed project-wide.
         let _ = self.client.code_lens_refresh().await;
