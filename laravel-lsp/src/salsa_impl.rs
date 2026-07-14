@@ -4284,6 +4284,72 @@ pub struct MacroRegistrationData {
     pub priority: u8,
 }
 
+/// One provider file's own registration contribution — the macros, bindings,
+/// and facade aliases parsed from exactly that file — in sorted, comparable
+/// form. The save path snapshots this before and after a provider save: a
+/// non-empty diff with an empty class-surface diff is the body-only
+/// registration edit that previously never rippled to dependent call sites
+/// (#255).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProviderRegistrationsData {
+    /// `(receiver host FQCN, macro name)` pairs, sorted.
+    pub macros: Vec<(String, String)>,
+    /// `(abstract name, concrete FQCN)` pairs, sorted.
+    pub bindings: Vec<(String, String)>,
+    /// `(alias token, target FQCN)` pairs, sorted. Only `bootstrap/app.php`
+    /// (`withAliases`) and `config/app.php` (`aliases`) contribute here.
+    pub aliases: Vec<(String, String)>,
+}
+
+/// The reverse-index keys whose dependents a provider registration diff must
+/// re-resolve — the save path feeds these into the same blast radius a class
+/// surface change uses (#255). Empty when nothing changed.
+///
+/// Emitted per changed (added/removed/retargeted) entry, keyed on what the
+/// dependent call sites actually recorded in `MagicDependencyIndex`:
+///
+/// - **macro**: the receiver host FQCN (`Illuminate\Support\Str`) — every
+///   call site records the resolved receiver as an attempt, so this finds
+///   sites in both directions (macro added: the previously-failed sites;
+///   macro removed/renamed: the previously-resolved sites).
+/// - **binding / facade alias**: the concrete/target FQCN from both sides of
+///   the diff — a site that resolved through a binding (helper, `app('key')`,
+///   facade accessor) recorded the *concrete* it resolved to, so the old
+///   concrete finds the now-stale sites and the new one finds direct
+///   references. (A site that never resolved — `app('key')` before the key
+///   existed — recorded nothing and converges on the next full pass; it holds
+///   no stale classification either.)
+/// - **the provider's own path**: macro classifications record the macro's
+///   declaration file as a dependency ([`crate::member_resolver`]), which for
+///   inline `::macro()` registrations is the registering provider itself.
+pub fn registration_ripple_keys(
+    before: &ProviderRegistrationsData,
+    after: &ProviderRegistrationsData,
+    provider_path: &Path,
+) -> Vec<String> {
+    fn changed<'a>(
+        a: &'a [(String, String)],
+        b: &'a [(String, String)],
+    ) -> impl Iterator<Item = &'a (String, String)> {
+        let sa: std::collections::HashSet<&(String, String)> = a.iter().collect();
+        let sb: std::collections::HashSet<&(String, String)> = b.iter().collect();
+        sa.symmetric_difference(&sb)
+            .map(|e| *e)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    keys.extend(changed(&before.macros, &after.macros).map(|(host, _)| host.clone()));
+    keys.extend(changed(&before.bindings, &after.bindings).map(|(_, concrete)| concrete.clone()));
+    keys.extend(changed(&before.aliases, &after.aliases).map(|(_, target)| target.clone()));
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    keys.insert(provider_path.to_string_lossy().into_owned());
+    keys.into_iter().collect()
+}
+
 /// Pairs the class-hierarchy index (FQCN → file) with the in-actor container
 /// binding registry (binding key → concrete FQCN) behind the
 /// [`crate::member_resolver::ClassFileResolver`] seam, so the live query path
@@ -4977,6 +5043,16 @@ pub enum SalsaRequest {
     /// it does on the live query path. Mirrors [`Self::SnapshotBindings`].
     SnapshotMacros {
         reply: oneshot::Sender<Arc<std::collections::HashMap<(String, String), (PathBuf, u32)>>>,
+    },
+    /// One provider file's registration contribution (macros / bindings /
+    /// facade aliases), for the save path's pre/post registration diff (#255).
+    /// `fresh_text`, when given, re-registers the provider source first — the
+    /// App rescan a provider save queues is asynchronous, so without this the
+    /// post-save snapshot would still read the pre-save text.
+    FileProviderRegistrations {
+        path: PathBuf,
+        fresh_text: Option<String>,
+        reply: oneshot::Sender<ProviderRegistrationsData>,
     },
     /// Snapshot the interface→implementors reverse map — `interface FQCN` →
     /// directly implementing class FQCNs — for the same out-of-actor build, so a
@@ -5749,6 +5825,29 @@ impl SalsaHandle {
         self.sender
             .send(SalsaRequest::FileClassSurfaces {
                 path,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// One provider file's registration contribution (macros / bindings /
+    /// facade aliases), for the save path's pre/post registration diff (#255).
+    /// Pass `fresh_text` on the post-save call so the snapshot reads the saved
+    /// buffer rather than the stale provider input (the App rescan is async).
+    pub async fn file_provider_registrations(
+        &self,
+        path: PathBuf,
+        fresh_text: Option<String>,
+    ) -> Result<ProviderRegistrationsData, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::FileProviderRegistrations {
+                path,
+                fresh_text,
                 reply: reply_tx,
             })
             .await
@@ -6985,6 +7084,28 @@ impl SalsaActor {
                         map.insert(key.clone(), (data.decl_file.clone(), data.decl_line));
                     }
                     let _ = reply.send(Arc::new(map));
+                }
+                SalsaRequest::FileProviderRegistrations {
+                    path,
+                    fresh_text,
+                    reply,
+                } => {
+                    if let Some(text) = fresh_text {
+                        // Only re-register a provider the actor already knows —
+                        // a brand-new provider file is the App rescan's job.
+                        if let Some(sp_file) = self.salsa_sp_files.get(&path) {
+                            let priority = sp_file.priority(&self.db);
+                            if let Some(root) = self.salsa_sp_root.clone() {
+                                self.handle_register_service_provider_source(
+                                    path.clone(),
+                                    text,
+                                    priority,
+                                    root,
+                                );
+                            }
+                        }
+                    }
+                    let _ = reply.send(self.handle_file_provider_registrations(&path));
                 }
                 SalsaRequest::SnapshotImplementers { reply } => {
                     // A cheap clone of the interface→implementors reverse map the
@@ -9136,19 +9257,38 @@ impl SalsaActor {
         Arc::new(map)
     }
 
+    /// The Salsa-parsed provider files in lexicographic path order — the
+    /// deterministic merge order for the registry builders. `salsa_sp_files`
+    /// is a `HashMap` with unspecified iteration order; merging in that order
+    /// made an equal-priority key collision resolve to whichever provider the
+    /// map happened to yield first, flipping across LSP restarts (#255).
+    /// Combined with the builders' keep-first rule on equal priority, sorting
+    /// here makes the winner the provider with the lexicographically smallest
+    /// path — stable across restarts.
+    fn sorted_sp_files(&self) -> Vec<ServiceProviderFile> {
+        let mut entries: Vec<(&PathBuf, &ServiceProviderFile)> =
+            self.salsa_sp_files.iter().collect();
+        entries.sort_unstable_by_key(|(path, _)| *path);
+        entries.into_iter().map(|(_, file)| *file).collect()
+    }
+
     /// Build the macro registry — `(receiver_fqcn, macro_name)` → registration —
     /// by merging every Salsa-parsed service provider's `macros`, highest
     /// priority winning on key collision (framework=0 < package=1 < app=2). Built
     /// fresh each call from the tracked-query outputs (mirrors
     /// [`Self::build_facade_alias_snapshot`]); macros number in the dozens-to-
     /// hundreds, with no cache to invalidate on a provider edit.
+    ///
+    /// Providers merge in lexicographic path order ([`Self::sorted_sp_files`]),
+    /// so an equal-priority key collision deterministically resolves to the
+    /// provider with the smallest path (#255).
     fn build_macro_registry(&self) -> Arc<HashMap<(String, String), MacroRegistrationData>> {
         let mut map: HashMap<(String, String), MacroRegistrationData> = HashMap::new();
         let Some(root) = self.salsa_sp_root.as_ref() else {
             return Arc::new(map);
         };
-        for sp_file in self.salsa_sp_files.values() {
-            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+        for sp_file in self.sorted_sp_files() {
+            let parsed = parse_service_provider_source(&self.db, sp_file, root.clone());
             for m in parsed.macros(&self.db) {
                 let key = (
                     m.receiver_fqcn(&self.db).name(&self.db).clone(),
@@ -9170,6 +9310,55 @@ impl SalsaActor {
             }
         }
         Arc::new(map)
+    }
+
+    /// One provider file's own registration contribution, sorted for the
+    /// save path's pre/post diff (#255). Uniform across the three registries:
+    /// macros and bindings parse from the file's `ServiceProviderFile` input;
+    /// the facade-alias sources are `bootstrap/app.php` (`withAliases`, also a
+    /// provider input) and `config/app.php` (`aliases`, a config input).
+    /// A path the actor doesn't know yields the empty (default) contribution.
+    fn handle_file_provider_registrations(&self, path: &Path) -> ProviderRegistrationsData {
+        let mut out = ProviderRegistrationsData::default();
+        if let (Some(root), Some(sp_file)) = (
+            self.salsa_sp_root.as_ref(),
+            self.salsa_sp_files.get(path).copied(),
+        ) {
+            let parsed = parse_service_provider_source(&self.db, sp_file, root.clone());
+            for m in parsed.macros(&self.db) {
+                out.macros.push((
+                    m.receiver_fqcn(&self.db).name(&self.db).clone(),
+                    m.macro_name(&self.db).name(&self.db).clone(),
+                ));
+            }
+            for binding in parsed.bindings(&self.db) {
+                out.bindings.push((
+                    binding.abstract_name(&self.db).name(&self.db).clone(),
+                    binding
+                        .concrete_class(&self.db)
+                        .trim_start_matches('\\')
+                        .to_string(),
+                ));
+            }
+            if *path == root.join("bootstrap/app.php") {
+                let text = sp_file.text(&self.db);
+                if let Ok(tree) = parse_php(text) {
+                    out.aliases.extend(extract_with_aliases(&tree, text));
+                }
+            }
+        }
+        if let Some(root) = self.config_root.as_ref() {
+            if *path == root.join("config/app.php") {
+                if let Some(file) = self.config_files.get(path) {
+                    out.aliases
+                        .extend(crate::config::parse_facade_aliases(file.text(&self.db)));
+                }
+            }
+        }
+        out.macros.sort_unstable();
+        out.bindings.sort_unstable();
+        out.aliases.sort_unstable();
+        out
     }
 
     // === Service Provider Handlers ===
@@ -9654,6 +9843,11 @@ impl SalsaActor {
     }
 
     /// Handle getting all parsed bindings from Salsa
+    ///
+    /// Providers merge in lexicographic path order ([`Self::sorted_sp_files`]),
+    /// so an equal-priority key collision deterministically resolves to the
+    /// provider with the smallest path (#255) — mirrors
+    /// [`Self::build_macro_registry`].
     fn handle_get_all_parsed_bindings(&self) -> Vec<ParsedBindingData> {
         let root = match self.salsa_sp_root.as_ref() {
             Some(r) => r,
@@ -9662,8 +9856,8 @@ impl SalsaActor {
 
         let mut merged: HashMap<String, ParsedBindingData> = HashMap::new();
 
-        for sp_file in self.salsa_sp_files.values() {
-            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+        for sp_file in self.sorted_sp_files() {
+            let parsed = parse_service_provider_source(&self.db, sp_file, root.clone());
             for binding in parsed.bindings(&self.db) {
                 let name = binding.abstract_name(&self.db).name(&self.db).clone();
                 let data = ParsedBindingData {
