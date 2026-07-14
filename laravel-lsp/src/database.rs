@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
 /// Read a string column from a sqlx Row, falling back to a `Vec<u8>` +
@@ -184,6 +184,269 @@ fn classify_postgres_error(raw_error: &str, db_name: &str, candidates_str: &str)
     )
 }
 
+/// How long the circuit breaker stays open after a failed schema fetch
+/// before allowing a single half-open probe. A fixed cooldown (deliberately
+/// NOT exponential): every connection-failure class behaves identically —
+/// tune this one constant if 30s proves too eager or too lazy. Also the
+/// background loop's retry cadence while the DB is down.
+pub const DB_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Steady-state refresh interval for the background loop when the DB is
+/// healthy. Matches [`DatabaseSchema::is_valid`]'s 60s TTL so the served
+/// cache is never more than one interval stale.
+pub const DB_REFRESH_HEALTHY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Connect/acquire timeout for the background schema fetch. Only the
+/// detached background loop ever connects — interactive requests read the
+/// in-memory cache and never block — so this can afford to be patient.
+pub const DB_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Extra budget, on top of [`DB_CONNECT_TIMEOUT`], for the post-connect
+/// schema queries (identity probe + SHOW TABLES/COLUMNS and the
+/// per-driver equivalents). The whole background fetch is wrapped in a
+/// `timeout` of `DB_CONNECT_TIMEOUT + DB_FETCH_QUERY_BUDGET` so a
+/// connected-but-stalled server can never hang the loop forever — it
+/// always reaches success/failure/timeout and updates the breaker.
+/// Sized well above the ~2.5s a 600-table schema costs.
+pub const DB_FETCH_QUERY_BUDGET: Duration = Duration::from_secs(30);
+
+/// What a caller may do right now, per [`CircuitBreaker::allow_attempt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// Breaker closed — normal fetch allowed.
+    Closed,
+    /// Breaker open (cooling down, or a probe is already in flight) — deny;
+    /// return "no schema" without touching the database.
+    Open,
+    /// Cooldown elapsed — this caller is the single half-open probe.
+    HalfOpen,
+}
+
+/// Internal breaker state. `Open` and `HalfOpen` both carry the instant the
+/// state was entered so time-based transitions are pure functions of the
+/// injected `now`.
+#[derive(Debug, Clone, Copy)]
+enum BreakerState {
+    Closed,
+    Open { since: Instant },
+    HalfOpen { since: Instant },
+}
+
+/// Pure, synchronous, time-injected circuit breaker guarding database
+/// schema fetches.
+///
+/// With the database down, every completion/diagnostic/pre-warm used to
+/// reconnect and pay the full connect timeout. The breaker makes failure
+/// cheap: after any failed fetch it opens for [`DB_BREAKER_COOLDOWN`],
+/// during which attempts are denied instantly. After the cooldown exactly
+/// one half-open probe is allowed through; success closes the breaker,
+/// failure re-opens it for another cooldown.
+///
+/// All transitions take `now: Instant` as a parameter — no clocks, no
+/// async, no I/O — so the whole state machine is unit-testable without a
+/// database (see `database/tests.rs`).
+#[derive(Debug)]
+pub struct CircuitBreaker {
+    state: BreakerState,
+    cooldown: Duration,
+}
+
+impl CircuitBreaker {
+    pub fn new(cooldown: Duration) -> Self {
+        Self {
+            state: BreakerState::Closed,
+            cooldown,
+        }
+    }
+
+    /// Gate a fetch attempt. Returns [`Attempt::HalfOpen`] at most once per
+    /// cooldown window: the transition to `HalfOpen` happens here, so a
+    /// second caller arriving while the probe is outstanding gets
+    /// [`Attempt::Open`].
+    ///
+    /// A probe that never reports back (a fetch path that returns `None`
+    /// without recording failure, or a hung connect) would otherwise wedge
+    /// the breaker in `HalfOpen` forever — so an aged-out `HalfOpen` re-arms
+    /// into a fresh probe after another cooldown. Self-healing by
+    /// construction.
+    pub fn allow_attempt(&mut self, now: Instant) -> Attempt {
+        match self.state {
+            BreakerState::Closed => Attempt::Closed,
+            BreakerState::Open { since } | BreakerState::HalfOpen { since } => {
+                if now.duration_since(since) >= self.cooldown {
+                    self.state = BreakerState::HalfOpen { since: now };
+                    Attempt::HalfOpen
+                } else {
+                    Attempt::Open
+                }
+            }
+        }
+    }
+
+    /// Record a failed fetch. Returns `true` only on the Closed→Open
+    /// transition — the FIRST failure of a new outage episode, i.e. the
+    /// moment to notify the user. A failed half-open probe re-opens the
+    /// breaker but returns `false`: same outage, no fresh notification.
+    pub fn record_failure(&mut self, now: Instant) -> bool {
+        let just_opened = matches!(self.state, BreakerState::Closed);
+        self.state = BreakerState::Open { since: now };
+        just_opened
+    }
+
+    /// Record a successful fetch: close the breaker from any state. Returns
+    /// `true` only on a genuine recovery edge — Open/HalfOpen→Closed — the
+    /// moment to tell the user the DB is back. Returns `false` when already
+    /// Closed (a routine healthy refresh, or the very first successful fetch
+    /// from a fresh breaker), so startup and steady-state refreshes stay
+    /// silent. Mirrors [`Self::record_failure`]'s Closed→Open edge return.
+    /// The next failure after this is a NEW outage episode (fresh toast).
+    pub fn record_success(&mut self) -> bool {
+        let recovered = matches!(
+            self.state,
+            BreakerState::Open { .. } | BreakerState::HalfOpen { .. }
+        );
+        self.state = BreakerState::Closed;
+        recovered
+    }
+
+    /// How long until the breaker would next allow an attempt, given `now`.
+    /// Drives the background refresh loop's sleep so it wakes exactly when
+    /// the next half-open probe is due:
+    /// - `None` — closed (healthy); the caller sleeps its own steady-state
+    ///   refresh interval.
+    /// - `Some(d)` — open/half-open; `d` is the remaining cooldown before
+    ///   the next probe (saturating to zero once elapsed).
+    pub fn cooldown_remaining(&self, now: Instant) -> Option<Duration> {
+        match self.state {
+            BreakerState::Closed => None,
+            BreakerState::Open { since } | BreakerState::HalfOpen { since } => {
+                Some(self.cooldown.saturating_sub(now.duration_since(since)))
+            }
+        }
+    }
+}
+
+/// Coarse classification of a database connection failure. The breaker's
+/// backoff is UNIFORM across classes — only the user-facing notification
+/// text differs (see [`outage_toast_message`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutageClass {
+    /// Scenario 1: the server couldn't be reached at all — DNS failure,
+    /// connection refused, or a connect timeout.
+    Unreachable,
+    /// Scenario 2: the server was reached but the connection was rejected —
+    /// bad credentials, unknown database, missing privileges.
+    Rejected,
+    /// Scenario 0: no usable database configuration. A normal state for
+    /// projects without a DB — never notified.
+    NotConfigured,
+    /// Anything else — notified with a generic message.
+    Other,
+}
+
+/// Classify a RAW driver error string (before the per-driver classifiers
+/// compose their remediation-rich messages) into an [`OutageClass`].
+/// Substring matching on well-known driver/OS error markers, lowercased for
+/// robustness — the same pragmatic approach `classify_mysql_error` takes,
+/// and for the same reason: by this layer the error is already a `String`.
+pub fn outage_class_from_raw(raw_error: &str) -> OutageClass {
+    let raw = raw_error.to_lowercase();
+    // Auth / unknown-database / privilege markers across MySQL (1045, 1044,
+    // 1049), Postgres (28P01, 28000, 3D000), and SQL Server ("Login failed").
+    const REJECTED: &[&str] = &[
+        "access denied",
+        "1045 (28000)",
+        "1044 (42000)",
+        "1049 (42000)",
+        "unknown database",
+        "28p01",
+        "28000",
+        "3d000",
+        "password authentication failed",
+        "login failed",
+        "does not exist",
+    ];
+    // Network-level markers: TCP refused/reset, DNS lookup failures, and
+    // timeouts (sqlx reports a connect that exceeds `acquire_timeout` as
+    // "pool timed out while waiting for an open connection").
+    const UNREACHABLE: &[&str] = &[
+        "connection refused",
+        "2003",
+        "could not connect",
+        "timed out",
+        "timeout",
+        "failed to lookup address",
+        "name or service not known",
+        "nodename nor servname",
+        "no route to host",
+        "network is unreachable",
+        "connection reset",
+        "broken pipe",
+    ];
+    if REJECTED.iter().any(|m| raw.contains(m)) {
+        return OutageClass::Rejected;
+    }
+    if UNREACHABLE.iter().any(|m| raw.contains(m)) {
+        return OutageClass::Unreachable;
+    }
+    OutageClass::Other
+}
+
+/// The one-per-outage toast text for a breaker Closed→Open transition, or
+/// `None` for classes that must stay silent (a project without a database
+/// is a normal state, not an outage).
+///
+/// `detail` is the remediation-rich message the per-driver classifiers
+/// composed (it names the exact endpoints tried, which is more truthful
+/// than a single host:port when Sail fallbacks are in play).
+pub fn outage_toast_message(class: OutageClass, detail: &str) -> Option<String> {
+    let retry = DB_BREAKER_COOLDOWN.as_secs();
+    match class {
+        OutageClass::NotConfigured => None,
+        OutageClass::Unreachable => Some(format!(
+            "Laravel: can't reach the database — is it running? DB-aware \
+             completions and diagnostics are disabled until it's reachable \
+             (the LSP retries every {retry}s). {detail}"
+        )),
+        OutageClass::Rejected => Some(format!(
+            "Laravel: reached the database but the connection was rejected — \
+             check the credentials and that the database exists. DB-aware \
+             completions and diagnostics are disabled until it connects \
+             (the LSP retries every {retry}s). {detail}"
+        )),
+        OutageClass::Other => Some(format!(
+            "Laravel: database connection failed, so DB-aware completions \
+             and diagnostics are disabled until it recovers (the LSP \
+             retries every {retry}s). {detail}"
+        )),
+    }
+}
+
+/// Details of an outage — emitted when the breaker transitions Closed→Open
+/// (the start of an outage episode).
+#[derive(Debug, Clone)]
+pub struct DbOutageEvent {
+    pub class: OutageClass,
+    /// The classified, remediation-rich error message from the driver layer.
+    pub message: String,
+}
+
+/// A breaker edge worth telling the user about. The provider can't talk
+/// LSP, so `main.rs` listens on a channel of these and sends the (single)
+/// toast for each edge, no matter which caller — pre-warm, completion,
+/// diagnostics, hover — drove the breaker there.
+///
+/// Both edges fire exactly once per transition: `Outage` on Closed→Open
+/// (retry probes inside the same outage are silent), `Reconnected` on
+/// Open/HalfOpen→Closed (a routine already-healthy refresh is silent).
+#[derive(Debug, Clone)]
+pub enum DbBreakerEvent {
+    /// The database just became unreachable/unusable.
+    Outage(DbOutageEvent),
+    /// The database just came back after an outage.
+    Reconnected,
+}
+
 /// Build the `user[:password]` userinfo segment of a `driver://userinfo@…`
 /// connection URL.
 ///
@@ -250,6 +513,45 @@ struct ConnCandidate {
     success_note: Option<String>,
 }
 
+/// A Sail/Docker TCP endpoint detected for the database — the host-side bind
+/// IP and forwarded port, plus a note on how it was found (compose file or
+/// APP_PORT). Produced by [`DatabaseSchemaProvider::detect_sail_endpoint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectedEndpoint {
+    host: String,
+    port: u16,
+    note: String,
+}
+
+/// Count a line's leading spaces (YAML indentation). Tabs are not valid YAML
+/// indentation; a line indented with tabs yields 0 here and simply fails the
+/// indentation checks — fail-open, never a panic.
+fn indent_spaces(line: &str) -> usize {
+    line.chars().take_while(|c| *c == ' ').count()
+}
+
+/// Is `trimmed` a `key:` line that INTRODUCES a nested block (rather than a
+/// `key: value` scalar)? Used to match `services:`, a service header, and
+/// `ports:`. A block is introduced when what follows the `:` is empty, a
+/// `#` comment, or a YAML tag (`!`-prefixed, e.g. `ports: !override` /
+/// `!reset` — standard in Sail override files — or `!!seq`): the tag
+/// annotates the block on the lines below, so `ports: !override` IS the
+/// `ports:` key. A plain inline scalar (`ports: 3306:3306`) is still rejected.
+fn line_is_key(trimmed: &str, key: &str) -> bool {
+    match trimmed.strip_prefix(key) {
+        Some(rest) => {
+            let rest = rest.trim_start();
+            if let Some(after) = rest.strip_prefix(':') {
+                let after = after.trim_start();
+                after.is_empty() || after.starts_with('#') || after.starts_with('!')
+            } else {
+                false
+            }
+        }
+        None => false,
+    }
+}
+
 /// Cached database schema with expiration
 #[derive(Debug, Clone)]
 pub struct DatabaseSchema {
@@ -304,7 +606,13 @@ pub struct DatabaseConnectionError {
     pub driver: String,
 }
 
-/// Database schema provider with caching
+/// Database schema provider with caching.
+///
+/// `Clone` is cheap and share-state: every field is an `Arc` (or a
+/// `PathBuf`), so a clone is the same logical provider — same cache, same
+/// breaker. This lets callers lift the handle out of an
+/// `Arc<RwLock<Option<…>>>` guard and drop the guard before an await.
+#[derive(Clone)]
 pub struct DatabaseSchemaProvider {
     /// Project root path
     project_root: PathBuf,
@@ -316,6 +624,16 @@ pub struct DatabaseSchemaProvider {
     last_error: Arc<RwLock<Option<DatabaseConnectionError>>>,
     /// Whether we've attempted a connection
     connection_attempted: Arc<RwLock<bool>>,
+    /// Circuit breaker guarding schema fetches. Lives ENTIRELY in the
+    /// background refresh loop (`refresh_tick`) — interactive callers never
+    /// touch it. After a failed fetch the loop opens the breaker and backs
+    /// off; interactive reads just see a stale/absent cache. See
+    /// [`CircuitBreaker`].
+    breaker: Arc<RwLock<CircuitBreaker>>,
+    /// Where breaker edges are announced — one `Outage` per outage episode,
+    /// one `Reconnected` per recovery. `None` until `main.rs` wires the
+    /// toast listener.
+    event_tx: Arc<RwLock<Option<mpsc::UnboundedSender<DbBreakerEvent>>>>,
 }
 
 impl DatabaseSchemaProvider {
@@ -327,7 +645,15 @@ impl DatabaseSchemaProvider {
             config_cache: Arc::new(RwLock::new(None)),
             last_error: Arc::new(RwLock::new(None)),
             connection_attempted: Arc::new(RwLock::new(false)),
+            breaker: Arc::new(RwLock::new(CircuitBreaker::new(DB_BREAKER_COOLDOWN))),
+            event_tx: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Register the channel on which breaker edges (`Outage` / `Reconnected`)
+    /// are announced. Called once by the LSP layer when the provider is set up.
+    pub async fn set_event_channel(&self, tx: mpsc::UnboundedSender<DbBreakerEvent>) {
+        *self.event_tx.write().await = Some(tx);
     }
 
     /// Test helper: seed the schema cache directly so tests can exercise
@@ -358,43 +684,134 @@ impl DatabaseSchemaProvider {
         *self.connection_attempted.read().await
     }
 
-    /// Set connection error
-    async fn set_error(&self, driver: &str, message: &str) {
+    /// Record a failed fetch: store the error for `get_last_error`, feed
+    /// the circuit breaker, and — exactly when this failure OPENS the
+    /// breaker (Closed→Open, the first failure of an outage episode) —
+    /// announce it on the outage channel. Failed half-open probes while
+    /// the outage continues re-open the breaker silently, so the user
+    /// sees ONE notification per outage, not one per retry.
+    ///
+    /// Every driver's failure path funnels through here, which is what
+    /// makes the breaker cover mysql/pgsql/sqlite/sqlsrv with one hook.
+    async fn set_error(&self, driver: &str, message: &str, class: OutageClass) {
         *self.last_error.write().await = Some(DatabaseConnectionError {
             message: message.to_string(),
             driver: driver.to_string(),
         });
-    }
-
-    /// Clear connection error
-    async fn clear_error(&self) {
-        *self.last_error.write().await = None;
-    }
-
-    /// Get database schema, using cache if valid
-    pub async fn get_schema(&self) -> Option<DatabaseSchema> {
-        // Check cache first
-        {
-            let cache = self.schema_cache.read().await;
-            if let Some(ref schema) = *cache {
-                if schema.is_valid() {
-                    debug!("Using cached database schema");
-                    return Some(schema.clone());
-                }
+        let just_opened = self.breaker.write().await.record_failure(Instant::now());
+        if just_opened {
+            if let Some(tx) = self.event_tx.read().await.as_ref() {
+                let _ = tx.send(DbBreakerEvent::Outage(DbOutageEvent {
+                    class,
+                    message: message.to_string(),
+                }));
             }
         }
+    }
 
-        // Cache miss or expired, fetch fresh schema
-        info!("Fetching fresh database schema");
-        let schema = self.fetch_schema().await?;
-
-        // Update cache
-        {
-            let mut cache = self.schema_cache.write().await;
-            *cache = Some(schema.clone());
+    /// Record a successful fetch: clear the stored error and close the
+    /// breaker. On a genuine recovery edge (Open/HalfOpen→Closed) announce
+    /// `Reconnected` on the channel — exactly once per outage→recovery
+    /// cycle. A routine already-healthy refresh closes silently. A later
+    /// failure then counts as a NEW outage episode (fresh toast).
+    async fn clear_error(&self) {
+        *self.last_error.write().await = None;
+        let recovered = self.breaker.write().await.record_success();
+        if recovered {
+            if let Some(tx) = self.event_tx.read().await.as_ref() {
+                let _ = tx.send(DbBreakerEvent::Reconnected);
+            }
         }
+    }
 
-        Some(schema)
+    /// Get the database schema **from the in-memory cache only** — the
+    /// interactive read path.
+    ///
+    /// This is called from LSP request handlers (completion, diagnostics,
+    /// hover, exists/unique). tower-lsp dispatches at most a handful of
+    /// handlers concurrently, so a handler that blocked on a DB connect
+    /// would starve unrelated requests (a plain view/route hover froze for
+    /// ~30s during an outage — the isolation bug this design fixes).
+    /// Therefore this method NEVER connects, NEVER touches the breaker or a
+    /// lock, and NEVER blocks: it returns the last-known-good schema
+    /// (served stale on purpose — the background loop keeps it fresh) or
+    /// `None` on a cold miss. All connecting happens off the request path
+    /// in [`Self::refresh_tick`].
+    pub async fn get_schema(&self) -> Option<DatabaseSchema> {
+        self.schema_cache.read().await.clone()
+    }
+
+    /// One iteration of the background refresh loop — the ONLY place that
+    /// connects. Returns how long the caller should sleep before the next
+    /// tick.
+    ///
+    /// Flow: consult the breaker; if it allows (closed, or a half-open
+    /// probe is due), run a whole-fetch-timeout-bounded fetch. Success
+    /// fills the cache and closes the breaker (via `clear_error`); failure
+    /// or timeout opens it (via `set_error`) and emits the one-per-outage
+    /// event on the Closed→Open edge. The next sleep is derived from the
+    /// resulting breaker state: [`DB_BREAKER_COOLDOWN`] while open (the
+    /// retry/HalfOpen cadence), `healthy_interval` while closed.
+    ///
+    /// Detached from any tower-lsp request slot, so a slow or stalled fetch
+    /// here can never starve interactive requests.
+    pub async fn refresh_tick(
+        &self,
+        connect_timeout: Duration,
+        healthy_interval: Duration,
+    ) -> Duration {
+        let attempt = self.breaker.write().await.allow_attempt(Instant::now());
+        if attempt != Attempt::Open {
+            self.fetch_and_store(connect_timeout).await;
+        }
+        self.breaker
+            .read()
+            .await
+            .cooldown_remaining(Instant::now())
+            .unwrap_or(healthy_interval)
+    }
+
+    /// Background-only: run one whole-fetch-timeout-bounded fetch and, on
+    /// success, publish it to the interactive cache. The timeout bounds the
+    /// ENTIRE fetch — connect AND the post-connect identity probe / schema
+    /// queries — so a connected-but-stalled server can't wedge the loop; on
+    /// timeout we record a failure so the breaker opens and the loop backs
+    /// off. `set_error` / `clear_error` inside `fetch_schema` drive the
+    /// breaker + notification; the timeout branch records the failure the
+    /// cancelled fetch never got to. Returns whether the cache was updated.
+    async fn fetch_and_store(&self, connect_timeout: Duration) -> bool {
+        let budget = connect_timeout + DB_FETCH_QUERY_BUDGET;
+        self.run_bounded_fetch(budget, self.fetch_schema(connect_timeout))
+            .await
+    }
+
+    /// Apply the whole-fetch timeout and cache/breaker bookkeeping to an
+    /// arbitrary fetch future. Split out from [`Self::fetch_and_store`] so
+    /// the timeout→breaker-open path is unit-testable with an injected slow
+    /// future (no live DB needed).
+    async fn run_bounded_fetch<F>(&self, budget: Duration, fetch: F) -> bool
+    where
+        F: std::future::Future<Output = Option<DatabaseSchema>>,
+    {
+        match tokio::time::timeout(budget, fetch).await {
+            Ok(Some(schema)) => {
+                *self.schema_cache.write().await = Some(schema);
+                true
+            }
+            // fetch_schema already recorded the error (set_error) on the way out.
+            Ok(None) => false,
+            Err(_) => {
+                let msg = format!(
+                    "Database schema fetch timed out after {budget:?} — the server \
+                     accepted a connection but a schema query stalled. Check the \
+                     database server's health / load."
+                );
+                warn!("{}", msg);
+                self.set_error("timeout", &msg, OutageClass::Unreachable)
+                    .await;
+                false
+            }
+        }
     }
 
     /// Get list of table names
@@ -525,29 +942,43 @@ impl DatabaseSchemaProvider {
         info!("Database schema cache invalidated");
     }
 
-    /// Fetch fresh schema from database
-    async fn fetch_schema(&self) -> Option<DatabaseSchema> {
+    /// Fetch fresh schema from database. `connect_timeout` bounds
+    /// connection establishment for every driver (sqlx `acquire_timeout`;
+    /// explicit `tokio::time::timeout` for tiberius, which has no built-in
+    /// connect timeout and would otherwise hang on the OS default for an
+    /// unreachable host).
+    async fn fetch_schema(&self, connect_timeout: Duration) -> Option<DatabaseSchema> {
         // Mark that we've attempted a connection
         *self.connection_attempted.write().await = true;
 
         let config = match self.get_database_config().await {
             Some(c) => c,
             None => {
-                self.set_error("unknown", "Database configuration not found in .env")
-                    .await;
+                // Scenario 0 — no DB configured. The breaker still opens
+                // (don't re-parse config every request) but the class keeps
+                // the notification silent: this is a normal state.
+                self.set_error(
+                    "unknown",
+                    "Database configuration not found in .env",
+                    OutageClass::NotConfigured,
+                )
+                .await;
                 return None;
             }
         };
 
         let result = match config.driver.as_str() {
-            "mysql" | "mariadb" => self.fetch_mysql_schema(&config).await,
-            "pgsql" | "postgres" => self.fetch_postgres_schema(&config).await,
-            "sqlite" => self.fetch_sqlite_schema(&config).await,
-            "sqlsrv" => self.fetch_sqlserver_schema(&config).await,
+            "mysql" | "mariadb" => self.fetch_mysql_schema(&config, connect_timeout).await,
+            "pgsql" | "postgres" => self.fetch_postgres_schema(&config, connect_timeout).await,
+            "sqlite" => self.fetch_sqlite_schema(&config, connect_timeout).await,
+            "sqlsrv" => self.fetch_sqlserver_schema(&config, connect_timeout).await,
             _ => {
+                // Not a connection outage — the LSP simply can't speak this
+                // driver. Silent (NotConfigured), the warn! log tells the story.
                 self.set_error(
                     &config.driver,
                     &format!("Unsupported database driver: {}", config.driver),
+                    OutageClass::NotConfigured,
                 )
                 .await;
                 warn!("Unsupported database driver: {}", config.driver);
@@ -727,38 +1158,71 @@ impl DatabaseSchemaProvider {
         })
     }
 
-    /// Extract the connection block for a specific driver from config/database.php
-    fn extract_connection_block(&self, content: &str, driver: &str) -> Option<String> {
-        // Find 'driver_name' => [
-        let pattern = format!(r#"['"]{driver}['"]\s*=>\s*\["#);
-        let regex = Regex::new(&pattern).ok()?;
+    /// Extract the connection block for a specific connection name from
+    /// config/database.php.
+    ///
+    /// Two forms are supported:
+    /// 1. **Inline array** (the common case) — `'mysql' => [ ... ]`.
+    /// 2. **Variable reference** — `'mysql' => $mysql`, where the block is
+    ///    defined elsewhere as `$mysql = [ ... ]`. Laravel apps (Sail's own
+    ///    published `config/database.php` among them) often factor a
+    ///    connection into a `$mysql` variable and reference it in
+    ///    `'connections' => [ 'mysql' => $mysql ]`. Without this, the block
+    ///    came back empty and EVERY setting (host, database, credentials)
+    ///    silently fell back to hardcoded defaults, ignoring `.env`.
+    ///
+    /// Fails open (returns `None`) when neither form matches — the caller
+    /// then uses its hardcoded defaults, the prior behaviour.
+    fn extract_connection_block(&self, content: &str, connection: &str) -> Option<String> {
+        let name = regex::escape(connection);
 
-        let match_start = regex.find(content)?.end();
+        // Form 1: inline array — `'mysql' => [`.
+        let inline = format!(r#"['"]{name}['"]\s*=>\s*\["#);
+        if let Ok(re) = Regex::new(&inline) {
+            if let Some(m) = re.find(content) {
+                if let Some(block) = Self::extract_bracketed_block(content, m.end()) {
+                    return Some(block);
+                }
+            }
+        }
 
-        // Find the matching closing bracket
-        let remaining = &content[match_start..];
+        // Form 2: variable reference — `'mysql' => $mysql` → find `$mysql = [`.
+        let var_ref = format!(r#"['"]{name}['"]\s*=>\s*\$([A-Za-z_]\w*)"#);
+        let var_name = Regex::new(&var_ref)
+            .ok()?
+            .captures(content)?
+            .get(1)?
+            .as_str()
+            .to_string();
+
+        // Locate the variable's array definition. Requiring `= [` here means a
+        // definition that is itself a bare `$other` (an alias) does NOT match —
+        // one level of resolution only, so there's no self-reference loop.
+        let def = format!(r#"\${}\s*=\s*\["#, regex::escape(&var_name));
+        let def_match = Regex::new(&def).ok()?.find(content)?;
+        Self::extract_bracketed_block(content, def_match.end())
+    }
+
+    /// Given `content` and a byte offset pointing just PAST an opening `[`,
+    /// return the substring up to (not including) the matching `]` via
+    /// bracket-depth counting, or `None` if unbalanced. `char_indices` keeps
+    /// the slice boundary on a valid char boundary; brackets are ASCII.
+    fn extract_bracketed_block(content: &str, after_open_bracket: usize) -> Option<String> {
+        let remaining = content.get(after_open_bracket..)?;
         let mut depth = 1;
-        let mut end_pos = 0;
-
-        for (i, c) in remaining.chars().enumerate() {
+        for (i, c) in remaining.char_indices() {
             match c {
                 '[' => depth += 1,
                 ']' => {
                     depth -= 1;
                     if depth == 0 {
-                        end_pos = i;
-                        break;
+                        return Some(remaining[..i].to_string());
                     }
                 }
                 _ => {}
             }
         }
-
-        if end_pos > 0 {
-            Some(remaining[..end_pos].to_string())
-        } else {
-            None
-        }
+        None
     }
 
     /// Parse an optional setting from the connection block. Same env() chain
@@ -998,7 +1462,11 @@ impl DatabaseSchemaProvider {
     /// 3. **TCP** with the configured host, plus a `127.0.0.1` fallback
     ///    for Sail / Docker Compose setups where the configured host is a
     ///    container service name unresolvable from outside Docker.
-    async fn fetch_mysql_schema(&self, config: &DatabaseConfig) -> Option<DatabaseSchema> {
+    async fn fetch_mysql_schema(
+        &self,
+        config: &DatabaseConfig,
+        connect_timeout: Duration,
+    ) -> Option<DatabaseSchema> {
         use sqlx::mysql::MySqlPoolOptions;
         use sqlx::Row;
 
@@ -1019,7 +1487,7 @@ impl DatabaseSchemaProvider {
             );
             match MySqlPoolOptions::new()
                 .max_connections(1)
-                .acquire_timeout(Duration::from_secs(5))
+                .acquire_timeout(connect_timeout)
                 .connect(&cand.url)
                 .await
             {
@@ -1061,7 +1529,8 @@ impl DatabaseSchemaProvider {
                 let raw_err = last_err.unwrap_or_else(|| "(no error captured)".to_string());
                 let msg = classify_mysql_error(&raw_err, &config.database, &candidates_str);
                 warn!("{}", msg);
-                self.set_error("mysql", &msg).await;
+                self.set_error("mysql", &msg, outage_class_from_raw(&raw_err))
+                    .await;
                 return None;
             }
         };
@@ -1258,21 +1727,460 @@ impl DatabaseSchemaProvider {
         })
     }
 
+    /// Does `host` look like a Docker Compose service name (rather than a
+    /// real hostname or IP)? Service names are the trigger for the Sail
+    /// fallbacks: bare word, no dots, not `localhost`, not `127.0.0.1`.
+    /// From the LSP's vantage point (outside the Docker network) a service
+    /// name doesn't resolve, so we look for a mapped host port instead.
+    fn is_docker_service_name(host: &str) -> bool {
+        !host.is_empty()
+            && !host.contains('.')
+            && !host.eq_ignore_ascii_case("localhost")
+            && host != "127.0.0.1"
+    }
+
+    /// Should Sail/Docker bind-IP detection run for this host?
+    ///
+    /// A superset of [`Self::is_docker_service_name`] that ALSO covers a
+    /// plain loopback primary — `127.0.0.1` or `localhost`. Those are the
+    /// default when `DB_HOST` is unset, yet the DB may actually live on
+    /// another loopback IP (Herd owns `127.0.0.1`, so Sail is pinned to
+    /// `127.0.0.2` via `APP_PORT`). Detection then adds the real
+    /// `127.0.0.2` endpoint after the literal primary.
+    ///
+    /// Deliberately does NOT run for an explicit non-loopback host — a real
+    /// IP (`192.168.x`, a public IP), a domain, or an explicit `127.0.0.2`:
+    /// the user named the endpoint precisely, so we honour it verbatim
+    /// (`is_docker_service_name` already rejects dotted hosts).
+    fn should_attempt_sail_detection(host: &str) -> bool {
+        Self::is_docker_service_name(host)
+            || host.eq_ignore_ascii_case("localhost")
+            || host == "127.0.0.1"
+    }
+
     /// Build the ordered list of host candidates to try. The primary
     /// (configured) host is always first; if it looks like a Docker Compose
-    /// service name (no dots, not `localhost`) we add `127.0.0.1` as a
-    /// fallback so Sail / Docker Compose setups work without the LSP needing
-    /// to be inside the Docker network.
+    /// service name we add `127.0.0.1` as a backstop so Sail / Docker
+    /// Compose setups work without the LSP needing to be inside the Docker
+    /// network.
     fn host_candidates(primary: &str) -> Vec<String> {
         let mut candidates = vec![primary.to_string()];
-        if !primary.is_empty()
-            && !primary.contains('.')
-            && !primary.eq_ignore_ascii_case("localhost")
-            && primary != "127.0.0.1"
-        {
+        if Self::is_docker_service_name(primary) {
             candidates.push("127.0.0.1".to_string());
         }
         candidates
+    }
+
+    /// The ordered `(host, port, success_note)` TCP endpoints to try, shared
+    /// by the MySQL and Postgres candidate builders:
+    /// 1. the configured `host:port` (primary),
+    /// 2. any Sail/Docker endpoint detected from a compose file or APP_PORT
+    ///    (see [`Self::detect_sail_endpoint`]) — this is what finds a DB
+    ///    bound to a non-`127.0.0.1` loopback IP like `127.0.0.2`,
+    /// 3. the `127.0.0.1` backstop (present only for service-name hosts).
+    ///
+    /// Deduplicated on `(host, port)` so a detected `127.0.0.1:<port>`
+    /// doesn't also emit the backstop twice.
+    fn tcp_endpoints(&self, config: &DatabaseConfig) -> Vec<(String, u16, Option<String>)> {
+        const SAIL_BACKSTOP_NOTE: &str =
+            "Looks like a Sail / Docker Compose setup — the LSP runs outside Docker, so the \
+             service hostname doesn't resolve, but the mapped host port on 127.0.0.1 does.";
+
+        let hosts = Self::host_candidates(&config.host);
+        let mut eps: Vec<(String, u16, Option<String>)> = Vec::new();
+
+        // 1. Primary configured host:port.
+        eps.push((hosts[0].clone(), config.port, None));
+
+        // 2. Detected Sail/Docker endpoint (carries its OWN host + port — the
+        //    forwarded host port may differ from the driver's internal port).
+        if let Some(ep) = self.detect_sail_endpoint(config) {
+            if !eps.iter().any(|(h, p, _)| *h == ep.host && *p == ep.port) {
+                eps.push((ep.host, ep.port, Some(ep.note)));
+            }
+        }
+
+        // 3. 127.0.0.1 backstop — only present in `hosts` for service names.
+        for h in hosts.iter().skip(1) {
+            if !eps
+                .iter()
+                .any(|(host, p, _)| host == h && *p == config.port)
+            {
+                eps.push((h.clone(), config.port, Some(SAIL_BACKSTOP_NOTE.to_string())));
+            }
+        }
+
+        eps
+    }
+
+    /// Detect a Sail/Docker TCP endpoint for the database when `config.host`
+    /// is a Docker service name. Mike's setup is the motivating case: Herd
+    /// owns `127.0.0.1`, so Docker/Sail confines every service to
+    /// `127.0.0.2`, and the DB is at `127.0.0.2:3306` — a host the old
+    /// `mysql` service-name + hardcoded `127.0.0.1` candidates never tried.
+    ///
+    /// Layered, first non-empty wins:
+    /// 1. compose override (`docker-compose.override.yml` etc.),
+    /// 2. base compose (`docker-compose.yml` etc.),
+    /// 3. `APP_PORT` in `.env` (e.g. `127.0.0.2:80` → bind IP `127.0.0.2`).
+    ///
+    /// Fails open at every step (returns `None`) — never panics, never
+    /// guesses — so a malformed compose file just falls through to the next
+    /// layer, then to the `127.0.0.1` backstop.
+    fn detect_sail_endpoint(&self, config: &DatabaseConfig) -> Option<DetectedEndpoint> {
+        if !Self::should_attempt_sail_detection(&config.host) {
+            return None;
+        }
+
+        const OVERRIDE: &[&str] = &[
+            "docker-compose.override.yml",
+            "docker-compose.override.yaml",
+            "compose.override.yaml",
+            "compose.override.yml",
+        ];
+        const BASE: &[&str] = &[
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "compose.yaml",
+            "compose.yml",
+        ];
+
+        self.detect_from_compose_files(config, OVERRIDE)
+            .or_else(|| self.detect_from_compose_files(config, BASE))
+            .or_else(|| self.detect_from_app_port(config))
+    }
+
+    /// Try each compose filename in order; the first that yields a forwarded
+    /// endpoint for the DB service wins.
+    fn detect_from_compose_files(
+        &self,
+        config: &DatabaseConfig,
+        filenames: &[&str],
+    ) -> Option<DetectedEndpoint> {
+        for filename in filenames {
+            let path = self.project_root.join(filename);
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Some((host, port)) = self.parse_compose_ports(&content, config) {
+                debug!("🗄️  Sail detection: {host}:{port} for DB service from {filename}");
+                return Some(DetectedEndpoint {
+                    note: format!(
+                        "Sail / Docker Compose: DB port forwarded to {host}:{port}, \
+                         detected from {filename}."
+                    ),
+                    host,
+                    port,
+                });
+            }
+        }
+        None
+    }
+
+    /// `APP_PORT` (Sail's web-container bind) often carries the loopback IP
+    /// the whole project is pinned to — e.g. `APP_PORT=127.0.0.2:80`. If it
+    /// has an `IP:PORT` shape with a valid IPv4, reuse that IP and pair it
+    /// with the DB's configured port.
+    fn detect_from_app_port(&self, config: &DatabaseConfig) -> Option<DetectedEndpoint> {
+        let app_port = self.resolve_env("APP_PORT")?;
+        let (ip, _web_port) = app_port.split_once(':')?;
+        let host = Self::normalize_bind_ip(ip.trim())?;
+        // A plain 127.0.0.1 bind (or a wildcard that normalises to it) is
+        // already covered by the 127.0.0.1 backstop — which, for a
+        // service-name host, is always present and carries the correct
+        // SAIL_BACKSTOP_NOTE. Emitting it here too would only add a
+        // misattributed "from APP_PORT" note that dedupe then drops. Only a
+        // non-loopback-default bind (e.g. 127.0.0.2) is worth a candidate.
+        if host == "127.0.0.1" {
+            return None;
+        }
+        Some(DetectedEndpoint {
+            note: format!(
+                "Sail / Docker Compose: DB host {host} taken from the APP_PORT bind IP in .env."
+            ),
+            host,
+            port: config.port,
+        })
+    }
+
+    /// Parse a compose file's YAML for the DB service's forwarded host
+    /// endpoint. Targeted, dependency-free, and fail-open: locate
+    /// `services:` → the DB service block (by `config.host`, else the known
+    /// driver service names) → its `ports:` list → the entry whose CONTAINER
+    /// (target) port equals `config.port`, returning that entry's host-side
+    /// `(bind_ip, host_port)`. Returns `None` on any ambiguity.
+    fn parse_compose_ports(&self, content: &str, config: &DatabaseConfig) -> Option<(String, u16)> {
+        let lines: Vec<&str> = content.lines().collect();
+        for name in self.compose_service_names(config) {
+            if let Some(items) = Self::service_ports_items(&lines, &name) {
+                if let Some(ep) = self.select_forwarded_endpoint(&items, config) {
+                    return Some(ep);
+                }
+            }
+        }
+        None
+    }
+
+    /// The service names to look for, in precedence order: the configured
+    /// host first, then the conventional service names for the driver.
+    fn compose_service_names(&self, config: &DatabaseConfig) -> Vec<String> {
+        let mut names = vec![config.host.clone()];
+        let extra: &[&str] = match config.driver.as_str() {
+            "mysql" | "mariadb" => &["mysql", "mariadb"],
+            "pgsql" | "postgres" => &["pgsql", "postgres", "postgresql"],
+            _ => &[],
+        };
+        for e in extra {
+            if !names.iter().any(|n| n == e) {
+                names.push((*e).to_string());
+            }
+        }
+        names
+    }
+
+    /// Extract the raw `(indent, content)` lines of a named service's
+    /// `ports:` list. Indentation-aware, comment/blank tolerant.
+    fn service_ports_items(lines: &[&str], service: &str) -> Option<Vec<(usize, String)>> {
+        let is_skippable = |l: &str| l.trim().is_empty() || l.trim_start().starts_with('#');
+
+        // 1. Top-level `services:` key.
+        let services_idx = lines
+            .iter()
+            .position(|l| indent_spaces(l) == 0 && line_is_key(l.trim_start(), "services"))?;
+
+        // 2. The indent of `services:`'s direct children (first real child).
+        let child_indent = lines[services_idx + 1..]
+            .iter()
+            .find(|l| !is_skippable(l))
+            .map(|l| indent_spaces(l))?;
+        if child_indent == 0 {
+            return None;
+        }
+
+        // 3. Find the service header at `child_indent`.
+        let mut i = services_idx + 1;
+        let mut body_start = None;
+        while i < lines.len() {
+            let line = lines[i];
+            if is_skippable(line) {
+                i += 1;
+                continue;
+            }
+            let ind = indent_spaces(line);
+            if ind < child_indent {
+                break; // left the services block
+            }
+            if ind == child_indent && line_is_key(line.trim_start(), service) {
+                body_start = Some(i + 1);
+                break;
+            }
+            i += 1;
+        }
+        let body_start = body_start?;
+
+        // The service body's direct-child indent (first real line of the
+        // body). `ports:` must live here — matching a bare `ports:` at ANY
+        // deeper indent would read a NESTED one (e.g. under an `x-*` compose
+        // extension field) that textually precedes the real service-level
+        // list, returning a confident wrong binding. The first non-skippable
+        // line after the header is either a body child (deeper) or a sibling/
+        // dedent (<= child_indent, i.e. no body of its own) → None.
+        let body_indent = lines[body_start..]
+            .iter()
+            .find(|l| !is_skippable(l))
+            .map(|l| indent_spaces(l))?;
+        if body_indent <= child_indent {
+            return None;
+        }
+
+        // 4. Find `ports:` at the service body's direct-child indent only.
+        let mut j = body_start;
+        let mut ports = None;
+        while j < lines.len() {
+            let line = lines[j];
+            if is_skippable(line) {
+                j += 1;
+                continue;
+            }
+            let ind = indent_spaces(line);
+            if ind <= child_indent {
+                break; // left the service body
+            }
+            // Skip nested content (deeper than a direct child, e.g. an
+            // `x-meta:` block's own `ports:`); only a direct child counts.
+            if ind == body_indent && line_is_key(line.trim_start(), "ports") {
+                ports = Some((j + 1, ind));
+                break;
+            }
+            j += 1;
+        }
+        let (ports_start, ports_indent) = ports?;
+
+        // 5. Collect the ports list lines (deeper than `ports:`).
+        let mut items = Vec::new();
+        let mut k = ports_start;
+        while k < lines.len() {
+            let line = lines[k];
+            if is_skippable(line) {
+                k += 1;
+                continue;
+            }
+            let ind = indent_spaces(line);
+            if ind <= ports_indent {
+                break;
+            }
+            items.push((ind, line.trim_start().to_string()));
+            k += 1;
+        }
+        (!items.is_empty()).then_some(items)
+    }
+
+    /// Group the ports lines into entries (`-` starts an entry; deeper lines
+    /// continue it) and return the first entry whose container port matches
+    /// `config.port`, as `(bind_ip, host_port)`.
+    fn select_forwarded_endpoint(
+        &self,
+        items: &[(usize, String)],
+        config: &DatabaseConfig,
+    ) -> Option<(String, u16)> {
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        for (_, content) in items {
+            if content.starts_with('-') {
+                groups.push(vec![content.clone()]);
+            } else {
+                // Continuation line: attach to the current entry, or bail if
+                // it appears before any `-` (malformed).
+                groups.last_mut()?.push(content.clone());
+            }
+        }
+        groups
+            .iter()
+            .find_map(|group| self.endpoint_from_group(group, config))
+    }
+
+    /// Parse a single ports entry — short form (`ip:host:container`) or long
+    /// form (`target:`/`published:`/`host_ip:`) — into `(bind_ip, host_port)`
+    /// if its container port matches `config.port`.
+    fn endpoint_from_group(
+        &self,
+        group: &[String],
+        config: &DatabaseConfig,
+    ) -> Option<(String, u16)> {
+        let head = group[0].strip_prefix('-')?.trim();
+        let head_is_field = head
+            .split_once(':')
+            .map(|(k, _)| {
+                matches!(
+                    k.trim(),
+                    "target" | "published" | "host_ip" | "protocol" | "mode" | "name"
+                )
+            })
+            .unwrap_or(false);
+
+        if group.len() > 1 || head.is_empty() || head_is_field {
+            // Long-form mapping: build a small key→value map.
+            let mut map: HashMap<String, String> = HashMap::new();
+            if head_is_field {
+                if let Some((k, v)) = head.split_once(':') {
+                    map.insert(k.trim().to_string(), v.trim().to_string());
+                }
+            }
+            for cont in &group[1..] {
+                if let Some((k, v)) = cont.split_once(':') {
+                    map.insert(k.trim().to_string(), v.trim().to_string());
+                }
+            }
+            self.endpoint_from_longform(&map, config)
+        } else {
+            self.endpoint_from_shortform(head, config)
+        }
+    }
+
+    /// Parse a short-form ports string: `container`, `host:container`, or
+    /// `ip:host:container`, with an optional `/proto` suffix. `${VAR}` and
+    /// `${VAR:-default}` are resolved BEFORE splitting (the `:-` default
+    /// syntax itself contains a colon).
+    fn endpoint_from_shortform(&self, raw: &str, config: &DatabaseConfig) -> Option<(String, u16)> {
+        let unquoted = raw
+            .trim()
+            .trim_matches(|c: char| c == '\'' || c == '"')
+            .trim();
+        let resolved = self.resolve_compose_vars(unquoted);
+        let no_proto = resolved.split('/').next().unwrap_or(&resolved).trim();
+        let parts: Vec<&str> = no_proto.split(':').map(|p| p.trim()).collect();
+
+        let (bind_ip, host_port_str, container_str) = match parts.as_slice() {
+            // A bare container port maps to a RANDOM host port — unusable.
+            [_container] => return None,
+            [host_port, container] => ("", *host_port, *container),
+            [ip, host_port, container] => (*ip, *host_port, *container),
+            _ => return None,
+        };
+
+        let container: u16 = container_str.parse().ok()?;
+        if container != config.port {
+            return None;
+        }
+        let host_port: u16 = host_port_str.parse().ok()?;
+        let host = Self::normalize_bind_ip(bind_ip)?;
+        Some((host, host_port))
+    }
+
+    /// Parse a long-form ports mapping (`target`/`published`/`host_ip`) into
+    /// `(bind_ip, host_port)` if `target` matches `config.port`.
+    fn endpoint_from_longform(
+        &self,
+        map: &HashMap<String, String>,
+        config: &DatabaseConfig,
+    ) -> Option<(String, u16)> {
+        let clean = |s: &str| -> String {
+            self.resolve_compose_vars(
+                s.trim()
+                    .trim_matches(|c: char| c == '\'' || c == '"')
+                    .trim(),
+            )
+        };
+        let target: u16 = clean(map.get("target")?).trim().parse().ok()?;
+        if target != config.port {
+            return None;
+        }
+        let host_port: u16 = clean(map.get("published")?).trim().parse().ok()?;
+        let host = match map.get("host_ip") {
+            Some(ip) => Self::normalize_bind_ip(clean(ip).trim())?,
+            None => "127.0.0.1".to_string(),
+        };
+        Some((host, host_port))
+    }
+
+    /// Resolve `${VAR}` and `${VAR:-default}` in a compose value via
+    /// [`Self::resolve_env`], falling back to the default (or empty) when the
+    /// var is unset. Bare `$VAR` is not handled (Sail uses the braced form).
+    fn resolve_compose_vars(&self, s: &str) -> String {
+        let Ok(re) = Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}") else {
+            return s.to_string();
+        };
+        re.replace_all(s, |caps: &regex::Captures| {
+            let var = &caps[1];
+            let default = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            self.resolve_env(var).unwrap_or_else(|| default.to_string())
+        })
+        .into_owned()
+    }
+
+    /// Normalise a compose/APP_PORT bind IP into a URL host:
+    /// - empty → `127.0.0.1` (the compose default when no bind IP is given),
+    /// - `0.0.0.0` / `::` / `*` → `127.0.0.1` (wildcard binds are reachable
+    ///   on loopback),
+    /// - a valid IPv4 literal → itself,
+    /// - anything else (hostnames, IPv6 literals) → `None` (fail open).
+    fn normalize_bind_ip(ip: &str) -> Option<String> {
+        let ip = ip.trim();
+        if ip.is_empty() || ip == "0.0.0.0" || ip == "::" || ip == "[::]" || ip == "*" {
+            return Some("127.0.0.1".to_string());
+        }
+        ip.parse::<std::net::Ipv4Addr>()
+            .ok()
+            .map(|_| ip.to_string())
     }
 
     /// Build the ordered list of MySQL connection candidates. Priority:
@@ -1319,27 +2227,20 @@ impl DatabaseSchemaProvider {
         }
 
         // TCP candidates. Always added — these are the fallback path when
-        // neither URL nor socket are configured, OR when those fail.
-        for host in Self::host_candidates(&config.host) {
-            let is_sail_fallback = host == "127.0.0.1" && host != config.host;
+        // neither URL nor socket are configured, OR when those fail. The
+        // endpoint list is: configured host → any detected Sail/Docker bind
+        // (e.g. 127.0.0.2, or a custom forwarded port) → 127.0.0.1 backstop.
+        for (host, port, note) in self.tcp_endpoints(config) {
             out.push(ConnCandidate {
-                label: format!("tcp {}:{}", host, config.port),
+                label: format!("tcp {host}:{port}"),
                 url: format!(
                     "mysql://{}@{}:{}/{}",
                     userinfo(&config.username, &config.password),
                     host,
-                    config.port,
+                    port,
                     config.database
                 ),
-                success_note: if is_sail_fallback {
-                    Some(
-                        "Looks like a Sail / Docker Compose setup — the LSP runs outside Docker, \
-                         so the service hostname doesn't work, but the mapped host port does."
-                            .to_string(),
-                    )
-                } else {
-                    None
-                },
+                success_note: note,
             });
         }
 
@@ -1373,22 +2274,17 @@ impl DatabaseSchemaProvider {
             });
         }
 
-        for host in Self::host_candidates(&config.host) {
-            let is_sail_fallback = host == "127.0.0.1" && host != config.host;
+        for (host, port, note) in self.tcp_endpoints(config) {
             out.push(ConnCandidate {
-                label: format!("tcp {}:{}", host, config.port),
+                label: format!("tcp {host}:{port}"),
                 url: format!(
                     "postgres://{}@{}:{}/{}",
                     userinfo(&config.username, &config.password),
                     host,
-                    config.port,
+                    port,
                     config.database
                 ),
-                success_note: if is_sail_fallback {
-                    Some("Sail / Docker Compose fallback to 127.0.0.1.".to_string())
-                } else {
-                    None
-                },
+                success_note: note,
             });
         }
 
@@ -1397,7 +2293,11 @@ impl DatabaseSchemaProvider {
 
     /// Fetch schema from PostgreSQL. Same candidate priority as
     /// `fetch_mysql_schema`: DB_URL → unix_socket → TCP with Sail fallback.
-    async fn fetch_postgres_schema(&self, config: &DatabaseConfig) -> Option<DatabaseSchema> {
+    async fn fetch_postgres_schema(
+        &self,
+        config: &DatabaseConfig,
+        connect_timeout: Duration,
+    ) -> Option<DatabaseSchema> {
         use sqlx::postgres::PgPoolOptions;
 
         let candidates = self.build_postgres_candidates(config);
@@ -1408,7 +2308,7 @@ impl DatabaseSchemaProvider {
         for cand in &candidates {
             match PgPoolOptions::new()
                 .max_connections(1)
-                .acquire_timeout(Duration::from_secs(5))
+                .acquire_timeout(connect_timeout)
                 .connect(&cand.url)
                 .await
             {
@@ -1443,7 +2343,8 @@ impl DatabaseSchemaProvider {
                 let raw_err = last_err.unwrap_or_else(|| "(no error captured)".to_string());
                 let msg = classify_postgres_error(&raw_err, &config.database, &candidates_str);
                 warn!("{}", msg);
-                self.set_error("pgsql", &msg).await;
+                self.set_error("pgsql", &msg, outage_class_from_raw(&raw_err))
+                    .await;
                 return None;
             }
         };
@@ -1498,7 +2399,11 @@ impl DatabaseSchemaProvider {
     }
 
     /// Fetch schema from SQLite
-    async fn fetch_sqlite_schema(&self, config: &DatabaseConfig) -> Option<DatabaseSchema> {
+    async fn fetch_sqlite_schema(
+        &self,
+        config: &DatabaseConfig,
+        connect_timeout: Duration,
+    ) -> Option<DatabaseSchema> {
         use sqlx::sqlite::SqlitePoolOptions;
         use sqlx::Row;
 
@@ -1515,7 +2420,10 @@ impl DatabaseSchemaProvider {
                 db_path
             );
             warn!("{}", msg);
-            self.set_error("sqlite", &msg).await;
+            // Scenario 2-shaped: the "server" (filesystem) is fine, the
+            // configured database itself is missing — same remediation
+            // family as an unknown database ("check that it exists").
+            self.set_error("sqlite", &msg, OutageClass::Rejected).await;
             return None;
         }
 
@@ -1523,15 +2431,17 @@ impl DatabaseSchemaProvider {
 
         let pool = match SqlitePoolOptions::new()
             .max_connections(1)
-            .acquire_timeout(Duration::from_secs(5))
+            .acquire_timeout(connect_timeout)
             .connect(&url)
             .await
         {
             Ok(p) => p,
             Err(e) => {
+                let raw_err = e.to_string();
                 let msg = format!("SQLite connection failed: {}. Check DB_DATABASE in .env", e);
                 warn!("{}", msg);
-                self.set_error("sqlite", &msg).await;
+                self.set_error("sqlite", &msg, outage_class_from_raw(&raw_err))
+                    .await;
                 return None;
             }
         };
@@ -1588,8 +2498,15 @@ impl DatabaseSchemaProvider {
         })
     }
 
-    /// Fetch schema from SQL Server
-    async fn fetch_sqlserver_schema(&self, config: &DatabaseConfig) -> Option<DatabaseSchema> {
+    /// Fetch schema from SQL Server. tiberius has no built-in connect
+    /// timeout, so both the raw TCP connect and the TDS handshake are
+    /// wrapped in `tokio::time::timeout` — an unreachable sqlsrv host
+    /// otherwise hangs on the OS default (minutes).
+    async fn fetch_sqlserver_schema(
+        &self,
+        config: &DatabaseConfig,
+        connect_timeout: Duration,
+    ) -> Option<DatabaseSchema> {
         use tiberius::{AuthMethod, Client, Config};
         use tokio::net::TcpStream;
         use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -1601,27 +2518,60 @@ impl DatabaseSchemaProvider {
         tib_config.authentication(AuthMethod::sql_server(&config.username, &config.password));
         tib_config.trust_cert();
 
-        let tcp = match TcpStream::connect(tib_config.get_addr()).await {
-            Ok(t) => t,
-            Err(e) => {
+        let tcp = match tokio::time::timeout(
+            connect_timeout,
+            TcpStream::connect(tib_config.get_addr()),
+        )
+        .await
+        {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
                 let msg = format!(
                     "SQL Server TCP connection failed: {}. Check DB_HOST, DB_PORT in .env",
                     e
                 );
                 warn!("{}", msg);
-                self.set_error("sqlsrv", &msg).await;
+                self.set_error("sqlsrv", &msg, OutageClass::Unreachable)
+                    .await;
+                return None;
+            }
+            Err(_) => {
+                let msg = format!(
+                    "SQL Server TCP connection timed out after {:?}. Check DB_HOST, DB_PORT in .env",
+                    connect_timeout
+                );
+                warn!("{}", msg);
+                self.set_error("sqlsrv", &msg, OutageClass::Unreachable)
+                    .await;
                 return None;
             }
         };
 
         tcp.set_nodelay(true).ok();
 
-        let mut client = match Client::connect(tib_config, tcp.compat_write()).await {
-            Ok(c) => c,
-            Err(e) => {
+        let mut client = match tokio::time::timeout(
+            connect_timeout,
+            Client::connect(tib_config, tcp.compat_write()),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                let raw_err = e.to_string();
                 let msg = format!("SQL Server connection failed: {}. Check DB_DATABASE, DB_USERNAME, DB_PASSWORD in .env", e);
                 warn!("{}", msg);
-                self.set_error("sqlsrv", &msg).await;
+                self.set_error("sqlsrv", &msg, outage_class_from_raw(&raw_err))
+                    .await;
+                return None;
+            }
+            Err(_) => {
+                let msg = format!(
+                    "SQL Server handshake timed out after {:?}. Check DB_HOST, DB_PORT in .env",
+                    connect_timeout
+                );
+                warn!("{}", msg);
+                self.set_error("sqlsrv", &msg, OutageClass::Unreachable)
+                    .await;
                 return None;
             }
         };

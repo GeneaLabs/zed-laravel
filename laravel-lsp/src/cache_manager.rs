@@ -62,6 +62,29 @@ fn get_cache_file(project_root: &Path) -> Option<PathBuf> {
     get_cache_dir(project_root).map(|dir| dir.join("cache.json"))
 }
 
+/// Delete every on-disk cache for `project_root`.
+///
+/// All of the LSP's disk caches live in the same per-project directory
+/// (this module's `cache.json`, plus `pattern_cache.bin`, `magic_cache.bin`,
+/// `command_cache.bin`, and the vendor-alias cache — each sibling module
+/// derives the identical `{cache_dir}/{project-hash}/` path), so one
+/// directory removal wipes them all. Used by the `laravel.reindexProject`
+/// command: with the disk caches gone, the next warming pass restores
+/// nothing and rebuilds everything from source — a genuinely cold reindex.
+///
+/// A missing directory is success (nothing to clear), not an error; the
+/// modules that later save their caches recreate the directory themselves.
+pub fn clear_disk_caches(project_root: &Path) -> std::io::Result<()> {
+    let Some(dir) = get_cache_dir(project_root) else {
+        // No resolvable home directory — nowhere a cache could live.
+        return Ok(());
+    };
+    match fs::remove_dir_all(&dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 /// Stored file modification time
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileMtime {

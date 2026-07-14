@@ -61,7 +61,15 @@ use crate::view_var_index::ViewRender;
 /// v3: per-file receiver dependencies + controller view renders (#80) — the
 /// incremental save flow needs both alive after a cache-warm restart, where
 /// the resolution pass that would otherwise populate them never runs.
-const SCHEMA_VERSION: u32 = 3;
+/// v4: FQCN→file resolution correctness fixes — the class-locator now
+/// re-establishes app-over-vendor precedence and the `path_within_root`
+/// containment guard on every lookup (they were previously skippable on a
+/// cached hit). Entries a pre-fix build persisted may hold an edge-case
+/// misresolution (a vendor class where app should have won, or an out-of-root
+/// path), so a warm v3 cache is discarded and the project re-indexed with the
+/// corrected resolver rather than trusting stale entries. Parsing did not
+/// change, so the pattern/config disk caches are intentionally NOT bumped.
+const SCHEMA_VERSION: u32 = 4;
 
 const CACHE_FILENAME: &str = "magic_cache.bin";
 

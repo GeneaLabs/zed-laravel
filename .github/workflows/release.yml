@@ -42,6 +42,17 @@ jobs:
           fi
           # Remove 'v' prefix if present (e.g., v1.2.3 -> 1.2.3)
           VERSION="${TAG#v}"
+          # Fail fast unless VERSION is a strict semver (with optional
+          # pre-release suffix). Every downstream consumer — the three sed
+          # version substitutions, the commit message, and the tag/release
+          # curl calls — uses this value or the tag it derives from, so this
+          # single guard keeps sed metacharacters (/, &, \) and anything else
+          # surprising out of all of them.
+          SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'
+          if [[ ! "$VERSION" =~ $SEMVER_RE ]]; then
+            echo "::error::Tag '${TAG}' does not yield a valid semver version (got '${VERSION}')"
+            exit 1
+          fi
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "Extracted version: ${VERSION}"
 

@@ -91,3 +91,28 @@ fn test_xdg_cache_path() {
     assert!(cache_dir.is_some());
     println!("Cache dir for {:?}: {:?}", project_root, cache_dir.unwrap());
 }
+
+#[test]
+fn test_clear_disk_caches_removes_dir_and_is_idempotent() {
+    // A unique tempdir as the project root gives a unique cache-dir hash, so
+    // this test's disk writes/deletes are isolated to their own directory
+    // under the real per-user cache root and can't collide with another run.
+    let temp = TempDir::new().unwrap();
+    let project_root = temp.path();
+
+    // Seed the per-project cache dir with a stand-in for the .bin/.json caches.
+    let cache_dir = get_cache_dir(project_root).expect("cache dir resolvable");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(cache_dir.join("pattern_cache.bin"), b"stale").unwrap();
+    assert!(cache_dir.exists(), "precondition: cache dir seeded");
+
+    // Clearing removes the whole per-project directory.
+    clear_disk_caches(project_root).expect("clear must succeed");
+    assert!(
+        !cache_dir.exists(),
+        "clear_disk_caches must remove the per-project cache dir"
+    );
+
+    // Idempotent: clearing an already-absent dir is success, not an error.
+    clear_disk_caches(project_root).expect("clearing a missing dir is a no-op success");
+}

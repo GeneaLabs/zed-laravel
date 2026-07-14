@@ -4509,3 +4509,46 @@ class AppServiceProvider extends ServiceProvider {
         "the removed macro must be GONE after re-registration"
     );
 }
+
+// ─── M1 single-parse capture: member_context gating via the ACTOR ─────────
+//
+// The vendor gate + zero-cost `None` must also hold through the actor's
+// `handle_get_patterns` (the on-demand / save-refresh constructor), so warm
+// build and save-refresh agree on which files carry context.
+
+#[tokio::test]
+async fn handle_get_patterns_captures_context_non_vendor() {
+    let handle = SalsaActor::spawn();
+    let path = std::path::PathBuf::from("/proj/app/Http/Controllers/C.php");
+    let src = "<?php\nnamespace App;\nclass C { public function f(\\App\\Models\\User $u) { return $u->email; } }\n";
+    handle
+        .update_file(path.clone(), 1, src.to_string())
+        .await
+        .unwrap();
+    let data = handle.get_patterns(path).await.unwrap().expect("patterns");
+    let ctx = data
+        .member_context
+        .as_ref()
+        .expect("a non-vendor member reader must capture context");
+    assert_eq!(ctx.sites.len(), data.member_access_refs.len());
+}
+
+#[tokio::test]
+async fn handle_get_patterns_skips_capture_for_vendor() {
+    let handle = SalsaActor::spawn();
+    let path = std::path::PathBuf::from("/proj/vendor/acme/pkg/src/C.php");
+    let src = "<?php\nnamespace Acme;\nclass C { public function f(\\App\\Models\\User $u) { return $u->email; } }\n";
+    handle
+        .update_file(path.clone(), 1, src.to_string())
+        .await
+        .unwrap();
+    let data = handle.get_patterns(path).await.unwrap().expect("patterns");
+    assert!(
+        !data.member_access_refs.is_empty(),
+        "the file DOES have a member access (proving the gate drops context)"
+    );
+    assert!(
+        data.member_context.is_none(),
+        "a vendor file must capture no context through the actor either"
+    );
+}

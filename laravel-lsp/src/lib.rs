@@ -66,6 +66,7 @@ pub mod php_variable_rename;
 pub mod queries;
 pub mod query_chain;
 pub mod references;
+pub mod reindex;
 pub mod rename;
 pub mod route_binding;
 pub mod route_chain;
@@ -97,6 +98,10 @@ pub mod member_resolver;
 
 // Controller/Volt → Blade view-variable type inference (magic members in Blade)
 pub mod view_var_index;
+
+// M1 single-parse capture: compile a file's own-source resolution context at
+// parse so the magic-member resolve passes never re-read/re-parse it.
+pub mod member_capture;
 
 // Re-export commonly used types
 pub use config::find_project_root;

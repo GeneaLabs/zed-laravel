@@ -1844,6 +1844,41 @@ fn get_laravel_validation_rules() -> Vec<ValidationRuleInfo> {
     ]
 }
 
+/// One accumulated external (watched-file) `.php` change, awaiting the
+/// debounced incremental magic-member batch (M2). Snapshotted at event time so
+/// the batch can run the same pre/post surface diff `did_save` runs, without a
+/// project-size gate.
+///
+/// `old_surfaces` / `old_render_views` are the file's fqcn→surface-signature
+/// map and rendered view names *before* the change — captured on the first
+/// event for a path in a burst (first-event-wins: a later event must not
+/// overwrite the true pre-state, since an interleaved query may already have
+/// re-parsed the hierarchy). For a deleted path they're snapshotted *before*
+/// `remove_file` tears the hierarchy nodes down. `deleted` is only an advisory
+/// hint: whether the file actually exists is decided by re-reading it *at drain*
+/// (see `run_magic_batch_once`), because two overlapping notifications for the
+/// same path with opposite existence can leave this flag stale.
+#[derive(Debug, Clone, Default)]
+struct PendingWatchedChange {
+    old_surfaces: std::collections::HashMap<String, u64>,
+    old_render_views: Vec<String>,
+    deleted: bool,
+}
+
+/// Shared state for the debounced watched-files magic batch (M2). The pending
+/// map and the `running` flag live under ONE mutex on purpose: it makes the
+/// scheduler's "a task is live → don't spawn" decision and the task's "map
+/// empty → relinquish liveness and exit" decision atomic against each other.
+/// Splitting them (a separate pending lock + a `JoinHandle::is_finished`
+/// liveness check) reintroduces a lost-wakeup race — a producer can record an
+/// event and see the not-yet-returned task as live, skip spawning, and strand
+/// the event with no task to drain it. One lock closes that window.
+#[derive(Default)]
+struct WatchedBatchState {
+    pending: HashMap<PathBuf, PendingWatchedChange>,
+    running: bool,
+}
+
 /// The main Laravel Language Server struct
 /// This holds all the state for our LSP
 #[derive(Clone)]
@@ -1868,10 +1903,20 @@ struct LaravelLanguageServer {
     pending_rescans: Arc<RwLock<HashSet<RescanType>>>,
     /// Handle for the rescan debounce timer
     rescan_debounce_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
-    /// Handle for the debounced full magic-member index rebuild. Coalesces
-    /// rapid edits into one project-wide reconverge (the "full" half of the
-    /// hybrid incremental refresh; the per-file refresh is the "instant" half).
+    /// Handle for the debounced watched-files magic-member batch task (M2),
+    /// kept solely so the handler tests can await the task to observe
+    /// convergence. Liveness (spawn-vs-skip) is NOT decided from this handle —
+    /// that would race the task's exit — but from `WatchedBatchState::running`
+    /// under the state mutex. Coalesces an external-edit burst (git pull,
+    /// formatter, branch switch) into one dependency-tracked incremental
+    /// reconverge; a batch already draining is never aborted.
     magic_rebuild_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Accumulated external `.php` changes + the batch task's liveness flag,
+    /// under one mutex (see [`WatchedBatchState`]). Producer:
+    /// `did_change_watched_files` records events and spawns a task iff none is
+    /// running. Consumer: the batch task drains it and clears `running` when it
+    /// finds the map empty — both decisions serialized on this one lock.
+    magic_batch_state: Arc<tokio::sync::Mutex<WatchedBatchState>>,
     /// File existence cache with TTL (path -> (exists, cached_at))
     /// This avoids blocking I/O in async context for file_exists checks
     file_exists_cache: Arc<RwLock<HashMap<PathBuf, (bool, Instant)>>>,
@@ -1923,10 +1968,20 @@ struct LaravelLanguageServer {
     /// built; cleared on a provider/composer rescan. Used by semantic-token
     /// highlighting to reject non-directive `@`-text.
     cached_directive_names: Arc<RwLock<Option<HashSet<String>>>>,
-    /// Database schema provider for exists:/unique: validation rules
+    /// Database schema provider for exists:/unique: validation rules.
+    /// Outage notifications are edge-triggered by the provider's circuit
+    /// breaker (one toast per outage episode, re-armed on reconnect) — see
+    /// `init_database_schema_provider` for the listener wiring.
     database_schema: Arc<RwLock<Option<laravel_lsp::database::DatabaseSchemaProvider>>>,
-    /// Whether we've shown the database connection error diagnostic this session
-    database_diagnostic_shown: Arc<RwLock<bool>>,
+    /// Idempotency guard for `init_database_schema_provider`, which is
+    /// called from two startup sites. Holds the root the live background
+    /// tasks (refresh loop + outage-channel listener) were started for,
+    /// plus their `JoinHandle`s. A re-init for the SAME root is a no-op
+    /// (this is what stops the duplicate-outage-toast bug — two providers
+    /// meant two breakers, each firing its own toast); a re-init for a
+    /// DIFFERENT root aborts these tasks before starting fresh. So exactly
+    /// one provider / loop / listener / breaker is live at a time.
+    db_provider_task: Arc<tokio::sync::Mutex<Option<(PathBuf, Vec<tokio::task::JoinHandle<()>>)>>>,
     /// Cached index of named routes discovered across project / packages / framework.
     /// Populated at init by walking routes/, vendor/*/routes/, and content-matched
     /// vendor PHP files. Replaces the legacy hard-coded route-file scan.
@@ -1937,6 +1992,16 @@ struct LaravelLanguageServer {
     /// index) would flag every lensed symbol with a false "no references"
     /// warning, flooding the Problems panel.
     warm_complete: Arc<std::sync::atomic::AtomicBool>,
+
+    /// `true` while an indexing pass (initial warm OR a `laravel.reindexProject`
+    /// reindex) is running. Guards against concurrent passes: both the startup
+    /// warm and the reindex command claim it via
+    /// [`laravel_lsp::reindex::IndexingFlightGuard`], and a reindex triggered
+    /// while another pass holds it no-ops instead of running two warming
+    /// pipelines over the same shared caches (which would race the
+    /// full-replace magic-member import). The guard clears it on drop, so a
+    /// panicking warming task can't leave it stuck raised.
+    indexing_in_flight: Arc<std::sync::atomic::AtomicBool>,
 
     /// Project-wide index of column/table definitions parsed from
     /// `database/migrations/*.php`. Powers goto-definition on chain literals
@@ -2015,6 +2080,21 @@ struct LaravelLanguageServer {
     /// schedule call cancels the previous timer, so a burst of saves
     /// produces one disk write after the burst settles.
     magic_cache_save_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+
+    /// Session-only LRU of vendor files whose own magic-member usages were
+    /// lazily indexed on `did_open`. The eager build skips vendor files as
+    /// usage *sites*, so find-references would omit a vendor file's own
+    /// occurrence lines — opening one fills that gap via
+    /// [`Self::refresh_file_magic`]. Because `did_close` deliberately never
+    /// evicts (see the note there), these entries would otherwise accumulate
+    /// monotonically; on overflow the OLDEST opened vendor file's session
+    /// contributions are removed again (see
+    /// [`Self::record_vendor_open_magic`]). Tracks ONLY paths added via the
+    /// on-open path — never eager app files or saved files.
+    /// `std::sync::Mutex`, not `RwLock`: `lru` mutates on read to reorder
+    /// recency, and every critical section is a short map op (same rationale
+    /// as the `class_locator` cache).
+    vendor_open_magic_lru: Arc<std::sync::Mutex<lru::LruCache<PathBuf, ()>>>,
     /// Dominant Inertia page extension (`vue` / `tsx` / `jsx` / `svelte`),
     /// detected once at startup by counting files under `resources/js/Pages/`.
     /// Used as the default for the "create page" code action and to break
@@ -2031,6 +2111,15 @@ struct LaravelLanguageServer {
 
 /// Default Salsa debounce delay in milliseconds
 const DEFAULT_SALSA_DEBOUNCE_MS: u64 = 200;
+
+/// Cap on `vendor_open_magic_lru`: how many opened vendor files keep their
+/// on-open magic-member contributions alive at once. Tunable — raising it
+/// trades memory (entries + receiver deps per file) for a longer-lived
+/// session index; 128 comfortably exceeds the number of vendor files a
+/// session realistically has open or recently browsed, so an evicted file
+/// still sitting open in the editor is practically impossible (and even
+/// then, re-opening or saving it re-indexes it).
+const VENDOR_OPEN_MAGIC_LRU_CAP: usize = 128;
 
 // NOTE: Blade directives are now dynamically discovered via get_all_blade_directives()
 // which scans the Laravel framework, app service providers, and packages.
@@ -3052,6 +3141,7 @@ const MAX_CONCURRENT_MAGIC_PARSES: usize = 8;
 /// Shared by the warm build and the debounced incremental rebuild so both run
 /// byte-for-byte the same resolution. Returns empty when the class hierarchy
 /// snapshot is empty (nothing to resolve against).
+#[allow(clippy::too_many_arguments)]
 async fn build_magic_member_entries(
     salsa: &SalsaHandle,
     pattern_cache: &Arc<
@@ -3060,12 +3150,16 @@ async fn build_magic_member_entries(
     root: &Path,
     view_paths: &[PathBuf],
     max_concurrent: usize,
-    // First-load progress handle. Drives the "Building semantic index N of M…"
+    // First-load progress handle. Drives the "Resolving members in N of M…"
     // status while PHP member accesses resolve — the slow phase on big projects
     // that previously ran silently (the file-parse loop has nothing to report
     // on a cache-warm start, so the bar otherwise sits frozen). `None` on the
     // incremental save-refresh path, which has no progress UI.
     mut progress: Option<&mut laravel_lsp::indexing_progress::IndexingProgress>,
+    // Where this phase's slice of the unified progress bar starts: reports
+    // map into `progress_base..=100`, continuing from wherever the parse
+    // phase left the bar instead of restarting at 0%.
+    progress_base: u32,
     // Shared persistent view-var index. The pass-1 build publishes into it
     // wholesale so the incremental save flow (#80) can later update single
     // files and resolve Blade accesses without another project pass.
@@ -3095,38 +3189,67 @@ async fn build_magic_member_entries(
     let implementers = salsa.snapshot_implementers().await.unwrap_or_default();
     let root = root.to_path_buf();
 
+    // One `ClassViewCache` shared across every worker in all three passes.
+    // Before, each `spawn_blocking` built its own, so a class referenced from N
+    // files was analyzed N times (O(n²) — Eloquent `Model`, base controllers,
+    // common traits paid over and over). The cache is now a concurrent
+    // (`DashMap`-backed) memo, so one `Arc` cloned into each worker means each
+    // FQCN is analyzed once *total* for the whole build. Lifetime = this build
+    // pass: it's dropped when the function returns, so the next rebuild starts
+    // cold (edit-freshness across builds is byte-identical to before).
+    let classviews = Arc::new(laravel_lsp::member_resolver::ClassViewCache::new());
+
     // ── Pass 1: build the view-variable index ────────────────────────────
     // Scan non-vendor controllers (PHP with `view()` calls) for render sites,
     // resolving each passed variable's type so Blade accesses can be typed.
-    let view_targets: Vec<PathBuf> = pattern_cache
-        .iter()
-        .filter(|e| {
-            !e.key().components().any(|c| c.as_os_str() == "vendor")
-                && !e.key().to_string_lossy().ends_with(".blade.php")
-                && !e.value().1.views.is_empty()
-        })
-        .map(|e| e.key().clone())
-        .collect();
+    let view_targets: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> =
+        pattern_cache
+            .iter()
+            .filter(|e| {
+                !e.key().components().any(|c| c.as_os_str() == "vendor")
+                    && !e.key().to_string_lossy().ends_with(".blade.php")
+                    && !e.value().1.views.is_empty()
+            })
+            .map(|e| (e.key().clone(), e.value().1.clone()))
+            .collect();
     let mut view_var_index = laravel_lsp::view_var_index::ViewVarIndex::new();
     let mut view_renders: Vec<(PathBuf, Vec<laravel_lsp::view_var_index::ViewRender>)> = Vec::new();
     {
         let vv_sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
         let mut vv_handles = Vec::with_capacity(view_targets.len());
-        for path in view_targets {
+        for (path, data) in view_targets {
             let permit_owner = vv_sem.clone();
             let class_files = class_files.clone();
+            let classviews = classviews.clone();
             let root = root.clone();
             vv_handles.push(tokio::spawn(async move {
                 let _permit = permit_owner.acquire_owned().await.ok()?;
                 tokio::task::spawn_blocking(move || {
-                    let source = std::fs::read_to_string(&path).ok()?;
-                    let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
-                    let renders = laravel_lsp::view_var_index::view_renders_in_file(
-                        &source,
-                        &*class_files,
-                        &mut classviews,
-                        &root,
-                    );
+                    // Evaluate the view-render plans captured at parse — no file
+                    // read. The resolver is the bare class→file map, exactly as
+                    // the tree path passed it (renders never consult the
+                    // container/facade snapshots).
+                    let renders = match data.member_context.as_ref() {
+                        Some(ctx) => laravel_lsp::view_var_index::evaluate_render_plans(
+                            &ctx.view_renders,
+                            &ctx.aliases,
+                            &*class_files,
+                            &classviews,
+                            &root,
+                        ),
+                        // Fallback — not expected for a non-vendor file post-v11
+                        // (capture always runs); re-read + re-parse to stay
+                        // correct if a context is ever absent.
+                        None => {
+                            let source = std::fs::read_to_string(&path).ok()?;
+                            laravel_lsp::view_var_index::view_renders_in_file(
+                                &source,
+                                &*class_files,
+                                &classviews,
+                                &root,
+                            )
+                        }
+                    };
                     (!renders.is_empty()).then_some((path, renders))
                 })
                 .await
@@ -3182,12 +3305,11 @@ async fn build_magic_member_entries(
         let facade_aliases = facade_aliases.clone();
         let macros = macros.clone();
         let implementers = implementers.clone();
+        let classviews = classviews.clone();
         let root = root.clone();
         magic_handles.push(tokio::spawn(async move {
             let _permit = permit_owner.acquire_owned().await.ok()?;
             tokio::task::spawn_blocking(move || {
-                let source = std::fs::read_to_string(&path).ok()?;
-                let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
                 let mut deps = HashSet::new();
                 let resolver = laravel_lsp::member_resolver::SnapshotResolver {
                     class_files,
@@ -3196,23 +3318,53 @@ async fn build_magic_member_entries(
                     macros,
                     implementers,
                 };
-                let mut entries = laravel_lsp::member_resolver::resolve_member_access_entries(
-                    &source,
-                    &data.member_access_refs,
-                    &resolver,
-                    &mut classviews,
-                    &root,
-                    Some(&mut deps),
-                );
-                // Volt SFC `.php` components: index `$this->member` reads under
-                // the component's synthetic key (no-op for plain/model .php).
-                entries.extend(
-                    laravel_lsp::view_var_index::resolve_component_member_accesses(
-                        &path,
-                        &source,
-                        &data.member_access_refs,
-                    ),
-                );
+                // Resolve from the context captured at parse — no file read.
+                let entries = match data.member_context.as_ref() {
+                    Some(ctx) => {
+                        let mut e =
+                            laravel_lsp::member_resolver::resolve_member_access_entries_with_context(
+                                ctx,
+                                &data.member_access_refs,
+                                &resolver,
+                                &classviews,
+                                &root,
+                                Some(&mut deps),
+                            );
+                        // Volt SFC `.php` components: index `$this->member`
+                        // reads under the captured synthetic key.
+                        if let Some(comp) = &ctx.component {
+                            e.extend(
+                                laravel_lsp::view_var_index::resolve_component_member_accesses_with_context(
+                                    comp,
+                                    &path,
+                                    &data.member_access_refs,
+                                ),
+                            );
+                        }
+                        e
+                    }
+                    // Fallback — not expected for a non-vendor file post-v11;
+                    // re-read + re-parse to stay correct if context is absent.
+                    None => {
+                        let source = std::fs::read_to_string(&path).ok()?;
+                        let mut e = laravel_lsp::member_resolver::resolve_member_access_entries(
+                            &source,
+                            &data.member_access_refs,
+                            &resolver,
+                            &classviews,
+                            &root,
+                            Some(&mut deps),
+                        );
+                        e.extend(
+                            laravel_lsp::view_var_index::resolve_component_member_accesses(
+                                &path,
+                                &source,
+                                &data.member_access_refs,
+                            ),
+                        );
+                        e
+                    }
+                };
                 // Keep dep-only files: a file whose every classification
                 // failed still *depends* on those classes — dropping it here
                 // would blind the incremental save flow to exactly the
@@ -3233,11 +3385,18 @@ async fn build_magic_member_entries(
         }
         magic_done += 1;
         if let Some(p) = progress.as_deref_mut() {
-            let pct = ((magic_done.saturating_mul(100) / magic_total.max(1)) as u32).min(100);
+            let pct = laravel_lsp::indexing_progress::weighted_pct(
+                magic_done,
+                magic_total,
+                progress_base,
+                100u32.saturating_sub(progress_base),
+            );
+            // The final report is forced so a sub-throttle finish can't
+            // drop the top-of-slice update and strand the bar mid-slice.
             p.report(
-                format!("Indexing {magic_done} of {magic_total} files…"),
+                format!("Resolving members in {magic_done} of {magic_total} files…"),
                 Some(pct),
-                false,
+                magic_done == magic_total,
             )
             .await;
         }
@@ -3270,11 +3429,11 @@ async fn build_magic_member_entries(
             let implementers = implementers.clone();
             let view_var_index = view_var_index.clone();
             let view_paths = view_paths.clone();
+            let classviews = classviews.clone();
             let root = root.clone();
             blade_handles.push(tokio::spawn(async move {
                 let _permit = permit_owner.acquire_owned().await.ok()?;
                 tokio::task::spawn_blocking(move || {
-                    let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
                     // Container-aware resolver so `app('key')->member` accesses in
                     // Blade/Volt resolve to the bound model during indexing.
                     let resolver = laravel_lsp::member_resolver::SnapshotResolver {
@@ -3284,11 +3443,8 @@ async fn build_magic_member_entries(
                         macros,
                         implementers,
                     };
-                    // A Volt component (own front-matter, or an MFC template
-                    // referencing `$this->`) needs the file source — for property
-                    // typing AND for keying `$this->member` component references.
-                    // Files with no `$this->` (e.g. the ~58k published icon
-                    // templates) read nothing and resolve via the view-var index.
+                    // `$this->…` usage: same test as before (drives MFC prop
+                    // typing) but now off the captured refs, no file read.
                     let uses_this = data
                         .member_access_refs
                         .iter()
@@ -3297,69 +3453,149 @@ async fn build_magic_member_entries(
                             .blade_loops
                             .iter()
                             .any(|l| l.iterable.starts_with("$this->"));
-                    let source = if data.is_volt || uses_this {
-                        std::fs::read_to_string(&path).ok()
-                    } else {
-                        None
-                    };
-
-                    let volt_props = if data.is_volt {
-                        source.as_deref().map(|src| {
-                            laravel_lsp::view_var_index::volt_property_types(
-                                src,
-                                &resolver,
-                                &mut classviews,
-                                &root,
-                            )
-                        })
-                    } else if uses_this {
-                        laravel_lsp::view_var_index::mfc_volt_property_types(
-                            &path,
-                            &resolver,
-                            &mut classviews,
-                            &root,
-                        )
-                    } else {
-                        None
-                    };
 
                     let mut deps = HashSet::new();
-                    let mut entries = if let Some(prop_types) = volt_props {
-                        laravel_lsp::view_var_index::resolve_volt_member_accesses(
-                            &data.member_access_refs,
-                            &prop_types,
-                            &data.blade_loops,
-                            &resolver,
-                            &mut classviews,
-                            &root,
-                            Some(&mut deps),
-                        )
-                    } else {
-                        let view_name =
-                            laravel_lsp::view_var_index::view_name_for_path(&path, &view_paths)?;
-                        laravel_lsp::view_var_index::resolve_blade_member_accesses(
-                            &data.member_access_refs,
-                            &view_name,
-                            &view_var_index,
-                            &data.blade_loops,
-                            &resolver,
-                            &mut classviews,
-                            &root,
-                            Some(&mut deps),
-                        )
+                    // Resolve from captured context when present (the target Blade
+                    // file is NEVER read — only cross-file MFC sibling `.php`
+                    // reads remain, which the spec keeps at resolve). A missing
+                    // context is not expected for a non-vendor Blade file post-v11
+                    // (capture always runs), but — symmetric with Pass 1/2 — we
+                    // re-read + re-parse rather than silently drop the file.
+                    //
+                    // Routing (BOTH branches, mirroring the save-refresh path):
+                    //   is_volt  → ALWAYS the Volt resolver, with an empty prop
+                    //              map when there's no `<?php` front-matter. Never
+                    //              fall to the Blade resolver for an is_volt file:
+                    //              `is_volt` is a raw-byte needle scan, so a stray
+                    //              `computed(`/`form(` in a plain template with no
+                    //              PHP block would otherwise route to Blade here
+                    //              while the save path routes to Volt — and the
+                    //              Blade branch's `view_name_for_path?` could drop
+                    //              the whole file.
+                    //   uses_this→ MFC template: type from the sibling `.php`.
+                    //   else     → controller-rendered Blade (view-var index).
+                    let entries = match data.member_context.as_ref() {
+                        Some(ctx) => {
+                            let volt_props = if data.is_volt {
+                                Some(
+                                    ctx.volt_surface
+                                        .as_ref()
+                                        .map(|s| {
+                                            laravel_lsp::view_var_index::evaluate_volt_surface(
+                                                s,
+                                                &resolver,
+                                                &classviews,
+                                                &root,
+                                            )
+                                        })
+                                        .unwrap_or_default(),
+                                )
+                            } else if uses_this {
+                                laravel_lsp::view_var_index::mfc_volt_property_types(
+                                    &path,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                )
+                            } else {
+                                None
+                            };
+                            let mut e = if let Some(prop_types) = volt_props {
+                                laravel_lsp::view_var_index::resolve_volt_member_accesses_with_context(
+                                    ctx,
+                                    &data.member_access_refs,
+                                    &prop_types,
+                                    &data.blade_loops,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                    Some(&mut deps),
+                                )
+                            } else {
+                                let view_name = laravel_lsp::view_var_index::view_name_for_path(
+                                    &path,
+                                    &view_paths,
+                                )?;
+                                laravel_lsp::view_var_index::resolve_blade_member_accesses_with_context(
+                                    ctx,
+                                    &data.member_access_refs,
+                                    &view_name,
+                                    &view_var_index,
+                                    &data.blade_loops,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                    Some(&mut deps),
+                                )
+                            };
+                            // Component `$this->member` refs (SFC own class from
+                            // the captured members, or MFC sibling read). Additive.
+                            if let Some(comp) = &ctx.component {
+                                e.extend(
+                                    laravel_lsp::view_var_index::resolve_component_member_accesses_with_context(
+                                        comp,
+                                        &path,
+                                        &data.member_access_refs,
+                                    ),
+                                );
+                            }
+                            e
+                        }
+                        None => {
+                            let source = std::fs::read_to_string(&path).ok()?;
+                            let volt_props = if data.is_volt {
+                                Some(laravel_lsp::view_var_index::volt_property_types(
+                                    &source,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                ))
+                            } else if uses_this {
+                                laravel_lsp::view_var_index::mfc_volt_property_types(
+                                    &path,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                )
+                            } else {
+                                None
+                            };
+                            let mut e = if let Some(prop_types) = volt_props {
+                                laravel_lsp::view_var_index::resolve_volt_member_accesses(
+                                    &data.member_access_refs,
+                                    &prop_types,
+                                    &data.blade_loops,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                    Some(&mut deps),
+                                )
+                            } else {
+                                let view_name = laravel_lsp::view_var_index::view_name_for_path(
+                                    &path,
+                                    &view_paths,
+                                )?;
+                                laravel_lsp::view_var_index::resolve_blade_member_accesses(
+                                    &data.member_access_refs,
+                                    &view_name,
+                                    &view_var_index,
+                                    &data.blade_loops,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                    Some(&mut deps),
+                                )
+                            };
+                            e.extend(
+                                laravel_lsp::view_var_index::resolve_component_member_accesses(
+                                    &path,
+                                    &source,
+                                    &data.member_access_refs,
+                                ),
+                            );
+                            e
+                        }
                     };
-                    // Component `$this->member` references (SFC own class, or MFC
-                    // sibling). Additive — these are component-self refs, not
-                    // model/view-var resolutions.
-                    if let Some(src) = &source {
-                        entries.extend(
-                            laravel_lsp::view_var_index::resolve_component_member_accesses(
-                                &path,
-                                src,
-                                &data.member_access_refs,
-                            ),
-                        );
-                    }
                     // Dep-only files stay — see the pass-2 comment.
                     (!entries.is_empty() || !deps.is_empty()).then_some((path, entries, deps))
                 })
@@ -3374,6 +3610,16 @@ async fn build_magic_member_entries(
             }
         }
     }
+
+    // Cache effectiveness: `misses` is the number of distinct FQCNs analyzed
+    // for the whole build; `hits` is every lookup that reused a prior analysis.
+    // A high hit ratio is the shared cache doing its job — an ancestor class /
+    // model is analyzed once total instead of once per referencing file.
+    info!(
+        "🪄 magic build ClassViewCache: {} distinct classes analyzed, {} cache hits",
+        classviews.misses(),
+        classviews.hits(),
+    );
 
     laravel_lsp::magic_disk_cache::MagicCacheData {
         entries: magic_entries,
@@ -3847,9 +4093,11 @@ impl LaravelLanguageServer {
         };
 
         if items.is_empty() {
-            // Distinguish two empty-result causes for the log/diagnostic:
-            // (a) DB is unreachable — actionable, user can fix .env. Show a
-            //     one-time INFO toast so they discover the dependency.
+            // Distinguish two empty-result causes for the log:
+            // (a) DB is unreachable — the user was already notified by the
+            //     circuit-breaker toast when the outage began (one per
+            //     outage episode, wired in init_database_schema_provider),
+            //     so just log here.
             // (b) DB is reachable but the specific table/columns aren't in
             //     the introspected schema (e.g., user typed a typo, table
             //     was dropped, schema cache stale). Stay silent — toasting
@@ -3863,7 +4111,6 @@ impl LaravelLanguageServer {
                      DB connection error: {}",
                     ctx.expecting, error.message
                 );
-                self.maybe_notify_db_unreachable(&error.message).await;
             } else {
                 info!(
                     "🔗 chain completion: matched {:?} but produced 0 items — \
@@ -4060,47 +4307,6 @@ impl LaravelLanguageServer {
         }
     }
 
-    /// Send a one-time notification informing the user that table and
-    /// column autocomplete requires a working DB connection. Shares the
-    /// `database_diagnostic_shown` flag with the existing exists:/unique:
-    /// diagnostic path, so the user only sees ONE notification per LSP
-    /// session no matter how they hit the unreachable DB.
-    ///
-    /// Uses `window/showMessageRequest` (with a Dismiss action) rather than
-    /// `window/showMessage` because the latter auto-dismisses after a few
-    /// seconds — the user may not even see it if they're typing. With an
-    /// action button, the notification stays until they explicitly click it.
-    async fn maybe_notify_db_unreachable(&self, error_message: &str) {
-        let mut shown = self.database_diagnostic_shown.write().await;
-        if *shown {
-            return;
-        }
-        *shown = true;
-        drop(shown);
-
-        let message = format!(
-            "Laravel: Database is unreachable, so table and column \
-             autocompletion is disabled. Fix DB connectivity in .env \
-             (DB_HOST / DB_PORT / credentials) and reload the window to \
-             enable. Error: {error_message}"
-        );
-        let actions = vec![tower_lsp::lsp_types::MessageActionItem {
-            title: "Dismiss".to_string(),
-            properties: Default::default(),
-        }];
-        // We don't care about the response — the only action is "Dismiss".
-        // The point of using show_message_request is that the notification
-        // persists until the user clicks.
-        let _ = self
-            .client
-            .show_message_request(
-                tower_lsp::lsp_types::MessageType::WARNING,
-                message,
-                Some(actions),
-            )
-            .await;
-    }
-
     fn new(client: Client) -> Self {
         Self {
             client,
@@ -4114,6 +4320,7 @@ impl LaravelLanguageServer {
             pending_rescans: Arc::new(RwLock::new(HashSet::new())),
             rescan_debounce_handle: Arc::new(RwLock::new(None)),
             magic_rebuild_handle: Arc::new(RwLock::new(None)),
+            magic_batch_state: Arc::new(tokio::sync::Mutex::new(WatchedBatchState::default())),
             file_exists_cache: Arc::new(RwLock::new(HashMap::new())),
             cached_config: Arc::new(RwLock::new(None)),
             cached_livewire: Arc::new(RwLock::new(None)),
@@ -4128,9 +4335,10 @@ impl LaravelLanguageServer {
             cached_validation_rule_names: Arc::new(RwLock::new(Vec::new())),
             cached_directive_names: Arc::new(RwLock::new(None)),
             database_schema: Arc::new(RwLock::new(None)),
-            database_diagnostic_shown: Arc::new(RwLock::new(false)),
+            db_provider_task: Arc::new(tokio::sync::Mutex::new(None)),
             route_index: Arc::new(RwLock::new(None)),
             warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            indexing_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_index: Arc::new(RwLock::new(None)),
             command_index: Arc::new(RwLock::new(None)),
             vendor_translation_namespaces: Arc::new(RwLock::new(None)),
@@ -4143,6 +4351,9 @@ impl LaravelLanguageServer {
                 laravel_lsp::view_var_index::ViewVarIndex::new(),
             )),
             magic_cache_save_handle: Arc::new(RwLock::new(None)),
+            vendor_open_magic_lru: Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(VENDOR_OPEN_MAGIC_LRU_CAP).unwrap(),
+            ))),
             inertia_default_ext: Arc::new(RwLock::new(None)),
         }
     }
@@ -4346,6 +4557,88 @@ impl LaravelLanguageServer {
         }
     }
 
+    /// Run a full cold reindex in response to the `laravel.reindexProject`
+    /// command (dispatched by the "Laravel: Reindex project" code action).
+    ///
+    /// "Cold" means every cached artifact is thrown away and rebuilt from
+    /// source, in this order:
+    ///
+    /// 1. **Claim the indexing-flight guard.** If another pass — the startup
+    ///    warm or a prior reindex — already holds it, this trigger no-ops:
+    ///    two warming pipelines over the same shared caches would race the
+    ///    full-replace magic-member import. The guard releases on drop, so
+    ///    the flag can't stick if a warming task panics.
+    /// 2. **Wipe the on-disk caches** (pattern, magic, command, config,
+    ///    vendor) so the warming pass restores nothing and re-parses all.
+    /// 3. **Reset the process-global memos** (class locator, parsed-file) so
+    ///    no stale walk result or parse survives the rebuild.
+    /// 4. **Clear the in-memory indexes** (pattern cache, symbol index, class
+    ///    hierarchy, per-file LRU caches) so warming re-parses every file.
+    /// 5. **Re-run the standard registration + warming pipeline** with a
+    ///    work-done progress bar, holding the guard until warming completes.
+    ///
+    /// Reuses the existing warming pipeline ([`Self::register_project_files_with_salsa`])
+    /// rather than duplicating the parse/build logic.
+    async fn trigger_reindex(&self) {
+        // 1. Serialize against any other indexing pass.
+        let Some(guard) =
+            laravel_lsp::reindex::IndexingFlightGuard::try_acquire(self.indexing_in_flight.clone())
+        else {
+            info!("🔁 Reindex requested but an indexing pass is already running — ignoring");
+            return;
+        };
+
+        let Some(root) = self.root_path.read().await.clone() else {
+            info!("🔁 Reindex requested but no project root is set — ignoring");
+            return; // guard drops here, releasing the flag
+        };
+
+        info!("🔁 Reindex: full cold rebuild of {:?}", root);
+
+        // Suppress the unused-symbol diagnostic while the reference indexes are
+        // torn down and rebuilt — the warming task flips this back to `true`
+        // when it finishes (mirrors the startup gate). Without this, a
+        // diagnostics pass during the rebuild would see an empty index and
+        // flag every lensed symbol as unused.
+        self.warm_complete
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // 2. Disk caches — blocking filesystem I/O, so off the async runtime.
+        let root_for_clear = root.clone();
+        match tokio::task::spawn_blocking(move || {
+            laravel_lsp::cache_manager::clear_disk_caches(&root_for_clear)
+        })
+        .await
+        {
+            Ok(Ok(())) => info!("🔁 Reindex: disk caches cleared"),
+            Ok(Err(e)) => warn!("🔁 Reindex: clearing disk caches failed: {}", e),
+            Err(e) => warn!("🔁 Reindex: disk-cache clear task panicked: {}", e),
+        }
+
+        // 3. Process-global memos (both promoted from test-only to production
+        // callers for exactly this reset).
+        laravel_lsp::class_locator::reset_locator_cache();
+        laravel_lsp::laravel_introspector::chain::reset_parsed_file_cache();
+
+        // 4. In-memory actor indexes — one message for an atomic wipe.
+        if let Err(e) = self.salsa.clear_reindex_state().await {
+            warn!("🔁 Reindex: clearing in-memory indexes failed: {}", e);
+        }
+
+        // 5. Re-run the standard pipeline with progress, handing the guard to
+        // the warming task so the flag stays raised until warming completes.
+        let progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
+            self.client.clone(),
+            laravel_lsp::indexing_progress::INDEXING_TOKEN,
+            "Laravel",
+            "Reindexing project…",
+            Some(0),
+        )
+        .await;
+        self.register_project_files_with_salsa(&root, progress, Some(guard))
+            .await;
+    }
+
     /// Register project files with Salsa for reference finding
     ///
     /// This scans key directories (controllers, views, Livewire, routes) and
@@ -4353,13 +4646,27 @@ impl LaravelLanguageServer {
     /// cache parsed patterns for efficient reference lookups.
     /// Register the project's PHP/Blade files with Salsa and kick off the
     /// pattern-cache warming task. If `progress` is provided it'll drive the
-    /// "Discovering files" → "Indexing X of N" → "Indexed" status-bar updates;
+    /// "Loading N of M cached entries" → "Parsing X of N" → "Resolving
+    /// members in X of N" → "Indexed" status-bar updates (one monotonic
+    /// 0→100% bar — the phases fill disjoint slices split per branch: cold
+    /// is parse-dominant (`0..PARSE_SPAN..100`), warm is load- and
+    /// re-resolve-dominant (`LOAD_SPAN`, `WARM_PARSE_TOP`,
+    /// `WARM_RESOLVE_BASE`); see the slice map in `indexing_progress`);
     /// pass `None` from any code path that just needs the registration done
     /// without UI (e.g. re-registration after a config change).
+    ///
+    /// `guard`, when present, is the [`laravel_lsp::reindex::IndexingFlightGuard`]
+    /// claimed by the caller (startup warm or the reindex command). It's moved
+    /// into the spawned warming task and dropped when warming completes, so the
+    /// "indexing in flight" flag stays raised for the whole pass — not just the
+    /// synchronous registration prefix — and a concurrent reindex trigger
+    /// no-ops until warming finishes. Callers that don't serialize (the
+    /// config-change re-register) pass `None`.
     async fn register_project_files_with_salsa(
         &self,
         root_path: &Path,
         progress: Option<laravel_lsp::indexing_progress::IndexingProgress>,
+        guard: Option<laravel_lsp::reindex::IndexingFlightGuard>,
     ) {
         let config = match self.get_cached_config().await {
             Some(c) => c,
@@ -4429,17 +4736,75 @@ impl LaravelLanguageServer {
         let pattern_cache = self.salsa.pattern_cache();
         let root_for_load = root_path.to_path_buf();
         let cache_for_load = pattern_cache.clone();
-        let load_result = tokio::task::spawn_blocking(move || {
-            laravel_lsp::pattern_disk_cache::load_into(&cache_for_load, &root_for_load)
-        })
-        .await
-        .unwrap_or_default();
+        // The load is a sync, parallel (rayon) pass over ~40k cache
+        // entries — a multi-second stall on a cold FS that previously ran
+        // under a single static "Loading cached index…" message and read
+        // as frozen. It publishes live counts into `load_progress`; a
+        // concurrent throttled reporter here renders them into the load
+        // slice (0..LOAD_SPAN) while the blocking task runs. spawn_blocking
+        // keeps the rayon pass off the async runtime; the select loop lets
+        // the reporter fire on a timer without blocking the load.
+        let load_progress = Arc::new(laravel_lsp::pattern_disk_cache::LoadProgress::default());
+        let lp_for_task = load_progress.clone();
+        let mut load_task = tokio::task::spawn_blocking(move || {
+            laravel_lsp::pattern_disk_cache::load_into_reporting(
+                &cache_for_load,
+                &root_for_load,
+                Some(lp_for_task.as_ref()),
+            )
+        });
+        let load_result = loop {
+            tokio::select! {
+                res = &mut load_task => break res.unwrap_or_default(),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {
+                    if let Some(p) = progress.as_mut() {
+                        let total = load_progress.total.load(std::sync::atomic::Ordering::Relaxed);
+                        // total stays 0 until the cache is decoded (and on a
+                        // cold start with no cache it never moves) — only
+                        // report once there's a real denominator.
+                        if total > 0 {
+                            let done =
+                                load_progress.done.load(std::sync::atomic::Ordering::Relaxed);
+                            let pct = laravel_lsp::indexing_progress::weighted_pct(
+                                done,
+                                total,
+                                0,
+                                laravel_lsp::indexing_progress::LOAD_SPAN,
+                            );
+                            p.report(
+                                format!("Loading {done} of {total} cached entries…"),
+                                Some(pct),
+                                false,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        };
         let (restored, dropped) = (load_result.restored, load_result.dropped);
         if restored + dropped > 0 {
             info!(
                 "🗄️  Disk cache: restored {} fresh entries, dropped {} stale",
                 restored, dropped
             );
+        }
+        // Complete the load slice cleanly: the final throttled report above
+        // may have been dropped, and a warm reload's parse phase starts at
+        // LOAD_SPAN — a forced report guarantees the bar reaches the
+        // hand-off. Gated on `restored > 0` (not `restored + dropped`): the
+        // warm parse base is LOAD_SPAN only when entries were restored, so
+        // an all-dropped reload stays a cold start and this must NOT jump
+        // the bar to LOAD_SPAN ahead of a parse phase that begins at 0.
+        if restored > 0 {
+            if let Some(p) = progress.as_mut() {
+                p.report(
+                    format!("Loaded {restored} cached entries."),
+                    Some(laravel_lsp::indexing_progress::LOAD_SPAN),
+                    true,
+                )
+                .await;
+            }
         }
         // Re-import the restored files' class-hierarchy nodes. Without this the
         // hierarchy index is empty on a warm start (no parse runs for
@@ -4518,10 +4883,25 @@ impl LaravelLanguageServer {
         // For the granular restore's per-file re-resolution (it reuses the
         // same machinery as the save-time dependents pass).
         let server_for_warm = self.clone_for_spawn();
+        // Did the disk-cache load slice actually run? True whenever the
+        // cache existed and was scanned — restored OR dropped — because the
+        // load reporter advances the bar over `0..LOAD_SPAN` for every
+        // decoded entry regardless of freshness. The warming task keys its
+        // parse-slice *base* off this (not off `cached_hits`): on an
+        // all-dropped reload the load slice climbed to LOAD_SPAN but
+        // nothing was restored, so parsing must CONTINUE from LOAD_SPAN
+        // rather than snap back to 0.
+        let cache_scanned = restored + dropped > 0;
         tokio::spawn(async move {
             // `progress` moves into this task — when warming finishes (or
             // hits an early return) we call `end` to clear the status bar.
             let mut progress = progress;
+            // The indexing-flight guard (if any) moves in too and is dropped
+            // when this task returns — by any path, including the early
+            // returns below — releasing the "indexing in flight" flag only
+            // once warming has actually completed. `_` because we never touch
+            // it; we just tie its lifetime to the task.
+            let _indexing_guard = guard;
             let started_at = std::time::Instant::now();
 
             // Defensively prewarm the global query cache on this thread
@@ -4533,15 +4913,6 @@ impl LaravelLanguageServer {
             tokio::task::spawn_blocking(laravel_lsp::queries::prewarm_query_cache)
                 .await
                 .ok();
-
-            // Discovery is done — transition to "Indexing" phase. Forced
-            // so the user sees the phase change even if the throttle
-            // would otherwise drop it.
-            if let Some(p) = progress.as_mut() {
-                // Parse phase transition: still at 0% — the per-file
-                // updates below increment from here to 100.
-                p.report("Indexing project files…", Some(0), true).await;
-            }
 
             let paths = match salsa.list_project_files().await {
                 Ok(p) => p,
@@ -4575,16 +4946,41 @@ impl LaravelLanguageServer {
                     cached_hits, to_parse
                 );
             }
+            // Parse slice `parse_base..parse_top` of the unified bar, chosen
+            // from two independent signals (see `parse_slice`): the base
+            // continues the load slice when the cache was scanned (so an
+            // all-dropped reload doesn't snap the bar back to 0), the top
+            // reflects how much is being re-parsed. Three shapes: fully-warm
+            // → LOAD_SPAN..WARM_PARSE_TOP; all-dropped → LOAD_SPAN..PARSE_SPAN;
+            // fully-cold → 0..PARSE_SPAN.
+            let (parse_base, parse_top) =
+                laravel_lsp::indexing_progress::parse_slice(cache_scanned, cached_hits > 0);
+
+            // Discovery is done — transition to the parse phase. Forced so
+            // the user sees the phase change even if the throttle would
+            // drop it. Reported at `parse_base` (not 0) so a warm reload
+            // continues from where the load slice left the bar instead of
+            // resetting to 0%.
+            if let Some(p) = progress.as_mut() {
+                p.report("Parsing project files…", Some(parse_base), true)
+                    .await;
+            }
 
             let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
 
-            // Spawn one task per file we still need to parse. The
+            // Per-phase wall-clock for the summary log below — the
+            // parse/resolve ratio it reports is what PARSE_SPAN (the
+            // progress-bar split) is tuned against.
+            let parse_started = std::time::Instant::now();
+
+            // Spawn one task per file we still need to parse into a
+            // JoinSet, which we drain in COMPLETION order below. The
             // semaphore ensures we never have more than N parses running
             // (or holding parsed-tree memory) at once.
-            let mut handles = Vec::with_capacity(to_parse);
+            let mut parse_set = tokio::task::JoinSet::new();
             for path in paths_to_parse {
                 let permit_owner = semaphore.clone();
-                handles.push(tokio::spawn(async move {
+                parse_set.spawn(async move {
                     let _permit = match permit_owner.acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => return None,
@@ -4650,48 +5046,69 @@ impl LaravelLanguageServer {
                     .ok()
                     .flatten();
                     parsed.map(|(data, nodes)| (path, data, nodes))
-                }));
+                });
             }
 
-            // Collect all parse results into a single buffer, then bulk-
-            // import directly into the shared DashMap-backed pattern cache
-            // via SalsaHandle::bulk_import_patterns. That call bypasses
-            // the actor's mpsc channel entirely — see the comment on
-            // SalsaActor::pattern_cache and SalsaHandle::bulk_import_patterns
+            // Drain the JoinSet in COMPLETION order into a single buffer,
+            // then bulk-import directly into the shared DashMap-backed
+            // pattern cache via SalsaHandle::bulk_import_patterns. That call
+            // bypasses the actor's mpsc channel entirely — see the comment
+            // on SalsaActor::pattern_cache and SalsaHandle::bulk_import_patterns
             // for the architectural why. With this path: warming on a
             // 40k-file project takes ~7s wall (~6.5s parse + ~10ms import).
             //
-            // Progress reports are emitted as each handle completes. The
-            // IndexingProgress helper throttles internally so we don't
-            // need to be careful about emitting every iteration.
+            // `join_next` yields each task AS IT FINISHES, not in spawn
+            // order. This is load-bearing for the progress bar: awaiting the
+            // handles in spawn order stalled `completed` on the first slow
+            // file (this project has 6–23 MB seeder files that parse for
+            // seconds), freezing the bar mid-slice while the fast files
+            // finished invisibly in the background, then draining the
+            // backlog in one jump. Completion-order draining lets every
+            // finished file advance the bar smoothly regardless of size or
+            // spawn position. The buffer still gathers every result (order
+            // doesn't matter — it's bulk-imported as a set).
             let mut buffer: Vec<(
                 PathBuf,
                 Arc<laravel_lsp::salsa_impl::ParsedPatternsData>,
                 Vec<laravel_lsp::class_hierarchy_index::ClassNode>,
             )> = Vec::with_capacity(to_parse);
             let mut completed = 0usize;
-            for h in handles {
-                if let Ok(Some(pair)) = h.await {
+            while let Some(res) = parse_set.join_next().await {
+                if let Ok(Some(pair)) = res {
                     buffer.push(pair);
                 }
                 completed += 1;
                 if let Some(p) = progress.as_mut() {
                     // Progress is over the files we're actually parsing
                     // this session, not the total project size. Showing
-                    // "Indexing 12 of 12 files" after a warm restart
+                    // "Parsing 12 of 12 files" after a warm restart
                     // gives accurate feedback for the work in progress;
                     // the user already saw the cached restore land in
                     // the "Loading cached index…" step before this.
-                    let denom = to_parse.max(1);
-                    let pct = ((completed.saturating_mul(100) / denom) as u32).min(100);
+                    //
+                    // The parse loop owns the parse_base..parse_top slice of
+                    // the unified bar (branch-weighted above); the phases
+                    // below continue from parse_top, so the bar fills 0→100
+                    // monotonically instead of resetting between phases.
+                    // The final report is forced: a warm reload parses its
+                    // handful of files in a sub-throttle burst, and if the
+                    // `completed == to_parse` report were dropped the bar
+                    // would stick mid-slice for the whole post-parse tail.
+                    let pct = laravel_lsp::indexing_progress::weighted_pct(
+                        completed,
+                        to_parse,
+                        parse_base,
+                        parse_top - parse_base,
+                    );
                     p.report(
-                        format!("Indexing {} of {} files…", completed, to_parse),
+                        format!("Parsing {} of {} files…", completed, to_parse),
                         Some(pct),
-                        false,
+                        completed == to_parse,
                     )
                     .await;
                 }
             }
+            let parse_elapsed = parse_started.elapsed();
             // Split the combined parse results: patterns go to the shared
             // cache, class-hierarchy nodes to the actor-owned index. Files
             // with no class declarations contribute no hierarchy entry.
@@ -4714,27 +5131,63 @@ impl LaravelLanguageServer {
 
             // Persist the entire live pattern_cache (cached restores +
             // freshly parsed entries) so the next LSP startup can skip
-            // most of the work. Runs on the blocking pool because it's
-            // sync I/O — and we don't gate user-visible warming
-            // completion on it; the save just runs and logs its outcome.
-            let cache_for_save = pattern_cache_for_warm.clone();
-            let root_for_save_inner = root_for_save.clone();
-            // Snapshot the (now fully populated: restored + freshly parsed)
-            // hierarchy so it's persisted alongside the patterns and survives
-            // the next warm restart.
-            let hierarchy_for_save = salsa.snapshot_hierarchy_nodes().await.unwrap_or_default();
-            let save_result = tokio::task::spawn_blocking(move || {
-                laravel_lsp::pattern_disk_cache::save_from(
-                    &cache_for_save,
-                    &hierarchy_for_save,
-                    &root_for_save_inner,
-                )
-            })
-            .await;
-            match save_result {
-                Ok(Ok(n)) => info!("🗄️  Disk cache: saved {} entries", n),
-                Ok(Err(e)) => debug!("Disk cache save failed: {}", e),
-                Err(e) => debug!("Disk cache save task panicked: {}", e),
+            // most of the work. Skipped on a no-change reload: when this
+            // session parsed nothing (`to_parse == 0`) and the disk
+            // restore dropped no stale entries (`dropped == 0`), the
+            // in-memory cache is exactly what's already on disk, and the
+            // full stat + clone + encode + rewrite pass would persist
+            // nothing new. Any fresh parse or dropped entry disables the
+            // skip, so real changes are always saved.
+            //
+            // When it runs, the save is SPAWNED fire-and-forget and does
+            // NOT gate completion: on a cold reindex the encode + write of
+            // ~47k M1-inflated entries takes ~42s, and blocking `end()` on
+            // it made the whole index look like it took 96s when the actual
+            // parse + resolve finished in ~54s. The magic phase and `end()`
+            // now proceed immediately; the cache persists in the background.
+            // No progress phase is shown for it — the bar flows parse →
+            // magic → end without a save step.
+            //
+            // Concurrency: two saves can overlap (a reindex fires while a
+            // prior background save is still writing), so `save_from` writes
+            // to a per-call unique temp file and atomically renames it onto
+            // the cache path — last writer wins on a complete, valid file;
+            // neither can observe the other's partial bytes.
+            //
+            // Durability: a process exit mid-save loses that save. That's
+            // fine — the cache is advisory; the next startup just re-parses
+            // what wasn't persisted.
+            if to_parse == 0 && dropped == 0 {
+                info!("🗄️  Disk cache: unchanged since last save, skipping rewrite");
+            } else {
+                let cache_for_save = pattern_cache_for_warm.clone();
+                let root_for_save_inner = root_for_save.clone();
+                // Clone the actor handle into the background task so the
+                // hierarchy snapshot (its only critical-path cost otherwise)
+                // also happens off the warming path.
+                let salsa_for_save = salsa.clone();
+                tokio::spawn(async move {
+                    // Snapshot the (now fully populated: restored + freshly
+                    // parsed) hierarchy so it's persisted alongside the
+                    // patterns and survives the next warm restart.
+                    let hierarchy_for_save = salsa_for_save
+                        .snapshot_hierarchy_nodes()
+                        .await
+                        .unwrap_or_default();
+                    let save_result = tokio::task::spawn_blocking(move || {
+                        laravel_lsp::pattern_disk_cache::save_from(
+                            &cache_for_save,
+                            &hierarchy_for_save,
+                            &root_for_save_inner,
+                        )
+                    })
+                    .await;
+                    match save_result {
+                        Ok(Ok(n)) => info!("🗄️  Disk cache: saved {} entries (background)", n),
+                        Ok(Err(e)) => debug!("Disk cache save failed: {}", e),
+                        Err(e) => debug!("Disk cache save task panicked: {}", e),
+                    }
+                });
             }
 
             // Build the inverted symbol index now that pattern_cache
@@ -4766,6 +5219,16 @@ impl LaravelLanguageServer {
             // (~135s on a real app) after any edit-then-restart.
             // Disk read on the blocking pool so it never stalls the async
             // runtime (the file can be large on a big project).
+            //
+            // The restore (read + decode + prune) is one opaque blocking
+            // op with no per-item hook — a forced phase report at the
+            // parse boundary keeps the bar showing live text instead of
+            // reading as dead while it runs.
+            if let Some(p) = progress.as_mut() {
+                p.report("Restoring member index…", Some(parse_top), true)
+                    .await;
+            }
+            let magic_started = std::time::Instant::now();
             let restored = {
                 let root_for_load = root_for_save.clone();
                 tokio::task::spawn_blocking(move || {
@@ -4784,6 +5247,11 @@ impl LaravelLanguageServer {
                 .flatten()
             };
             if let Some((data, evicted)) = restored {
+                // Warm reload: the granular re-resolve below owns the
+                // rest of the bar. Clamped to the parse slice's actual
+                // top so a cold-parse/warm-magic mix (pattern cache
+                // stale, magic cache fresh) can't jump the bar backwards.
+                let resolve_base = parse_top.max(laravel_lsp::indexing_progress::WARM_RESOLVE_BASE);
                 if evicted > 0 {
                     info!(
                         "🪄 Magic-member restore: evicted {} deleted file(s) from cache",
@@ -4813,6 +5281,13 @@ impl LaravelLanguageServer {
                     .filter(|(path, _)| changed_set.contains(path))
                     .flat_map(|(_, renders)| renders.iter().map(|r| r.view_name.clone()))
                     .collect();
+                // Bulk import is the next opaque op — advance the bar to
+                // the resolve base with a forced phase message so the
+                // hand-off into the re-resolve slice stays visible.
+                if let Some(p) = progress.as_mut() {
+                    p.report("Importing member index…", Some(resolve_base), true)
+                        .await;
+                }
                 match import_magic_data(&salsa, &magic_deps_for_warm, entries).await {
                     Ok(n) => info!("🪄 Magic-member index: {} entries (restored from disk)", n),
                     Err(e) => debug!("Magic-member restore import failed: {}", e),
@@ -4872,7 +5347,11 @@ impl LaravelLanguageServer {
                             "🪄 Granular magic restore: re-resolving {} changed/dependent file(s)",
                             work.len()
                         );
-                        server_for_warm.refresh_files_magic(work).await;
+                        // The dominant warm phase — it drives the
+                        // resolve_base..=100 slice of the unified bar.
+                        server_for_warm
+                            .refresh_files_magic(work, progress.as_mut(), resolve_base)
+                            .await;
                     }
                 }
                 // Deleted files were pruned from the live index above; the
@@ -4880,6 +5359,15 @@ impl LaravelLanguageServer {
                 // the cleaned set here to converge the on-disk cache (#67).
                 if evicted > 0 {
                     server_for_warm.schedule_magic_cache_save().await;
+                }
+                // Walk the bar to 100 unconditionally: on a no-change
+                // reload the granular re-resolve above has no work (so
+                // nothing else fills the resolve slice), and when it did
+                // run its last throttled report may have been dropped.
+                // One forced report guarantees completion either way.
+                if let Some(p) = progress.as_mut() {
+                    p.report("Restored member index from cache.", Some(100), true)
+                        .await;
                 }
             } else {
                 // Resolve fresh, drive progress (the file-parse loop had nothing
@@ -4894,10 +5382,19 @@ impl LaravelLanguageServer {
                     &view_paths_for_warm,
                     MAX_CONCURRENT_PARSES,
                     progress.as_mut(),
+                    parse_top,
                     &view_vars_for_warm,
                 )
                 .await;
                 if !magic_data.entries.is_empty() {
+                    // The resolve loop above filled the bar to 100; the
+                    // save + import below are opaque bulk ops that can
+                    // still take seconds on a big project, so forced
+                    // phase messages keep the (full) bar showing live
+                    // text until `end()`.
+                    if let Some(p) = progress.as_mut() {
+                        p.report("Saving member index…", Some(100), true).await;
+                    }
                     // Persist on the blocking pool (sync I/O), handing the
                     // data back so the import below still owns it — no clone.
                     let root_for_msave = root_for_save.clone();
@@ -4920,6 +5417,9 @@ impl LaravelLanguageServer {
                             Default::default()
                         }
                     };
+                    if let Some(p) = progress.as_mut() {
+                        p.report("Importing member index…", Some(100), true).await;
+                    }
                     match import_magic_data(&salsa, &magic_deps_for_warm, magic_data.entries).await
                     {
                         Ok(n) => info!("🪄 Magic-member index: {} entries", n),
@@ -4927,6 +5427,7 @@ impl LaravelLanguageServer {
                     }
                 }
             }
+            let magic_elapsed = magic_started.elapsed();
             // The reference indexes are built — ask the client to refresh code
             // lenses requested while warming was still in progress (those
             // resolved against an empty index and read 0). Fire-and-forget, so
@@ -4942,8 +5443,8 @@ impl LaravelLanguageServer {
 
             let elapsed = started_at.elapsed();
             info!(
-                "🔥 Laravel: pattern cache warmed ({} newly parsed, {} from disk, total {}, in {:?})",
-                imported, cached_hits, total, elapsed
+                "🔥 Laravel: pattern cache warmed ({} newly parsed, {} from disk, total {}, in {:?}; parse {:?}, magic-resolve {:?})",
+                imported, cached_hits, total, elapsed, parse_elapsed, magic_elapsed
             );
 
             if let Some(p) = progress {
@@ -5954,11 +6455,15 @@ impl LaravelLanguageServer {
             return; // body-only edit — nothing beyond this file can change
         }
 
-        // The ripple runs in the background so did_save returns promptly.
+        // The ripple runs in the background so did_save returns promptly. The
+        // saved file was already refreshed by the per-file pass above, so it's
+        // the sole exclusion here.
         let server = self.clone_for_spawn();
+        let mut already_refreshed = HashSet::new();
+        already_refreshed.insert(path.clone());
         tokio::spawn(async move {
             server
-                .refresh_magic_dependents(&path, changed_classes, changed_views)
+                .refresh_magic_dependents(&already_refreshed, changed_classes, changed_views)
                 .await;
         });
     }
@@ -5972,9 +6477,14 @@ impl LaravelLanguageServer {
     /// semaphore keeps CPU bounded throughout. (An earlier revision fell
     /// back to the full rebuild above 500 dependents; on a real project
     /// that fallback *was* the long re-index it existed to prevent.)
+    ///
+    /// `already_refreshed` are the files the caller has *itself* re-resolved
+    /// this pass (the saved file on the save path; every changed present file
+    /// on the watched-batch path) — they're removed from the work set so a
+    /// file already converged isn't parsed twice.
     async fn refresh_magic_dependents(
         &self,
-        saved: &Path,
+        already_refreshed: &HashSet<PathBuf>,
         changed_classes: Vec<String>,
         changed_views: Vec<String>,
     ) {
@@ -6016,7 +6526,9 @@ impl LaravelLanguageServer {
             }
         }
 
-        work.remove(saved); // already refreshed by the per-file pass
+        for p in already_refreshed {
+            work.remove(p); // already refreshed by the caller's per-file pass
+        }
         if work.is_empty() {
             return;
         }
@@ -6024,14 +6536,27 @@ impl LaravelLanguageServer {
             "🪄 Incremental magic refresh: re-resolving {} dependent file(s)",
             work.len()
         );
-        self.refresh_files_magic(work).await;
+        // No progress UI on the incremental path — this runs behind
+        // did_save, not the startup indexing bar.
+        self.refresh_files_magic(work, None, 0).await;
     }
 
     /// Re-resolve a set of files through the per-file magic refresh at
     /// bounded concurrency. Shared by the save-time dependents pass and the
     /// granular startup restore (#80). Open buffers are authoritative;
     /// everything else reads from disk on the blocking pool.
-    async fn refresh_files_magic(&self, work: HashSet<PathBuf>) {
+    ///
+    /// `progress` drives the `progress_base..=100` slice of the unified
+    /// indexing bar on the warm-startup call — the dominant warm phase,
+    /// which previously ran silent and read as a frozen bar. The
+    /// incremental save-refresh callers have no progress UI and pass
+    /// `None` (base then unused).
+    async fn refresh_files_magic(
+        &self,
+        work: HashSet<PathBuf>,
+        mut progress: Option<&mut laravel_lsp::indexing_progress::IndexingProgress>,
+        progress_base: u32,
+    ) {
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MAGIC_PARSES));
         let mut handles = Vec::with_capacity(work.len());
         for dep in work {
@@ -6039,33 +6564,33 @@ impl LaravelLanguageServer {
             let permit_owner = sem.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = permit_owner.acquire_owned().await.ok()?;
-                let buffered = match Url::from_file_path(&dep) {
-                    Ok(url) => server
-                        .documents
-                        .read()
-                        .await
-                        .get(&url)
-                        .map(|(content, _)| content.clone()),
-                    Err(()) => None,
-                };
-                let content = match buffered {
-                    Some(c) => c,
-                    None => {
-                        let dep_for_read = dep.clone();
-                        tokio::task::spawn_blocking(move || {
-                            std::fs::read_to_string(&dep_for_read).ok()
-                        })
-                        .await
-                        .ok()
-                        .flatten()?
-                    }
-                };
+                let content = server.read_file_for_magic(&dep).await?;
                 server.refresh_file_magic(&dep, &content).await;
                 Some(())
             }));
         }
+        let total = handles.len();
+        let mut done = 0usize;
         for h in handles {
             let _ = h.await;
+            done += 1;
+            if let Some(p) = progress.as_deref_mut() {
+                let pct = laravel_lsp::indexing_progress::weighted_pct(
+                    done,
+                    total,
+                    progress_base,
+                    100u32.saturating_sub(progress_base),
+                );
+                // Throttled: the warm caller posts a forced 100% report
+                // right after this returns, so a dropped final update
+                // here can't strand the bar.
+                p.report(
+                    format!("Resolving members in {done} of {total} files…"),
+                    Some(pct),
+                    false,
+                )
+                .await;
+            }
         }
         // Reference counts may have changed project-wide.
         let _ = self.client.code_lens_refresh().await;
@@ -6116,13 +6641,25 @@ impl LaravelLanguageServer {
                 .map(|vv| vv.renders_for(path).is_some())
                 .unwrap_or(false);
             if !patterns.views.is_empty() || had_renders {
-                let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
-                let renders = laravel_lsp::view_var_index::view_renders_in_file(
-                    content,
-                    &*class_files,
-                    &mut classviews,
-                    &root,
-                );
+                let classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+                // Evaluate the captured render plans; fall back to a re-parse for
+                // a vendor save (no captured context) — see the resolution
+                // fallback below for the vendor rationale.
+                let renders = match patterns.member_context.as_ref() {
+                    Some(ctx) => laravel_lsp::view_var_index::evaluate_render_plans(
+                        &ctx.view_renders,
+                        &ctx.aliases,
+                        &*class_files,
+                        &classviews,
+                        &root,
+                    ),
+                    None => laravel_lsp::view_var_index::view_renders_in_file(
+                        content,
+                        &*class_files,
+                        &classviews,
+                        &root,
+                    ),
+                };
                 if let Ok(mut vv) = self.view_vars.write() {
                     let old = vv.renders_for(path).map(|r| r.to_vec()).unwrap_or_default();
                     if old != renders {
@@ -6159,7 +6696,7 @@ impl LaravelLanguageServer {
         let is_volt =
             is_blade && laravel_lsp::livewire_resolver::source_contains_volt_signature(content);
 
-        let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+        let classviews = laravel_lsp::member_resolver::ClassViewCache::new();
         let mut deps: HashSet<String> = HashSet::new();
         // Container-aware resolver shared by all three resolution paths so
         // `app('key')->member` resolves to the bound model. Fetched here — after
@@ -6180,67 +6717,149 @@ impl LaravelLanguageServer {
             macros,
             implementers,
         };
-        let mut entries = if is_volt {
-            let prop_types = laravel_lsp::view_var_index::volt_property_types(
-                content,
-                &resolver,
-                &mut classviews,
-                &root,
-            );
-            laravel_lsp::view_var_index::resolve_volt_member_accesses(
-                &patterns.member_access_refs,
-                &prop_types,
-                &patterns.blade_loops,
-                &resolver,
-                &mut classviews,
-                &root,
-                Some(&mut deps),
-            )
-        } else if is_blade {
-            // Controller-rendered Blade: resolve against the persistent
-            // view-var index. The read guard spans only this sync call —
-            // no awaits while held.
-            let view_paths = self
-                .cached_config
+        // Controller-rendered Blade needs the view paths (an await), fetched
+        // here at the async top level so both the captured-context and the
+        // vendor fallback branches below can use it without re-awaiting.
+        let view_paths = if is_blade && !is_volt {
+            self.cached_config
                 .read()
                 .await
                 .as_ref()
                 .map(|c| c.view_paths.clone())
-                .unwrap_or_default();
-            match laravel_lsp::view_var_index::view_name_for_path(path, &view_paths) {
-                Some(view_name) => match self.view_vars.read() {
-                    Ok(vv) => laravel_lsp::view_var_index::resolve_blade_member_accesses(
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // Resolve from the context captured at parse when present. The ONLY
+        // no-context case is a VENDOR save: the build passes skip vendor, so
+        // vendor files carry no `member_context` — fall back to the original
+        // re-parse-over-`content` path so a vendor edit still refreshes
+        // correctly. (Both paths read the SAME `content` the patterns were
+        // parsed from, so per-file resolution is self-consistent — the
+        // build-path's former disk-vs-buffer skew doesn't apply here.)
+        let mut entries = match patterns.member_context.as_ref() {
+            Some(ctx) => {
+                if is_volt {
+                    let prop_types = ctx
+                        .volt_surface
+                        .as_ref()
+                        .map(|s| {
+                            laravel_lsp::view_var_index::evaluate_volt_surface(
+                                s,
+                                &resolver,
+                                &classviews,
+                                &root,
+                            )
+                        })
+                        .unwrap_or_default();
+                    laravel_lsp::view_var_index::resolve_volt_member_accesses_with_context(
+                        ctx,
                         &patterns.member_access_refs,
-                        &view_name,
-                        &vv,
+                        &prop_types,
                         &patterns.blade_loops,
                         &resolver,
-                        &mut classviews,
+                        &classviews,
                         &root,
                         Some(&mut deps),
-                    ),
-                    Err(_) => Vec::new(),
-                },
-                None => Vec::new(),
+                    )
+                } else if is_blade {
+                    match laravel_lsp::view_var_index::view_name_for_path(path, &view_paths) {
+                        Some(view_name) => match self.view_vars.read() {
+                            Ok(vv) => {
+                                laravel_lsp::view_var_index::resolve_blade_member_accesses_with_context(
+                                    ctx,
+                                    &patterns.member_access_refs,
+                                    &view_name,
+                                    &vv,
+                                    &patterns.blade_loops,
+                                    &resolver,
+                                    &classviews,
+                                    &root,
+                                    Some(&mut deps),
+                                )
+                            }
+                            Err(_) => Vec::new(),
+                        },
+                        None => Vec::new(),
+                    }
+                } else {
+                    laravel_lsp::member_resolver::resolve_member_access_entries_with_context(
+                        ctx,
+                        &patterns.member_access_refs,
+                        &resolver,
+                        &classviews,
+                        &root,
+                        Some(&mut deps),
+                    )
+                }
             }
-        } else {
-            laravel_lsp::member_resolver::resolve_member_access_entries(
-                content,
-                &patterns.member_access_refs,
-                &resolver,
-                &mut classviews,
-                &root,
-                Some(&mut deps),
-            )
+            None => {
+                if is_volt {
+                    let prop_types = laravel_lsp::view_var_index::volt_property_types(
+                        content,
+                        &resolver,
+                        &classviews,
+                        &root,
+                    );
+                    laravel_lsp::view_var_index::resolve_volt_member_accesses(
+                        &patterns.member_access_refs,
+                        &prop_types,
+                        &patterns.blade_loops,
+                        &resolver,
+                        &classviews,
+                        &root,
+                        Some(&mut deps),
+                    )
+                } else if is_blade {
+                    match laravel_lsp::view_var_index::view_name_for_path(path, &view_paths) {
+                        Some(view_name) => match self.view_vars.read() {
+                            Ok(vv) => laravel_lsp::view_var_index::resolve_blade_member_accesses(
+                                &patterns.member_access_refs,
+                                &view_name,
+                                &vv,
+                                &patterns.blade_loops,
+                                &resolver,
+                                &classviews,
+                                &root,
+                                Some(&mut deps),
+                            ),
+                            Err(_) => Vec::new(),
+                        },
+                        None => Vec::new(),
+                    }
+                } else {
+                    laravel_lsp::member_resolver::resolve_member_access_entries(
+                        content,
+                        &patterns.member_access_refs,
+                        &resolver,
+                        &classviews,
+                        &root,
+                        Some(&mut deps),
+                    )
+                }
+            }
         };
         // Component `$this->member` references (Volt SFC `.php` or Blade SFC).
-        entries.extend(
-            laravel_lsp::view_var_index::resolve_component_member_accesses(
-                path,
-                content,
-                &patterns.member_access_refs,
+        match patterns.member_context.as_ref() {
+            Some(ctx) => {
+                if let Some(comp) = &ctx.component {
+                    entries.extend(
+                        laravel_lsp::view_var_index::resolve_component_member_accesses_with_context(
+                            comp,
+                            path,
+                            &patterns.member_access_refs,
+                        ),
+                    );
+                }
+            }
+            None => entries.extend(
+                laravel_lsp::view_var_index::resolve_component_member_accesses(
+                    path,
+                    content,
+                    &patterns.member_access_refs,
+                ),
             ),
-        );
+        }
 
         if let Err(e) = self
             .salsa
@@ -6254,6 +6873,37 @@ impl LaravelLanguageServer {
         }
 
         changed_views
+    }
+
+    /// Bound the session growth of on-open vendor magic indexing: record
+    /// `path` in `vendor_open_magic_lru` and, on overflow, remove the OLDEST
+    /// previously-opened vendor file's session contributions — the same
+    /// removal a delete performs on the magic side: `reindex_file_magic` with
+    /// empty entries (which keeps the file's literal symbols alive via the
+    /// pattern-cache re-insert) plus its recorded receiver deps. Without this
+    /// bound the entries would accumulate for the whole session, because
+    /// `did_close` deliberately never evicts (references-multibuffer
+    /// rationale — see the note there). With the cap at
+    /// [`VENDOR_OPEN_MAGIC_LRU_CAP`], evicting a file that is *still open* is
+    /// practically impossible; if it ever happens its own-file references
+    /// simply go missing again until the next re-open or save re-indexes it.
+    async fn record_vendor_open_magic(&self, path: &Path) {
+        let evicted = {
+            let mut lru = self.vendor_open_magic_lru.lock().unwrap();
+            // `push` returns the displaced pair: the SAME key on a re-open
+            // (a recency touch — must not evict the entries we just wrote),
+            // or the LRU-oldest entry on overflow.
+            match lru.push(path.to_path_buf(), ()) {
+                Some((old, ())) if old != path => Some(old),
+                _ => None,
+            }
+        };
+        if let Some(old) = evicted {
+            let _ = self.salsa.reindex_file_magic(old.clone(), Vec::new()).await;
+            if let Ok(mut deps) = self.magic_deps.write() {
+                deps.remove_file(&old);
+            }
+        }
     }
 
     /// Schedule the debounced re-save of the magic disk cache. Call after
@@ -6329,72 +6979,259 @@ impl LaravelLanguageServer {
         }
     }
 
-    /// Schedule the debounced project-wide magic-member reconverge. No longer
-    /// part of the per-save path (#80 — saves use the dependency-tracked
-    /// incremental refresh); this remains the reconverge after external
-    /// (watched-file) changes, whose ripples the save-time diff never saw.
-    /// The debounce coalesces bursts (git checkout touching hundreds of
-    /// files) into one rebuild.
+    /// Schedule the debounced watched-files magic-member batch (M2). Coalesces
+    /// an external-edit burst (git pull, formatter, branch switch) into one
+    /// dependency-tracked incremental reconverge, whose ripples the save-time
+    /// diff never saw. No longer part of the per-save path (#80 — saves use the
+    /// dependency-tracked incremental refresh directly).
+    ///
+    /// **Non-aborting, self-extending, single-lock liveness.** The producer
+    /// (`did_change_watched_files`) has already recorded its snapshots into
+    /// `magic_batch_state.pending` before calling this. Under the *same* state
+    /// mutex the task uses to decide its exit, we check `running`: if a task is
+    /// already live it will observe the just-recorded events itself (the map is
+    /// the signal), so we skip; otherwise we set `running = true` and spawn.
+    ///
+    /// Serializing the spawn decision and the task's exit decision on one lock
+    /// is what closes the lost-wakeup race: a task only clears `running` while
+    /// holding this lock *and* having just seen the map empty, so any event a
+    /// producer records is either visible to that in-lock emptiness check (task
+    /// loops and drains it) or recorded after `running` was cleared (this
+    /// producer sees `running == false` and spawns). Never aborting a running
+    /// task also means a batch already draining can't lose its snapshots.
     async fn schedule_magic_rebuild(&self) {
-        if let Some(handle) = self.magic_rebuild_handle.write().await.take() {
-            handle.abort();
+        {
+            let mut state = self.magic_batch_state.lock().await;
+            if state.running {
+                return; // a live task will observe the recorded events itself
+            }
+            state.running = true;
         }
         let server = self.clone_for_spawn();
         let handle = tokio::spawn(async move {
-            sleep(Duration::from_millis(MAGIC_REBUILD_DEBOUNCE_MS)).await;
-            server.rebuild_magic_index_full().await;
+            server.run_magic_watched_batch().await;
         });
+        // Stored only so the handler tests can await convergence; liveness is
+        // `state.running`, never `handle.is_finished()` (which would race exit).
         *self.magic_rebuild_handle.write().await = Some(handle);
     }
 
-    /// Re-resolve the whole project's magic-member reverse index from the
-    /// current pattern cache. Reuses the exact warm-build passes via
-    /// [`build_magic_member_entries`]; `build_symbol_index` clears the index
-    /// first (literals + magic) so the append below can't duplicate.
+    /// The watched-files incremental batch task (M2). Debounces, then drains
+    /// `magic_batch_state.pending` and converges the magic-member index for
+    /// exactly the changed files plus their dependency blast radius — work
+    /// proportional to the change, never to project size, so there is no size
+    /// gate. Loops while the burst keeps arriving inside the debounce window,
+    /// and re-loops if the map refilled while a drain was in flight, so nothing
+    /// is dropped. Relinquishes liveness (`running = false`) only under the
+    /// state lock, having just observed the map empty in the same critical
+    /// section — the other half of the invariant in `schedule_magic_rebuild`.
+    async fn run_magic_watched_batch(&self) {
+        loop {
+            // Quiet-period debounce: sleep, and if more events landed during the
+            // sleep, sleep again — coalescing the whole burst into one drain.
+            sleep(Duration::from_millis(MAGIC_REBUILD_DEBOUNCE_MS)).await;
+            loop {
+                let count = self.magic_batch_state.lock().await.pending.len();
+                if count == 0 {
+                    break; // nothing accumulated — fall through to the exit check
+                }
+                let before = count;
+                sleep(Duration::from_millis(MAGIC_REBUILD_DEBOUNCE_MS)).await;
+                if self.magic_batch_state.lock().await.pending.len() == before {
+                    break; // no new events during the last window — drain now
+                }
+            }
+
+            // Drain-or-exit, atomic under the state lock: if the map is empty we
+            // clear `running` and return *inside* the critical section, so a
+            // producer can't observe us as live-but-about-to-exit. Otherwise we
+            // take the batch (leaving `running == true`) and process it.
+            let batch = {
+                let mut state = self.magic_batch_state.lock().await;
+                if state.pending.is_empty() {
+                    state.running = false;
+                    return;
+                }
+                std::mem::take(&mut state.pending)
+            };
+            self.run_magic_batch_once(batch).await;
+            // Loop: any events that refilled the map while we drained are picked
+            // up by the next debounce, never a rival task (`running` is still
+            // true, so `schedule_magic_rebuild` skips spawning).
+        }
+    }
+
+    /// Converge the magic-member index for one drained batch of watched changes.
+    /// Mirrors the save path's pre/post surface diff (`refresh_magic_on_save` →
+    /// `refresh_magic_dependents`), but over a set of externally-changed files
+    /// instead of one saved buffer:
     ///
-    /// Gated on project size: on very large projects the full reconverge is too
-    /// heavy to run per edit-settle, so it is skipped and the per-file refresh
-    /// remains the only incremental path there.
-    async fn rebuild_magic_index_full(&self) {
-        let Some(root) = self.root_path.read().await.clone() else {
-            return;
-        };
-        let view_paths = match self.cached_config.read().await.as_ref() {
-            Some(c) => c.view_paths.clone(),
-            None => return,
-        };
-        let pattern_cache = self.salsa.pattern_cache();
+    /// Existence is decided **at drain**, by re-reading the file — not from the
+    /// recorded `deleted` flag, which two overlapping notifications for one path
+    /// can leave stale. `read_file_for_magic` returning `None` means the file is
+    /// gone *right now*, so it takes the delete path regardless of the flag:
+    ///
+    /// - **present, non-vendor** files are re-resolved in full
+    ///   (`refresh_file_magic`) — own contribution + per-file changed views —
+    ///   exactly as a save would;
+    /// - **present, vendor** files get a surfaces-only pass (parse + hierarchy
+    ///   update via `get_patterns`, no own-contribution resolution) so a vendor
+    ///   base-class change still ripples to app subclasses, without eagerly
+    ///   indexing vendor usage sites the build passes deliberately skip;
+    /// - **gone** files (a real delete, or a flag-race present-but-missing)
+    ///   contribute their pre-change surface FQCNs and render views to the blast
+    ///   radius, and are purged from `magic_deps` / `view_vars` (the
+    ///   watched-delete path previously leaked both — only the Salsa
+    ///   `RemoveFile` symbol/hierarchy eviction ran).
+    ///
+    /// The unioned `changed_classes` / `changed_views` then drive the same
+    /// `refresh_magic_dependents` blast radius as a save, excluding the present
+    /// files already refreshed here.
+    async fn run_magic_batch_once(&self, batch: HashMap<PathBuf, PendingWatchedChange>) {
+        let mut changed_classes: HashSet<String> = HashSet::new();
+        let mut changed_views: HashSet<String> = HashSet::new();
+        let mut refreshed: HashSet<PathBuf> = HashSet::new();
 
-        const MAX_FULL_REBUILD_FILES: usize = 15_000;
-        if pattern_cache.len() > MAX_FULL_REBUILD_FILES {
-            debug!(
-                "🪄 Project too large ({} files) — skipping debounced full magic rebuild; per-file refresh only",
-                pattern_cache.len()
-            );
-            return;
+        for (path, pending) in batch {
+            let is_vendor = path.components().any(|c| c.as_os_str() == "vendor");
+
+            // Authoritative existence check: read the file NOW. `None` = gone,
+            // whatever the advisory `deleted` flag says (a flag-race across
+            // overlapping notifications can leave it present-but-missing).
+            let content = self.read_file_for_magic(&path).await;
+
+            let Some(content) = content else {
+                // Gone: post-change surface is empty, so every pre-change FQCN is
+                // a changed class and every rendered view a changed view. Purge
+                // the file's own dep + render contributions (Salsa RemoveFile
+                // only evicts symbol/hierarchy — this closes the leak). Applies
+                // to vendor too: purge is a no-op there (build passes skip vendor
+                // usage sites), and the old surfaces still ripple to subclasses.
+                changed_classes.extend(pending.old_surfaces.into_keys());
+                changed_views.extend(pending.old_render_views);
+                if let Ok(mut deps) = self.magic_deps.write() {
+                    deps.remove_file(&path);
+                }
+                if let Ok(mut vv) = self.view_vars.write() {
+                    vv.remove_file(&path);
+                }
+                continue;
+            };
+
+            if is_vendor {
+                // Surfaces-only: parse to refresh the hierarchy node, then diff
+                // the surface so a vendor base-class change ripples to app
+                // subclasses. No own-contribution resolution, no place in the
+                // dependent work set (preserve the build-pass vendor exclusion).
+                let _ = self.salsa.get_patterns(path.clone()).await;
+                let new_surfaces = self
+                    .salsa
+                    .file_class_surfaces(path.clone())
+                    .await
+                    .unwrap_or_default();
+                changed_classes.extend(laravel_lsp::class_hierarchy_index::surface_map_diff(
+                    &pending.old_surfaces,
+                    &new_surfaces,
+                ));
+                continue;
+            }
+
+            // Present, non-vendor: full per-file refresh, same as a save.
+            let views = self.refresh_file_magic(&path, &content).await;
+            let new_surfaces = self
+                .salsa
+                .file_class_surfaces(path.clone())
+                .await
+                .unwrap_or_default();
+            changed_classes.extend(laravel_lsp::class_hierarchy_index::surface_map_diff(
+                &pending.old_surfaces,
+                &new_surfaces,
+            ));
+            changed_views.extend(views);
+            refreshed.insert(path);
         }
 
-        if let Err(e) = self.salsa.build_symbol_index().await {
-            debug!("Symbol index rebuild failed: {}", e);
+        // The per-file passes above already mutated the live indexes — keep the
+        // disk cache converging regardless of ripple size.
+        self.schedule_magic_cache_save().await;
+
+        if changed_classes.is_empty() && changed_views.is_empty() {
             return;
         }
-        let data = build_magic_member_entries(
-            &self.salsa,
-            &pattern_cache,
-            &root,
-            &view_paths,
-            MAX_CONCURRENT_MAGIC_PARSES,
-            None, // save-refresh path has no first-load progress UI
-            &self.view_vars,
+        self.refresh_magic_dependents(
+            &refreshed,
+            changed_classes.into_iter().collect(),
+            changed_views.into_iter().collect(),
         )
         .await;
-        match import_magic_data(&self.salsa, &self.magic_deps, data.entries).await {
-            Ok(n) => info!("🪄 Magic-member index reconverged: {} entries", n),
-            Err(e) => debug!("Magic reconverge failed: {}", e),
+    }
+
+    /// Read a file's authoritative content for a magic refresh: the open editor
+    /// buffer if the file is open (its unsaved content is authoritative), else
+    /// the on-disk bytes read on the blocking pool. `None` if neither is
+    /// available (the file was deleted between the watched event and the drain).
+    async fn read_file_for_magic(&self, path: &Path) -> Option<String> {
+        if let Ok(url) = Url::from_file_path(path) {
+            if let Some((content, _)) = self.documents.read().await.get(&url) {
+                return Some(content.clone());
+            }
         }
-        // Counts changed — ask the client to re-resolve code lenses.
-        let _ = self.client.code_lens_refresh().await;
-        self.schedule_magic_cache_save().await;
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(&path).ok())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Record one external `.php` change into `magic_batch_state.pending` for
+    /// the debounced batch (M2), capturing the file's pre-change surface
+    /// snapshot.
+    ///
+    /// **First-event-wins for the snapshot.** If the path is already pending,
+    /// only its `deleted` hint is updated — the original pre-change surfaces are
+    /// kept, because by now an interleaved query may have re-parsed the
+    /// hierarchy and a fresh snapshot would no longer be the true pre-state. The
+    /// double-check on re-lock closes the window between computing the snapshot
+    /// and inserting it. (`deleted` is only advisory; the batch decides real
+    /// existence by re-reading at drain — see `run_magic_batch_once`.)
+    ///
+    /// The caller MUST invoke this *before* the arm's Salsa mutation — in
+    /// particular before `remove_file`, which eagerly tears down the very
+    /// hierarchy nodes the surface snapshot reads.
+    async fn record_watched_change(&self, path: &Path, deleted: bool) {
+        {
+            let mut state = self.magic_batch_state.lock().await;
+            if let Some(entry) = state.pending.get_mut(path) {
+                entry.deleted = deleted;
+                return;
+            }
+        }
+        // First event for this path — snapshot the pre-change surface + renders.
+        let old_surfaces = self
+            .salsa
+            .file_class_surfaces(path.to_path_buf())
+            .await
+            .unwrap_or_default();
+        let old_render_views = self
+            .view_vars
+            .read()
+            .ok()
+            .and_then(|vv| {
+                vv.renders_for(path)
+                    .map(|rs| rs.iter().map(|r| r.view_name.clone()).collect::<Vec<_>>())
+            })
+            .unwrap_or_default();
+        self.magic_batch_state
+            .lock()
+            .await
+            .pending
+            .entry(path.to_path_buf())
+            .or_insert(PendingWatchedChange {
+                old_surfaces,
+                old_render_views,
+                deleted,
+            })
+            .deleted = deleted;
     }
 
     /// Execute all pending rescans
@@ -6659,8 +7496,11 @@ impl LaravelLanguageServer {
                 // mid-session config change, where flashing a status-bar
                 // entry for a re-index would feel surprising. The
                 // user-facing first-load progress is wired into
-                // `initialized()` instead.
-                self.register_project_files_with_salsa(&discovered_root, None)
+                // `initialized()` instead. No flight guard: this re-register
+                // isn't a user-triggered reindex, and the reindex command
+                // guards itself against the passes that matter (startup + a
+                // second reindex).
+                self.register_project_files_with_salsa(&discovered_root, None, None)
                     .await;
 
                 // Re-validate all open documents since config changed (view paths, component paths, etc.)
@@ -7106,11 +7946,110 @@ impl LaravelLanguageServer {
         diagnostics
     }
 
-    /// Initialize the database schema provider for exists:/unique: validation rules
+    /// Initialize the database schema provider for exists:/unique: validation
+    /// rules — **idempotent**. Called from two startup sites (the
+    /// config-discovery flow and the `initialized` background task), so it
+    /// guards against setting up a second provider: a second call for the
+    /// same root is a no-op, and a call for a different root aborts the old
+    /// tasks first. Exactly one provider / refresh loop / channel listener /
+    /// breaker is ever live — which is what keeps a single outage from
+    /// producing two toasts (two breakers, each firing its own).
     async fn init_database_schema_provider(&self, root: &Path) {
-        use laravel_lsp::database::DatabaseSchemaProvider;
+        use laravel_lsp::database::{outage_toast_message, DatabaseSchemaProvider, DbBreakerEvent};
 
-        let provider = DatabaseSchemaProvider::new(root.to_path_buf());
+        let root_buf = root.to_path_buf();
+
+        // Idempotency guard. Held across the whole init so the two startup
+        // sites serialize: the first sets everything up and stores the task
+        // handles; the second sees the same root and returns. No other code
+        // locks `db_provider_task`, so holding it across the awaits below
+        // can't deadlock.
+        let mut task_guard = self.db_provider_task.lock().await;
+        match task_guard.as_ref() {
+            Some((existing_root, _)) if *existing_root == root_buf => {
+                debug!(
+                    "🗄️  DB schema provider already initialised for {:?} — skipping re-init",
+                    root_buf
+                );
+                return;
+            }
+            Some((existing_root, handles)) => {
+                info!(
+                    "🗄️  DB schema provider root changed ({:?} → {:?}) — aborting old tasks",
+                    existing_root, root_buf
+                );
+                for handle in handles {
+                    handle.abort();
+                }
+            }
+            None => {}
+        }
+
+        let provider = DatabaseSchemaProvider::new(root_buf.clone());
+
+        // Wire the breaker-edge notifications. The provider's circuit
+        // breaker — which lives entirely in the background refresh loop
+        // below — announces each edge on this channel: `Outage` on the
+        // Closed→Open transition (the FIRST failure of an outage episode;
+        // retry probes inside the same outage are silent), and
+        // `Reconnected` on the recovery edge (Open/HalfOpen→Closed). So the
+        // user sees exactly one outage toast then, when the DB comes back,
+        // exactly one reconnect toast. Outage text is scenario-specific
+        // (unreachable vs rejected vs generic); "no DB configured" maps to
+        // `None` and stays silent.
+        //
+        // Both use `window/showMessageRequest` (a persistent toast with a
+        // Dismiss action), NOT `window/showMessage` (auto-dismissing): the
+        // outage message is dense — scenario diagnosis, what to check, and
+        // the retry cadence — and needs time to read, so it stays until the
+        // user dismisses it. It can no longer linger misleadingly after
+        // recovery, because the `Reconnected` toast fires on the recovery
+        // edge and corrects the picture.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<DbBreakerEvent>();
+        provider.set_event_channel(event_tx).await;
+        let toast_client = self.client.clone();
+        let listener_handle = tokio::spawn(async move {
+            use tower_lsp::lsp_types::{MessageActionItem, MessageType};
+            // A single Dismiss action makes the toast persistent — it stays
+            // until the user clicks, rather than auto-fading in a few seconds.
+            let dismiss = || {
+                vec![MessageActionItem {
+                    title: "Dismiss".to_string(),
+                    properties: Default::default(),
+                }]
+            };
+            // Ends when the provider (and with it the sender) is dropped
+            // or replaced by a re-init.
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    DbBreakerEvent::Outage(outage) => {
+                        let Some(message) = outage_toast_message(outage.class, &outage.message)
+                        else {
+                            info!(
+                                "🗄️  DB circuit breaker opened silently ({:?}): {}",
+                                outage.class, outage.message
+                            );
+                            continue;
+                        };
+                        // We don't act on the response — the only action is
+                        // Dismiss; the point is that the toast persists.
+                        let _ = toast_client
+                            .show_message_request(MessageType::WARNING, message, Some(dismiss()))
+                            .await;
+                    }
+                    DbBreakerEvent::Reconnected => {
+                        let _ = toast_client
+                            .show_message_request(
+                                MessageType::INFO,
+                                "Laravel: database reconnected — DB-aware features re-enabled."
+                                    .to_string(),
+                                Some(dismiss()),
+                            )
+                            .await;
+                    }
+                }
+            }
+        });
 
         // Log config status but always store provider
         // Errors will be handled when completions are requested
@@ -7125,41 +8064,58 @@ impl LaravelLanguageServer {
             false
         };
 
-        // Always store provider - errors handled when completions requested
+        // Always store provider - interactive reads hit its in-memory cache.
         *self.database_schema.write().await = Some(provider);
 
-        // Pre-warm the schema cache in the background. The cold fetch costs
-        // ~50ms for SHOW TABLES + ~4ms per table for SHOW COLUMNS — on a
-        // 600-table schema that's ~2.5s. Doing it here, in parallel with
-        // vendor/app provider rescans and pattern cache warming, means the
-        // user's first `DB::table('|')` completion hits a warm cache and
-        // returns instantly. Skipped when there's no config (nothing to
-        // introspect and the toast would be noise).
+        // Track the live background tasks so they can be aborted on a root
+        // change. The listener is always running; the refresh loop is pushed
+        // below when there's a DB config.
+        let mut task_handles = vec![listener_handle];
+
+        // Spawn the SINGLE background refresh loop — the only code that ever
+        // connects to the database. It owns connect + fetch + cache-fill +
+        // circuit breaker + outage notification, entirely off the tower-lsp
+        // request-dispatch slots, so a slow or dead database can never
+        // starve interactive requests (hover/goto/completion on a non-DB
+        // target stays instant during an outage — the isolation bug this
+        // design fixes). The first tick doubles as the pre-warm: a cold
+        // ~2.5s fetch for a 600-table schema, after which interactive
+        // `DB::table('|')` completions hit a warm cache.
+        //
+        // Cadence is driven by the breaker: refresh every ~60s while
+        // healthy (matching the cache TTL), retry every ~30s (the half-open
+        // probe) while the DB is down. Skipped entirely when there's no DB
+        // config — nothing to introspect and no outage to report.
         if has_config {
+            use laravel_lsp::database::{DB_CONNECT_TIMEOUT, DB_REFRESH_HEALTHY_INTERVAL};
             let db = self.database_schema.clone();
-            tokio::spawn(async move {
-                let start = std::time::Instant::now();
-                info!("🔥 Pre-warming database schema cache...");
-                let schema = {
-                    let guard = db.read().await;
-                    match guard.as_ref() {
-                        Some(provider) => provider.get_schema().await,
-                        None => None,
-                    }
-                };
-                match schema {
-                    Some(s) => info!(
-                        "🔥 Database schema cache warmed: {} tables in {:?}",
-                        s.tables.len(),
-                        start.elapsed()
-                    ),
-                    None => info!(
-                        "🔥 Database schema pre-warm failed ({:?}) — will retry on first completion",
-                        start.elapsed()
-                    ),
+            let refresh_handle = tokio::spawn(async move {
+                info!("🔥 Starting background database schema refresh loop...");
+                loop {
+                    // Hold the read guard only for the tick; drop it before
+                    // sleeping so a re-init can take the write lock. Multiple
+                    // concurrent readers (interactive requests) are fine.
+                    let sleep = {
+                        let guard = db.read().await;
+                        match guard.as_ref() {
+                            Some(provider) => {
+                                provider
+                                    .refresh_tick(DB_CONNECT_TIMEOUT, DB_REFRESH_HEALTHY_INTERVAL)
+                                    .await
+                            }
+                            // Provider gone (shutdown) — stop the loop.
+                            None => break,
+                        }
+                    };
+                    tokio::time::sleep(sleep).await;
                 }
             });
+            task_handles.push(refresh_handle);
         }
+
+        // Record the live tasks (still holding the guard) so a later
+        // same-root init no-ops and a different-root init aborts them.
+        *task_guard = Some((root_buf, task_handles));
     }
 
     /// Check if a file exists with async I/O and TTL caching
@@ -8163,39 +9119,36 @@ impl LaravelLanguageServer {
             if !has_middleware_context {
                 // Check previous lines (up to 20 lines back) for middleware array context
                 // We need to find an opening pattern without a matching close
-                if let Some(prev_lines) = previous_lines {
-                    let mut found_in_previous = false;
-                    let mut bracket_depth = 0i32;
+                let prev_lines = previous_lines?;
+                let mut found_in_previous = false;
+                let mut bracket_depth = 0i32;
 
-                    // Scan backwards through previous lines
-                    for prev_line in prev_lines.iter().rev().take(20) {
-                        // Count brackets to track nesting
-                        for ch in prev_line.chars() {
-                            match ch {
-                                '[' => bracket_depth += 1,
-                                ']' => bracket_depth -= 1,
-                                _ => {}
-                            }
-                        }
-
-                        // Check if this line has a middleware indicator
-                        if middleware_indicators
-                            .iter()
-                            .any(|ind| prev_line.contains(ind))
-                        {
-                            // Found middleware context, and we should still be inside it
-                            // (bracket_depth > 0 means we haven't closed the array yet)
-                            if bracket_depth > 0 {
-                                found_in_previous = true;
-                                break;
-                            }
+                // Scan backwards through previous lines
+                for prev_line in prev_lines.iter().rev().take(20) {
+                    // Count brackets to track nesting
+                    for ch in prev_line.chars() {
+                        match ch {
+                            '[' => bracket_depth += 1,
+                            ']' => bracket_depth -= 1,
+                            _ => {}
                         }
                     }
 
-                    if !found_in_previous {
-                        return None;
+                    // Check if this line has a middleware indicator
+                    if middleware_indicators
+                        .iter()
+                        .any(|ind| prev_line.contains(ind))
+                    {
+                        // Found middleware context, and we should still be inside it
+                        // (bracket_depth > 0 means we haven't closed the array yet)
+                        if bracket_depth > 0 {
+                            found_in_previous = true;
+                            break;
+                        }
                     }
-                } else {
+                }
+
+                if !found_in_previous {
                     return None;
                 }
             }
@@ -11695,17 +12648,13 @@ impl LaravelLanguageServer {
                     // Try to get tables (this triggers connection if not cached)
                     let tables = provider.get_tables().await;
 
-                    // If tables is empty and there was a connection error, publish diagnostic
+                    // If tables is empty and there was a connection error,
+                    // bail. No toast from here: the circuit-breaker channel
+                    // (wired in init_database_schema_provider) already
+                    // notified the user once when this outage began.
                     if tables.is_empty() {
                         if let Some(error) = provider.get_last_error().await {
                             info!("   ❌ Database connection error: {}", error.message);
-                            // Surface the unreachable-DB notification via the
-                            // single persistent toast. The previous inline
-                            // diagnostic at the rule position used the same
-                            // one-shot flag as the toast, so whichever fired
-                            // first hid the other. One channel = one signal,
-                            // and toast persists until the user dismisses it.
-                            self.maybe_notify_db_unreachable(&error.message).await;
                             // Return empty - no completions available
                             return Vec::new();
                         }
@@ -11875,15 +12824,12 @@ impl LaravelLanguageServer {
                         }
                     }
                 } else {
+                    // No provider means no database configuration was
+                    // discovered — scenario 0, a normal state for projects
+                    // without a DB. Deliberately silent (log only): toasting
+                    // "configure your database" at every exists:/unique:
+                    // completion would nag DB-less projects.
                     debug!("warn:  Database schema provider not initialized");
-                    // Same persistent-toast channel as the unreachable-DB
-                    // path above. "Provider not initialised" means no .env
-                    // (or no detection of one); say so explicitly.
-                    self.maybe_notify_db_unreachable(
-                        "Database not configured. Set DB_CONNECTION, DB_HOST, \
-                         DB_DATABASE, DB_USERNAME, DB_PASSWORD in .env.",
-                    )
-                    .await;
                     Vec::new()
                 }
             }
@@ -16006,6 +16952,7 @@ return [
             pending_rescans: self.pending_rescans.clone(),
             rescan_debounce_handle: self.rescan_debounce_handle.clone(),
             magic_rebuild_handle: self.magic_rebuild_handle.clone(),
+            magic_batch_state: self.magic_batch_state.clone(),
             file_exists_cache: self.file_exists_cache.clone(),
             cached_config: self.cached_config.clone(),
             cached_livewire: self.cached_livewire.clone(),
@@ -16020,9 +16967,10 @@ return [
             cached_validation_rule_names: self.cached_validation_rule_names.clone(),
             cached_directive_names: self.cached_directive_names.clone(),
             database_schema: self.database_schema.clone(),
-            database_diagnostic_shown: self.database_diagnostic_shown.clone(),
+            db_provider_task: self.db_provider_task.clone(),
             route_index: self.route_index.clone(),
             warm_complete: self.warm_complete.clone(),
+            indexing_in_flight: self.indexing_in_flight.clone(),
             migration_index: self.migration_index.clone(),
             command_index: self.command_index.clone(),
             vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
@@ -16031,6 +16979,7 @@ return [
             magic_deps: self.magic_deps.clone(),
             view_vars: self.view_vars.clone(),
             magic_cache_save_handle: self.magic_cache_save_handle.clone(),
+            vendor_open_magic_lru: self.vendor_open_magic_lru.clone(),
             inertia_default_ext: self.inertia_default_ext.clone(),
         }
     }
@@ -16274,14 +17223,12 @@ return [
         }
 
         // Database-unreachable notifications go through the persistent
-        // toast (`maybe_notify_db_unreachable`) — driven from the chain
-        // completion handler when an LSP-completing path actually needs
-        // the DB and finds it unavailable. We deliberately don't publish
-        // a diagnostic from here: a 0:0 diagnostic on whatever file
-        // happened to be open is awkward, and emitting both a diagnostic
-        // AND a toast meant whichever fired first stole the
-        // `database_diagnostic_shown` flag and suppressed the other.
-        // Toast wins; diagnostic is gone.
+        // toast driven by the schema provider's circuit breaker (wired in
+        // `init_database_schema_provider`): one toast per outage episode,
+        // re-armed on reconnect. We deliberately don't publish a diagnostic
+        // from here: a 0:0 diagnostic on whatever file happened to be open
+        // is awkward, and a second channel for the same signal caused
+        // suppression races in the past. Toast wins; diagnostic is gone.
 
         // Get the Laravel config (checks memory cache first, then Salsa)
         let t_config = std::time::Instant::now();
@@ -16375,8 +17322,14 @@ return [
                         );
                     }
                     (_, Some(root)) => {
-                        let db_guard = self.database_schema.read().await;
-                        match db_guard.as_ref() {
+                        // Clone the provider handle (cheap — it's a bundle of
+                        // Arcs) out of the guard and drop the guard before the
+                        // await. chain_diagnostics' DB calls are now instant
+                        // in-memory cache reads (never connect), so this is no
+                        // longer a freeze risk — but not holding the outer lock
+                        // across an await keeps a re-init from blocking too.
+                        let db = self.database_schema.read().await.clone();
+                        match db {
                             None => info!(
                                 "🔗 chain_diagnostics: {} chains but DB schema provider not \
                                  initialised — column/relation diagnostics need a DB connection",
@@ -16386,7 +17339,7 @@ return [
                                 let t_chain = std::time::Instant::now();
                                 let chain_diags = laravel_lsp::query_chain::chain_diagnostics(
                                     &fresh_chains,
-                                    db,
+                                    &db,
                                     &root,
                                     source,
                                     severity,
@@ -20492,7 +21445,16 @@ impl LanguageServer for LaravelLanguageServer {
                 }),
 
                 // ✅ Code actions for quick fixes (create missing views, etc.)
+                // and the always-available "Laravel: Reindex project" action
+                // (a `source`-kind action carrying the reindex command).
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+
+                // ✅ Execute-command provider — the server-side commands a
+                // client may invoke via `workspace/executeCommand`. Currently
+                // just `laravel.reindexProject`, which the reindex code action
+                // dispatches. Declared from the reindex module so the
+                // capability and the `execute_command` handler can't drift.
+                execute_command_provider: Some(laravel_lsp::reindex::execute_command_options()),
 
                 // ✅ Document symbol provider — populates outline panels
                 // (Zed outline, Helix symbol picker, Neovim aerial, etc.) with
@@ -20694,16 +21656,25 @@ impl LanguageServer for LaravelLanguageServer {
                 // We use dynamic registration (not declared in
                 // `initialize`) because the view paths and livewire
                 // path depend on project config we only just loaded.
+                // First-party PSR-4 source roots (M2) widen the watcher beyond
+                // the hardcoded controllers path so an external edit to any
+                // source dir converges the magic-member index. The autoload is
+                // process-cached, already loaded by resolution paths this run.
+                let psr4_roots =
+                    laravel_lsp::composer_autoload::ComposerAutoload::for_project(&root)
+                        .project_source_roots();
                 let registration = laravel_lsp::file_watcher::build_registration(
                     &root,
                     &config.view_paths,
                     config.livewire_path.as_deref(),
+                    &psr4_roots,
                 );
                 match server.client.register_capability(vec![registration]).await {
                     Ok(_) => info!(
-                        "🛡️  Registered file watcher: {} view paths, livewire={}",
+                        "🛡️  Registered file watcher: {} view paths, livewire={}, {} PSR-4 source root(s)",
                         config.view_paths.len(),
-                        config.livewire_path.is_some()
+                        config.livewire_path.is_some(),
+                        psr4_roots.len()
                     ),
                     Err(e) => debug!(
                         "File watcher registration failed (client may not support it): {}",
@@ -20711,8 +21682,17 @@ impl LanguageServer for LaravelLanguageServer {
                     ),
                 }
 
+                // Claim the indexing-flight guard for the startup warm so a
+                // `laravel.reindexProject` triggered while first-load is still
+                // running no-ops instead of racing it. At startup the flag is
+                // free, so this normally succeeds; if it somehow doesn't, we
+                // pass `None` and warming proceeds unguarded (the pre-existing
+                // behavior) rather than skipping the initial index.
+                let startup_guard = laravel_lsp::reindex::IndexingFlightGuard::try_acquire(
+                    server.indexing_in_flight.clone(),
+                );
                 server
-                    .register_project_files_with_salsa(&root, progress.take())
+                    .register_project_files_with_salsa(&root, progress.take(), startup_guard)
                     .await;
             } else {
                 info!("Config not available for project file registration");
@@ -20964,6 +21944,27 @@ impl LanguageServer for LaravelLanguageServer {
                 debug!("Failed to update Salsa database: {}", e);
             }
             info!("   ⏱️  salsa.update_file: {:?}", t2.elapsed());
+
+            // The eager magic build skips vendor files as usage *sites*, so
+            // find-references omits a vendor file's own `$model->member`
+            // occurrence lines (goto/hover already work — only the reference
+            // set is incomplete). Opening the file is the signal to lazily
+            // fill that gap: resolve THIS file's usages and add them to the
+            // reverse index. Runs AFTER `update_file` so the refresh parses
+            // the just-opened buffer; awaited inline (one cheap file) so an
+            // immediate find-references can't race the insert. Session-only:
+            // `refresh_file_magic` never schedules a magic-cache save, so
+            // these entries don't leak into the disk cache or the next cold
+            // start. No dependents/ripple wrapper — opening a file changes no
+            // class surface, so there is nothing to converge.
+            if file_path.components().any(|c| c.as_os_str() == "vendor")
+                && file_path.to_string_lossy().ends_with(".php")
+            {
+                let t = std::time::Instant::now();
+                self.refresh_file_magic(&file_path, &text).await;
+                self.record_vendor_open_magic(&file_path).await;
+                info!("   ⏱️  vendor on-open magic refresh: {:?}", t.elapsed());
+            }
         }
 
         // Validate and publish diagnostics for Blade files
@@ -21178,6 +22179,9 @@ impl LanguageServer for LaravelLanguageServer {
         let mut skipped_open = 0usize;
         let mut migrations_changed = false;
         let mut commands_changed = false;
+        // Did this batch record any `.php` magic change? Gates the debounced
+        // incremental batch — an Inertia-only burst does no magic work.
+        let mut magic_dirty = false;
 
         for change in params.changes {
             if open_docs.contains(&change.uri) {
@@ -21213,6 +22217,16 @@ impl LanguageServer for LaravelLanguageServer {
             }
             if !migrations_changed && path.to_string_lossy().contains("database/migrations") {
                 migrations_changed = true;
+            }
+            // Snapshot the file's pre-change surface for the incremental magic
+            // batch (M2) BEFORE the arm's Salsa mutation runs — critically,
+            // before a DELETE's `remove_file` tears down the hierarchy nodes the
+            // snapshot reads. `.php` covers `.blade.php` too. First-event-wins
+            // is enforced inside `record_watched_change`.
+            if path.to_string_lossy().ends_with(".php") {
+                let is_delete = matches!(change.typ, FileChangeType::DELETED);
+                self.record_watched_change(&path, is_delete).await;
+                magic_dirty = true;
             }
             match change.typ {
                 FileChangeType::CREATED => {
@@ -21310,14 +22324,29 @@ impl LanguageServer for LaravelLanguageServer {
             }
         }
 
+        // A watched create/delete changes which FQCNs resolve to a file, so
+        // drop the FQCN→file resolution cache for this project (a new class
+        // becomes resolvable, a removed one stops). This covers the watched
+        // paths (controllers, PSR-4 source roots, views, livewire, vendor);
+        // any still-unwatched path relies on the locator's negative-entry TTL
+        // — see the Fork-2 note in class_locator. Inertia-only bursts count
+        // here too (a new/removed page file), hence the counter gate rather
+        // than `magic_dirty`.
+        if created_or_changed + deleted > 0 {
+            if let Some(root) = self.initialized_root.read().await.clone() {
+                laravel_lsp::class_locator::invalidate_project(&root);
+            }
+        }
+
         // External PHP changes (git pull, formatter outside Zed) bypass the
         // save-time incremental refresh entirely — their surface diffs were
         // never computed, so the dependency-tracked path can't see their
-        // ripples. The debounced full reconverge (still gated on project
-        // size) restores the old guarantee that the magic index converges
-        // after disk-level changes. Saves no longer trigger this (#80);
-        // external edits are the one remaining caller.
-        if created_or_changed + deleted > 0 {
+        // ripples. Their pre-change surfaces are now recorded in
+        // `magic_batch_state.pending`; the debounced incremental batch (M2)
+        // diffs pre/post per file and re-resolves only the actual blast radius,
+        // scaling with change size rather than project size — so no size gate.
+        // Saves no longer trigger this (#80); external edits are the one caller.
+        if magic_dirty {
             self.schedule_magic_rebuild().await;
         }
     }
@@ -22958,18 +23987,21 @@ impl LanguageServer for LaravelLanguageServer {
         let uri = &params.text_document.uri;
         let context = &params.context;
 
-        // Early return if no diagnostics in context
-        if context.diagnostics.is_empty() {
-            return Ok(None);
-        }
-
         info!(
             "🔧 code_action called for {} with {} diagnostics",
             uri,
             context.diagnostics.len()
         );
 
-        let mut actions = Vec::new();
+        // The "Laravel: Reindex project" action is always offered for PHP/Blade
+        // files (subject to the request's `only` filter), independent of cursor
+        // position and diagnostics — that's how a Zed extension exposes a global
+        // command. Seed the response with it, then append the diagnostic-driven
+        // quick-fixes below. Unlike those, this action needs no project root or
+        // diagnostics, so it survives the "no diagnostics" case that used to
+        // early-return.
+        let mut actions =
+            laravel_lsp::reindex::global_code_actions(uri.path(), context.only.as_deref());
 
         // Get root path for Livewire (needs to calculate view path)
         let root_guard = self.root_path.read().await;
@@ -23031,6 +24063,24 @@ impl LanguageServer for LaravelLanguageServer {
             info!("🔧 Returning {} code actions", actions.len());
             Ok(Some(actions))
         }
+    }
+
+    /// Handle `workspace/executeCommand`. The only command we declare is
+    /// `laravel.reindexProject` (see `execute_command_provider` in
+    /// `initialize`), dispatched by the "Laravel: Reindex project" code action.
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> jsonrpc::Result<Option<serde_json::Value>> {
+        info!("⚙️  execute_command: {}", params.command);
+        if params.command == laravel_lsp::reindex::REINDEX_COMMAND {
+            self.trigger_reindex().await;
+        } else {
+            warn!("execute_command: unknown command {}", params.command);
+        }
+        // No result payload — the reindex runs in the background and reports
+        // progress via the status bar, not a command return value.
+        Ok(None)
     }
 
     async fn completion(

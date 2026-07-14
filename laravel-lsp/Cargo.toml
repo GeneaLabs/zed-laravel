@@ -68,6 +68,12 @@ arc-swap = "1.9"
 # SalsaActor::pattern_cache for context.
 dashmap = "6"
 
+# Data-parallel freshness pass over the on-disk pattern cache on startup:
+# ~40k entries each need an mtime stat + position-index rebuild, which is
+# embarrassingly parallel. Already compiled transitively (salsa depends on
+# it), so this direct dep adds no new crate to the build.
+rayon = "1"
+
 # The release binaries for Linux are statically-linked musl builds (one
 # binary runs on glibc distros, Alpine, and NixOS alike), but musl's
 # default allocator serializes multithreaded allocation behind a global
@@ -97,6 +103,14 @@ tempfile = "3.27"
 # run with `cargo bench --bench route_cache`.
 [[bench]]
 name = "route_cache"
+harness = false
+
+# Magic-member resolution benchmark — reproduces the O(n²) fresh-cache-per-file
+# pass vs a single shared ClassViewCache across N referencing files. Same custom
+# timing harness (no criterion dependency); run with
+# `cargo bench --bench magic_members`.
+[[bench]]
+name = "magic_members"
 harness = false
 
 [profile.release]

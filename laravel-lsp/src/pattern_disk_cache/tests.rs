@@ -200,6 +200,186 @@ fn hierarchy_nodes_survive_save_and_load() {
 }
 
 #[test]
+fn concurrent_saves_do_not_corrupt_the_cache() {
+    // The save now runs spawned/background, so a reindex can start a second
+    // `save_from` while a prior one is still writing. Each save must use a
+    // per-call unique temp file so the two can't interleave bytes into one
+    // file — they simply race to last-writer-wins on a complete, valid one.
+    // Two threads hammer the same project root; a shared temp path would
+    // intermittently leave a corrupt (undecodable) cache here.
+    let project = TempDir::new().unwrap();
+    let file = touch(project.path(), "shared.blade.php", "<x-foo/>");
+    let root = project.path().to_path_buf();
+
+    let handles: Vec<_> = (0..2)
+        .map(|k| {
+            let root = root.clone();
+            let file = file.clone();
+            std::thread::spawn(move || {
+                for _ in 0..50 {
+                    // Each save references the same real file, so the
+                    // restored count is a deterministic 1 whichever rename
+                    // wins; only the pattern payload differs between writers.
+                    let cache = Arc::new(DashMap::new());
+                    cache.insert(file.clone(), (0, Arc::new(fake_patterns(&format!("v{k}")))));
+                    save_from(&cache, &Default::default(), &root).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // The on-disk cache must be a complete, decodable file — never a
+    // truncated interleave of the two racing writers.
+    let restored_cache = Arc::new(DashMap::new());
+    let lr = load_into(&restored_cache, project.path());
+    assert_eq!(
+        lr.restored, 1,
+        "final cache decodes to the one shared entry"
+    );
+    assert_eq!(lr.dropped, 0);
+    assert!(restored_cache.contains_key(&file));
+}
+
+#[test]
+fn parallel_load_matches_serial_for_mixed_fixture() {
+    // The freshness pass is now parallel (rayon). It must produce the
+    // EXACT same outcome as the serial logic it replaced for a fixture
+    // mixing fresh (unchanged), stale (mtime-bumped), and missing
+    // (deleted) entries: same restored set, same restored/dropped counts,
+    // same surfaced hierarchy (order-independent).
+    let project = TempDir::new().unwrap();
+    let cache = Arc::new(DashMap::new());
+
+    // Enough entries that rayon actually splits the work across threads.
+    let fresh_src = |i: usize| format!("<?php\nnamespace App;\nclass Fresh{i} {{}}\n");
+    let fresh: Vec<PathBuf> = (0..50)
+        .map(|i| {
+            let p = touch(project.path(), &format!("Fresh{i}.php"), &fresh_src(i));
+            cache.insert(
+                p.clone(),
+                (0, Arc::new(fake_patterns(&format!("fresh{i}")))),
+            );
+            p
+        })
+        .collect();
+    let stale: Vec<PathBuf> = (0..20)
+        .map(|i| {
+            let p = touch(project.path(), &format!("Stale{i}.php"), "<?php class S {}");
+            cache.insert(
+                p.clone(),
+                (0, Arc::new(fake_patterns(&format!("stale{i}")))),
+            );
+            p
+        })
+        .collect();
+    let missing: Vec<PathBuf> = (0..10)
+        .map(|i| {
+            let p = touch(
+                project.path(),
+                &format!("Missing{i}.php"),
+                "<?php class M {}",
+            );
+            cache.insert(
+                p.clone(),
+                (0, Arc::new(fake_patterns(&format!("missing{i}")))),
+            );
+            p
+        })
+        .collect();
+
+    // Real hierarchy nodes for the fresh files, so we can assert they're
+    // surfaced — and only they are.
+    let mut hierarchy = std::collections::HashMap::new();
+    for (i, p) in fresh.iter().enumerate() {
+        hierarchy.insert(
+            p.clone(),
+            crate::class_hierarchy_index::classes_in_file(p, &fresh_src(i)),
+        );
+    }
+    save_from(&cache, &hierarchy, project.path()).unwrap();
+
+    // Invalidate: bump the stale files' mtime, delete the missing ones.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    for p in &stale {
+        std::fs::write(p, "<?php class S2 {}").unwrap();
+    }
+    for p in &missing {
+        std::fs::remove_file(p).unwrap();
+    }
+
+    let restored_cache = Arc::new(DashMap::new());
+    let lr = load_into(&restored_cache, project.path());
+
+    assert_eq!(lr.restored, fresh.len(), "all fresh entries restored");
+    assert_eq!(
+        lr.dropped,
+        stale.len() + missing.len(),
+        "stale + missing entries dropped"
+    );
+
+    // Exactly the fresh files landed in the live cache.
+    assert_eq!(restored_cache.len(), fresh.len());
+    for p in &fresh {
+        assert!(
+            restored_cache.contains_key(p),
+            "fresh file missing from cache: {p:?}"
+        );
+    }
+    for p in stale.iter().chain(&missing) {
+        assert!(
+            !restored_cache.contains_key(p),
+            "invalid file leaked into cache: {p:?}"
+        );
+    }
+
+    // Hierarchy surfaced for exactly the fresh files (set equality — the
+    // parallel collect gives no ordering guarantee, and none is needed).
+    let surfaced: std::collections::HashSet<PathBuf> =
+        lr.hierarchy.iter().map(|(p, _)| p.clone()).collect();
+    let expected: std::collections::HashSet<PathBuf> = fresh.iter().cloned().collect();
+    assert_eq!(
+        surfaced, expected,
+        "hierarchy surfaced for exactly the fresh files"
+    );
+}
+
+#[test]
+fn load_progress_counts_every_entry() {
+    use std::sync::atomic::Ordering;
+
+    let project = TempDir::new().unwrap();
+    let cache = Arc::new(DashMap::new());
+    for i in 0..30 {
+        let p = touch(project.path(), &format!("F{i}.php"), "<?php class F {}");
+        cache.insert(p, (0, Arc::new(fake_patterns(&format!("f{i}")))));
+    }
+    save_from(&cache, &Default::default(), project.path()).unwrap();
+
+    let progress = LoadProgress::default();
+    let restored_cache = Arc::new(DashMap::new());
+    let lr = load_into_reporting(&restored_cache, project.path(), Some(&progress));
+
+    assert_eq!(
+        progress.total.load(Ordering::Relaxed),
+        30,
+        "total = decoded entry count, published before the pass"
+    );
+    assert_eq!(
+        progress.done.load(Ordering::Relaxed),
+        30,
+        "every entry increments done exactly once"
+    );
+    assert_eq!(
+        progress.done.load(Ordering::Relaxed),
+        lr.restored + lr.dropped,
+        "done accounts for every entry as restored or dropped"
+    );
+}
+
+#[test]
 fn member_access_refs_survive_save_and_load() {
     // The real bug hunt: views round-trip through the disk cache, but do
     // member accesses? If this fails, bincode is dropping them and warm

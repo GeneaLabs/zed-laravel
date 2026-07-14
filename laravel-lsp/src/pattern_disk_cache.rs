@@ -31,12 +31,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use directories::ProjectDirs;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -91,7 +93,15 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        re-parse. The envelope SHAPE didn't change — only the extraction
 ///        OUTPUT — which is exactly why an output-affecting change must
 ///        bump this even when serde would happily decode the old bytes.
-const SCHEMA_VERSION: u32 = 10;
+///   v11 — M1 single-parse capture: `ParsedPatternsData` grew a
+///        `member_context` (per-site receiver recipes + view-render plans +
+///        Volt surface), compiled at parse so the magic build stops re-reading
+///        target files. bincode is non-self-describing, so a v10 entry lacks
+///        those bytes entirely — stale slim entries must re-parse rather than
+///        mis-decode. The bump also guarantees every restored non-vendor entry
+///        carries context, so no "refs present but context missing" state can
+///        exist on the resolve path.
+const SCHEMA_VERSION: u32 = 11;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 
@@ -130,6 +140,19 @@ pub struct LoadResult {
     pub restored: usize,
     pub dropped: usize,
     pub hierarchy: Vec<(PathBuf, Vec<ClassNode>)>,
+}
+
+/// Live counter the parallel freshness pass in [`load_into_reporting`]
+/// publishes into, so an async caller can render a moving progress bar
+/// during the (multi-second on a cold FS) 40k-entry load instead of one
+/// static message. `total` is `0` until the cache is decoded, then the
+/// entry count; `done` counts entries processed. Both are monotonic
+/// within a single load. All fields are atomics so the rayon workers and
+/// the async reporter can touch them concurrently without a lock.
+#[derive(Default)]
+pub struct LoadProgress {
+    pub done: AtomicUsize,
+    pub total: AtomicUsize,
 }
 
 /// Where the cache file for `project_root` lives on disk. Returns `None`
@@ -179,9 +202,33 @@ fn read_mtime(path: &Path) -> Option<(u64, u32)> {
 ///
 /// Errors silently degrade to "no cache available": the calling warming
 /// flow handles that fine — it just parses everything from scratch.
+///
+/// Thin wrapper over [`load_into_reporting`] with no progress plumbing —
+/// the entry point for callers (and tests) that don't render a bar.
 pub fn load_into(
     pattern_cache: &Arc<DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
     project_root: &Path,
+) -> LoadResult {
+    load_into_reporting(pattern_cache, project_root, None)
+}
+
+/// Same as [`load_into`], but publishes live per-entry counts into
+/// `progress` (when `Some`) so an async caller can render a moving bar
+/// during the freshness pass.
+///
+/// The pass is parallelized with rayon: on a large project the cache
+/// holds ~40k entries (source + vendor), and each one needs an
+/// independent mtime stat (a filesystem `metadata` call — the dominant
+/// cost on a cold FS cache) plus a position-index rebuild. Serially that
+/// was a multi-second startup stall; `into_par_iter` fans it across the
+/// rayon pool. The result is identical to a serial pass — DashMap inserts
+/// are lock-free, the counters are atomics, and the surfaced hierarchy is
+/// order-independent (the caller bulk-imports it as a set) — so the only
+/// observable change is that it finishes sooner.
+pub fn load_into_reporting(
+    pattern_cache: &Arc<DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
+    project_root: &Path,
+    progress: Option<&LoadProgress>,
 ) -> LoadResult {
     let Some(path) = cache_file_path(project_root) else {
         return LoadResult::default();
@@ -209,31 +256,57 @@ pub fn load_into(
         return LoadResult::default();
     }
 
-    let mut result = LoadResult::default();
-    for (path, entry) in cache.entries {
-        // Stat the file. If it's gone, or its mtime differs from the
-        // cached value, drop the entry — warming will re-parse it.
-        match read_mtime(&path) {
-            Some((s, n)) if s == entry.mtime_secs && n == entry.mtime_nanos => {
-                // Fresh: rebuild the position index (we skipped persisting
-                // it because it duplicates the Vec data) and insert.
-                let mut patterns = entry.patterns;
-                patterns.build_position_index();
-                // Surface the file's hierarchy nodes so the caller can
-                // re-import them — the index is otherwise empty on a warm
-                // start (no parse runs for disk-restored files).
-                if !entry.nodes.is_empty() {
-                    result.hierarchy.push((path.clone(), entry.nodes));
-                }
-                pattern_cache.insert(path, (0, Arc::new(patterns)));
-                result.restored += 1;
-            }
-            _ => {
-                result.dropped += 1;
-            }
-        }
+    // Publish the denominator now that the cache is decoded, so the async
+    // reporter can switch from an indeterminate message to "done of total"
+    // the moment the (fast) decode finishes and the (slow) stat pass runs.
+    if let Some(p) = progress {
+        p.total.store(cache.entries.len(), Ordering::Relaxed);
     }
-    result
+
+    // Freshness pass, parallelized. Each entry is validated, and fresh
+    // ones are rebuilt + inserted, independently; the closure surfaces the
+    // restored entry's hierarchy nodes (or `None`) and bumps the shared
+    // counters. `collect` gathers the hierarchy into a Vec whose order
+    // doesn't matter — it's imported as a set.
+    let restored = AtomicUsize::new(0);
+    let dropped = AtomicUsize::new(0);
+    let hierarchy: Vec<(PathBuf, Vec<ClassNode>)> = cache
+        .entries
+        .into_par_iter()
+        .filter_map(|(path, entry)| {
+            // Stat the file. If it's gone, or its mtime differs from the
+            // cached value, drop the entry — warming will re-parse it.
+            let node_entry = match read_mtime(&path) {
+                Some((s, n)) if s == entry.mtime_secs && n == entry.mtime_nanos => {
+                    // Fresh: rebuild the position index (we skipped persisting
+                    // it because it duplicates the Vec data) and insert.
+                    let mut patterns = entry.patterns;
+                    patterns.build_position_index();
+                    // Surface the file's hierarchy nodes so the caller can
+                    // re-import them — the index is otherwise empty on a warm
+                    // start (no parse runs for disk-restored files).
+                    let node_entry = (!entry.nodes.is_empty()).then(|| (path.clone(), entry.nodes));
+                    pattern_cache.insert(path, (0, Arc::new(patterns)));
+                    restored.fetch_add(1, Ordering::Relaxed);
+                    node_entry
+                }
+                _ => {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            };
+            if let Some(p) = progress {
+                p.done.fetch_add(1, Ordering::Relaxed);
+            }
+            node_entry
+        })
+        .collect();
+
+    LoadResult {
+        restored: restored.into_inner(),
+        dropped: dropped.into_inner(),
+        hierarchy,
+    }
 }
 
 /// Persist every entry currently in `pattern_cache` to disk, stamped
@@ -292,10 +365,25 @@ pub fn save_from(
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent).context("could not create cache directory")?;
     }
-    // Write to a temp file then rename — atomic on POSIX, so a crash
-    // mid-save leaves the previous cache intact rather than a truncated
-    // one we'd fail to decode on next load.
-    let tmp = cache_path.with_extension("bin.tmp");
+    // Write to a PER-CALL unique temp file, then atomically rename it onto
+    // the cache path. Atomic-rename-on-POSIX gives two guarantees at once:
+    //   1. Crash safety — a crash mid-write leaves the previous cache
+    //      intact rather than a truncated file we'd fail to decode.
+    //   2. Concurrent-save safety — the save now runs spawned/background
+    //      (see the warming path), so a reindex can start a second save
+    //      while a prior one is still writing. A SHARED tmp path would let
+    //      the two interleave their bytes into one file and corrupt it; a
+    //      unique suffix per call keeps them disjoint, and the two renames
+    //      simply race to last-writer-wins on a complete, valid file.
+    // The suffix combines the process id with a monotonic counter so it's
+    // unique across concurrent saves within this process.
+    static SAVE_SEQ: AtomicUsize = AtomicUsize::new(0);
+    let unique = format!(
+        "bin.tmp.{}.{}",
+        std::process::id(),
+        SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let tmp = cache_path.with_extension(unique);
     std::fs::write(&tmp, &encoded).context("write tmp cache file failed")?;
     std::fs::rename(&tmp, &cache_path).context("rename tmp cache file failed")?;
 

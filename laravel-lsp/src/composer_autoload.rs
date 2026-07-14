@@ -183,6 +183,83 @@ impl ComposerAutoload {
         dirs
     }
 
+    /// The project's own first-party PSR-4 source-root directories — the
+    /// `autoload` / `autoload-dev` mappings from the project `composer.json`
+    /// (`App\` → `app/`, `Database\Factories\` → `database/factories/`, and any
+    /// custom `Modules\` / `src/` layout). Used to widen the file watcher so an
+    /// external edit to *any* first-party source dir — not just the four
+    /// hardcoded ones — converges the magic-member index (M2).
+    ///
+    /// Vendor package roots (from `installed.json`) are deliberately excluded:
+    /// the existing `vendor/**` watcher globs already cover them, and a
+    /// `composer update` rewriting thousands of vendor files must not fan the
+    /// widened watcher out across the whole dependency tree.
+    ///
+    /// Filters, in order (each guards a real failure mode):
+    /// - **fail-closed containment** — a root that can't be proven inside the
+    ///   project root is dropped, the same [`path_within_root`] guard
+    ///   [`resolve`](Self::resolve) applies before any on-disk touch (a
+    ///   `..`-bearing or absolute PSR-4 value);
+    /// - **vendor exclusion** — anything under `<root>/vendor` (every
+    ///   `installed.json` root) is dropped;
+    /// - **root-equals-project** — a `"Foo\\": ""` mapping resolves to the
+    ///   project root itself, whose `**/*.php` glob would sweep compiled Blade
+    ///   under `storage/framework/views` and every other unindexed tree — dropped;
+    /// - **existence** — only directories that exist on disk are worth a watcher;
+    /// - **subsumption dedup** — a root nested under another kept root (e.g.
+    ///   `app/Models` under `App\` → `app/`) is redundant, its files already
+    ///   matched by the ancestor's recursive glob, so only the shallowest is kept.
+    ///
+    /// Comparisons run in canonical path space (so the macOS `/var`→`/private/var`
+    /// symlinked-tempdir case, and a vendor dir reached through a symlink, compare
+    /// correctly), but the returned paths are the **original** (un-canonicalized)
+    /// roots — matching the initialized-root-relative style of the watcher's fixed
+    /// globs.
+    pub fn project_source_roots(&self) -> Vec<PathBuf> {
+        let canonical_root = self
+            .project_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.project_root.clone());
+        let vendor = self.project_root.join("vendor");
+        let canonical_vendor = vendor.canonicalize().unwrap_or(vendor);
+
+        // Keep each surviving root as (canonical-for-comparison, original-to-return).
+        let mut candidates: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for (_prefix, source_roots) in &self.prefixes {
+            for root in source_roots {
+                if !path_within_root(root, &self.project_root) {
+                    continue;
+                }
+                if !root.is_dir() {
+                    continue;
+                }
+                let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                if canonical.starts_with(&canonical_vendor) {
+                    continue;
+                }
+                if canonical == canonical_root {
+                    continue;
+                }
+                if !candidates.iter().any(|(c, _)| c == &canonical) {
+                    candidates.push((canonical, root.clone()));
+                }
+            }
+        }
+
+        // Shallowest-first, then drop any root nested under one already kept.
+        candidates.sort_by_key(|(canon, _)| canon.components().count());
+        let mut kept_canonical: Vec<PathBuf> = Vec::new();
+        let mut kept: Vec<PathBuf> = Vec::new();
+        for (canonical, original) in candidates {
+            if kept_canonical.iter().any(|k| canonical.starts_with(k)) {
+                continue;
+            }
+            kept_canonical.push(canonical);
+            kept.push(original);
+        }
+        kept
+    }
+
     /// Parse autoload data fresh from disk. Doesn't touch the cache —
     /// callers should normally use [`for_project`] instead.
     pub fn load(project_root: &Path) -> Self {

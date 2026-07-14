@@ -201,7 +201,7 @@ pub fn resolve_blade_member_accesses(
     view_index: &ViewVarIndex,
     blade_loops: &[BladeLoopVar],
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
     mut deps: Option<&mut HashSet<String>>,
 ) -> Vec<MagicMemberEntry> {
@@ -302,7 +302,7 @@ fn classify_fqcn_member(
     member: &str,
     form: AccessForm,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<ClassifiedMember> {
     let file = resolver.class_file(fqcn)?;
@@ -320,7 +320,7 @@ fn resolve_chain_receiver(
     member: &str,
     form: AccessForm,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
     deps: Option<&mut HashSet<String>>,
 ) -> Option<ClassifiedMember> {
@@ -518,7 +518,7 @@ pub fn resolve_component_member_accesses(
 pub fn volt_property_types(
     source: &str,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> HashMap<String, String> {
     let Some(front) = volt_frontmatter(source) else {
@@ -680,7 +680,7 @@ fn computed_assignment(
     bytes: &[u8],
     aliases: &UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<(String, String)> {
     let var = plain_variable_name(assign.child_by_field_name("left")?, bytes)?;
@@ -711,7 +711,7 @@ fn render_method_vars(
     bytes: &[u8],
     aliases: &UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> HashMap<String, String> {
     let Some(ret) = function_return_expr(method) else {
@@ -787,7 +787,7 @@ fn function_return_expr(func: Node) -> Option<Node> {
 pub fn mfc_volt_property_types(
     blade_path: &Path,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<HashMap<String, String>> {
     let sibling = crate::livewire_resolver::mfc_sibling(blade_path)?;
@@ -810,7 +810,7 @@ pub fn resolve_volt_member_accesses(
     prop_types: &HashMap<String, String>,
     blade_loops: &[BladeLoopVar],
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
     mut deps: Option<&mut HashSet<String>>,
 ) -> Vec<MagicMemberEntry> {
@@ -1094,7 +1094,7 @@ fn clean_type(raw: &str) -> Option<String> {
 pub fn view_renders_in_file(
     source: &str,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Vec<ViewRender> {
     let Ok(tree) = parse_php(source) else {
@@ -1129,7 +1129,7 @@ fn render_from_view_call(
     bytes: &[u8],
     aliases: &crate::query_chain::use_aliases::UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
 ) -> Option<ViewRender> {
     let args = call.child_by_field_name("arguments")?;
@@ -1172,7 +1172,7 @@ fn collect_vars(
     bytes: &[u8],
     aliases: &crate::query_chain::use_aliases::UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
     vars: &mut HashMap<String, String>,
 ) {
@@ -1229,7 +1229,7 @@ fn collect_with_chain(
     bytes: &[u8],
     aliases: &crate::query_chain::use_aliases::UseAliases,
     resolver: &impl ClassFileResolver,
-    classviews: &mut ClassViewCache,
+    classviews: &ClassViewCache,
     project_root: &Path,
     vars: &mut HashMap<String, String>,
 ) {
@@ -1322,6 +1322,756 @@ fn string_literal_value(node: Node, bytes: &[u8]) -> Option<String> {
             .trim_matches(['\'', '"'])
             .to_string(),
     )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M1 single-parse capture — view-render + Volt-surface + component capture/eval
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// These COMPILE the intra-file structure at parse (view() renders, Volt
+// front-matter surface, component member names) and EVAL it at resolve against
+// snapshots, so the magic build never re-reads/re-parses the file. Each capture
+// function mirrors its live counterpart's traversal exactly, emitting a plan
+// instead of resolving; each eval replays the plan, applying insert vs
+// or_insert precedence identically. The live functions above stay untouched —
+// the equivalence baseline.
+
+use crate::salsa_impl::{
+    ComponentContextData, MemberContextData, ReceiverRecipeData, ValueExprPlanData,
+    ViewRenderPlanData, VoltPropPlanData, VoltSurfaceData,
+};
+use tree_sitter::Tree;
+
+// ─── Capture: controller view() renders (pass 1) ───────────────────────────
+
+/// Compile every `view('name', […])` render site into a [`ViewRenderPlanData`]
+/// — the parse-time form of [`view_renders_in_file`].
+pub(crate) fn capture_render_plans(
+    source: &str,
+    tree: &Tree,
+    aliases: &UseAliases,
+) -> Vec<ViewRenderPlanData> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "function_call_expression" && call_function_name(n, bytes) == Some("view") {
+            if let Some(plan) = render_plan_from_view_call(n, bytes, aliases) {
+                out.push(plan);
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    out
+}
+
+/// The plan form of [`render_from_view_call`].
+fn render_plan_from_view_call(
+    call: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+) -> Option<ViewRenderPlanData> {
+    let args = call.child_by_field_name("arguments")?;
+    let arg_exprs = positional_args(args);
+    let view_name = string_literal_value(*arg_exprs.first()?, bytes)?;
+
+    let mut items = Vec::new();
+    if let Some(data) = arg_exprs.get(1) {
+        items.extend(collect_var_plan_items(*data, bytes, aliases));
+    }
+    collect_with_chain_plans(call, bytes, aliases, &mut items);
+    Some(ViewRenderPlanData { view_name, items })
+}
+
+/// The plan form of [`collect_vars`]: `(key, plan)` pairs in traversal order.
+/// For the array form every key is emitted (eval gates on the value resolving,
+/// preserving last-wins); for `compact` only intra-file-typed vars are emitted
+/// (mirrors `flow::resolve` skipping the untypable).
+fn collect_var_plan_items(
+    data: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+) -> Vec<(String, ValueExprPlanData)> {
+    let mut items = Vec::new();
+    match data.kind() {
+        "array_creation_expression" => {
+            let mut c = data.walk();
+            for el in data.named_children(&mut c) {
+                if el.kind() != "array_element_initializer" {
+                    continue;
+                }
+                let mut ec = el.walk();
+                let kids: Vec<_> = el.named_children(&mut ec).collect();
+                if kids.len() != 2 {
+                    continue;
+                }
+                let Some(key) = string_literal_value(kids[0], bytes) else {
+                    continue;
+                };
+                items.push((
+                    key,
+                    crate::member_resolver::compile_value_expr(kids[1], bytes, aliases),
+                ));
+            }
+        }
+        "function_call_expression" if call_function_name(data, bytes) == Some("compact") => {
+            if let Some(args) = data.child_by_field_name("arguments") {
+                for arg in positional_args(args) {
+                    let Some(name) = string_literal_value(arg, bytes) else {
+                        continue;
+                    };
+                    if let Some(plan) =
+                        crate::member_resolver::compile_flow_var(arg, bytes, &name, aliases)
+                    {
+                        items.push((name, plan));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    items
+}
+
+/// The plan form of [`collect_with_chain`].
+fn collect_with_chain_plans(
+    view_call: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+    items: &mut Vec<(String, ValueExprPlanData)>,
+) {
+    let mut node = view_call;
+    while let Some(parent) = node.parent() {
+        if parent.kind() != "member_call_expression"
+            || parent.child_by_field_name("object").map(|o| o.id()) != Some(node.id())
+        {
+            break;
+        }
+        if parent
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())
+            == Some("with")
+        {
+            if let Some(args) = parent.child_by_field_name("arguments") {
+                let exprs = positional_args(args);
+                match exprs.as_slice() {
+                    [key, value] => {
+                        if let Some(name) = string_literal_value(*key, bytes) {
+                            items.push((
+                                name,
+                                crate::member_resolver::compile_value_expr(*value, bytes, aliases),
+                            ));
+                        }
+                    }
+                    [data] => items.extend(collect_var_plan_items(*data, bytes, aliases)),
+                    _ => {}
+                }
+            }
+        }
+        node = parent;
+    }
+}
+
+/// Pass-1 replacement: build [`ViewRender`]s from captured plans without
+/// re-reading/re-parsing the controller.
+pub fn evaluate_render_plans(
+    plans: &[ViewRenderPlanData],
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+) -> Vec<ViewRender> {
+    plans
+        .iter()
+        .map(|plan| ViewRender {
+            view_name: plan.view_name.clone(),
+            // Resolve-gated last-wins over the site's items (an unresolvable
+            // later value never overwrites an earlier resolved one).
+            vars: eval_value_items(&plan.items, aliases, resolver, classviews, project_root),
+        })
+        .collect()
+}
+
+// ─── Capture: Volt front-matter surface (item 8) ───────────────────────────
+
+/// Compile a Volt SFC's front-matter surface into an ordered plan — the
+/// parse-time form of [`volt_property_types`]. Items are emitted in the SAME
+/// DFS order the live typer applies them, so the eval replay reproduces the
+/// insert (typed prop, overwrites) vs or_insert (inferred, first-wins)
+/// precedence exactly.
+pub(crate) fn capture_volt_surface(source: &str) -> Option<VoltSurfaceData> {
+    let front = volt_frontmatter(source)?;
+    let tree = parse_php(front).ok()?;
+    let bytes = front.as_bytes();
+    let aliases = extract_use_aliases(&tree, front);
+    let mut items: Vec<VoltPropPlanData> = Vec::new();
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            "property_declaration" if is_public(n, bytes) => {
+                if let (Some(ty), Some(name)) = (
+                    n.child_by_field_name("type"),
+                    property_element_name(n, bytes),
+                ) {
+                    if let Some(fqcn) = clean_type(ty.utf8_text(bytes).unwrap_or("")) {
+                        items.push(VoltPropPlanData::TypedProp {
+                            name,
+                            fqcn: resolve_class_name(&fqcn, &aliases),
+                        });
+                    }
+                }
+            }
+            "method_declaration" if method_name_is(n, bytes, "mount") => {
+                collect_mount_assignment_plans(n, bytes, &aliases, &mut items);
+            }
+            "method_declaration" if method_name_is(n, bytes, "with") => {
+                if let Some(ret) = function_return_expr(n) {
+                    items.push(VoltPropPlanData::OrInsertGroup(collect_var_plan_items(
+                        ret, bytes, &aliases,
+                    )));
+                }
+            }
+            "method_declaration" if method_name_is(n, bytes, "render") => {
+                if let Some(ret) = function_return_expr(n) {
+                    if let Some(view_call) = find_view_call(ret, bytes) {
+                        if let Some(plan) = render_plan_from_view_call(view_call, bytes, &aliases) {
+                            items.push(VoltPropPlanData::OrInsertGroup(plan.items));
+                        }
+                    }
+                }
+            }
+            "method_declaration" if method_has_attribute(n, bytes, "Computed") => {
+                if let Some(name) = n
+                    .child_by_field_name("name")
+                    .and_then(|nm| nm.utf8_text(bytes).ok())
+                {
+                    let body = function_return_expr(n).map(|ret| {
+                        crate::member_resolver::compile_value_expr(ret, bytes, &aliases)
+                    });
+                    let declared = n
+                        .child_by_field_name("return_type")
+                        .and_then(|rt| clean_type(rt.utf8_text(bytes).ok()?))
+                        .map(|t| resolve_class_name(&t, &aliases));
+                    items.push(VoltPropPlanData::Computed {
+                        name: name.to_string(),
+                        body,
+                        declared,
+                    });
+                }
+            }
+            "function_call_expression" if call_function_name(n, bytes) == Some("mount") => {
+                if let Some(closure) = first_closure_arg(n) {
+                    collect_mount_assignment_plans(closure, bytes, &aliases, &mut items);
+                }
+            }
+            "function_call_expression" if call_function_name(n, bytes) == Some("state") => {
+                if let Some(args) = n.child_by_field_name("arguments") {
+                    if let Some(data) = positional_args(args).first() {
+                        items.push(VoltPropPlanData::OrInsertGroup(collect_var_plan_items(
+                            *data, bytes, &aliases,
+                        )));
+                    }
+                }
+            }
+            "function_call_expression" if call_function_name(n, bytes) == Some("with") => {
+                if let Some(closure) = first_closure_arg(n) {
+                    if let Some(ret) = function_return_expr(closure) {
+                        items.push(VoltPropPlanData::OrInsertGroup(collect_var_plan_items(
+                            ret, bytes, &aliases,
+                        )));
+                    }
+                }
+            }
+            "assignment_expression" => {
+                if let Some((var, plan)) = compile_computed_assignment(n, bytes, &aliases) {
+                    items.push(VoltPropPlanData::OrInsert { name: var, plan });
+                }
+            }
+            _ => {}
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    Some(VoltSurfaceData { items, aliases })
+}
+
+/// Resolve a handler's ordered `(name, plan)` items into a `var → FQCN` map,
+/// gating each on the value resolving — the exact analog of the tree engine's
+/// `collect_vars` (`if let Some((fqcn, _)) = resolve_expression_type(..) {
+/// vars.insert(key, fqcn); }`). A later value overwrites an earlier one ONLY
+/// when it resolves, so within a handler it is last-RESOLVING-wins. Shared by
+/// [`evaluate_render_plans`] (returns the map directly) and
+/// [`evaluate_volt_surface`]'s `OrInsertGroup` fold.
+fn eval_value_items(
+    items: &[(String, ValueExprPlanData)],
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+    for (key, value_plan) in items {
+        if let Some((fqcn, _)) = crate::member_resolver::eval_value_expr(
+            value_plan,
+            aliases,
+            resolver,
+            classviews,
+            project_root,
+        ) {
+            vars.insert(key.clone(), fqcn);
+        }
+    }
+    vars
+}
+
+/// The plan form of [`collect_mount_assignments`] — each `$this->prop = $param`
+/// becomes an `OrInsert` of the param's (pure, declared) type.
+fn collect_mount_assignment_plans(
+    func: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+    items: &mut Vec<VoltPropPlanData>,
+) {
+    let mut param_types: HashMap<String, String> = HashMap::new();
+    if let Some(params) = func.child_by_field_name("parameters") {
+        let mut c = params.walk();
+        for p in params.named_children(&mut c) {
+            if p.kind() != "simple_parameter" {
+                continue;
+            }
+            let (Some(ty), Some(nm)) =
+                (p.child_by_field_name("type"), p.child_by_field_name("name"))
+            else {
+                continue;
+            };
+            let Some(fqcn) = clean_type(ty.utf8_text(bytes).unwrap_or("")) else {
+                continue;
+            };
+            if let Ok(name) = nm.utf8_text(bytes) {
+                param_types.insert(
+                    name.trim_start_matches('$').to_string(),
+                    resolve_class_name(&fqcn, aliases),
+                );
+            }
+        }
+    }
+    if param_types.is_empty() {
+        return;
+    }
+    let Some(body) = func.child_by_field_name("body") else {
+        return;
+    };
+    let mut stack = vec![body];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "assignment_expression" {
+            if let (Some(left), Some(right)) = (
+                n.child_by_field_name("left"),
+                n.child_by_field_name("right"),
+            ) {
+                if let (Some(prop), Some(param)) = (
+                    this_property_name(left, bytes),
+                    plain_variable_name(right, bytes),
+                ) {
+                    if let Some(fqcn) = param_types.get(&param) {
+                        items.push(VoltPropPlanData::OrInsert {
+                            name: prop,
+                            plan: ValueExprPlanData::Resolved {
+                                fqcn: fqcn.clone(),
+                                confidence: Confidence::High,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+}
+
+/// The plan form of [`computed_assignment`].
+fn compile_computed_assignment(
+    assign: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+) -> Option<(String, ValueExprPlanData)> {
+    let var = plain_variable_name(assign.child_by_field_name("left")?, bytes)?;
+    let right = assign.child_by_field_name("right")?;
+    if right.kind() != "function_call_expression"
+        || call_function_name(right, bytes) != Some("computed")
+    {
+        return None;
+    }
+    let closure = first_closure_arg(right)?;
+    if let Some(rt) = closure.child_by_field_name("return_type") {
+        if let Some(t) = rt.utf8_text(bytes).ok().and_then(clean_type) {
+            return Some((
+                var,
+                ValueExprPlanData::Resolved {
+                    fqcn: resolve_class_name(&t, aliases),
+                    confidence: Confidence::High,
+                },
+            ));
+        }
+    }
+    let ret = function_return_expr(closure)?;
+    Some((
+        var,
+        crate::member_resolver::compile_value_expr(ret, bytes, aliases),
+    ))
+}
+
+/// Volt-props replacement: evaluate a captured surface into `prop → FQCN`
+/// without re-reading/re-parsing the component. Byte-identical to
+/// [`volt_property_types`] for the same source.
+pub fn evaluate_volt_surface(
+    surface: &VoltSurfaceData,
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    for item in &surface.items {
+        match item {
+            VoltPropPlanData::TypedProp { name, fqcn } => {
+                out.insert(name.clone(), fqcn.clone());
+            }
+            VoltPropPlanData::OrInsert { name, plan } => {
+                if let Some((fqcn, _)) = crate::member_resolver::eval_value_expr(
+                    plan,
+                    &surface.aliases,
+                    resolver,
+                    classviews,
+                    project_root,
+                ) {
+                    out.entry(name.clone()).or_insert(fqcn);
+                }
+            }
+            VoltPropPlanData::OrInsertGroup(group) => {
+                // Two-stage precedence (the tree's temp-map then fold_or_insert):
+                //   1. WITHIN the handler — resolve-gated last-wins into a temp
+                //      map (a later unresolvable value never clobbers an earlier
+                //      resolved one).
+                //   2. ACROSS handlers — or_insert the temp into the surface, so
+                //      the FIRST handler to set a key wins. (temp's keys are
+                //      distinct, so its iteration order is immaterial here.)
+                let temp =
+                    eval_value_items(group, &surface.aliases, resolver, classviews, project_root);
+                for (k, v) in temp {
+                    out.entry(k).or_insert(v);
+                }
+            }
+            VoltPropPlanData::Computed {
+                name,
+                body,
+                declared,
+            } => {
+                let fqcn = body
+                    .as_ref()
+                    .and_then(|b| {
+                        crate::member_resolver::eval_value_expr(
+                            b,
+                            &surface.aliases,
+                            resolver,
+                            classviews,
+                            project_root,
+                        )
+                        .map(|(f, _)| f)
+                    })
+                    .or_else(|| declared.clone());
+                if let Some(fqcn) = fqcn {
+                    out.entry(name.clone()).or_insert(fqcn);
+                }
+            }
+        }
+    }
+    out
+}
+
+// ─── Capture: component identity + member names (item 8) ───────────────────
+
+/// Capture a Livewire/Volt component's synthetic key + declared member names,
+/// when both are intra-file. `members` is `None` for a multi-file-component
+/// TEMPLATE (its class lives in a sibling `.php`, read at eval). `is_volt` is
+/// the already-captured `source_contains_volt_signature` for Blade files.
+pub(crate) fn capture_component(
+    path: &Path,
+    source: &str,
+    is_volt: bool,
+) -> Option<ComponentContextData> {
+    let is_blade = path.to_string_lossy().ends_with(".blade.php");
+    if is_blade {
+        if is_volt {
+            // Single-file Volt component: members come from the front-matter.
+            let members = volt_frontmatter(source)
+                .map(volt_component_member_names)
+                .unwrap_or_default();
+            Some(ComponentContextData {
+                key: format!("volt::{}", path.display()),
+                members: Some(sorted_members(members)),
+            })
+        } else {
+            // MFC template: identity is the sibling `.php`; its member names are
+            // read from that sibling at eval (a cross-file read kept at resolve).
+            let sib = crate::livewire_resolver::mfc_sibling(path)?;
+            Some(ComponentContextData {
+                key: format!("volt::{}", sib.display()),
+                members: None,
+            })
+        }
+    } else if crate::php_class::detect_inline_livewire_class(source) {
+        Some(ComponentContextData {
+            key: format!("volt::{}", path.display()),
+            members: Some(sorted_members(volt_component_member_names(source))),
+        })
+    } else {
+        None
+    }
+}
+
+fn sorted_members(names: HashSet<String>) -> Vec<String> {
+    let mut v: Vec<String> = names.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// Component-refs replacement: index `$this->member` reads under the captured
+/// key without re-reading/re-parsing this file. For a multi-file-component
+/// template (`members == None`) the sibling `.php` is read here — the one
+/// cross-file read the spec keeps at resolve.
+pub fn resolve_component_member_accesses_with_context(
+    component: &ComponentContextData,
+    path: &Path,
+    member_refs: &[Arc<MemberAccessReferenceData>],
+) -> Vec<MagicMemberEntry> {
+    let members: HashSet<String> = match &component.members {
+        Some(m) => m.iter().cloned().collect(),
+        None => {
+            let Some(sib) = crate::livewire_resolver::mfc_sibling(path) else {
+                return Vec::new();
+            };
+            let src = std::fs::read_to_string(&sib).unwrap_or_default();
+            if src.is_empty() {
+                return Vec::new();
+            }
+            volt_component_member_names(&src)
+        }
+    };
+    if members.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen: HashSet<(u32, u32)> = HashSet::new();
+    for m in member_refs {
+        if m.receiver.trim() != "$this" || !members.contains(&m.member) {
+            continue;
+        }
+        if seen.insert((m.line, m.column)) {
+            out.push(MagicMemberEntry {
+                fqcn: component.key.clone(),
+                member: m.member.clone(),
+                line: m.line,
+                column: m.column,
+                end_column: m.end_column,
+            });
+        }
+    }
+    out
+}
+
+// ─── Eval: Blade / Volt member accesses from captured recipes ──────────────
+
+/// Pass-3 replacement (controller-rendered Blade): identical to
+/// [`resolve_blade_member_accesses`] except the non-variable (chain) receiver
+/// resolves through its captured recipe instead of a re-parsed snippet.
+/// `ctx.sites` is positionally parallel to `member_refs`.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_blade_member_accesses_with_context(
+    ctx: &MemberContextData,
+    member_refs: &[Arc<MemberAccessReferenceData>],
+    view_name: &str,
+    view_index: &ViewVarIndex,
+    blade_loops: &[BladeLoopVar],
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+    mut deps: Option<&mut HashSet<String>>,
+) -> Vec<MagicMemberEntry> {
+    debug_assert_eq!(ctx.sites.len(), member_refs.len());
+    let mut out: Vec<MagicMemberEntry> = Vec::new();
+    let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
+
+    let var_types = |var: &str, line: u32| -> Vec<String> {
+        let direct = view_index.var_types(view_name, var);
+        if !direct.is_empty() {
+            return direct;
+        }
+        match enclosing_loop_iterable(blade_loops, var, line) {
+            Some(iter) => bare_variable(iter)
+                .map(|iv| view_index.var_types(view_name, iv))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    };
+
+    for (m, site) in member_refs.iter().zip(ctx.sites.iter()) {
+        let receiver = m.receiver.trim();
+
+        let declaring: Vec<String> = if let Some(var) = bare_variable(receiver) {
+            var_types(var, m.line)
+                .into_iter()
+                .filter_map(|fqcn| {
+                    if let Some(d) = deps.as_deref_mut() {
+                        d.insert(fqcn.clone());
+                    }
+                    classify_fqcn_member(
+                        &fqcn,
+                        &m.member,
+                        m.form,
+                        resolver,
+                        classviews,
+                        project_root,
+                    )
+                    .map(|c| c.declaring_fqcn)
+                })
+                .collect()
+        } else {
+            resolve_recipe_chain_receiver(
+                &site.recipe,
+                &ctx.aliases,
+                &m.member,
+                m.form,
+                resolver,
+                classviews,
+                project_root,
+                deps.as_deref_mut(),
+            )
+            .map(|c| vec![c.declaring_fqcn])
+            .unwrap_or_default()
+        };
+
+        for fqcn in declaring {
+            if seen.insert((fqcn.clone(), m.line, m.column)) {
+                out.push(MagicMemberEntry {
+                    fqcn,
+                    member: m.member.clone(),
+                    line: m.line,
+                    column: m.column,
+                    end_column: m.end_column,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Pass-3 replacement (Volt): identical to [`resolve_volt_member_accesses`]
+/// except the non-prop (chain) receiver resolves through its captured recipe.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_volt_member_accesses_with_context(
+    ctx: &MemberContextData,
+    member_refs: &[Arc<MemberAccessReferenceData>],
+    prop_types: &HashMap<String, String>,
+    blade_loops: &[BladeLoopVar],
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+    mut deps: Option<&mut HashSet<String>>,
+) -> Vec<MagicMemberEntry> {
+    debug_assert_eq!(ctx.sites.len(), member_refs.len());
+    let mut out: Vec<MagicMemberEntry> = Vec::new();
+    let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
+
+    for (m, site) in member_refs.iter().zip(ctx.sites.iter()) {
+        let receiver = m.receiver.trim();
+        let declaring: Option<String> = if let Some(prop) = volt_base_prop(receiver) {
+            let direct = prop_types.get(prop).and_then(|fqcn| {
+                if let Some(d) = deps.as_deref_mut() {
+                    d.insert(fqcn.clone());
+                }
+                classify_fqcn_member(fqcn, &m.member, m.form, resolver, classviews, project_root)
+                    .map(|c| c.declaring_fqcn)
+            });
+            direct.or_else(|| {
+                let var = bare_variable(receiver)?;
+                let iter = enclosing_loop_iterable(blade_loops, var, m.line)?;
+                let iter_prop = volt_base_prop(iter)?;
+                prop_types.get(iter_prop).and_then(|fqcn| {
+                    if let Some(d) = deps.as_deref_mut() {
+                        d.insert(fqcn.clone());
+                    }
+                    classify_fqcn_member(
+                        fqcn,
+                        &m.member,
+                        m.form,
+                        resolver,
+                        classviews,
+                        project_root,
+                    )
+                    .map(|c| c.declaring_fqcn)
+                })
+            })
+        } else {
+            resolve_recipe_chain_receiver(
+                &site.recipe,
+                &ctx.aliases,
+                &m.member,
+                m.form,
+                resolver,
+                classviews,
+                project_root,
+                deps.as_deref_mut(),
+            )
+            .map(|c| c.declaring_fqcn)
+        };
+
+        if let Some(fqcn) = declaring {
+            if seen.insert((fqcn.clone(), m.line, m.column)) {
+                out.push(MagicMemberEntry {
+                    fqcn,
+                    member: m.member.clone(),
+                    line: m.line,
+                    column: m.column,
+                    end_column: m.end_column,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The captured-context form of [`resolve_chain_receiver`]: resolve a
+/// non-variable Blade/Volt receiver through its recipe, gate to HIGH/MEDIUM,
+/// record the dep, then classify.
+#[allow(clippy::too_many_arguments)]
+fn resolve_recipe_chain_receiver(
+    recipe: &ReceiverRecipeData,
+    aliases: &UseAliases,
+    member: &str,
+    form: AccessForm,
+    resolver: &impl ClassFileResolver,
+    classviews: &ClassViewCache,
+    project_root: &Path,
+    deps: Option<&mut HashSet<String>>,
+) -> Option<ClassifiedMember> {
+    let (fqcn, confidence) =
+        crate::member_resolver::eval_receiver(recipe, aliases, resolver, classviews, project_root)?;
+    if !matches!(confidence, Confidence::High | Confidence::Medium) {
+        return None;
+    }
+    if let Some(d) = deps {
+        d.insert(fqcn.clone());
+    }
+    classify_fqcn_member(&fqcn, member, form, resolver, classviews, project_root)
 }
 
 #[cfg(test)]

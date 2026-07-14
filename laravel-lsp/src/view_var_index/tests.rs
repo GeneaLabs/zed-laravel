@@ -12,7 +12,7 @@ fn renders(controller: &str) -> Vec<ViewRender> {
     view_renders_in_file(
         controller,
         &ClassHierarchyIndex::default(),
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         Path::new("/proj"),
     )
 }
@@ -296,14 +296,14 @@ fn blade_var_resolves_via_view_index() {
 
     // `{{ $user->email }}` captured at line 3, col 15.
     let refs = vec![member_ref("$user", "email", 3, 15)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.show",
         &idx,
         &[],
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -325,14 +325,14 @@ fn blade_unknown_member_is_dropped() {
     );
     // `nope` is not a column/accessor/relationship/property on User → dropped.
     let refs = vec![member_ref("$user", "nope", 1, 0)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.show",
         &idx,
         &[],
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -344,14 +344,14 @@ fn blade_var_with_no_inferred_type_is_dropped() {
     let p = blade_project();
     let idx = ViewVarIndex::new(); // empty — nothing rendered this view
     let refs = vec![member_ref("$user", "email", 1, 0)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.show",
         &idx,
         &[],
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -385,14 +385,14 @@ fn blade_container_binding_receiver_resolves() {
     let idx = ViewVarIndex::new(); // no controller render — type comes from the binding
     let resolver = user_bound_resolver(&p, "currentUser");
     let refs = vec![member_ref("app('currentUser')", "email", 5, 12)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.show",
         &idx,
         &[],
         &resolver,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -410,14 +410,14 @@ fn blade_container_binding_unknown_key_is_dropped() {
     let idx = ViewVarIndex::new();
     let resolver = user_bound_resolver(&p, "someOtherKey");
     let refs = vec![member_ref("app('currentUser')", "email", 1, 0)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.show",
         &idx,
         &[],
         &resolver,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -434,14 +434,14 @@ fn blade_relationship_resolves() {
     );
     // `{{ $user->posts }}` — relationship read as a property.
     let refs = vec![member_ref("$user", "posts", 2, 4)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.show",
         &idx,
         &[],
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -459,7 +459,7 @@ fn volt_types(src: &str) -> HashMap<String, String> {
     volt_property_types(
         src,
         &ClassHierarchyIndex::default(),
-        &mut ClassViewCache::new(),
+        &ClassViewCache::new(),
         Path::new("/proj"),
     )
 }
@@ -650,9 +650,8 @@ fn volt_resolves_this_property_access() {
 
     // `{{ $this->user->email }}` — receiver captured as `$this->user`.
     let refs = vec![member_ref("$this->user", "email", 5, 18)];
-    let mut cache = ClassViewCache::new();
-    let entries =
-        resolve_volt_member_accesses(&refs, &types, &[], &p.index, &mut cache, &p.root, None);
+    let cache = ClassViewCache::new();
+    let entries = resolve_volt_member_accesses(&refs, &types, &[], &p.index, &cache, &p.root, None);
     assert_eq!(entries.len(), 1, "got {entries:?}");
     assert_eq!(entries[0].fqcn, "App\\Models\\User");
     assert_eq!(entries[0].member, "email");
@@ -666,9 +665,8 @@ fn volt_resolves_bare_public_property_access() {
 
     // Public properties are also readable bare in the template: `{{ $user->email }}`.
     let refs = vec![member_ref("$user", "email", 1, 0)];
-    let mut cache = ClassViewCache::new();
-    let entries =
-        resolve_volt_member_accesses(&refs, &types, &[], &p.index, &mut cache, &p.root, None);
+    let cache = ClassViewCache::new();
+    let entries = resolve_volt_member_accesses(&refs, &types, &[], &p.index, &cache, &p.root, None);
     assert_eq!(entries.len(), 1, "got {entries:?}");
     assert_eq!(entries[0].fqcn, "App\\Models\\User");
 }
@@ -678,9 +676,8 @@ fn volt_unknown_property_is_dropped() {
     let p = blade_project();
     let types = HashMap::new(); // nothing inferred
     let refs = vec![member_ref("$this->user", "email", 1, 0)];
-    let mut cache = ClassViewCache::new();
-    let entries =
-        resolve_volt_member_accesses(&refs, &types, &[], &p.index, &mut cache, &p.root, None);
+    let cache = ClassViewCache::new();
+    let entries = resolve_volt_member_accesses(&refs, &types, &[], &p.index, &cache, &p.root, None);
     assert!(entries.is_empty(), "got {entries:?}");
 }
 
@@ -724,9 +721,9 @@ fn volt_foreach_loop_var_resolves_from_this_computed() {
         end_line: 20,
     }];
     let refs = vec![member_ref("$user", "email", 7, 40)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries =
-        resolve_volt_member_accesses(&refs, &types, &loops, &p.index, &mut cache, &p.root, None);
+        resolve_volt_member_accesses(&refs, &types, &loops, &p.index, &cache, &p.root, None);
     assert_eq!(entries.len(), 1, "got {entries:?}");
     assert_eq!(entries[0].fqcn, "App\\Models\\User");
     assert_eq!(entries[0].member, "email");
@@ -749,14 +746,14 @@ fn blade_foreach_loop_var_resolves_from_view_var() {
         end_line: 10,
     }];
     let refs = vec![member_ref("$user", "email", 4, 12)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries = resolve_blade_member_accesses(
         &refs,
         "users.index",
         &idx,
         &loops,
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         None,
     );
@@ -777,9 +774,9 @@ fn loop_var_outside_loop_range_is_dropped() {
     }];
     // Access on line 30 — outside the loop body → no resolution.
     let refs = vec![member_ref("$user", "email", 30, 0)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let entries =
-        resolve_volt_member_accesses(&refs, &types, &loops, &p.index, &mut cache, &p.root, None);
+        resolve_volt_member_accesses(&refs, &types, &loops, &p.index, &cache, &p.root, None);
     assert!(entries.is_empty(), "got {entries:?}");
 }
 
@@ -870,7 +867,7 @@ fn blade_deps_record_attempted_var_types_even_on_unknown_member() {
 
     // `notAColumn` doesn't classify — the dependency must still register.
     let refs = vec![member_ref("$user", "notAColumn", 3, 15)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let mut deps = HashSet::new();
     let entries = resolve_blade_member_accesses(
         &refs,
@@ -878,7 +875,7 @@ fn blade_deps_record_attempted_var_types_even_on_unknown_member() {
         &idx,
         &[],
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         Some(&mut deps),
     );
@@ -893,14 +890,14 @@ fn volt_deps_record_attempted_prop_types_even_on_unknown_member() {
     types.insert("user".to_string(), "App\\Models\\User".to_string());
 
     let refs = vec![member_ref("$this->user", "notAColumn", 1, 0)];
-    let mut cache = ClassViewCache::new();
+    let cache = ClassViewCache::new();
     let mut deps = HashSet::new();
     let entries = resolve_volt_member_accesses(
         &refs,
         &types,
         &[],
         &p.index,
-        &mut cache,
+        &cache,
         &p.root,
         Some(&mut deps),
     );
@@ -938,4 +935,445 @@ fn renders_for_returns_current_contribution() {
     let r = render("users.show", &[("user", "App\\Models\\User")]);
     idx.insert_file(a.clone(), std::slice::from_ref(&r));
     assert_eq!(idx.renders_for(&a), Some(std::slice::from_ref(&r)));
+}
+
+// ─── M1 single-parse capture: view-render + Volt-surface equivalence ──────
+//
+// Evaluating captured plans must be byte-identical to the live re-parse path,
+// across every render/Volt-surface shape the fixtures exercise.
+
+/// Resolve a controller's view() renders BOTH ways (live `view_renders_in_file`
+/// vs captured `evaluate_render_plans`), sorted for an order-independent
+/// comparison.
+fn render_both_ways(
+    resolver: &impl ClassFileResolver,
+    root: &Path,
+    controller: &str,
+) -> (Vec<ViewRender>, Vec<ViewRender>) {
+    let sort = |mut v: Vec<ViewRender>| {
+        v.sort_by(|a, b| a.view_name.cmp(&b.view_name));
+        v
+    };
+    let live = view_renders_in_file(controller, resolver, &ClassViewCache::new(), root);
+    let tree = crate::parser::parse_php(controller).unwrap();
+    let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, controller);
+    let plans = capture_render_plans(controller, &tree, &aliases);
+    let captured = evaluate_render_plans(&plans, &aliases, resolver, &ClassViewCache::new(), root);
+    (sort(live), sort(captured))
+}
+
+#[test]
+fn captured_render_plans_match_live_across_shapes() {
+    let p = blade_project();
+    let controller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $user) {
+        $u2 = User::first();
+        view('a.array', ['user' => $user, 'other' => 42]);   // array (one typed, one not)
+        view('a.compact', compact('user'));                  // compact
+        view('a.with')->with('user', $u2);                   // ->with(k, v)
+        view('a.witharr')->with(['user' => $user]);          // ->with([...])
+        view('a.dynamic', ['x' => $undefinedVar]);           // value that won't type
+        view($dynamicName, ['user' => $user]);               // dynamic view name → skipped by both
+    }
+}
+"#;
+    let (live, captured) = render_both_ways(&p.index, &p.root, controller);
+    assert_eq!(live, captured, "captured render plans diverged from live");
+    assert!(
+        live.iter().any(|r| r.vars.contains_key("user")),
+        "fixture typed no view vars — comparison would be near-vacuous"
+    );
+}
+
+/// Type a Volt SFC's front-matter BOTH ways (live `volt_property_types` vs
+/// captured `evaluate_volt_surface`).
+fn volt_both_ways(
+    resolver: &impl ClassFileResolver,
+    root: &Path,
+    src: &str,
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let live = volt_property_types(src, resolver, &ClassViewCache::new(), root);
+    let surface = capture_volt_surface(src).expect("volt surface captured");
+    let captured = evaluate_volt_surface(&surface, resolver, &ClassViewCache::new(), root);
+    (live, captured)
+}
+
+#[test]
+fn captured_volt_surface_matches_live_across_shapes() {
+    // Typed prop (authoritative), computed (body-inferred), state, with,
+    // mount-assignment, and `$x = computed(...)` — the whole surface zoo.
+    let src = r#"<?php
+use App\Models\User;
+use Illuminate\Support\Collection;
+use Livewire\Volt\Component;
+use function Livewire\Volt\{state, computed, mount, with};
+
+new class extends Component {
+    public User $user;               // typed prop — authoritative
+    public int $count = 0;           // non-class, dropped
+
+    public function mount(User $injected) {
+        $this->user = $injected;     // or_insert, loses to the typed prop
+    }
+
+    #[Computed]
+    public function latest(): Collection { return User::query()->latest()->get(); }
+
+    public function with(): array {
+        return ['viaWith' => User::first()];
+    }
+};
+
+$posts = computed(fn (): User => User::first());
+state(['seed' => User::first()]);
+?>
+<div>{{ $this->user->email }}</div>
+"#;
+    let (live, captured) = volt_both_ways(&ClassHierarchyIndex::default(), Path::new("/proj"), src);
+    assert_eq!(live, captured, "captured Volt surface diverged from live");
+    assert_eq!(
+        live.get("user").map(String::as_str),
+        Some("App\\Models\\User"),
+        "typed prop must stay authoritative"
+    );
+}
+
+/// Build a Blade `MemberContextData` as the parse-time capture does (per-site
+/// recipes from receiver-text snippets; empty file-level aliases).
+fn blade_context(refs: &[Arc<MemberAccessReferenceData>]) -> crate::salsa_impl::MemberContextData {
+    let sites = refs
+        .iter()
+        .map(|m| crate::member_resolver::compile_blade_site(m.receiver.trim()))
+        .collect();
+    crate::salsa_impl::MemberContextData {
+        aliases: Default::default(),
+        sites,
+        view_renders: Vec::new(),
+        volt_surface: None,
+        component: None,
+    }
+}
+
+#[test]
+fn captured_blade_member_accesses_match_live() {
+    // A bare `$user` (view-var path — recipe unused) and a chain receiver
+    // `app('currentUser')->email` (recipe path) resolved both ways.
+    let p = blade_project();
+    let mut idx = ViewVarIndex::new();
+    idx.insert_file(
+        p.root.join("C.php"),
+        &[render("users.show", &[("user", "App\\Models\\User")])],
+    );
+    let resolver = user_bound_resolver(&p, "currentUser");
+    let refs = vec![
+        member_ref("$user", "posts", 2, 4),
+        member_ref("app('currentUser')", "email", 3, 8),
+    ];
+
+    let live = resolve_blade_member_accesses(
+        &refs,
+        "users.show",
+        &idx,
+        &[],
+        &resolver,
+        &ClassViewCache::new(),
+        &p.root,
+        None,
+    );
+    let ctx = blade_context(&refs);
+    let captured = resolve_blade_member_accesses_with_context(
+        &ctx,
+        &refs,
+        "users.show",
+        &idx,
+        &[],
+        &resolver,
+        &ClassViewCache::new(),
+        &p.root,
+        None,
+    );
+    assert_eq!(live, captured, "captured Blade accesses diverged from live");
+    assert_eq!(captured.len(), 2, "both sites should resolve: {captured:?}");
+}
+
+// ─── M1 review follow-ups: Bug 1 & Bug 2 regressions + coverage ───────────
+
+#[test]
+fn captured_volt_duplicate_key_within_handler_is_last_wins() {
+    // Bug 1: within ONE render() handler the tree engine merges the array data
+    // and the chained ->with into a single temp map with `insert` (LAST-wins),
+    // then or_inserts across handlers. A flat first-wins replay wrongly kept the
+    // array value. Trigger: array `account => User` shadowed by `->with('account',
+    // Admin)` in the same handler → must be Admin, with the Admin dep.
+    let src = r#"<?php
+use App\Models\User;
+use App\Models\Admin;
+use Livewire\Volt\Component;
+new class extends Component {
+    public function render() {
+        return view('x', ['account' => User::first()])->with('account', Admin::first());
+    }
+};
+?>
+<div>{{ $this->account->id }}</div>
+"#;
+    let (live, captured) = volt_both_ways(&ClassHierarchyIndex::default(), Path::new("/proj"), src);
+    assert_eq!(
+        live, captured,
+        "duplicate-key-within-handler diverged from live"
+    );
+    assert_eq!(
+        live.get("account").map(String::as_str),
+        Some("App\\Models\\Admin"),
+        "within-handler last-wins: ->with('account', Admin) must beat the array value"
+    );
+}
+
+#[test]
+fn captured_volt_first_handler_wins_across_handlers() {
+    // The other half of the precedence: across DISTINCT handlers a key is
+    // FIRST-VISITED-handler-wins (`fold_or_insert` → `or_insert`). BOTH engines
+    // walk the front-matter with the SAME stack DFS, which pops sibling
+    // statements last-to-first — so of two top-level handlers the SOURCE-LAST one
+    // (`with` here) is visited first and wins. The point of this test is that
+    // live == captured for the cross-handler fold AND the winner is a specific,
+    // non-empty value (so it can't pass vacuously) — not the source position.
+    let src = r#"<?php
+use App\Models\User;
+use App\Models\Admin;
+use Livewire\Volt\Component;
+use function Livewire\Volt\{state, with};
+new class extends Component {};
+state(['a' => User::first()]);
+with(fn () => ['a' => Admin::first()]);
+?>
+<div>{{ $this->a }}</div>
+"#;
+    let (live, captured) = volt_both_ways(&ClassHierarchyIndex::default(), Path::new("/proj"), src);
+    assert_eq!(
+        live, captured,
+        "cross-handler precedence diverged from live"
+    );
+    // First-VISITED handler wins: the DFS reaches `with` (source-last) before
+    // `state`, so `a = Admin` in both engines.
+    assert_eq!(
+        live.get("a").map(String::as_str),
+        Some("App\\Models\\Admin"),
+        "cross-handler or_insert: the first-VISITED handler (with) must win"
+    );
+    assert!(
+        !live.is_empty(),
+        "surface resolved nothing — test would be vacuous"
+    );
+}
+
+#[test]
+fn captured_volt_within_handler_earlier_resolved_beats_unresolvable_later() {
+    // The precise over-correction guard for Bug 1's fix: WITHIN one handler the
+    // tree engine inserts ONLY when the value resolves (resolvability is
+    // cross-file / eval-time), so a LATER UNRESOLVABLE duplicate must NOT clobber
+    // an EARLIER resolved one. A capture-time last-occurrence dedup would wrongly
+    // keep the unresolvable later value and drop `account` entirely. (`$mystery`
+    // is an undefined local → unresolvable at eval.) Both the array-literal
+    // duplicate and the view([...])->with('same', $mystery) chain form.
+    let array_form = r#"<?php
+use App\Models\User;
+use Livewire\Volt\Component;
+use function Livewire\Volt\with;
+new class extends Component {};
+with(fn () => ['account' => User::first(), 'account' => $mystery]);
+?>
+<div>{{ $this->account }}</div>
+"#;
+    let chain_form = r#"<?php
+use App\Models\User;
+use Livewire\Volt\Component;
+new class extends Component {
+    public function render() {
+        return view('x', ['account' => User::first()])->with('account', $mystery);
+    }
+};
+?>
+<div>{{ $this->account }}</div>
+"#;
+    for src in [array_form, chain_form] {
+        let (live, captured) =
+            volt_both_ways(&ClassHierarchyIndex::default(), Path::new("/proj"), src);
+        assert_eq!(
+            live, captured,
+            "earlier-resolved-vs-later-unresolvable diverged from live:\n{src}"
+        );
+        assert_eq!(
+            live.get("account").map(String::as_str),
+            Some("App\\Models\\User"),
+            "earlier RESOLVED value must win over a later unresolvable one:\n{src}"
+        );
+    }
+}
+
+#[test]
+fn is_volt_needle_without_frontmatter_routes_to_volt_not_blade() {
+    // Bug 2: `source_contains_volt_signature` is a raw-byte needle scan (no
+    // `<?php` required), so a plain template with a stray `computed(` and no
+    // front-matter is is_volt=true / volt_surface=None. The OLD engine and the
+    // save-refresh route such a file to the VOLT resolver (empty props); the
+    // build path must too — never to the Blade resolver, whose view-var index
+    // would resolve `$user->email` and whose `view_name_for_path?` could drop
+    // the whole file.
+    let p = blade_project();
+    let mut idx = ViewVarIndex::new();
+    idx.insert_file(
+        p.root.join("C.php"),
+        &[render("users.show", &[("user", "App\\Models\\User")])],
+    );
+
+    let source = "<div x-data=\"{ get computed() { return 1 } }\">{{ $user->email }}</div>\n";
+    assert!(
+        crate::livewire_resolver::source_contains_volt_signature(source),
+        "test needs the volt needle to fire — signature function changed?"
+    );
+    let path = p.root.join("resources/views/users/show.blade.php");
+    let refs = vec![member_ref("$user", "email", 0, 20)];
+    let ctx = crate::member_capture::capture_member_context(&path, source, None, &refs, true)
+        .expect("is_volt file with refs captures context");
+    assert!(
+        ctx.volt_surface.is_none(),
+        "a needle without a <?php block must have no captured Volt surface"
+    );
+
+    // What BOTH build and save now call: the Volt resolver with an empty prop
+    // map. It must match the OLD tree Volt path (also an empty map).
+    let volt_ctx = resolve_volt_member_accesses_with_context(
+        &ctx,
+        &refs,
+        &HashMap::new(),
+        &[],
+        &p.index,
+        &ClassViewCache::new(),
+        &p.root,
+        None,
+    );
+    let volt_tree = resolve_volt_member_accesses(
+        &refs,
+        &volt_property_types(source, &p.index, &ClassViewCache::new(), &p.root),
+        &[],
+        &p.index,
+        &ClassViewCache::new(),
+        &p.root,
+        None,
+    );
+    assert_eq!(
+        volt_ctx, volt_tree,
+        "Volt build path diverged from Volt save/old"
+    );
+
+    // And the routing genuinely matters: the Blade path WOULD resolve
+    // `$user->email` via the view-var index — the bug's misroute. The fix picks
+    // Volt (empty), so the two paths differ.
+    let blade = resolve_blade_member_accesses(
+        &refs,
+        "users.show",
+        &idx,
+        &[],
+        &p.index,
+        &ClassViewCache::new(),
+        &p.root,
+        None,
+    );
+    assert_ne!(
+        volt_ctx, blade,
+        "Volt vs Blade must differ here, else the routing fix is untested"
+    );
+    assert!(volt_ctx.is_empty() && !blade.is_empty());
+}
+
+#[test]
+fn captured_render_multiple_sites_same_view_name() {
+    // Two `view('x', …)` sites for the SAME view name must both survive in
+    // order, and match live (the view-var index unions them downstream).
+    let p = blade_project();
+    let controller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function a(User $user) { view('shared', ['user' => $user]); }
+    public function b(User $user) { view('shared', ['also' => $user]); }
+}
+"#;
+    let (live, captured) = render_both_ways(&p.index, &p.root, controller);
+    assert_eq!(live, captured, "multi-site same-name renders diverged");
+    assert_eq!(
+        live.iter().filter(|r| r.view_name == "shared").count(),
+        2,
+        "both same-name render sites must be present: {live:?}"
+    );
+}
+
+#[test]
+fn captured_render_duplicate_array_key_last_wins() {
+    // A duplicate key inside ONE `view()` array is last-wins (the tree's
+    // `vars.insert`); the controller render path already uses `insert`, so
+    // capture must agree.
+    let p = blade_project();
+    let controller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+use App\Models\Admin;
+class C {
+    public function show(User $user, Admin $admin) {
+        view('x', ['who' => $user, 'who' => $admin]);
+    }
+}
+"#;
+    let (live, captured) = render_both_ways(&p.index, &p.root, controller);
+    assert_eq!(live, captured, "duplicate array key diverged");
+    assert_eq!(
+        live[0].vars.get("who").map(String::as_str),
+        Some("App\\Models\\Admin"),
+        "last array entry wins"
+    );
+}
+
+#[test]
+fn captured_component_member_accesses_match_live() {
+    // resolve_component_member_accesses_with_context (captured member names for
+    // a Volt SFC) must match the live re-parse for the component's `$this->…`
+    // reads.
+    let p = blade_project();
+    let source = r#"<?php
+use App\Models\User;
+use Livewire\Volt\Component;
+new class extends Component {
+    public User $user;
+    public int $count = 0;
+    public function increment() { $this->count++; }
+};
+?>
+<div>{{ $this->user }} {{ $this->count }}</div>
+"#;
+    let path = p.root.join("resources/views/livewire/counter.blade.php");
+    let refs = vec![
+        member_ref("$this", "user", 10, 4),
+        member_ref("$this", "count", 10, 20),
+        member_ref("$this", "increment", 11, 4),
+        member_ref("$this", "notAMember", 12, 4),
+    ];
+
+    let live = resolve_component_member_accesses(&path, source, &refs);
+    let comp = capture_component(&path, source, true).expect("volt SFC → component context");
+    let captured = resolve_component_member_accesses_with_context(&comp, &path, &refs);
+
+    assert_eq!(
+        live, captured,
+        "component member accesses diverged from live"
+    );
+    assert_eq!(
+        captured.len(),
+        3,
+        "user/count/increment index; notAMember drops"
+    );
+    assert!(captured.iter().all(|e| e.fqcn.starts_with("volt::")));
 }
