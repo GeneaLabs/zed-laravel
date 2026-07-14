@@ -67,6 +67,7 @@ pub struct SourceFile {
     pub path: PathBuf,
 
     /// The document version from LSP
+    #[returns(copy)]
     pub version: i32,
 
     /// The file content
@@ -82,6 +83,7 @@ pub struct ConfigFile {
     pub path: PathBuf,
 
     /// Version incremented when file changes
+    #[returns(copy)]
     pub version: i32,
 
     /// The file content
@@ -94,6 +96,7 @@ pub struct ConfigFile {
 #[salsa::input]
 pub struct ProjectFiles {
     /// Version incremented when file list changes
+    #[returns(copy)]
     pub version: i32,
 
     /// PHP files in app/Http/Controllers
@@ -121,6 +124,7 @@ pub struct ServiceProviderFile {
     pub path: PathBuf,
 
     /// Version incremented when file changes
+    #[returns(copy)]
     pub version: i32,
 
     /// The file content
@@ -128,6 +132,7 @@ pub struct ServiceProviderFile {
     pub text: String,
 
     /// Priority: 0=framework, 1=package, 2=app
+    #[returns(copy)]
     pub priority: u8,
 }
 
@@ -139,6 +144,7 @@ pub struct EnvFile {
     pub path: PathBuf,
 
     /// Version incremented when file changes
+    #[returns(copy)]
     pub version: i32,
 
     /// The file content
@@ -146,6 +152,7 @@ pub struct EnvFile {
     pub text: String,
 
     /// Priority: 0=.env.example, 1=.env.local, 2=.env (highest)
+    #[returns(copy)]
     pub priority: u8,
 }
 
@@ -249,9 +256,13 @@ pub struct PackageNamespace<'db> {
 #[salsa::tracked]
 pub struct ViewReference<'db> {
     pub name: ViewName<'db>,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
+    #[returns(copy)]
     pub is_route_view: bool,
 }
 
@@ -260,8 +271,11 @@ pub struct ViewReference<'db> {
 pub struct ComponentReference<'db> {
     pub name: ComponentName<'db>,
     pub tag_name: ComponentName<'db>,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
 }
 
@@ -271,12 +285,17 @@ pub struct DirectiveReference<'db> {
     pub name: DirectiveName<'db>,
     #[returns(ref)]
     pub arguments: Option<String>,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
     /// Column of first character INSIDE the quoted string (after opening quote)
+    #[returns(copy)]
     pub string_column: u32,
     /// Column one past the last character INSIDE the quoted string (before closing quote)
+    #[returns(copy)]
     pub string_end_column: u32,
 }
 
@@ -284,9 +303,13 @@ pub struct DirectiveReference<'db> {
 #[salsa::tracked]
 pub struct EnvReference<'db> {
     pub name: EnvVarName<'db>,
+    #[returns(copy)]
     pub has_fallback: bool,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
 }
 
@@ -294,8 +317,11 @@ pub struct EnvReference<'db> {
 #[salsa::tracked]
 pub struct ConfigReference<'db> {
     pub key: ConfigKey<'db>,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
 }
 
@@ -310,8 +336,11 @@ pub struct LivewireName<'db> {
 #[salsa::tracked]
 pub struct LivewireReference<'db> {
     pub name: LivewireName<'db>,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
 }
 
@@ -319,8 +348,11 @@ pub struct LivewireReference<'db> {
 #[salsa::tracked]
 pub struct MiddlewareReference<'db> {
     pub name: MiddlewareName<'db>,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
 }
 
@@ -328,8 +360,11 @@ pub struct MiddlewareReference<'db> {
 #[salsa::tracked]
 pub struct TranslationReference<'db> {
     pub key: TranslationKey<'db>,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
 }
 
@@ -353,9 +388,13 @@ pub enum AssetHelperType {
 #[salsa::tracked]
 pub struct AssetReference<'db> {
     pub path: AssetPath<'db>,
+    #[returns(copy)]
     pub helper_type: AssetHelperType,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
 }
 
@@ -363,9 +402,13 @@ pub struct AssetReference<'db> {
 #[salsa::tracked]
 pub struct BindingReference<'db> {
     pub name: BindingName<'db>,
+    #[returns(copy)]
     pub is_class_reference: bool,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
 }
 
@@ -373,8 +416,11 @@ pub struct BindingReference<'db> {
 #[salsa::tracked]
 pub struct RouteReference<'db> {
     pub name: RouteName<'db>,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
 }
 
@@ -382,8 +428,11 @@ pub struct RouteReference<'db> {
 #[salsa::tracked]
 pub struct UrlReference<'db> {
     pub path: UrlPath<'db>,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
 }
 
@@ -391,8 +440,11 @@ pub struct UrlReference<'db> {
 #[salsa::tracked]
 pub struct ActionReference<'db> {
     pub action: ActionName<'db>,
+    #[returns(copy)]
     pub line: u32,
+    #[returns(copy)]
     pub column: u32,
+    #[returns(copy)]
     pub end_column: u32,
 }
 
@@ -401,6 +453,7 @@ pub struct ActionReference<'db> {
 /// (Salsa's tuple-based Hash impl has a 12-element limit)
 #[salsa::tracked]
 pub struct ParsedPatterns<'db> {
+    #[returns(copy)]
     pub file: SourceFile,
     #[returns(ref)]
     pub views: Vec<ViewReference<'db>>,
@@ -444,6 +497,7 @@ pub struct LaravelConfigRef<'db> {
     pub livewire_path: Option<PathBuf>,
 
     /// Whether Livewire is installed (detected from composer.json)
+    #[returns(copy)]
     pub has_livewire: bool,
 }
 
@@ -1129,7 +1183,7 @@ pub fn parse_composer_json(db: &dyn Db, file: ConfigFile) -> (bool, Vec<String>)
 }
 
 /// Parse config/view.php to extract view paths
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn parse_view_config(db: &dyn Db, file: ConfigFile, root: PathBuf) -> Vec<PathBuf> {
     let text = file.text(db);
     let mut paths = Vec::new();
@@ -1170,7 +1224,7 @@ pub fn parse_view_config(db: &dyn Db, file: ConfigFile, root: PathBuf) -> Vec<Pa
 
 /// Parse a Blade file's loop-block structure (@foreach / @forelse / @for / @while).
 /// Memoized: only re-runs when the file's text changes.
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn parse_blade_loop_blocks(
     db: &dyn Db,
     file: SourceFile,
@@ -1181,7 +1235,7 @@ pub fn parse_blade_loop_blocks(
 
 /// Parse simple `$name = ...;` assignments out of a Blade file's `@php ... @endphp` blocks.
 /// Memoized: only re-runs when the file's text changes.
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn parse_blade_php_assignments(db: &dyn Db, file: SourceFile) -> Vec<(String, String)> {
     let text = file.text(db);
     crate::blade_php_block::extract_php_block_assignments(text)
@@ -1190,7 +1244,7 @@ pub fn parse_blade_php_assignments(db: &dyn Db, file: SourceFile) -> Vec<(String
 /// Extract the document-symbol tree for a file (route file, Blade template,
 /// Livewire component, or Eloquent model). Returns an empty vec for other file
 /// kinds. Memoized: only re-runs when the file's text changes.
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn extract_document_symbols(
     db: &dyn Db,
     file: SourceFile,
@@ -1203,7 +1257,7 @@ pub fn extract_document_symbols(
 
 /// Resolve a `$this->X` member access against a Livewire component's PHP file.
 /// Tries property type first, then method return type. Memoized per (file_version, member).
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn resolve_livewire_member_type(
     db: &dyn Db,
     file: SourceFile,
@@ -1214,7 +1268,7 @@ pub fn resolve_livewire_member_type(
 }
 
 /// Parse config/livewire.php to extract Livewire component path
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn parse_livewire_config(db: &dyn Db, file: ConfigFile, root: PathBuf) -> Option<PathBuf> {
     let text = file.text(db);
 
@@ -1298,14 +1352,19 @@ pub struct ParsedEnvVar<'db> {
     #[returns(ref)]
     pub value: String,
     /// Line number in source file (0-indexed)
+    #[returns(copy)]
     pub line: u32,
     /// Column of the variable name
+    #[returns(copy)]
     pub column: u32,
     /// Column where value starts
+    #[returns(copy)]
     pub value_column: u32,
     /// Whether this variable is commented out
+    #[returns(copy)]
     pub is_commented: bool,
     /// Priority of the source file (higher wins)
+    #[returns(copy)]
     pub priority: u8,
     /// Source file path
     #[returns(ref)]
@@ -1418,8 +1477,10 @@ pub struct ParsedMiddlewareReg<'db> {
     #[returns(ref)]
     pub file_path: Option<PathBuf>,
     /// Line in source file where registered
+    #[returns(copy)]
     pub source_line: u32,
     /// Priority (0=framework, 1=package, 2=app)
+    #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
     #[returns(ref)]
@@ -1438,10 +1499,13 @@ pub struct ParsedBindingReg<'db> {
     #[returns(ref)]
     pub file_path: Option<PathBuf>,
     /// Type of binding
+    #[returns(copy)]
     pub binding_type: BindingTypeEnum,
     /// Line in source file where registered
+    #[returns(copy)]
     pub source_line: u32,
     /// Priority (0=framework, 1=package, 2=app)
+    #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
     #[returns(ref)]
@@ -1469,8 +1533,10 @@ pub struct ParsedMacroReg<'db> {
     #[returns(ref)]
     pub decl_file: PathBuf,
     /// 0-based definition line — the closure's line, or the mixin method's line.
+    #[returns(copy)]
     pub decl_line: u32,
     /// Priority (0=framework, 1=package, 2=app)
+    #[returns(copy)]
     pub priority: u8,
 }
 
@@ -1484,8 +1550,10 @@ pub struct ParsedViewNamespaceReg<'db> {
     #[returns(ref)]
     pub view_path: Option<PathBuf>,
     /// Line in source file where registered
+    #[returns(copy)]
     pub source_line: u32,
     /// Priority (0=framework, 1=package, 2=app)
+    #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
     #[returns(ref)]
@@ -1505,8 +1573,10 @@ pub struct ParsedBladeComponentReg<'db> {
     #[returns(ref)]
     pub file_path: Option<PathBuf>,
     /// Line in source file where registered
+    #[returns(copy)]
     pub source_line: u32,
     /// Priority (0=framework, 1=package, 2=app)
+    #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
     #[returns(ref)]
@@ -1523,8 +1593,10 @@ pub struct ParsedComponentNamespaceReg<'db> {
     #[returns(ref)]
     pub php_namespace: String,
     /// Line in source file where registered
+    #[returns(copy)]
     pub source_line: u32,
     /// Priority (0=framework, 1=package, 2=app)
+    #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
     #[returns(ref)]
@@ -1542,8 +1614,10 @@ pub struct ParsedAnonymousComponentPathReg<'db> {
     #[returns(ref)]
     pub directory: PathBuf,
     /// Line in source file where registered
+    #[returns(copy)]
     pub source_line: u32,
     /// Priority (0=framework, 1=package, 2=app)
+    #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
     #[returns(ref)]
@@ -1561,8 +1635,10 @@ pub struct ParsedAnonymousComponentNamespaceReg<'db> {
     #[returns(ref)]
     pub directory: String,
     /// Line in source file where registered
+    #[returns(copy)]
     pub source_line: u32,
     /// Priority (0=framework, 1=package, 2=app)
+    #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
     #[returns(ref)]
