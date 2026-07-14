@@ -566,6 +566,7 @@ pub fn resolve_and_classify(
         classviews,
         project_root,
     ) {
+        record_macro_decl_dep(&resolved, &fqcn, member, resolver, deps.as_deref_mut());
         return Some(resolved);
     }
 
@@ -582,7 +583,7 @@ pub fn resolve_and_classify(
     // the actual safety here.
     if form.is_call() && is_eloquent_builder(&fqcn) && is_scope_param_receiver(receiver, bytes) {
         let model = enclosing_class_fqcn(receiver, bytes)?;
-        if let Some(d) = deps {
+        if let Some(d) = deps.as_deref_mut() {
             d.insert(model.clone());
         }
         let resolved = classify_against(
@@ -595,9 +596,33 @@ pub fn resolve_and_classify(
             classviews,
             project_root,
         )?;
+        record_macro_decl_dep(&resolved, &model, member, resolver, deps);
         return Some(resolved);
     }
     None
+}
+
+/// Record a macro's declaration file as a reverse-index dependency for a
+/// site that classified as [`MagicMemberKind::Macro`] (#255). For an inline
+/// `::macro()` registration that file IS the registering service provider,
+/// so a provider-body edit's save ripple (`registration_ripple_keys`, keyed
+/// on the provider path among others) reaches the site directly; the host
+/// FQCN recorded by the resolution above covers the added/removed-key
+/// directions. No-op for every other kind, or when the registry has no
+/// entry (the classification just proved it does).
+fn record_macro_decl_dep(
+    resolved: &ResolvedMemberAccess,
+    fqcn: &str,
+    member: &str,
+    resolver: &impl ClassFileResolver,
+    deps: Option<&mut HashSet<String>>,
+) {
+    if resolved.kind != MagicMemberKind::Macro {
+        return;
+    }
+    if let (Some(d), Some((decl_file, _))) = (deps, resolver.macro_target(fqcn, member)) {
+        d.insert(decl_file.to_string_lossy().into_owned());
+    }
 }
 
 /// Classify `member` against `fqcn`'s resolved surfaces — the shared tail of
@@ -2447,6 +2472,7 @@ fn resolve_recipe_and_classify(
         classviews,
         project_root,
     ) {
+        record_macro_decl_dep(&resolved, &fqcn, member, resolver, deps.as_deref_mut());
         return Some(resolved);
     }
 
@@ -2454,10 +2480,10 @@ fn resolve_recipe_and_classify(
     // gate + captured enclosing class.
     if form.is_call() && is_eloquent_builder(&fqcn) && site.is_scope_param_receiver {
         let model = site.enclosing_class_fqcn.clone()?;
-        if let Some(d) = deps {
+        if let Some(d) = deps.as_deref_mut() {
             d.insert(model.clone());
         }
-        return classify_against(
+        let resolved = classify_against(
             &model,
             member,
             form,
@@ -2466,7 +2492,9 @@ fn resolve_recipe_and_classify(
             resolver,
             classviews,
             project_root,
-        );
+        )?;
+        record_macro_decl_dep(&resolved, &model, member, resolver, deps);
+        return Some(resolved);
     }
     None
 }

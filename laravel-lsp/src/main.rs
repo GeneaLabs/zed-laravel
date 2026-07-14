@@ -38,11 +38,11 @@ use laravel_lsp::route_discovery::{
 
 // Salsa 0.25 database - integrated via actor pattern for async compatibility
 use laravel_lsp::salsa_impl::{
-    ActionReferenceData, AssetReferenceData, BindingReferenceData, ComponentReferenceData,
-    ConfigReferenceData, DirectiveReferenceData, EnvReferenceData, FeatureReferenceData,
-    LaravelConfigData, LivewireReferenceData, MiddlewareReferenceData, PatternAtPosition,
-    ReferenceLocationData, RouteReferenceData, SalsaActor, SalsaHandle, TranslationReferenceData,
-    UrlReferenceData, ViewReferenceData,
+    registration_ripple_keys, ActionReferenceData, AssetReferenceData, BindingReferenceData,
+    ComponentReferenceData, ConfigReferenceData, DirectiveReferenceData, EnvReferenceData,
+    FeatureReferenceData, LaravelConfigData, LivewireReferenceData, MiddlewareReferenceData,
+    PatternAtPosition, ReferenceLocationData, RouteReferenceData, SalsaActor, SalsaHandle,
+    TranslationReferenceData, UrlReferenceData, ViewReferenceData,
 };
 
 // The Linux release binaries are static musl builds; musl's default
@@ -6390,13 +6390,16 @@ impl LaravelLanguageServer {
     /// no magic work). The flow (#80):
     ///
     /// 1. Snapshot the file's pre-save class surfaces (the hierarchy still
-    ///    holds them — nothing has re-parsed yet).
+    ///    holds them — nothing has re-parsed yet) and, for a provider, its
+    ///    registration contribution (macros / bindings / facade aliases).
     /// 2. Push the saved buffer into Salsa, run the instant per-file refresh
     ///    (which re-parses, updates the hierarchy, records receiver deps, and
     ///    updates the file's view-render contribution).
-    /// 3. Diff pre/post surfaces and view renders. A body-only edit — the
-    ///    overwhelming majority of saves — diffs empty and stops here: no
-    ///    other file's resolution can have changed.
+    /// 3. Diff pre/post surfaces, registrations, and view renders. An edit
+    ///    that changes none of them — the overwhelming majority of saves —
+    ///    diffs empty and stops here: no other file's resolution can have
+    ///    changed. (Registration diffs are what catch a `boot()`/`register()`
+    ///    body edit whose surface diff is empty, #255.)
     /// 4. Otherwise re-resolve only the actual blast radius (dependents of
     ///    the changed classes + their descendants, plus Blade files of views
     ///    whose variable types changed) in the background, at bounded
@@ -6419,6 +6422,18 @@ impl LaravelLanguageServer {
             .await
             .unwrap_or_default();
 
+        // Pre-save registration snapshot (#255) — a provider's macros /
+        // bindings / facade aliases live in `boot()`/`register()` BODIES, so
+        // a registration edit leaves the class-surface diff below empty and
+        // would never ripple to dependent call sites. Cheap for the
+        // non-provider majority: a path the actor doesn't track yields the
+        // empty default.
+        let old_registrations = self
+            .salsa
+            .file_provider_registrations(path.clone(), None)
+            .await
+            .unwrap_or_default();
+
         // Ensure Salsa reflects the saved buffer before resolving — a pending
         // did_change debounce may not have fired yet. Use the buffer's version
         // so this doesn't regress against a newer in-flight update.
@@ -6437,6 +6452,17 @@ impl LaravelLanguageServer {
             debug!("Failed to update Salsa on save for {}: {}", path_str, e);
         }
 
+        // Post-save registration snapshot (#255). `Some(text)` re-registers
+        // the provider source first — the App rescan a provider save queues is
+        // asynchronous, so without it this would still read the pre-save
+        // text. Taken before the per-file refresh so that pass already sees
+        // the fresh registries.
+        let new_registrations = self
+            .salsa
+            .file_provider_registrations(path.clone(), Some(text.to_string()))
+            .await
+            .unwrap_or_default();
+
         let changed_views = self.refresh_file_magic(&path, text).await;
 
         let new_surfaces = self
@@ -6444,15 +6470,27 @@ impl LaravelLanguageServer {
             .file_class_surfaces(path.clone())
             .await
             .unwrap_or_default();
-        let changed_classes =
+        let mut changed_classes =
             laravel_lsp::class_hierarchy_index::surface_map_diff(&old_surfaces, &new_surfaces);
+        // A body-only registration edit ripples through the same blast radius
+        // as a surface change: the emitted keys are what dependent call sites
+        // recorded in the reverse index (macro host FQCNs, binding/alias
+        // concretes, the provider's own path), and expand_class_descendants
+        // passes unknown seeds through unchanged into dependents_of (#255).
+        changed_classes.extend(registration_ripple_keys(
+            &old_registrations,
+            &new_registrations,
+            &path,
+        ));
 
         // The per-file refresh above already mutated the live indexes —
         // keep the disk cache converging regardless of ripple size.
         self.schedule_magic_cache_save().await;
 
         if changed_classes.is_empty() && changed_views.is_empty() {
-            return; // body-only edit — nothing beyond this file can change
+            // No surface, render, or registration change — nothing beyond
+            // this file can have changed.
+            return;
         }
 
         // The ripple runs in the background so did_save returns promptly. The

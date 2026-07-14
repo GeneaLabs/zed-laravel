@@ -4334,7 +4334,7 @@ pub fn registration_ripple_keys(
         let sa: std::collections::HashSet<&(String, String)> = a.iter().collect();
         let sb: std::collections::HashSet<&(String, String)> = b.iter().collect();
         sa.symmetric_difference(&sb)
-            .map(|e| *e)
+            .copied()
             .collect::<Vec<_>>()
             .into_iter()
     }
