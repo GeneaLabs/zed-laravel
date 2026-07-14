@@ -8163,39 +8163,36 @@ impl LaravelLanguageServer {
             if !has_middleware_context {
                 // Check previous lines (up to 20 lines back) for middleware array context
                 // We need to find an opening pattern without a matching close
-                if let Some(prev_lines) = previous_lines {
-                    let mut found_in_previous = false;
-                    let mut bracket_depth = 0i32;
+                let prev_lines = previous_lines?;
+                let mut found_in_previous = false;
+                let mut bracket_depth = 0i32;
 
-                    // Scan backwards through previous lines
-                    for prev_line in prev_lines.iter().rev().take(20) {
-                        // Count brackets to track nesting
-                        for ch in prev_line.chars() {
-                            match ch {
-                                '[' => bracket_depth += 1,
-                                ']' => bracket_depth -= 1,
-                                _ => {}
-                            }
-                        }
-
-                        // Check if this line has a middleware indicator
-                        if middleware_indicators
-                            .iter()
-                            .any(|ind| prev_line.contains(ind))
-                        {
-                            // Found middleware context, and we should still be inside it
-                            // (bracket_depth > 0 means we haven't closed the array yet)
-                            if bracket_depth > 0 {
-                                found_in_previous = true;
-                                break;
-                            }
+                // Scan backwards through previous lines
+                for prev_line in prev_lines.iter().rev().take(20) {
+                    // Count brackets to track nesting
+                    for ch in prev_line.chars() {
+                        match ch {
+                            '[' => bracket_depth += 1,
+                            ']' => bracket_depth -= 1,
+                            _ => {}
                         }
                     }
 
-                    if !found_in_previous {
-                        return None;
+                    // Check if this line has a middleware indicator
+                    if middleware_indicators
+                        .iter()
+                        .any(|ind| prev_line.contains(ind))
+                    {
+                        // Found middleware context, and we should still be inside it
+                        // (bracket_depth > 0 means we haven't closed the array yet)
+                        if bracket_depth > 0 {
+                            found_in_previous = true;
+                            break;
+                        }
                     }
-                } else {
+                }
+
+                if !found_in_previous {
                     return None;
                 }
             }
