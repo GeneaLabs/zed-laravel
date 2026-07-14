@@ -591,3 +591,1195 @@ fn postgres_candidates_empty_password_url_has_no_colon() {
     );
     assert!(!tcp.url.contains(":@"), "got: {}", tcp.url);
 }
+
+// ---------------------------------------------------------------------------
+// Circuit breaker state machine (pure, time-injected — no DB, no async)
+// ---------------------------------------------------------------------------
+
+const COOLDOWN: Duration = Duration::from_secs(30);
+
+fn breaker() -> CircuitBreaker {
+    CircuitBreaker::new(COOLDOWN)
+}
+
+#[test]
+fn breaker_starts_closed_and_allows_attempts() {
+    let mut b = breaker();
+    let now = Instant::now();
+    assert_eq!(b.allow_attempt(now), Attempt::Closed);
+    // Closed → no cooldown pending → loop refreshes at the healthy cadence.
+    assert_eq!(b.cooldown_remaining(now), None);
+}
+
+#[test]
+fn breaker_first_failure_opens_and_signals_new_outage() {
+    let mut b = breaker();
+    let t0 = Instant::now();
+    assert!(
+        b.record_failure(t0),
+        "Closed→Open is the start of an outage episode"
+    );
+    assert_eq!(b.allow_attempt(t0 + Duration::from_secs(1)), Attempt::Open);
+    // Open → a cooldown is pending (~29s left after 1s).
+    assert_eq!(
+        b.cooldown_remaining(t0 + Duration::from_secs(1)),
+        Some(COOLDOWN - Duration::from_secs(1))
+    );
+}
+
+#[test]
+fn breaker_denies_until_cooldown_elapses() {
+    let mut b = breaker();
+    let t0 = Instant::now();
+    b.record_failure(t0);
+    assert_eq!(
+        b.allow_attempt(t0 + COOLDOWN - Duration::from_millis(1)),
+        Attempt::Open
+    );
+    assert_eq!(
+        b.cooldown_remaining(t0 + COOLDOWN - Duration::from_millis(1)),
+        Some(Duration::from_millis(1))
+    );
+}
+
+#[test]
+fn breaker_allows_exactly_one_probe_after_cooldown() {
+    let mut b = breaker();
+    let t0 = Instant::now();
+    b.record_failure(t0);
+    assert_eq!(b.allow_attempt(t0 + COOLDOWN), Attempt::HalfOpen);
+    // A second caller while the probe is outstanding is denied.
+    assert_eq!(
+        b.allow_attempt(t0 + COOLDOWN + Duration::from_millis(1)),
+        Attempt::Open
+    );
+}
+
+#[test]
+fn breaker_probe_success_closes() {
+    let mut b = breaker();
+    let t0 = Instant::now();
+    b.record_failure(t0);
+    assert_eq!(b.allow_attempt(t0 + COOLDOWN), Attempt::HalfOpen);
+    b.record_success();
+    let after = t0 + COOLDOWN + Duration::from_secs(1);
+    assert_eq!(b.allow_attempt(after), Attempt::Closed);
+    assert_eq!(b.cooldown_remaining(after), None);
+}
+
+#[test]
+fn breaker_cooldown_remaining_saturates_to_zero_once_elapsed() {
+    let mut b = breaker();
+    let t0 = Instant::now();
+    b.record_failure(t0);
+    // Past the cooldown but before allow_attempt flips it to half-open:
+    // the next probe is due now, so zero remaining (loop sleeps 0, retries).
+    assert_eq!(
+        b.cooldown_remaining(t0 + COOLDOWN + Duration::from_secs(5)),
+        Some(Duration::ZERO)
+    );
+}
+
+#[test]
+fn breaker_probe_failure_reopens_without_new_outage_signal() {
+    let mut b = breaker();
+    let t0 = Instant::now();
+    assert!(b.record_failure(t0), "first failure = new outage");
+    assert_eq!(b.allow_attempt(t0 + COOLDOWN), Attempt::HalfOpen);
+    assert!(
+        !b.record_failure(t0 + COOLDOWN),
+        "failed probe = same outage, no fresh notification"
+    );
+    // Re-opened: denied for another full cooldown, then a new probe.
+    assert_eq!(
+        b.allow_attempt(t0 + COOLDOWN + COOLDOWN - Duration::from_secs(1)),
+        Attempt::Open
+    );
+    assert_eq!(b.allow_attempt(t0 + COOLDOWN + COOLDOWN), Attempt::HalfOpen);
+}
+
+#[test]
+fn breaker_failure_after_recovery_signals_fresh_outage() {
+    let mut b = breaker();
+    let t0 = Instant::now();
+    assert!(b.record_failure(t0));
+    assert_eq!(b.allow_attempt(t0 + COOLDOWN), Attempt::HalfOpen);
+    b.record_success(); // reconnected
+    assert!(
+        b.record_failure(t0 + COOLDOWN + Duration::from_secs(60)),
+        "a failure after a successful reconnect is a NEW outage episode"
+    );
+}
+
+#[test]
+fn breaker_stuck_probe_self_heals_after_cooldown() {
+    let mut b = breaker();
+    let t0 = Instant::now();
+    b.record_failure(t0);
+    // Probe goes out at t0+30s and never reports back (e.g. a fetch path
+    // that bails without recording failure).
+    assert_eq!(b.allow_attempt(t0 + COOLDOWN), Attempt::HalfOpen);
+    // Still guarded while the probe ages...
+    assert_eq!(
+        b.allow_attempt(t0 + COOLDOWN + COOLDOWN - Duration::from_secs(1)),
+        Attempt::Open
+    );
+    // ...but after another cooldown the breaker re-arms a fresh probe
+    // instead of staying wedged in HalfOpen forever.
+    assert_eq!(b.allow_attempt(t0 + COOLDOWN + COOLDOWN), Attempt::HalfOpen);
+}
+
+#[test]
+fn record_success_reports_recovery_edge_only() {
+    let mut b = breaker();
+    let t0 = Instant::now();
+
+    // Fresh breaker (already Closed): the first successful fetch is a
+    // healthy startup, NOT a recovery — no reconnect toast.
+    assert!(
+        !b.record_success(),
+        "healthy startup must not signal a reconnect"
+    );
+
+    // Open → Closed is a genuine recovery edge.
+    b.record_failure(t0);
+    assert!(b.record_success(), "Open→Closed is a recovery edge");
+
+    // HalfOpen → Closed is a genuine recovery edge (a probe succeeded).
+    b.record_failure(t0);
+    assert_eq!(b.allow_attempt(t0 + COOLDOWN), Attempt::HalfOpen);
+    assert!(b.record_success(), "HalfOpen→Closed is a recovery edge");
+
+    // Already Closed → Closed is a routine steady-state refresh — silent.
+    assert!(
+        !b.record_success(),
+        "an already-healthy refresh must not signal a reconnect"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Outage classification (scenario 1: unreachable / scenario 2: rejected)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn outage_class_connection_refused_is_unreachable() {
+    assert_eq!(
+        outage_class_from_raw("tcp 127.0.0.1:3306: Connection refused (os error 61)"),
+        OutageClass::Unreachable
+    );
+}
+
+#[test]
+fn outage_class_pool_timeout_is_unreachable() {
+    assert_eq!(
+        outage_class_from_raw("pool timed out while waiting for an open connection"),
+        OutageClass::Unreachable
+    );
+}
+
+#[test]
+fn outage_class_dns_failure_is_unreachable() {
+    assert_eq!(
+        outage_class_from_raw(
+            "failed to lookup address information: nodename nor servname provided, or not known"
+        ),
+        OutageClass::Unreachable
+    );
+}
+
+#[test]
+fn outage_class_mysql_access_denied_is_rejected() {
+    assert_eq!(
+        outage_class_from_raw(
+            "error returned from database: 1045 (28000): Access denied for user 'root'@'localhost'"
+        ),
+        OutageClass::Rejected
+    );
+}
+
+#[test]
+fn outage_class_mysql_unknown_database_is_rejected() {
+    assert_eq!(
+        outage_class_from_raw("error returned from database: 1049 (42000): Unknown database 'app'"),
+        OutageClass::Rejected
+    );
+}
+
+#[test]
+fn outage_class_postgres_bad_password_is_rejected() {
+    assert_eq!(
+        outage_class_from_raw("28P01: password authentication failed for user \"postgres\""),
+        OutageClass::Rejected
+    );
+}
+
+#[test]
+fn outage_class_sqlserver_login_failed_is_rejected() {
+    assert_eq!(
+        outage_class_from_raw("Login failed for user 'sa'."),
+        OutageClass::Rejected
+    );
+}
+
+#[test]
+fn outage_class_unrecognized_error_is_other() {
+    assert_eq!(
+        outage_class_from_raw("something exploded in a novel way"),
+        OutageClass::Other
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Notification text selection (scenario-specific; scenario 0 silent)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn toast_unreachable_asks_if_db_is_running_and_carries_detail() {
+    let msg = outage_toast_message(
+        OutageClass::Unreachable,
+        "Couldn't reach [tcp 127.0.0.1:3306]",
+    )
+    .expect("scenario 1 must notify");
+    assert!(msg.contains("is it running"), "got: {msg}");
+    assert!(
+        msg.contains("Couldn't reach [tcp 127.0.0.1:3306]"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn toast_rejected_points_at_credentials_and_carries_detail() {
+    let msg = outage_toast_message(OutageClass::Rejected, "MySQL rejected the credentials")
+        .expect("scenario 2 must notify");
+    assert!(msg.contains("rejected"), "got: {msg}");
+    assert!(msg.contains("credentials"), "got: {msg}");
+    assert!(msg.contains("MySQL rejected the credentials"), "got: {msg}");
+}
+
+#[test]
+fn toast_not_configured_is_silent() {
+    assert!(
+        outage_toast_message(OutageClass::NotConfigured, "no config").is_none(),
+        "a project without a database is a normal state, not an outage"
+    );
+}
+
+#[test]
+fn toast_other_is_generic_but_present() {
+    let msg = outage_toast_message(OutageClass::Other, "weird error").expect("must notify");
+    assert!(msg.contains("database connection failed"), "got: {msg}");
+    assert!(msg.contains("weird error"), "got: {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// Provider-level notification gating: one Outage per outage episode, one
+// Reconnected per recovery. Exercises the set_error/clear_error breaker
+// hooks and the event channel end to end — still no real database.
+// ---------------------------------------------------------------------------
+
+/// Unwrap a breaker event as an outage, failing loudly on a reconnect.
+fn expect_outage(event: DbBreakerEvent) -> DbOutageEvent {
+    match event {
+        DbBreakerEvent::Outage(o) => o,
+        DbBreakerEvent::Reconnected => panic!("expected an Outage event, got Reconnected"),
+    }
+}
+
+#[tokio::test]
+async fn outage_channel_fires_once_per_outage_and_rearms_on_reconnect() {
+    let provider = DatabaseSchemaProvider::new(PathBuf::from("/tmp"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    provider.set_event_channel(tx).await;
+
+    let refused = "tcp 127.0.0.1:3306: Connection refused (os error 61)";
+    provider
+        .set_error("mysql", refused, OutageClass::Unreachable)
+        .await;
+    provider
+        .set_error("mysql", refused, OutageClass::Unreachable)
+        .await;
+
+    let first = expect_outage(rx.try_recv().expect("first failure announces the outage"));
+    assert_eq!(first.class, OutageClass::Unreachable);
+    assert_eq!(first.message, refused);
+    assert!(
+        rx.try_recv().is_err(),
+        "continuing failures in the same outage must not re-announce"
+    );
+
+    provider.clear_error().await; // successful reconnect closes the breaker
+    assert!(
+        matches!(rx.try_recv(), Ok(DbBreakerEvent::Reconnected)),
+        "recovery announces exactly one Reconnected"
+    );
+
+    provider
+        .set_error("mysql", refused, OutageClass::Unreachable)
+        .await;
+    let second = expect_outage(
+        rx.try_recv()
+            .expect("a NEW outage after reconnect announces exactly once more"),
+    );
+    assert_eq!(second.class, OutageClass::Unreachable);
+}
+
+#[tokio::test]
+async fn reconnect_event_fires_once_per_recovery_and_not_on_healthy_startup() {
+    let provider = DatabaseSchemaProvider::new(PathBuf::from("/tmp"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    provider.set_event_channel(tx).await;
+
+    // Healthy startup: a first successful fetch from a fresh (Closed)
+    // breaker must NOT toast "reconnected".
+    provider.clear_error().await;
+    assert!(
+        rx.try_recv().is_err(),
+        "healthy startup emits no reconnect toast"
+    );
+
+    // Outage → recovery: exactly one Reconnected on the recovery edge.
+    provider
+        .set_error("mysql", "Connection refused", OutageClass::Unreachable)
+        .await;
+    let _ = expect_outage(rx.try_recv().expect("outage announced"));
+    provider.clear_error().await;
+    assert!(
+        matches!(rx.try_recv(), Ok(DbBreakerEvent::Reconnected)),
+        "recovery announces exactly one Reconnected"
+    );
+
+    // A second successful refresh (already Closed) is steady state — silent.
+    provider.clear_error().await;
+    assert!(
+        rx.try_recv().is_err(),
+        "an already-healthy refresh emits no reconnect toast"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Isolation: interactive accessors are pure cache reads and NEVER connect.
+// This is the key regression guard for the freeze bug — a DB-touching LSP
+// request handler that blocked on a connect starved unrelated requests.
+// ---------------------------------------------------------------------------
+
+fn schema_with(tables: &[&str], cached_at: Instant) -> DatabaseSchema {
+    DatabaseSchema {
+        tables: tables.iter().map(|t| t.to_string()).collect(),
+        columns: HashMap::new(),
+        columns_with_types: HashMap::new(),
+        cached_at,
+    }
+}
+
+#[tokio::test]
+async fn interactive_accessors_are_cache_only_and_never_connect() {
+    // Cache cold, and (a /tmp project with no config/database.php) the DB is
+    // effectively "down". Interactive reads must return empty WITHOUT ever
+    // attempting a connection.
+    let provider = DatabaseSchemaProvider::new(PathBuf::from("/tmp"));
+
+    assert!(provider.get_schema().await.is_none());
+    assert!(provider.get_tables().await.is_empty());
+    assert!(provider.get_columns("users").await.is_empty());
+    assert!(provider.get_columns_with_types("users").await.is_empty());
+
+    assert!(
+        !provider.was_connection_attempted().await,
+        "interactive reads must NEVER connect — only the background loop does"
+    );
+}
+
+#[tokio::test]
+async fn interactive_get_schema_serves_stale_cache() {
+    let provider = DatabaseSchemaProvider::new(PathBuf::from("/tmp"));
+    // A schema older than the 60s TTL — is_valid() is false…
+    let stale = schema_with(&["users"], Instant::now() - Duration::from_secs(120));
+    assert!(!stale.is_valid());
+    provider.set_test_schema(stale).await;
+
+    // …but interactive reads serve last-known-good regardless of TTL. The
+    // background loop is responsible for refreshing it, not the reader.
+    let tables = provider.get_tables().await;
+    assert_eq!(tables, vec!["users".to_string()]);
+    assert!(!provider.was_connection_attempted().await);
+}
+
+// ---------------------------------------------------------------------------
+// Background refresh loop: owns connect + breaker + notification, off the
+// request path. Exercised without a live DB via the no-config failure path,
+// the injected-slow-future timeout path, and the pure breaker cadence.
+// ---------------------------------------------------------------------------
+
+/// The background loop's per-tick sleep should be roughly a full cooldown
+/// when the breaker is open — within one second of it, allowing for the
+/// microseconds of wall-clock drift between opening the breaker and reading
+/// the remaining cooldown back.
+fn assert_backs_off_on_cooldown(sleep: Duration) {
+    assert!(
+        sleep <= COOLDOWN && sleep > COOLDOWN - Duration::from_secs(1),
+        "expected ~cooldown backoff, got {sleep:?}"
+    );
+}
+
+#[tokio::test]
+async fn refresh_tick_failure_opens_breaker_backs_off_and_notifies_once() {
+    // /tmp has no config/database.php, so fetch_schema fails fast.
+    let provider = DatabaseSchemaProvider::new(PathBuf::from("/tmp"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    provider.set_event_channel(tx).await;
+
+    let sleep = provider
+        .refresh_tick(Duration::from_secs(1), Duration::from_secs(60))
+        .await;
+
+    assert!(
+        provider.was_connection_attempted().await,
+        "the background tick DOES fetch"
+    );
+    // Breaker opened → back off on the cooldown, not the healthy interval.
+    assert_backs_off_on_cooldown(sleep);
+    // Exactly one outage event (no config → NotConfigured → silent toast,
+    // but the edge still fires on the channel).
+    let event = expect_outage(rx.try_recv().expect("first failure announces the outage"));
+    assert_eq!(event.class, OutageClass::NotConfigured);
+    assert!(rx.try_recv().is_err(), "only one event per outage episode");
+
+    // A second immediate tick is denied by the open breaker: no re-fetch,
+    // no second event, still backing off on the cooldown.
+    let sleep2 = provider
+        .refresh_tick(Duration::from_secs(1), Duration::from_secs(60))
+        .await;
+    assert_backs_off_on_cooldown(sleep2);
+    assert!(rx.try_recv().is_err(), "open breaker suppresses re-fetch");
+}
+
+#[tokio::test]
+async fn whole_fetch_timeout_opens_breaker_instead_of_hanging() {
+    let provider = DatabaseSchemaProvider::new(PathBuf::from("/tmp"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    provider.set_event_channel(tx).await;
+
+    // A fetch that "connects" but then stalls far longer than the budget —
+    // the connected-but-stalled-server case that used to hang forever
+    // (post-connect queries were unbounded). A tiny budget vs a long stall
+    // makes the timeout fire near-instantly without hanging the test.
+    let budget = Duration::from_millis(20);
+    let stalled = async {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        Some(schema_with(&["users"], Instant::now()))
+    };
+    let stored = provider.run_bounded_fetch(budget, stalled).await;
+
+    assert!(!stored, "a timed-out fetch must not fill the cache");
+    assert!(provider.get_schema().await.is_none());
+    let event = expect_outage(
+        rx.try_recv()
+            .expect("timeout opens the breaker and notifies"),
+    );
+    assert_eq!(
+        event.class,
+        OutageClass::Unreachable,
+        "a stalled server is treated as unreachable"
+    );
+}
+
+#[tokio::test]
+async fn run_bounded_fetch_success_fills_cache() {
+    let provider = DatabaseSchemaProvider::new(PathBuf::from("/tmp"));
+    let fetched = async { Some(schema_with(&["users", "posts"], Instant::now())) };
+    let stored = provider
+        .run_bounded_fetch(Duration::from_secs(5), fetched)
+        .await;
+    assert!(stored);
+    assert_eq!(
+        provider.get_tables().await,
+        vec!["users".to_string(), "posts".to_string()]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sail / Docker bind-IP detection: find a DB bound to a non-127.0.0.1
+// loopback IP (Mike's Herd setup pins Sail to 127.0.0.2). Temp-dir fixtures
+// only — never touches the SQLite test-project/.env. Layered precedence:
+// compose override → base compose → APP_PORT → 127.0.0.1 backstop.
+// ---------------------------------------------------------------------------
+
+use tempfile::TempDir;
+
+/// TCP candidate labels from a builder, in order.
+fn tcp_labels(candidates: &[super::ConnCandidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|c| c.label.starts_with("tcp "))
+        .map(|c| c.label.clone())
+        .collect()
+}
+
+fn write(dir: &std::path::Path, name: &str, content: &str) {
+    std::fs::write(dir.join(name), content).unwrap();
+}
+
+/// A mysql config whose host is the Docker service name `mysql`.
+fn mysql_service_cfg() -> super::DatabaseConfig {
+    make_config_with(None, None, "mysql")
+}
+
+#[test]
+fn sail_override_bind_ip_becomes_a_candidate() {
+    let dir = TempDir::new().unwrap();
+    // FORWARD_DB_PORT unset → the `:-3306` default applies.
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    image: 'mysql:8'\n    ports:\n      - '127.0.0.2:${FORWARD_DB_PORT:-3306}:3306'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cands = provider.build_mysql_candidates(&mysql_service_cfg());
+    assert_eq!(
+        tcp_labels(&cands),
+        vec![
+            "tcp mysql:3306".to_string(),
+            "tcp 127.0.0.2:3306".to_string(),
+            "tcp 127.0.0.1:3306".to_string(),
+        ],
+        "detected bind IP goes after the service name and before the backstop"
+    );
+}
+
+#[test]
+fn sail_custom_forward_port_uses_host_port_not_container() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", "FORWARD_DB_PORT=33061\n");
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    ports:\n      - '127.0.0.2:${FORWARD_DB_PORT:-3306}:3306'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cands = provider.build_mysql_candidates(&mysql_service_cfg());
+    assert!(
+        tcp_labels(&cands).contains(&"tcp 127.0.0.2:33061".to_string()),
+        "the forwarded HOST port (33061) is used, not the container port; got {:?}",
+        tcp_labels(&cands)
+    );
+}
+
+#[test]
+fn sail_detects_from_base_compose_when_no_override() {
+    let dir = TempDir::new().unwrap();
+    write(
+        dir.path(),
+        "docker-compose.yml",
+        "services:\n  mysql:\n    ports:\n      - '127.0.0.2:3306:3306'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cands = provider.build_mysql_candidates(&mysql_service_cfg());
+    assert!(tcp_labels(&cands).contains(&"tcp 127.0.0.2:3306".to_string()));
+}
+
+#[test]
+fn sail_override_without_match_falls_through_to_base() {
+    let dir = TempDir::new().unwrap();
+    // Override maps a DIFFERENT container port → no match for DB port 3306.
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    ports:\n      - '127.0.0.9:9999:9999'\n",
+    );
+    write(
+        dir.path(),
+        "docker-compose.yml",
+        "services:\n  mysql:\n    ports:\n      - '127.0.0.3:3306:3306'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cands = provider.build_mysql_candidates(&mysql_service_cfg());
+    let labels = tcp_labels(&cands);
+    assert!(
+        labels.contains(&"tcp 127.0.0.3:3306".to_string()),
+        "got {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|l| l.contains("127.0.0.9")),
+        "got {labels:?}"
+    );
+}
+
+#[test]
+fn sail_detects_from_app_port_bind_ip() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", "APP_PORT=127.0.0.2:80\n");
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cands = provider.build_mysql_candidates(&mysql_service_cfg());
+    // The DB's own port (3306) is paired with the APP_PORT bind IP.
+    assert!(tcp_labels(&cands).contains(&"tcp 127.0.0.2:3306".to_string()));
+}
+
+#[test]
+fn app_port_without_ip_yields_no_extra_candidate() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", "APP_PORT=80\n");
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cands = provider.build_mysql_candidates(&mysql_service_cfg());
+    assert_eq!(
+        tcp_labels(&cands),
+        vec![
+            "tcp mysql:3306".to_string(),
+            "tcp 127.0.0.1:3306".to_string()
+        ],
+        "APP_PORT with no IP falls straight through to the 127.0.0.1 backstop"
+    );
+}
+
+#[test]
+fn sail_precedence_override_beats_base_and_app_port() {
+    let dir = TempDir::new().unwrap();
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    ports:\n      - '127.0.0.2:3306:3306'\n",
+    );
+    write(
+        dir.path(),
+        "docker-compose.yml",
+        "services:\n  mysql:\n    ports:\n      - '127.0.0.3:3306:3306'\n",
+    );
+    write(dir.path(), ".env", "APP_PORT=127.0.0.4:80\n");
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let labels = tcp_labels(&provider.build_mysql_candidates(&mysql_service_cfg()));
+    assert!(
+        labels.contains(&"tcp 127.0.0.2:3306".to_string()),
+        "override wins: {labels:?}"
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|l| l.contains("127.0.0.3") || l.contains("127.0.0.4")),
+        "{labels:?}"
+    );
+}
+
+#[test]
+fn sail_dedupes_detected_loopback_against_backstop() {
+    let dir = TempDir::new().unwrap();
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    ports:\n      - '127.0.0.1:3306:3306'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let labels = tcp_labels(&provider.build_mysql_candidates(&mysql_service_cfg()));
+    assert_eq!(
+        labels.iter().filter(|l| *l == "tcp 127.0.0.1:3306").count(),
+        1,
+        "a detected 127.0.0.1 must not duplicate the backstop: {labels:?}"
+    );
+    assert_eq!(
+        labels,
+        vec![
+            "tcp mysql:3306".to_string(),
+            "tcp 127.0.0.1:3306".to_string()
+        ]
+    );
+}
+
+#[test]
+fn detection_skipped_when_host_is_already_an_ip() {
+    let dir = TempDir::new().unwrap();
+    // Even with a compose file present, an IP host bypasses detection.
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    ports:\n      - '127.0.0.9:3306:3306'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cfg = make_config_with(None, None, "127.0.0.2");
+    let labels = tcp_labels(&provider.build_mysql_candidates(&cfg));
+    assert_eq!(
+        labels,
+        vec!["tcp 127.0.0.2:3306".to_string()],
+        "an IP host is used verbatim — no service-name heuristic, no compose scan"
+    );
+}
+
+#[test]
+fn sail_detection_feeds_postgres_candidates_too() {
+    let dir = TempDir::new().unwrap();
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  pgsql:\n    ports:\n      - '127.0.0.2:5432:5432'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let mut cfg = make_config_with(None, None, "pgsql");
+    cfg.driver = "pgsql".to_string();
+    cfg.port = 5432;
+    let labels = tcp_labels(&provider.build_postgres_candidates(&cfg));
+    assert_eq!(
+        labels,
+        vec![
+            "tcp pgsql:5432".to_string(),
+            "tcp 127.0.0.2:5432".to_string(),
+            "tcp 127.0.0.1:5432".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn sail_long_form_ports_mapping_is_parsed() {
+    let dir = TempDir::new().unwrap();
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    ports:\n      - target: 3306\n        published: 33061\n        host_ip: 127.0.0.2\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let labels = tcp_labels(&provider.build_mysql_candidates(&mysql_service_cfg()));
+    assert!(
+        labels.contains(&"tcp 127.0.0.2:33061".to_string()),
+        "long-form target/published/host_ip mapping: {labels:?}"
+    );
+}
+
+#[test]
+fn normalize_bind_ip_maps_wildcards_to_loopback() {
+    assert_eq!(
+        DatabaseSchemaProvider::normalize_bind_ip("0.0.0.0").as_deref(),
+        Some("127.0.0.1")
+    );
+    assert_eq!(
+        DatabaseSchemaProvider::normalize_bind_ip("::").as_deref(),
+        Some("127.0.0.1")
+    );
+    assert_eq!(
+        DatabaseSchemaProvider::normalize_bind_ip("").as_deref(),
+        Some("127.0.0.1")
+    );
+    assert_eq!(
+        DatabaseSchemaProvider::normalize_bind_ip("127.0.0.2").as_deref(),
+        Some("127.0.0.2")
+    );
+    // Hostnames / IPv6 literals fail open.
+    assert_eq!(
+        DatabaseSchemaProvider::normalize_bind_ip("db.example.com"),
+        None
+    );
+}
+
+// ---- nested-`ports:` mis-parse regression + APP_PORT loopback guard ----
+
+#[test]
+fn nested_ports_under_extension_field_is_ignored() {
+    // `x-meta` is a legal compose extension field; its nested `ports:` list
+    // appears textually BEFORE the real service-level one. The parser must
+    // read the service-level binding, not the nested decoy.
+    let dir = TempDir::new().unwrap();
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    x-meta:\n      ports:\n        - '10.0.0.1:9999:3306'\n    ports:\n      - '127.0.0.2:33061:3306'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let labels = tcp_labels(&provider.build_mysql_candidates(&mysql_service_cfg()));
+    assert!(
+        labels.contains(&"tcp 127.0.0.2:33061".to_string()),
+        "must read the REAL service-level ports, got {labels:?}"
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|l| l.contains("10.0.0.1") || l.contains(":9999")),
+        "must NOT read the nested x-meta ports, got {labels:?}"
+    );
+}
+
+#[test]
+fn nested_ports_only_yields_no_detection() {
+    // The service has ONLY a nested `x-meta.ports:` and no direct `ports:`.
+    // Ambiguity → None (never read the nested one); fall to the backstop.
+    let dir = TempDir::new().unwrap();
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    x-meta:\n      ports:\n        - '10.0.0.1:9999:3306'\n    image: 'mysql:8'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let labels = tcp_labels(&provider.build_mysql_candidates(&mysql_service_cfg()));
+    assert_eq!(
+        labels,
+        vec![
+            "tcp mysql:3306".to_string(),
+            "tcp 127.0.0.1:3306".to_string()
+        ],
+        "a nested-only ports list must not be read; got {labels:?}"
+    );
+}
+
+#[test]
+fn service_level_ports_before_nested_still_wins() {
+    // Order-independence: the real `ports:` appears BEFORE a later nested one.
+    let dir = TempDir::new().unwrap();
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    ports:\n      - '127.0.0.2:33061:3306'\n    x-meta:\n      ports:\n        - '10.0.0.1:9999:3306'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let labels = tcp_labels(&provider.build_mysql_candidates(&mysql_service_cfg()));
+    assert!(
+        labels.contains(&"tcp 127.0.0.2:33061".to_string()),
+        "got {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|l| l.contains("10.0.0.1")),
+        "got {labels:?}"
+    );
+}
+
+#[test]
+fn app_port_loopback_bind_yields_no_app_port_candidate() {
+    // APP_PORT=127.0.0.1:80 → the backstop already covers 127.0.0.1, so
+    // detect_from_app_port returns None and the sole 127.0.0.1 candidate
+    // carries the backstop note (not a misattributed APP_PORT note).
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", "APP_PORT=127.0.0.1:80\n");
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cfg = mysql_service_cfg();
+    assert!(
+        provider.detect_from_app_port(&cfg).is_none(),
+        "a 127.0.0.1 APP_PORT bind must not produce an APP_PORT-attributed candidate"
+    );
+    let cands = provider.build_mysql_candidates(&cfg);
+    let backstop = cands
+        .iter()
+        .find(|c| c.label == "tcp 127.0.0.1:3306")
+        .expect("backstop present");
+    assert!(
+        backstop
+            .success_note
+            .as_deref()
+            .unwrap_or("")
+            .contains("Sail"),
+        "the 127.0.0.1 candidate carries the backstop note, not APP_PORT attribution"
+    );
+    assert_eq!(
+        tcp_labels(&cands),
+        vec![
+            "tcp mysql:3306".to_string(),
+            "tcp 127.0.0.1:3306".to_string()
+        ]
+    );
+}
+
+// ---- broadened gate: detection also runs for a plain-loopback primary ----
+
+#[test]
+fn should_attempt_sail_detection_covers_loopback_but_not_explicit_ips() {
+    assert!(DatabaseSchemaProvider::should_attempt_sail_detection(
+        "mysql"
+    ));
+    assert!(DatabaseSchemaProvider::should_attempt_sail_detection(
+        "127.0.0.1"
+    ));
+    assert!(DatabaseSchemaProvider::should_attempt_sail_detection(
+        "localhost"
+    ));
+    assert!(DatabaseSchemaProvider::should_attempt_sail_detection(
+        "Localhost"
+    ));
+    // Explicit, precisely-named hosts are honoured verbatim — no detection.
+    assert!(!DatabaseSchemaProvider::should_attempt_sail_detection(
+        "127.0.0.2"
+    ));
+    assert!(!DatabaseSchemaProvider::should_attempt_sail_detection(
+        "192.168.1.50"
+    ));
+    assert!(!DatabaseSchemaProvider::should_attempt_sail_detection(
+        "db.example.com"
+    ));
+}
+
+#[test]
+fn loopback_host_with_app_port_detects_second_loopback_ip() {
+    // The Decision Cloud case: DB_HOST=127.0.0.1 but Sail is pinned to
+    // 127.0.0.2 via APP_PORT. Literal primary first, detected second.
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", "APP_PORT=127.0.0.2:80\n");
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cfg = make_config_with(None, None, "127.0.0.1");
+    assert_eq!(
+        tcp_labels(&provider.build_mysql_candidates(&cfg)),
+        vec![
+            "tcp 127.0.0.1:3306".to_string(),
+            "tcp 127.0.0.2:3306".to_string()
+        ],
+        "literal 127.0.0.1 primary first, detected 127.0.0.2 second"
+    );
+}
+
+#[test]
+fn localhost_host_with_app_port_detects_loopback_ip() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", "APP_PORT=127.0.0.2:80\n");
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cfg = make_config_with(None, None, "localhost");
+    assert_eq!(
+        tcp_labels(&provider.build_mysql_candidates(&cfg)),
+        vec![
+            "tcp localhost:3306".to_string(),
+            "tcp 127.0.0.2:3306".to_string()
+        ],
+        "the literal 'localhost' primary is kept; 127.0.0.2 is added"
+    );
+}
+
+#[test]
+fn loopback_host_with_compose_detects_bind_ip() {
+    let dir = TempDir::new().unwrap();
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    ports:\n      - '127.0.0.2:3306:3306'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cfg = make_config_with(None, None, "127.0.0.1");
+    assert_eq!(
+        tcp_labels(&provider.build_mysql_candidates(&cfg)),
+        vec![
+            "tcp 127.0.0.1:3306".to_string(),
+            "tcp 127.0.0.2:3306".to_string()
+        ]
+    );
+}
+
+#[test]
+fn loopback_host_with_matching_app_port_yields_only_primary() {
+    // APP_PORT bound to 127.0.0.1 → the 127.0.0.1 guard returns None, and a
+    // loopback primary has no backstop, so just the single primary remains.
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", "APP_PORT=127.0.0.1:80\n");
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cfg = make_config_with(None, None, "127.0.0.1");
+    assert_eq!(
+        tcp_labels(&provider.build_mysql_candidates(&cfg)),
+        vec!["tcp 127.0.0.1:3306".to_string()]
+    );
+}
+
+#[test]
+fn explicit_non_loopback_host_skips_detection_even_with_app_port() {
+    // A precisely-named host must be honoured verbatim — no APP_PORT/compose
+    // second-guessing, even when a signal is present.
+    for host in ["192.168.1.50", "db.example.com", "127.0.0.2"] {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".env", "APP_PORT=127.0.0.9:80\n");
+        write(
+            dir.path(),
+            "docker-compose.override.yml",
+            "services:\n  mysql:\n    ports:\n      - '127.0.0.8:3306:3306'\n",
+        );
+        let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+        let cfg = make_config_with(None, None, host);
+        assert_eq!(
+            tcp_labels(&provider.build_mysql_candidates(&cfg)),
+            vec![format!("tcp {host}:3306")],
+            "explicit host {host} must skip detection"
+        );
+    }
+}
+
+// ---- YAML merge tags (`!override` / `!reset`) — the real Sail override shape ----
+
+#[test]
+fn line_is_key_accepts_yaml_tag_but_not_inline_scalar() {
+    use super::line_is_key;
+    // A `!`-tag introduces the block below the key.
+    assert!(line_is_key("ports: !override", "ports"));
+    assert!(line_is_key("ports: !reset", "ports"));
+    assert!(line_is_key("ports:  !override  # note", "ports"));
+    // Still a key when bare or comment-only.
+    assert!(line_is_key("ports:", "ports"));
+    assert!(line_is_key("ports: # inline list follows", "ports"));
+    // A real inline scalar is NOT a block-introducing key.
+    assert!(!line_is_key("ports: 3306:3306", "ports"));
+    assert!(!line_is_key("image: mysql:8", "ports"));
+}
+
+/// The exact Decision Cloud override: `ports: !override` binding the DB to
+/// 127.0.0.2, layered over a base compose that binds to 127.0.0.1.
+const DC_OVERRIDE: &str = "services:\n  mysql:\n    ports: !override\n      - '127.0.0.2:3306:3306'\n  pgsql:\n    ports: !override\n      - '127.0.0.2:5432:5432'\n";
+const DC_BASE: &str = "services:\n  mysql:\n    ports:\n      - '${FORWARD_DB_PORT:-3306}:3306'\n";
+
+#[test]
+fn sail_override_with_merge_tag_wins_over_base() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "docker-compose.override.yml", DC_OVERRIDE);
+    write(dir.path(), "docker-compose.yml", DC_BASE);
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let labels = tcp_labels(&provider.build_mysql_candidates(&mysql_service_cfg()));
+    assert_eq!(
+        labels,
+        vec![
+            "tcp mysql:3306".to_string(),
+            "tcp 127.0.0.2:3306".to_string(),
+            "tcp 127.0.0.1:3306".to_string(),
+        ],
+        "the `!override` block must be read (127.0.0.2), beating base's 127.0.0.1"
+    );
+}
+
+#[test]
+fn sail_override_merge_tag_with_loopback_host() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "docker-compose.override.yml", DC_OVERRIDE);
+    write(dir.path(), "docker-compose.yml", DC_BASE);
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cfg = make_config_with(None, None, "127.0.0.1");
+    assert_eq!(
+        tcp_labels(&provider.build_mysql_candidates(&cfg)),
+        vec![
+            "tcp 127.0.0.1:3306".to_string(),
+            "tcp 127.0.0.2:3306".to_string()
+        ]
+    );
+}
+
+#[test]
+fn sail_override_merge_tag_custom_host_port() {
+    let dir = TempDir::new().unwrap();
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    ports: !override\n      - '127.0.0.2:33061:3306'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let labels = tcp_labels(&provider.build_mysql_candidates(&mysql_service_cfg()));
+    assert!(
+        labels.contains(&"tcp 127.0.0.2:33061".to_string()),
+        "the forwarded host port under a `!override` tag is honoured; got {labels:?}"
+    );
+}
+
+#[test]
+fn sail_override_merge_tag_feeds_postgres_too() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "docker-compose.override.yml", DC_OVERRIDE);
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let mut cfg = make_config_with(None, None, "pgsql");
+    cfg.driver = "pgsql".to_string();
+    cfg.port = 5432;
+    assert_eq!(
+        tcp_labels(&provider.build_postgres_candidates(&cfg)),
+        vec![
+            "tcp pgsql:5432".to_string(),
+            "tcp 127.0.0.2:5432".to_string(),
+            "tcp 127.0.0.1:5432".to_string(),
+        ]
+    );
+}
+
+// ---- variable-referenced connection block (Sail's `'mysql' => $mysql`) ----
+
+/// A Sail-style config where the connection is factored into a `$mysql`
+/// variable and referenced from `connections` (the real Decision Cloud shape).
+const CONFIG_VAR_FORM: &str = r#"<?php
+$mysql = [
+    'driver' => 'mysql',
+    'host' => env('DB_HOST', '127.0.0.1'),
+    'port' => env('DB_PORT', '3306'),
+    'database' => env('DB_DATABASE', 'laravel'),
+    'username' => env('DB_USERNAME', 'root'),
+    'password' => env('DB_PASSWORD', ''),
+];
+$mysqlUnbuffered = $mysql;
+return [
+    'default' => env('DB_CONNECTION', 'mysql'),
+    'connections' => [
+        'mysql' => $mysql,
+        'mysql_unbuffered' => $mysqlUnbuffered,
+    ],
+];
+"#;
+
+fn write_config_php(dir: &std::path::Path, content: &str) {
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    std::fs::write(dir.join("config").join("database.php"), content).unwrap();
+}
+
+const DC_ENV: &str =
+    "DB_CONNECTION=mysql\nDB_HOST=mysql\nDB_DATABASE=cashlender\nDB_USERNAME=sail\nDB_PASSWORD=password\n";
+
+#[test]
+fn extract_connection_block_inline_form_still_works() {
+    let provider = DatabaseSchemaProvider::new(PathBuf::from("/tmp"));
+    let content = "'connections' => [\n  'mysql' => [\n    'driver' => 'mysql',\n    'host' => env('DB_HOST', '127.0.0.1'),\n  ],\n]";
+    let block = provider
+        .extract_connection_block(content, "mysql")
+        .expect("inline array must resolve");
+    assert!(block.contains("'host' => env('DB_HOST'"), "got: {block}");
+}
+
+#[test]
+fn extract_connection_block_variable_form_resolves() {
+    let provider = DatabaseSchemaProvider::new(PathBuf::from("/tmp"));
+    let block = provider
+        .extract_connection_block(CONFIG_VAR_FORM, "mysql")
+        .expect("`'mysql' => $mysql` must resolve to the $mysql array");
+    assert!(block.contains("'host' => env('DB_HOST'"), "got: {block}");
+    assert!(
+        block.contains("'database' => env('DB_DATABASE'"),
+        "got: {block}"
+    );
+}
+
+#[test]
+fn extract_connection_block_undefined_variable_is_none() {
+    let provider = DatabaseSchemaProvider::new(PathBuf::from("/tmp"));
+    let content = "'connections' => [\n  'mysql' => $missing,\n]";
+    assert!(
+        provider
+            .extract_connection_block(content, "mysql")
+            .is_none(),
+        "an undefined variable reference must fail open to None (→ defaults)"
+    );
+}
+
+#[tokio::test]
+async fn variable_referenced_connection_resolves_env_not_defaults() {
+    let dir = TempDir::new().unwrap();
+    write_config_php(dir.path(), CONFIG_VAR_FORM);
+    write(dir.path(), ".env", DC_ENV);
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    // Before the fix these were all hardcoded defaults (127.0.0.1 / laravel /
+    // root / ""), silently ignoring .env.
+    assert_eq!(cfg.host, "mysql");
+    assert_eq!(cfg.database, "cashlender");
+    assert_eq!(cfg.username, "sail");
+    assert_eq!(cfg.password, "password");
+    assert_eq!(cfg.port, 3306);
+}
+
+#[tokio::test]
+async fn decision_cloud_end_to_end_variable_config_plus_sail_override() {
+    let dir = TempDir::new().unwrap();
+    write_config_php(dir.path(), CONFIG_VAR_FORM);
+    write(dir.path(), ".env", DC_ENV);
+    write(
+        dir.path(),
+        "docker-compose.override.yml",
+        "services:\n  mysql:\n    ports: !override\n      - '127.0.0.2:3306:3306'\n",
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_eq!(cfg.host, "mysql", "the real DB_HOST feeds detection");
+
+    let labels = tcp_labels(&provider.build_mysql_candidates(&cfg));
+    assert!(
+        labels.contains(&"tcp mysql:3306".to_string()),
+        "primary service-name candidate present: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"tcp 127.0.0.2:3306".to_string()),
+        "Sail override 127.0.0.2 detected once the host is correct: {labels:?}"
+    );
+}

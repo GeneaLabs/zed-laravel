@@ -1968,10 +1968,20 @@ struct LaravelLanguageServer {
     /// built; cleared on a provider/composer rescan. Used by semantic-token
     /// highlighting to reject non-directive `@`-text.
     cached_directive_names: Arc<RwLock<Option<HashSet<String>>>>,
-    /// Database schema provider for exists:/unique: validation rules
+    /// Database schema provider for exists:/unique: validation rules.
+    /// Outage notifications are edge-triggered by the provider's circuit
+    /// breaker (one toast per outage episode, re-armed on reconnect) — see
+    /// `init_database_schema_provider` for the listener wiring.
     database_schema: Arc<RwLock<Option<laravel_lsp::database::DatabaseSchemaProvider>>>,
-    /// Whether we've shown the database connection error diagnostic this session
-    database_diagnostic_shown: Arc<RwLock<bool>>,
+    /// Idempotency guard for `init_database_schema_provider`, which is
+    /// called from two startup sites. Holds the root the live background
+    /// tasks (refresh loop + outage-channel listener) were started for,
+    /// plus their `JoinHandle`s. A re-init for the SAME root is a no-op
+    /// (this is what stops the duplicate-outage-toast bug — two providers
+    /// meant two breakers, each firing its own toast); a re-init for a
+    /// DIFFERENT root aborts these tasks before starting fresh. So exactly
+    /// one provider / loop / listener / breaker is live at a time.
+    db_provider_task: Arc<tokio::sync::Mutex<Option<(PathBuf, Vec<tokio::task::JoinHandle<()>>)>>>,
     /// Cached index of named routes discovered across project / packages / framework.
     /// Populated at init by walking routes/, vendor/*/routes/, and content-matched
     /// vendor PHP files. Replaces the legacy hard-coded route-file scan.
@@ -4083,9 +4093,11 @@ impl LaravelLanguageServer {
         };
 
         if items.is_empty() {
-            // Distinguish two empty-result causes for the log/diagnostic:
-            // (a) DB is unreachable — actionable, user can fix .env. Show a
-            //     one-time INFO toast so they discover the dependency.
+            // Distinguish two empty-result causes for the log:
+            // (a) DB is unreachable — the user was already notified by the
+            //     circuit-breaker toast when the outage began (one per
+            //     outage episode, wired in init_database_schema_provider),
+            //     so just log here.
             // (b) DB is reachable but the specific table/columns aren't in
             //     the introspected schema (e.g., user typed a typo, table
             //     was dropped, schema cache stale). Stay silent — toasting
@@ -4099,7 +4111,6 @@ impl LaravelLanguageServer {
                      DB connection error: {}",
                     ctx.expecting, error.message
                 );
-                self.maybe_notify_db_unreachable(&error.message).await;
             } else {
                 info!(
                     "🔗 chain completion: matched {:?} but produced 0 items — \
@@ -4296,47 +4307,6 @@ impl LaravelLanguageServer {
         }
     }
 
-    /// Send a one-time notification informing the user that table and
-    /// column autocomplete requires a working DB connection. Shares the
-    /// `database_diagnostic_shown` flag with the existing exists:/unique:
-    /// diagnostic path, so the user only sees ONE notification per LSP
-    /// session no matter how they hit the unreachable DB.
-    ///
-    /// Uses `window/showMessageRequest` (with a Dismiss action) rather than
-    /// `window/showMessage` because the latter auto-dismisses after a few
-    /// seconds — the user may not even see it if they're typing. With an
-    /// action button, the notification stays until they explicitly click it.
-    async fn maybe_notify_db_unreachable(&self, error_message: &str) {
-        let mut shown = self.database_diagnostic_shown.write().await;
-        if *shown {
-            return;
-        }
-        *shown = true;
-        drop(shown);
-
-        let message = format!(
-            "Laravel: Database is unreachable, so table and column \
-             autocompletion is disabled. Fix DB connectivity in .env \
-             (DB_HOST / DB_PORT / credentials) and reload the window to \
-             enable. Error: {error_message}"
-        );
-        let actions = vec![tower_lsp::lsp_types::MessageActionItem {
-            title: "Dismiss".to_string(),
-            properties: Default::default(),
-        }];
-        // We don't care about the response — the only action is "Dismiss".
-        // The point of using show_message_request is that the notification
-        // persists until the user clicks.
-        let _ = self
-            .client
-            .show_message_request(
-                tower_lsp::lsp_types::MessageType::WARNING,
-                message,
-                Some(actions),
-            )
-            .await;
-    }
-
     fn new(client: Client) -> Self {
         Self {
             client,
@@ -4365,7 +4335,7 @@ impl LaravelLanguageServer {
             cached_validation_rule_names: Arc::new(RwLock::new(Vec::new())),
             cached_directive_names: Arc::new(RwLock::new(None)),
             database_schema: Arc::new(RwLock::new(None)),
-            database_diagnostic_shown: Arc::new(RwLock::new(false)),
+            db_provider_task: Arc::new(tokio::sync::Mutex::new(None)),
             route_index: Arc::new(RwLock::new(None)),
             warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexing_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -7976,11 +7946,110 @@ impl LaravelLanguageServer {
         diagnostics
     }
 
-    /// Initialize the database schema provider for exists:/unique: validation rules
+    /// Initialize the database schema provider for exists:/unique: validation
+    /// rules — **idempotent**. Called from two startup sites (the
+    /// config-discovery flow and the `initialized` background task), so it
+    /// guards against setting up a second provider: a second call for the
+    /// same root is a no-op, and a call for a different root aborts the old
+    /// tasks first. Exactly one provider / refresh loop / channel listener /
+    /// breaker is ever live — which is what keeps a single outage from
+    /// producing two toasts (two breakers, each firing its own).
     async fn init_database_schema_provider(&self, root: &Path) {
-        use laravel_lsp::database::DatabaseSchemaProvider;
+        use laravel_lsp::database::{outage_toast_message, DatabaseSchemaProvider, DbBreakerEvent};
 
-        let provider = DatabaseSchemaProvider::new(root.to_path_buf());
+        let root_buf = root.to_path_buf();
+
+        // Idempotency guard. Held across the whole init so the two startup
+        // sites serialize: the first sets everything up and stores the task
+        // handles; the second sees the same root and returns. No other code
+        // locks `db_provider_task`, so holding it across the awaits below
+        // can't deadlock.
+        let mut task_guard = self.db_provider_task.lock().await;
+        match task_guard.as_ref() {
+            Some((existing_root, _)) if *existing_root == root_buf => {
+                debug!(
+                    "🗄️  DB schema provider already initialised for {:?} — skipping re-init",
+                    root_buf
+                );
+                return;
+            }
+            Some((existing_root, handles)) => {
+                info!(
+                    "🗄️  DB schema provider root changed ({:?} → {:?}) — aborting old tasks",
+                    existing_root, root_buf
+                );
+                for handle in handles {
+                    handle.abort();
+                }
+            }
+            None => {}
+        }
+
+        let provider = DatabaseSchemaProvider::new(root_buf.clone());
+
+        // Wire the breaker-edge notifications. The provider's circuit
+        // breaker — which lives entirely in the background refresh loop
+        // below — announces each edge on this channel: `Outage` on the
+        // Closed→Open transition (the FIRST failure of an outage episode;
+        // retry probes inside the same outage are silent), and
+        // `Reconnected` on the recovery edge (Open/HalfOpen→Closed). So the
+        // user sees exactly one outage toast then, when the DB comes back,
+        // exactly one reconnect toast. Outage text is scenario-specific
+        // (unreachable vs rejected vs generic); "no DB configured" maps to
+        // `None` and stays silent.
+        //
+        // Both use `window/showMessageRequest` (a persistent toast with a
+        // Dismiss action), NOT `window/showMessage` (auto-dismissing): the
+        // outage message is dense — scenario diagnosis, what to check, and
+        // the retry cadence — and needs time to read, so it stays until the
+        // user dismisses it. It can no longer linger misleadingly after
+        // recovery, because the `Reconnected` toast fires on the recovery
+        // edge and corrects the picture.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<DbBreakerEvent>();
+        provider.set_event_channel(event_tx).await;
+        let toast_client = self.client.clone();
+        let listener_handle = tokio::spawn(async move {
+            use tower_lsp::lsp_types::{MessageActionItem, MessageType};
+            // A single Dismiss action makes the toast persistent — it stays
+            // until the user clicks, rather than auto-fading in a few seconds.
+            let dismiss = || {
+                vec![MessageActionItem {
+                    title: "Dismiss".to_string(),
+                    properties: Default::default(),
+                }]
+            };
+            // Ends when the provider (and with it the sender) is dropped
+            // or replaced by a re-init.
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    DbBreakerEvent::Outage(outage) => {
+                        let Some(message) = outage_toast_message(outage.class, &outage.message)
+                        else {
+                            info!(
+                                "🗄️  DB circuit breaker opened silently ({:?}): {}",
+                                outage.class, outage.message
+                            );
+                            continue;
+                        };
+                        // We don't act on the response — the only action is
+                        // Dismiss; the point is that the toast persists.
+                        let _ = toast_client
+                            .show_message_request(MessageType::WARNING, message, Some(dismiss()))
+                            .await;
+                    }
+                    DbBreakerEvent::Reconnected => {
+                        let _ = toast_client
+                            .show_message_request(
+                                MessageType::INFO,
+                                "Laravel: database reconnected — DB-aware features re-enabled."
+                                    .to_string(),
+                                Some(dismiss()),
+                            )
+                            .await;
+                    }
+                }
+            }
+        });
 
         // Log config status but always store provider
         // Errors will be handled when completions are requested
@@ -7995,41 +8064,58 @@ impl LaravelLanguageServer {
             false
         };
 
-        // Always store provider - errors handled when completions requested
+        // Always store provider - interactive reads hit its in-memory cache.
         *self.database_schema.write().await = Some(provider);
 
-        // Pre-warm the schema cache in the background. The cold fetch costs
-        // ~50ms for SHOW TABLES + ~4ms per table for SHOW COLUMNS — on a
-        // 600-table schema that's ~2.5s. Doing it here, in parallel with
-        // vendor/app provider rescans and pattern cache warming, means the
-        // user's first `DB::table('|')` completion hits a warm cache and
-        // returns instantly. Skipped when there's no config (nothing to
-        // introspect and the toast would be noise).
+        // Track the live background tasks so they can be aborted on a root
+        // change. The listener is always running; the refresh loop is pushed
+        // below when there's a DB config.
+        let mut task_handles = vec![listener_handle];
+
+        // Spawn the SINGLE background refresh loop — the only code that ever
+        // connects to the database. It owns connect + fetch + cache-fill +
+        // circuit breaker + outage notification, entirely off the tower-lsp
+        // request-dispatch slots, so a slow or dead database can never
+        // starve interactive requests (hover/goto/completion on a non-DB
+        // target stays instant during an outage — the isolation bug this
+        // design fixes). The first tick doubles as the pre-warm: a cold
+        // ~2.5s fetch for a 600-table schema, after which interactive
+        // `DB::table('|')` completions hit a warm cache.
+        //
+        // Cadence is driven by the breaker: refresh every ~60s while
+        // healthy (matching the cache TTL), retry every ~30s (the half-open
+        // probe) while the DB is down. Skipped entirely when there's no DB
+        // config — nothing to introspect and no outage to report.
         if has_config {
+            use laravel_lsp::database::{DB_CONNECT_TIMEOUT, DB_REFRESH_HEALTHY_INTERVAL};
             let db = self.database_schema.clone();
-            tokio::spawn(async move {
-                let start = std::time::Instant::now();
-                info!("🔥 Pre-warming database schema cache...");
-                let schema = {
-                    let guard = db.read().await;
-                    match guard.as_ref() {
-                        Some(provider) => provider.get_schema().await,
-                        None => None,
-                    }
-                };
-                match schema {
-                    Some(s) => info!(
-                        "🔥 Database schema cache warmed: {} tables in {:?}",
-                        s.tables.len(),
-                        start.elapsed()
-                    ),
-                    None => info!(
-                        "🔥 Database schema pre-warm failed ({:?}) — will retry on first completion",
-                        start.elapsed()
-                    ),
+            let refresh_handle = tokio::spawn(async move {
+                info!("🔥 Starting background database schema refresh loop...");
+                loop {
+                    // Hold the read guard only for the tick; drop it before
+                    // sleeping so a re-init can take the write lock. Multiple
+                    // concurrent readers (interactive requests) are fine.
+                    let sleep = {
+                        let guard = db.read().await;
+                        match guard.as_ref() {
+                            Some(provider) => {
+                                provider
+                                    .refresh_tick(DB_CONNECT_TIMEOUT, DB_REFRESH_HEALTHY_INTERVAL)
+                                    .await
+                            }
+                            // Provider gone (shutdown) — stop the loop.
+                            None => break,
+                        }
+                    };
+                    tokio::time::sleep(sleep).await;
                 }
             });
+            task_handles.push(refresh_handle);
         }
+
+        // Record the live tasks (still holding the guard) so a later
+        // same-root init no-ops and a different-root init aborts them.
+        *task_guard = Some((root_buf, task_handles));
     }
 
     /// Check if a file exists with async I/O and TTL caching
@@ -12565,17 +12651,13 @@ impl LaravelLanguageServer {
                     // Try to get tables (this triggers connection if not cached)
                     let tables = provider.get_tables().await;
 
-                    // If tables is empty and there was a connection error, publish diagnostic
+                    // If tables is empty and there was a connection error,
+                    // bail. No toast from here: the circuit-breaker channel
+                    // (wired in init_database_schema_provider) already
+                    // notified the user once when this outage began.
                     if tables.is_empty() {
                         if let Some(error) = provider.get_last_error().await {
                             info!("   ❌ Database connection error: {}", error.message);
-                            // Surface the unreachable-DB notification via the
-                            // single persistent toast. The previous inline
-                            // diagnostic at the rule position used the same
-                            // one-shot flag as the toast, so whichever fired
-                            // first hid the other. One channel = one signal,
-                            // and toast persists until the user dismisses it.
-                            self.maybe_notify_db_unreachable(&error.message).await;
                             // Return empty - no completions available
                             return Vec::new();
                         }
@@ -12745,15 +12827,12 @@ impl LaravelLanguageServer {
                         }
                     }
                 } else {
+                    // No provider means no database configuration was
+                    // discovered — scenario 0, a normal state for projects
+                    // without a DB. Deliberately silent (log only): toasting
+                    // "configure your database" at every exists:/unique:
+                    // completion would nag DB-less projects.
                     debug!("warn:  Database schema provider not initialized");
-                    // Same persistent-toast channel as the unreachable-DB
-                    // path above. "Provider not initialised" means no .env
-                    // (or no detection of one); say so explicitly.
-                    self.maybe_notify_db_unreachable(
-                        "Database not configured. Set DB_CONNECTION, DB_HOST, \
-                         DB_DATABASE, DB_USERNAME, DB_PASSWORD in .env.",
-                    )
-                    .await;
                     Vec::new()
                 }
             }
@@ -16891,7 +16970,7 @@ return [
             cached_validation_rule_names: self.cached_validation_rule_names.clone(),
             cached_directive_names: self.cached_directive_names.clone(),
             database_schema: self.database_schema.clone(),
-            database_diagnostic_shown: self.database_diagnostic_shown.clone(),
+            db_provider_task: self.db_provider_task.clone(),
             route_index: self.route_index.clone(),
             warm_complete: self.warm_complete.clone(),
             indexing_in_flight: self.indexing_in_flight.clone(),
@@ -17147,14 +17226,12 @@ return [
         }
 
         // Database-unreachable notifications go through the persistent
-        // toast (`maybe_notify_db_unreachable`) — driven from the chain
-        // completion handler when an LSP-completing path actually needs
-        // the DB and finds it unavailable. We deliberately don't publish
-        // a diagnostic from here: a 0:0 diagnostic on whatever file
-        // happened to be open is awkward, and emitting both a diagnostic
-        // AND a toast meant whichever fired first stole the
-        // `database_diagnostic_shown` flag and suppressed the other.
-        // Toast wins; diagnostic is gone.
+        // toast driven by the schema provider's circuit breaker (wired in
+        // `init_database_schema_provider`): one toast per outage episode,
+        // re-armed on reconnect. We deliberately don't publish a diagnostic
+        // from here: a 0:0 diagnostic on whatever file happened to be open
+        // is awkward, and a second channel for the same signal caused
+        // suppression races in the past. Toast wins; diagnostic is gone.
 
         // Get the Laravel config (checks memory cache first, then Salsa)
         let t_config = std::time::Instant::now();
@@ -17248,8 +17325,14 @@ return [
                         );
                     }
                     (_, Some(root)) => {
-                        let db_guard = self.database_schema.read().await;
-                        match db_guard.as_ref() {
+                        // Clone the provider handle (cheap — it's a bundle of
+                        // Arcs) out of the guard and drop the guard before the
+                        // await. chain_diagnostics' DB calls are now instant
+                        // in-memory cache reads (never connect), so this is no
+                        // longer a freeze risk — but not holding the outer lock
+                        // across an await keeps a re-init from blocking too.
+                        let db = self.database_schema.read().await.clone();
+                        match db {
                             None => info!(
                                 "🔗 chain_diagnostics: {} chains but DB schema provider not \
                                  initialised — column/relation diagnostics need a DB connection",
@@ -17259,7 +17342,7 @@ return [
                                 let t_chain = std::time::Instant::now();
                                 let chain_diags = laravel_lsp::query_chain::chain_diagnostics(
                                     &fresh_chains,
-                                    db,
+                                    &db,
                                     &root,
                                     source,
                                     severity,
