@@ -749,13 +749,22 @@ pub async fn resolve_related_model(
 ///   whose `competitions` property hop is seeded as the first pending hop.
 ///
 /// Each hop resolves against the *running* model via [`resolve_related_model`].
-/// A hop that doesn't name a relationship (an unrecognised builder method like
-/// `->limit()`, or a non-relation property) returns `None` and is skipped,
-/// leaving the model unchanged — the `ChainEffect::None` fallback. The mode is
-/// untouched: a relationship method returns a builder of the related model
-/// (`EloquentBuilder` stays `EloquentBuilder`), and the property form already
-/// entered the walker as `EloquentCollection`. No-op when there are no hops or
-/// the chain has no resolved model to start from.
+/// A failed hop (not a relationship, or no readable model file) is handled by
+/// mode:
+///
+/// - `EloquentBuilder` — the hop was a heuristic guess (any unrecognised
+///   method name mid-chain, e.g. `->limit()`), so a miss is skipped, leaving
+///   the model unchanged — the `ChainEffect::None` fallback.
+/// - `EloquentCollection` — the hop is a genuine relation claim (a
+///   `$user->rel->…` property receiver or an executed relation assignment,
+///   issue #246), so a miss means the collection's element type is unknown.
+///   `effective_model` is cleared and consumers stay quiet rather than
+///   false-positiving against the base model's columns.
+///
+/// The mode is untouched either way: a relationship method returns a builder
+/// of the related model (`EloquentBuilder` stays `EloquentBuilder`), and the
+/// collection forms already entered the walker as `EloquentCollection`. No-op
+/// when there are no hops or the chain has no resolved model to start from.
 pub async fn apply_relation_method_hops(ctx: &mut ChainContext, project_root: &Path) {
     if ctx.pending_relation_hops.is_empty() {
         return;
@@ -765,10 +774,15 @@ pub async fn apply_relation_method_hops(ctx: &mut ChainContext, project_root: &P
         return;
     };
     for hop in hops {
-        if let Some(related) = resolve_related_model(&current, &hop, project_root).await {
-            current = related;
+        match resolve_related_model(&current, &hop, project_root).await {
+            Some(related) => current = related,
+            None if ctx.mode == BuilderMode::EloquentCollection => {
+                ctx.effective_model = None;
+                return;
+            }
+            // Builder mode: not a relationship — keep `current`, try the next.
+            None => {}
         }
-        // `None` → not a relationship; keep `current` and try the next hop.
     }
     ctx.effective_model = Some(current);
 }

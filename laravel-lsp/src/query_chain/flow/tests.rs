@@ -552,3 +552,139 @@ function search() {
         "an extra flow hop lowers confidence"
     );
 }
+
+// ---- resolve_collection_relation (issue #246) ----------------------------
+
+/// Run [`super::resolve_collection_relation`] against the Nth occurrence of
+/// `$var` in the snippet.
+fn resolve_collection_at(src: &str, var: &str, n: usize) -> Option<(String, String)> {
+    let wrapped = format!("<?php\n{src}");
+    let tree = parse_php(&wrapped).expect("parse");
+    let bytes = wrapped.as_bytes();
+    let aliases = extract_use_aliases(&tree, &wrapped);
+    let node = find_nth_var(&tree, bytes, var, n)?;
+    super::resolve_collection_relation(node, bytes, var, &aliases)
+}
+
+#[test]
+fn collection_relation_detects_instance_rooted_chain() {
+    // The exact issue #246 shape: an executed relation query (with
+    // table-qualified select args) assigned to a variable. n=2 is the use
+    // site ($regs LHS is n=0... the RHS has no $regs, so LHS=0, use=1).
+    let src = r#"
+use App\Models\User;
+function run(User $user) {
+    $regs = $user->competitions()->select('competitions.id', 'competitions.type')->get();
+    $regs->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(
+        resolve_collection_at(src, "regs", 1),
+        Some(("App\\Models\\User".to_string(), "competitions".to_string()))
+    );
+}
+
+#[test]
+fn collection_relation_detects_static_rooted_chain() {
+    let src = r#"
+function run() {
+    $regs = User::query()->competitions()->get();
+    $regs->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(
+        resolve_collection_at(src, "regs", 1),
+        Some(("User".to_string(), "competitions".to_string()))
+    );
+}
+
+#[test]
+fn collection_relation_accepts_pluck_terminator() {
+    let src = r#"
+function run(User $user) {
+    $ids = $user->competitions()->pluck('id');
+    $ids->filter();
+}
+"#;
+    assert_eq!(
+        resolve_collection_at(src, "ids", 1),
+        Some(("User".to_string(), "competitions".to_string()))
+    );
+}
+
+#[test]
+fn collection_relation_rejects_unexecuted_relation_builder() {
+    // No collection terminator — `$q` is a relation *builder*, not a
+    // hydrated collection. Detection must not fire.
+    let src = r#"
+function run(User $user) {
+    $q = $user->competitions();
+    $q->where('type', 'league');
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "q", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_single_model_terminator() {
+    // `first()` yields a Model, not a Collection.
+    let src = r#"
+function run(User $user) {
+    $c = $user->competitions()->first();
+    $c->load('players');
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "c", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_known_builder_root_call() {
+    // `where()` is a recognised builder method — the collection holds the
+    // ROOT model, so the plain flow path (InstanceVar) must keep handling it.
+    let src = r#"
+function run(User $user) {
+    $users = $user->where('active', 1)->get();
+    $users->pluck('id');
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "users", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_unrecognised_middle_call() {
+    // A second unrecognised call mid-chain could be another relation hop —
+    // we only model a single hop, so stay out entirely (fall back to the
+    // plain flow path) rather than resolve to the wrong model.
+    let src = r#"
+function run(User $user) {
+    $x = $user->competitions()->organizer()->get();
+    $x->pluck('id');
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "x", 1), None);
+}
+
+#[test]
+fn collection_relation_requires_resolvable_base() {
+    // `$user` has no typed param / docblock / assignment — the base model is
+    // unknown, so detection returns None.
+    let src = r#"
+function run($user) {
+    $regs = $user->competitions()->get();
+    $regs->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "regs", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_non_starter_static_root() {
+    // `Carbon::now()` isn't an Eloquent static starter — not a chain we type.
+    let src = r#"
+function run() {
+    $x = Carbon::now()->addDays(3)->get();
+    $x->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "x", 1), None);
+}

@@ -84,15 +84,21 @@ pub enum EloquentReceiver {
         var: String,
         php_type: Option<String>,
     },
-    /// `$user->competitions->where(...)` — a relationship accessed as a
-    /// *property* (not a method call) eager-/lazy-loads it into a hydrated
-    /// `Collection` of the related model, so the chain runs in
-    /// `BuilderMode::EloquentCollection`. `base_type` is the declared FQCN of
-    /// the base variable (`$user` → `App\Models\User`), resolved synchronously
-    /// by the `var_type` resolver; `relation` is the property name
-    /// (`competitions`). The related model's FQCN can't be resolved in the
-    /// (synchronous) extractor pass — it needs a model-file read — so the
-    /// walker seeds `relation` as a pending relation hop
+    /// A hydrated `Collection` of a *related* model, reached two ways:
+    ///
+    /// - `$user->competitions->where(...)` — a relationship accessed as a
+    ///   *property* (not a method call) eager-/lazy-loads it into a hydrated
+    ///   `Collection` of the related model.
+    /// - `$regs = $user->competitions()->…->get(); $regs->whereIn(...)` — an
+    ///   executed relation query assigned to a variable (issue #246), detected
+    ///   by [`crate::query_chain::flow::resolve_collection_relation`].
+    ///
+    /// Either way the chain runs in `BuilderMode::EloquentCollection`.
+    /// `base_type` is the resolved FQCN of the base variable (`$user` →
+    /// `App\Models\User`); `relation` is the relation name (`competitions`).
+    /// The related model's FQCN can't be resolved in the (synchronous)
+    /// extractor pass — it needs a model-file read — so the walker seeds
+    /// `relation` as a pending relation hop
     /// ([`ChainContext::pending_relation_hops`]) that the async finalize step
     /// resolves into `effective_model`. `base_type` is `None` when the base
     /// variable's type can't be determined, in which case completion no-ops.

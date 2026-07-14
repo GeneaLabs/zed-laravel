@@ -623,6 +623,22 @@ fn member_chain_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> Chai
                 return ChainReceiver::Unknown;
             };
             let var = raw.trim_start_matches('$').to_string();
+            // Issue #246: `$var = $base->relation()->…->get()` — the variable
+            // holds a hydrated Collection of the *related* model, not a
+            // builder on the base model. Detect the executed-relation
+            // assignment shape first and emit the same receiver as the
+            // property-access form (`$base->relation->…`): collection mode at
+            // the base model, with the relation queued as a pending hop for
+            // the async finalize step.
+            if let Some((base_type, relation)) =
+                super::flow::resolve_collection_relation(node, bytes, &var, aliases)
+            {
+                return ChainReceiver::Eloquent(EloquentReceiver::RelationProperty {
+                    var,
+                    base_type: Some(base_type),
+                    relation,
+                });
+            }
             // Phase 9: try to resolve `$var`'s declared class via either a
             // typed function parameter (`function show(User $user)`) or an
             // `@var` docblock immediately above the variable's assignment.

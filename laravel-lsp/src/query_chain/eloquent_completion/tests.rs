@@ -618,6 +618,32 @@ class Competition extends Model {}
 }
 
 #[tokio::test]
+async fn apply_relation_method_hops_clears_model_on_collection_mode_miss() {
+    // Issue #246 AC: in EloquentCollection mode the hop is a genuine relation
+    // claim ($user->rel->… or an executed relation assignment). When it
+    // doesn't resolve, the element type is unknown — effective_model must be
+    // cleared so consumers stay quiet instead of false-positiving against the
+    // base model's columns.
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function competitions() { return $this->hasMany(Competition::class); }
+}
+"#;
+    let (_dir, root) = project_with_models_helper(&[("User", user)]).await;
+
+    let mut ctx = make_ctx("App\\Models\\User");
+    ctx.mode = BuilderMode::EloquentCollection;
+    ctx.pending_relation_hops = vec!["notARelation".to_string()];
+    apply_relation_method_hops(&mut ctx, &root).await;
+    assert_eq!(
+        ctx.effective_model, None,
+        "unresolvable collection-mode hop must clear the model"
+    );
+}
+
+#[tokio::test]
 async fn columns_for_collection_falls_back_when_model_missing() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_path_buf();

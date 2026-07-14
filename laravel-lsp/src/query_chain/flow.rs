@@ -60,7 +60,7 @@
 
 use tree_sitter::Node;
 
-use super::methods::is_eloquent_static_starter;
+use super::methods::{is_eloquent_static_starter, is_known_builder_method, COLLECTION_TERMINATORS};
 use super::use_aliases::{resolve_class_name, UseAliases};
 use crate::salsa_impl::Confidence;
 
@@ -118,6 +118,82 @@ pub fn resolve_expression(
     aliases: &UseAliases,
 ) -> Option<(String, Confidence)> {
     classify_rhs(node, bytes, aliases, 0, node.start_byte())
+}
+
+/// Detect an executed-relation-query assignment for `var_name` (issue #246):
+///
+/// ```php
+/// $registeredCompetitions = $user->competitions()->select('competitions.id')->get();
+/// $registeredCompetitions->whereIn('type', …);  // ← use site
+/// ```
+///
+/// The variable holds a hydrated `Collection` of the *related* model
+/// (`Competition`), not a builder on the root model (`User`). The shape is:
+/// the latest assignment's RHS is a member-call chain whose deepest call is
+/// NOT a recognised builder method (a potential relation hop), every call in
+/// between IS a recognised builder method, and the outermost call is a
+/// [`COLLECTION_TERMINATORS`] entry (`get`, `pluck`, …). The chain root is
+/// either a variable resolvable to a model (via the normal flow walk) or an
+/// Eloquent static starter (`User::query()`).
+///
+/// Returns `(base_model_fqcn, relation_name)` so the extractor can emit a
+/// collection-mode receiver with the relation queued as a pending hop — the
+/// relation→related-model resolution needs a model-file read, so it stays
+/// deferred to the async finalize step. `None` means the assignment doesn't
+/// match the shape (callers fall back to plain flow typing).
+pub fn resolve_collection_relation(
+    use_site: Node,
+    bytes: &[u8],
+    var_name: &str,
+    aliases: &UseAliases,
+) -> Option<(String, String)> {
+    let scope = enclosing_scope(use_site)?;
+    let (rhs, assignment_start) =
+        latest_assignment_rhs(scope, bytes, var_name, use_site.start_byte())?;
+    let outer = unwrap_parens(rhs);
+    if outer.kind() != "member_call_expression" {
+        return None;
+    }
+
+    // Collect the chain's method names outermost → innermost, stopping at
+    // the first non-call node (the chain root).
+    let mut methods: Vec<&str> = Vec::new();
+    let mut node = outer;
+    let root = loop {
+        if node.kind() == "member_call_expression" {
+            methods.push(node_text(node.child_by_field_name("name")?, bytes)?);
+            node = node.child_by_field_name("object")?;
+        } else {
+            break node;
+        }
+    };
+
+    // Shape gate: a collection terminator on top, the relation candidate at
+    // the bottom, only recognised builder methods in between. Table-qualified
+    // column strings in the middle links are just arguments — they never
+    // affect this method-name walk.
+    let (&terminator, rest) = methods.split_first()?;
+    let (&relation, middle) = rest.split_last()?;
+    if !COLLECTION_TERMINATORS.contains(&terminator)
+        || is_known_builder_method(relation)
+        || !middle.iter().all(|m| is_known_builder_method(m))
+    {
+        return None;
+    }
+
+    // Type the chain root: `$base` via the normal flow walk (bounded at this
+    // assignment, so we don't re-find the assignment we're inside), or a
+    // static Eloquent starter (`User::query()->relation()->get()`).
+    let base = match root.kind() {
+        "variable_name" => {
+            let raw = node_text(root, bytes)?;
+            let base_var = raw.trim_start_matches('$').to_string();
+            resolve_with_boundary(root, assignment_start, bytes, &base_var, aliases, 0)?.0
+        }
+        "scoped_call_expression" => classify_scoped_call(root, bytes, aliases)?,
+        _ => return None,
+    };
+    Some((base, relation.to_string()))
 }
 
 /// Like [`resolve`], but also reports the [`Confidence`] tier of the
