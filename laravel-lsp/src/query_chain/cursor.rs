@@ -390,15 +390,12 @@ fn initial_receiver_context(
                         (BuilderMode::BaseBuilder, None, None, None)
                     }
                 },
-                _ => match php_type {
-                    Some(class) => (
-                        BuilderMode::EloquentBuilder,
-                        None,
-                        Some(class.clone()),
-                        None,
-                    ),
-                    None => return None,
-                },
+                _ => (
+                    BuilderMode::EloquentBuilder,
+                    None,
+                    Some(php_type.clone()?),
+                    None,
+                ),
             }
         }
         // `$user->competitions->where(...)` — start at the base variable's

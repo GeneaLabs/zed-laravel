@@ -207,10 +207,7 @@ pub fn resolve_component(
     let sub = parents_to_path(parents);
 
     let base_dirs: Vec<&PathBuf> = match namespace {
-        Some(ns) => match config.component_namespaces.get(ns) {
-            Some(p) => vec![p],
-            None => return None,
-        },
+        Some(ns) => vec![config.component_namespaces.get(ns)?],
         None => config.component_locations.iter().collect(),
     };
 
