@@ -3796,28 +3796,29 @@ class ZzServiceProvider extends ServiceProvider {
         .await
         .unwrap();
 
-    // Stable across repeated builds: the smallest path wins, both registries.
-    for _ in 0..3 {
-        let macros = handle.snapshot_macros().await.unwrap();
-        let (decl_file, _) = macros
-            .get(&("Illuminate\\Support\\Str".to_string(), "shared".to_string()))
-            .expect("colliding macro key must still resolve");
-        assert_eq!(
-            decl_file, &first,
-            "equal-priority macro collision must resolve to the lexicographically smallest provider path",
-        );
+    // The reversed registration order above is the actual nondeterminism
+    // guard: an insertion-ordered merge would pick Zz, and an unsorted
+    // HashMap merge could. (Re-querying an unmutated map can't change its
+    // iteration order, so repeating the assertions would prove nothing.)
+    let macros = handle.snapshot_macros().await.unwrap();
+    let (decl_file, _) = macros
+        .get(&("Illuminate\\Support\\Str".to_string(), "shared".to_string()))
+        .expect("colliding macro key must still resolve");
+    assert_eq!(
+        decl_file, &first,
+        "equal-priority macro collision must resolve to the lexicographically smallest provider path",
+    );
 
-        let bindings = handle.get_all_parsed_bindings().await.unwrap();
-        let svc = bindings
-            .iter()
-            .find(|b| b.abstract_name == "svc")
-            .expect("colliding binding key must still resolve");
-        assert_eq!(
-            svc.concrete_class.trim_start_matches('\\'),
-            "App\\Services\\AaImpl",
-            "equal-priority binding collision must resolve to the lexicographically smallest provider path",
-        );
-    }
+    let bindings = handle.get_all_parsed_bindings().await.unwrap();
+    let svc = bindings
+        .iter()
+        .find(|b| b.abstract_name == "svc")
+        .expect("colliding binding key must still resolve");
+    assert_eq!(
+        svc.concrete_class.trim_start_matches('\\'),
+        "App\\Services\\AaImpl",
+        "equal-priority binding collision must resolve to the lexicographically smallest provider path",
+    );
 }
 
 #[tokio::test]
@@ -3924,6 +3925,78 @@ fn registration_ripple_keys_binding_retarget_emits_both_concretes() {
     assert!(
         keys.contains(&"/prov.php".to_string()),
         "a non-empty diff must include the provider's own path",
+    );
+}
+
+#[test]
+fn registration_ripple_keys_alias_retarget_emits_both_targets() {
+    // A facade-alias retarget must emit BOTH sides of the diff: the old
+    // target finds sites holding the now-stale classification; the new one
+    // finds direct references (mirrors the binding-retarget case).
+    let before = ProviderRegistrationsData {
+        aliases: vec![("Str".to_string(), "Illuminate\\Support\\Str".to_string())],
+        ..Default::default()
+    };
+    let after = ProviderRegistrationsData {
+        aliases: vec![("Str".to_string(), "App\\Support\\MyStr".to_string())],
+        ..Default::default()
+    };
+    let keys = registration_ripple_keys(&before, &after, Path::new("/prov.php"));
+    assert!(keys.contains(&"Illuminate\\Support\\Str".to_string()));
+    assert!(keys.contains(&"App\\Support\\MyStr".to_string()));
+}
+
+#[tokio::test]
+async fn config_app_alias_edit_ripples_through_save_transaction() {
+    // #255 Bug A regression (config/app.php): the legacy `aliases` array
+    // lives in the `config_files` input — a SEPARATE map from
+    // `salsa_sp_files` — so the save transaction must route the fresh text
+    // through the config input, or the post-save alias snapshot reads the
+    // same entry as the baseline and an alias edit never ripples.
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let cfg = root.join("config/app.php");
+    let v1 = r#"<?php
+return [
+    'aliases' => [
+        'Str' => Illuminate\Support\Str::class,
+    ],
+];
+"#;
+    let v2 = v1.replace("Illuminate\\Support\\Str", "App\\Support\\MyStr");
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+
+    // First save transaction establishes the baseline at v1.
+    let (_, after1) = handle
+        .file_provider_registrations(cfg.clone(), Some(v1.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        after1.aliases,
+        vec![("Str".to_string(), "Illuminate\\Support\\Str".to_string())],
+        "save transaction must register config/app.php's aliases",
+    );
+
+    // Second save retargets the alias: before = v1 baseline, after = v2.
+    let (before2, after2) = handle
+        .file_provider_registrations(cfg.clone(), Some(v2))
+        .await
+        .unwrap();
+    assert_eq!(
+        before2.aliases, after1.aliases,
+        "baseline must be the last-saved contribution"
+    );
+    let keys = registration_ripple_keys(&before2, &after2, &cfg);
+    assert!(
+        keys.contains(&"Illuminate\\Support\\Str".to_string())
+            && keys.contains(&"App\\Support\\MyStr".to_string()),
+        "a config/app.php alias retarget must ripple both targets; got {keys:?}",
     );
 }
 

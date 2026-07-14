@@ -1911,6 +1911,11 @@ struct LaravelLanguageServer {
     /// formatter, branch switch) into one dependency-tracked incremental
     /// reconverge; a batch already draining is never aborted.
     magic_rebuild_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Handle for the save-path dependent-ripple task
+    /// ([`Self::refresh_magic_on_save`]'s background `refresh_magic_dependents`
+    /// spawn), kept solely so tests can await the ripple deterministically
+    /// (#255) — the production path never joins or aborts it.
+    magic_ripple_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Accumulated external `.php` changes + the batch task's liveness flag,
     /// under one mutex (see [`WatchedBatchState`]). Producer:
     /// `did_change_watched_files` records events and spawns a task iff none is
@@ -4320,6 +4325,7 @@ impl LaravelLanguageServer {
             pending_rescans: Arc::new(RwLock::new(HashSet::new())),
             rescan_debounce_handle: Arc::new(RwLock::new(None)),
             magic_rebuild_handle: Arc::new(RwLock::new(None)),
+            magic_ripple_handle: Arc::new(RwLock::new(None)),
             magic_batch_state: Arc::new(tokio::sync::Mutex::new(WatchedBatchState::default())),
             file_exists_cache: Arc::new(RwLock::new(HashMap::new())),
             cached_config: Arc::new(RwLock::new(None)),
@@ -6494,11 +6500,14 @@ impl LaravelLanguageServer {
         let server = self.clone_for_spawn();
         let mut already_refreshed = HashSet::new();
         already_refreshed.insert(path.clone());
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             server
                 .refresh_magic_dependents(&already_refreshed, changed_classes, changed_views)
                 .await;
         });
+        // Kept awaitable for the save-path regression tests (#255) — mirrors
+        // `magic_rebuild_handle` on the watched-files batch.
+        *self.magic_ripple_handle.write().await = Some(handle);
     }
 
     /// Re-resolve the blast radius of a surface or render change: dependents
@@ -16985,6 +16994,7 @@ return [
             pending_rescans: self.pending_rescans.clone(),
             rescan_debounce_handle: self.rescan_debounce_handle.clone(),
             magic_rebuild_handle: self.magic_rebuild_handle.clone(),
+            magic_ripple_handle: self.magic_ripple_handle.clone(),
             magic_batch_state: self.magic_batch_state.clone(),
             file_exists_cache: self.file_exists_cache.clone(),
             cached_config: self.cached_config.clone(),

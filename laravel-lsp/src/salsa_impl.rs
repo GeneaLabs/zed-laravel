@@ -4346,8 +4346,8 @@ pub fn registration_ripple_keys(
 
     let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     keys.extend(changed(&before.macros, &after.macros).map(|(host, _)| host.clone()));
-    keys.extend(
-        changed(&before.bindings, &after.bindings).flat_map(|(abstract_name, concrete)| {
+    keys.extend(changed(&before.bindings, &after.bindings).flat_map(
+        |(abstract_name, concrete)| {
             [
                 format!(
                     "{}{abstract_name}",
@@ -4355,8 +4355,8 @@ pub fn registration_ripple_keys(
                 ),
                 concrete.clone(),
             ]
-        }),
-    );
+        },
+    ));
     keys.extend(changed(&before.aliases, &after.aliases).map(|(_, target)| target.clone()));
     if keys.is_empty() {
         return Vec::new();
@@ -8296,8 +8296,10 @@ impl SalsaActor {
         let mut class_component_files: HashMap<String, (u8, PathBuf)> = HashMap::new();
 
         if let Some(sp_root) = self.salsa_sp_root.as_ref() {
-            for sp_file in self.salsa_sp_files.values() {
-                let parsed = parse_service_provider_source(&self.db, *sp_file, sp_root.clone());
+            // Lexicographic provider order (`sorted_sp_files`) so the
+            // first-wins / priority tiebreaks below are deterministic (#255).
+            for sp_file in self.sorted_sp_files() {
+                let parsed = parse_service_provider_source(&self.db, sp_file, sp_root.clone());
 
                 // Collect view namespaces
                 for vn in parsed.view_namespaces(&self.db) {
@@ -9484,8 +9486,9 @@ impl SalsaActor {
         let root = self.salsa_sp_root.as_ref()?;
         let mut best: Option<ViewNamespaceData> = None;
 
-        for sp_file in self.salsa_sp_files.values() {
-            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+        // Lexicographic provider order — deterministic equal-priority winner (#255).
+        for sp_file in self.sorted_sp_files() {
+            let parsed = parse_service_provider_source(&self.db, sp_file, root.clone());
             for vn in parsed.view_namespaces(&self.db) {
                 if vn.namespace(&self.db).namespace(&self.db) == namespace {
                     let data = ViewNamespaceData {
@@ -9511,8 +9514,10 @@ impl SalsaActor {
         let mut merged: HashMap<String, ViewNamespaceData> = self.sp_view_namespaces.clone();
 
         if let Some(root) = self.salsa_sp_root.as_ref() {
-            for sp_file in self.salsa_sp_files.values() {
-                let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+            // Lexicographic provider order — deterministic equal-priority
+            // winner per key (#255); output order stays map-arbitrary.
+            for sp_file in self.sorted_sp_files() {
+                let parsed = parse_service_provider_source(&self.db, sp_file, root.clone());
                 for vn in parsed.view_namespaces(&self.db) {
                     let ns = vn.namespace(&self.db).namespace(&self.db).clone();
                     let data = ViewNamespaceData {
@@ -9547,8 +9552,9 @@ impl SalsaActor {
         let root = self.salsa_sp_root.as_ref()?;
         let mut best: Option<BladeComponentRegData> = None;
 
-        for sp_file in self.salsa_sp_files.values() {
-            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+        // Lexicographic provider order — deterministic equal-priority winner (#255).
+        for sp_file in self.sorted_sp_files() {
+            let parsed = parse_service_provider_source(&self.db, sp_file, root.clone());
             for bc in parsed.blade_components(&self.db) {
                 if bc.tag_name(&self.db).name(&self.db) == tag_name {
                     let data = BladeComponentRegData {
@@ -9575,8 +9581,10 @@ impl SalsaActor {
         let mut merged: HashMap<String, BladeComponentRegData> = self.sp_blade_components.clone();
 
         if let Some(root) = self.salsa_sp_root.as_ref() {
-            for sp_file in self.salsa_sp_files.values() {
-                let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+            // Lexicographic provider order — deterministic equal-priority
+            // winner per key (#255); output order stays map-arbitrary.
+            for sp_file in self.sorted_sp_files() {
+                let parsed = parse_service_provider_source(&self.db, sp_file, root.clone());
                 for bc in parsed.blade_components(&self.db) {
                     let tag = bc.tag_name(&self.db).name(&self.db).clone();
                     let data = BladeComponentRegData {
@@ -9612,8 +9620,9 @@ impl SalsaActor {
         let root = self.salsa_sp_root.as_ref()?;
         let mut best: Option<ComponentNamespaceData> = None;
 
-        for sp_file in self.salsa_sp_files.values() {
-            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+        // Lexicographic provider order — deterministic equal-priority winner (#255).
+        for sp_file in self.sorted_sp_files() {
+            let parsed = parse_service_provider_source(&self.db, sp_file, root.clone());
             for cn in parsed.component_namespaces(&self.db) {
                 if cn.prefix(&self.db).namespace(&self.db) == prefix {
                     let data = ComponentNamespaceData {
@@ -9640,8 +9649,10 @@ impl SalsaActor {
             self.sp_component_namespaces.clone();
 
         if let Some(root) = self.salsa_sp_root.as_ref() {
-            for sp_file in self.salsa_sp_files.values() {
-                let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+            // Lexicographic provider order — deterministic equal-priority
+            // winner per key (#255); output order stays map-arbitrary.
+            for sp_file in self.sorted_sp_files() {
+                let parsed = parse_service_provider_source(&self.db, sp_file, root.clone());
                 for cn in parsed.component_namespaces(&self.db) {
                     let pfx = cn.prefix(&self.db).namespace(&self.db).clone();
                     let data = ComponentNamespaceData {
@@ -9823,8 +9834,9 @@ impl SalsaActor {
         let root = self.salsa_sp_root.as_ref()?;
         let mut best: Option<ParsedMiddlewareData> = None;
 
-        for sp_file in self.salsa_sp_files.values() {
-            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+        // Lexicographic provider order — deterministic equal-priority winner (#255).
+        for sp_file in self.sorted_sp_files() {
+            let parsed = parse_service_provider_source(&self.db, sp_file, root.clone());
             for mw in parsed.middleware(&self.db) {
                 if mw.alias(&self.db).name(&self.db) == base_alias {
                     let data = ParsedMiddlewareData {
@@ -9856,8 +9868,10 @@ impl SalsaActor {
 
         let mut merged: HashMap<String, ParsedMiddlewareData> = HashMap::new();
 
-        for sp_file in self.salsa_sp_files.values() {
-            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+        // Lexicographic provider order — deterministic equal-priority
+        // winner per key (#255); output order stays map-arbitrary.
+        for sp_file in self.sorted_sp_files() {
+            let parsed = parse_service_provider_source(&self.db, sp_file, root.clone());
             for mw in parsed.middleware(&self.db) {
                 let alias = mw.alias(&self.db).name(&self.db).clone();
                 let data = ParsedMiddlewareData {
@@ -9886,8 +9900,10 @@ impl SalsaActor {
         let root = self.salsa_sp_root.as_ref()?;
         let mut best: Option<ParsedBindingData> = None;
 
-        for sp_file in self.salsa_sp_files.values() {
-            let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
+        // Lexicographic provider order — deterministic equal-priority winner
+        // (#255); mirrors [`Self::handle_get_all_parsed_bindings`].
+        for sp_file in self.sorted_sp_files() {
+            let parsed = parse_service_provider_source(&self.db, sp_file, root.clone());
             for binding in parsed.bindings(&self.db) {
                 if binding.abstract_name(&self.db).name(&self.db) == name {
                     let data = ParsedBindingData {

@@ -2725,6 +2725,67 @@ function show($mystery) {
     assert!(deps.is_empty(), "{deps:?}");
 }
 
+#[test]
+fn deps_record_macro_decl_file_on_macro_classification() {
+    // #255: a site that classifies as a Macro records the macro's declaration
+    // file — the registering provider for an inline `::macro()` — so the
+    // provider-path ripple key emitted by a provider-body save reaches it.
+    // Both resolution paths (live re-parse and captured recipe) must record
+    // identically; `resolve_both_ways` drives both chokepoints.
+    let dir = TempDir::new().unwrap();
+    let provider = dir.path().join("app/Providers/AppServiceProvider.php");
+    let resolver = macros_resolver("Illuminate\\Support\\Str", "uuid7", (provider.clone(), 17));
+    let caller = r#"<?php
+use Illuminate\Support\Str;
+class Ids {
+    public function make(): string { return Str::uuid7(); }
+}
+"#;
+    let ((tree_entries, tree_deps), (recipe_entries, recipe_deps)) =
+        resolve_both_ways(&resolver, dir.path(), caller);
+    let provider_dep = provider.to_string_lossy().into_owned();
+    assert!(
+        !tree_entries.is_empty() && !recipe_entries.is_empty(),
+        "the macro call site must classify on both paths",
+    );
+    assert!(
+        tree_deps.contains(&provider_dep),
+        "live path must record the macro decl file (the provider); got {tree_deps:?}",
+    );
+    assert!(
+        recipe_deps.contains(&provider_dep),
+        "captured-recipe path must record the macro decl file (the provider); got {recipe_deps:?}",
+    );
+}
+
+#[test]
+fn deps_record_binding_attempt_key_even_when_unresolved() {
+    // #255: a string-keyed container site records `binding:<key>` resolved or
+    // not — a brand-new binding's call sites resolved to NOTHING before the
+    // provider save, so this attempt key is the only dependency the
+    // registration diff can reach them through. Both paths must record it.
+    let dir = TempDir::new().unwrap();
+    let resolver = macros_resolver(
+        "Illuminate\\Support\\Str",
+        "unused",
+        (dir.path().join("p.php"), 1),
+    );
+    let caller = r#"<?php
+function f() {
+    return app('tenant')->name;
+}
+"#;
+    let ((_, tree_deps), (_, recipe_deps)) = resolve_both_ways(&resolver, dir.path(), caller);
+    assert!(
+        tree_deps.contains(&"binding:tenant".to_string()),
+        "live path must record the binding attempt key; got {tree_deps:?}",
+    );
+    assert!(
+        recipe_deps.contains(&"binding:tenant".to_string()),
+        "captured-recipe path must record the binding attempt key; got {recipe_deps:?}",
+    );
+}
+
 // ─── End-to-end: a closure-bound key resolves app('key')->member ───────────
 //
 // Proves the new tree-sitter binding walker feeds the SAME `concrete_class`

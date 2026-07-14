@@ -120,6 +120,95 @@ async fn drain_batch(backend: &LaravelLanguageServer) {
     }
 }
 
+/// Await the in-flight save-path dependent ripple (#255 keeps the handle
+/// alive and awaitable for exactly this — mirrors `drain_batch`).
+async fn drain_ripple(backend: &LaravelLanguageServer) {
+    let handle = backend.magic_ripple_handle.write().await.take();
+    if let Some(h) = handle {
+        let _ = h.await;
+    }
+}
+
+/// #255 Bug A end-to-end regression, through the REAL save path: a macro
+/// rename inside a provider's `boot()` body — an edit whose class-surface
+/// diff is empty — must re-resolve dependent call sites in other files.
+/// Crucially, the edit is delivered through `execute_salsa_update` (the
+/// did_change debounce body) BEFORE the save, exactly like a real
+/// "type → pause → save" flow: the debounce eagerly overwrites the live
+/// provider input, so a pre-save snapshot of the live inputs would diff
+/// empty and never ripple — the actor-kept baseline is what keeps the
+/// `before` side pre-edit.
+#[tokio::test]
+async fn provider_body_macro_rename_converges_dependent_on_save() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let backend = backend_for(root).await;
+    write_file(root, "composer.json", COMPOSER);
+
+    let provider_v1 = r#"<?php
+namespace App\Providers;
+use Illuminate\Support\Str;
+use Illuminate\Support\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Str::macro('slugify', fn () => 'x');
+    }
+}
+"#;
+    let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_v1);
+    backend
+        .salsa
+        .register_config_files(root.to_path_buf(), None, None, None)
+        .await
+        .unwrap();
+    backend
+        .salsa
+        .register_service_provider_source(
+            provider.clone(),
+            provider_v1.to_string(),
+            2,
+            root.to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+    // The dependent call site, in ANOTHER file.
+    let consumer_src = r#"<?php
+namespace App\Support;
+use Illuminate\Support\Str;
+class Ids {
+    public function make(): string { return Str::slugify(); }
+}
+"#;
+    let consumer = write_file(root, "app/Support/Ids.php", consumer_src);
+    seed(&backend, &consumer, consumer_src).await;
+    assert!(
+        member_names(&backend, &consumer).await.contains("slugify"),
+        "seed: the consumer's macro call must classify while the macro exists",
+    );
+
+    // Save #1 establishes the provider's registration baseline.
+    let uri = Url::from_file_path(&provider).unwrap();
+    backend.refresh_magic_on_save(&uri, provider_v1).await;
+    drain_ripple(&backend).await;
+
+    // The user types the rename; the did_change debounce fires and eagerly
+    // re-registers the provider input with the EDITED text — pre-save.
+    let provider_v2 = provider_v1.replace("'slugify'", "'sluggish'");
+    backend.execute_salsa_update(&uri, &provider_v2, 2).await;
+
+    // Then saves. The registration diff must come from the baseline, not the
+    // (already-edited) live input, for the ripple to fire at all.
+    backend.refresh_magic_on_save(&uri, &provider_v2).await;
+    drain_ripple(&backend).await;
+
+    let after = member_names(&backend, &consumer).await;
+    assert!(
+        !after.contains("slugify"),
+        "the dependent's stale macro classification must clear on the provider save; got {after:?}"
+    );
+}
+
 fn post_with_accessors(accessors: &[&str]) -> String {
     let methods: String = accessors
         .iter()
