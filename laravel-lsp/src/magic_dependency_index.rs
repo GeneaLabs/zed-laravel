@@ -21,6 +21,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Key-space prefix for a *container-binding attempt* dependency: a site whose
+/// receiver is a string-keyed container resolution (`app('key')`,
+/// `resolve('key')`, or a mapped zero-arg helper like `view()`) records
+/// `binding:<key>` — resolved or not. The colon keeps the space disjoint from
+/// FQCNs (`:` can't appear in a PHP class name), and recording the *abstract*
+/// key is what lets a brand-new binding ripple to its call sites on the
+/// provider save (#255): those sites resolved to nothing before, so they hold
+/// no concrete-FQCN dependency the registration diff could otherwise reach.
+pub const BINDING_DEP_PREFIX: &str = "binding:";
+
 #[derive(Default, Debug)]
 pub struct MagicDependencyIndex {
     /// fqcn → files that resolved a receiver against it.

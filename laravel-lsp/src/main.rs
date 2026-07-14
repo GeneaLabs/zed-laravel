@@ -6422,18 +6422,6 @@ impl LaravelLanguageServer {
             .await
             .unwrap_or_default();
 
-        // Pre-save registration snapshot (#255) — a provider's macros /
-        // bindings / facade aliases live in `boot()`/`register()` BODIES, so
-        // a registration edit leaves the class-surface diff below empty and
-        // would never ripple to dependent call sites. Cheap for the
-        // non-provider majority: a path the actor doesn't track yields the
-        // empty default.
-        let old_registrations = self
-            .salsa
-            .file_provider_registrations(path.clone(), None)
-            .await
-            .unwrap_or_default();
-
         // Ensure Salsa reflects the saved buffer before resolving — a pending
         // did_change debounce may not have fired yet. Use the buffer's version
         // so this doesn't regress against a newer in-flight update.
@@ -6452,12 +6440,19 @@ impl LaravelLanguageServer {
             debug!("Failed to update Salsa on save for {}: {}", path_str, e);
         }
 
-        // Post-save registration snapshot (#255). `Some(text)` re-registers
-        // the provider source first — the App rescan a provider save queues is
-        // asynchronous, so without it this would still read the pre-save
-        // text. Taken before the per-file refresh so that pass already sees
-        // the fresh registries.
-        let new_registrations = self
+        // Registration snapshot pair (#255) — a provider's macros / bindings /
+        // facade aliases live in `boot()`/`register()` BODIES, so a
+        // registration edit leaves the class-surface diff below empty and
+        // would never ripple to dependent call sites. One transactional call:
+        // `before` is the actor-kept baseline (last save), NOT the live
+        // inputs — the did_change debounce eagerly overwrites those on every
+        // typing pause, so a pre-save read here would already see the edited
+        // text and diff empty. `Some(text)` re-registers the saved buffer
+        // (provider input, or config/app.php's config input) before `after`
+        // is read, and advances the baseline. Taken before the per-file
+        // refresh so that pass already sees the fresh registries. Cheap for
+        // the non-provider majority: an untracked path yields empty defaults.
+        let (old_registrations, new_registrations) = self
             .salsa
             .file_provider_registrations(path.clone(), Some(text.to_string()))
             .await

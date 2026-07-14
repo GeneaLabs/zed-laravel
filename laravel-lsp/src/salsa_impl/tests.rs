@@ -3856,7 +3856,9 @@ class AppServiceProvider extends ServiceProvider {
         .await
         .unwrap();
 
-    let before = handle
+    // Pure read: `after` side carries the current contribution (baseline is
+    // empty until a save transaction).
+    let (_, before) = handle
         .file_provider_registrations(provider.clone(), None)
         .await
         .unwrap();
@@ -3866,7 +3868,7 @@ class AppServiceProvider extends ServiceProvider {
         "pre-save snapshot must carry the provider's registered macro",
     );
 
-    let after = handle
+    let (_, after) = handle
         .file_provider_registrations(provider.clone(), Some(after_src))
         .await
         .unwrap();

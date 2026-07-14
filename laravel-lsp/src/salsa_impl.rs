@@ -4312,12 +4312,17 @@ pub struct ProviderRegistrationsData {
 ///   call site records the resolved receiver as an attempt, so this finds
 ///   sites in both directions (macro added: the previously-failed sites;
 ///   macro removed/renamed: the previously-resolved sites).
-/// - **binding / facade alias**: the concrete/target FQCN from both sides of
-///   the diff — a site that resolved through a binding (helper, `app('key')`,
-///   facade accessor) recorded the *concrete* it resolved to, so the old
-///   concrete finds the now-stale sites and the new one finds direct
-///   references. (A site that never resolved — `app('key')` before the key
-///   existed — recorded nothing and converges on the next full pass; it holds
+/// - **binding**: the `binding:<abstract>` attempt key
+///   ([`crate::magic_dependency_index::BINDING_DEP_PREFIX`]) from both sides
+///   of the diff — every string-keyed container site (`app('key')`, mapped
+///   zero-arg helpers) records it resolved-or-not, so a BRAND-NEW binding
+///   reaches the sites that previously resolved to nothing — plus the
+///   concrete FQCN from both sides, which finds sites already referencing
+///   the target directly.
+/// - **facade alias**: the target FQCN from both sides of the diff — a site
+///   that resolved through an alias recorded the concrete it landed on, so
+///   the old target finds the now-stale sites. (An alias site that never
+///   resolved recorded nothing and converges on the next full pass; it holds
 ///   no stale classification either.)
 /// - **the provider's own path**: macro classifications record the macro's
 ///   declaration file as a dependency ([`crate::member_resolver`]), which for
@@ -4341,7 +4346,17 @@ pub fn registration_ripple_keys(
 
     let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     keys.extend(changed(&before.macros, &after.macros).map(|(host, _)| host.clone()));
-    keys.extend(changed(&before.bindings, &after.bindings).map(|(_, concrete)| concrete.clone()));
+    keys.extend(
+        changed(&before.bindings, &after.bindings).flat_map(|(abstract_name, concrete)| {
+            [
+                format!(
+                    "{}{abstract_name}",
+                    crate::magic_dependency_index::BINDING_DEP_PREFIX
+                ),
+                concrete.clone(),
+            ]
+        }),
+    );
     keys.extend(changed(&before.aliases, &after.aliases).map(|(_, target)| target.clone()));
     if keys.is_empty() {
         return Vec::new();
@@ -5044,15 +5059,24 @@ pub enum SalsaRequest {
     SnapshotMacros {
         reply: oneshot::Sender<Arc<std::collections::HashMap<(String, String), (PathBuf, u32)>>>,
     },
-    /// One provider file's registration contribution (macros / bindings /
-    /// facade aliases), for the save path's pre/post registration diff (#255).
-    /// `fresh_text`, when given, re-registers the provider source first — the
-    /// App rescan a provider save queues is asynchronous, so without this the
-    /// post-save snapshot would still read the pre-save text.
+    /// One provider file's `(before, after)` registration contribution
+    /// (macros / bindings / facade aliases), for the save path's registration
+    /// diff (#255). `before` is the actor-kept BASELINE — the contribution as
+    /// of the last save transaction — NOT the live inputs: the did_change
+    /// debounce eagerly overwrites `salsa_sp_files` / `config_files` on every
+    /// typing pause, so a snapshot of the live inputs taken at save time
+    /// already holds the edited text and would diff empty. A path with no
+    /// baseline yields the empty default (the first save of a session
+    /// over-ripples that provider's keys once — the fail-safe direction).
+    /// `fresh_text`, when given, marks a save transaction: the saved buffer is
+    /// re-registered first (the App rescan a provider save queues is
+    /// asynchronous), `after` reads the fresh registration, and the baseline
+    /// advances to it. Without `fresh_text` this is a pure read — the
+    /// baseline does not advance.
     FileProviderRegistrations {
         path: PathBuf,
         fresh_text: Option<String>,
-        reply: oneshot::Sender<ProviderRegistrationsData>,
+        reply: oneshot::Sender<(ProviderRegistrationsData, ProviderRegistrationsData)>,
     },
     /// Snapshot the interface→implementors reverse map — `interface FQCN` →
     /// directly implementing class FQCNs — for the same out-of-actor build, so a
@@ -5835,14 +5859,17 @@ impl SalsaHandle {
     }
 
     /// One provider file's registration contribution (macros / bindings /
-    /// facade aliases), for the save path's pre/post registration diff (#255).
-    /// Pass `fresh_text` on the post-save call so the snapshot reads the saved
-    /// buffer rather than the stale provider input (the App rescan is async).
+    /// facade aliases), as `(before, after)` for the save path's registration
+    /// diff (#255). `before` is the actor-kept baseline (last save
+    /// transaction), insulated from the did_change debounce's eager input
+    /// overwrite; `after` reads the current registration. Pass `fresh_text`
+    /// on the save call: it re-registers the saved buffer first and advances
+    /// the baseline. See [`SalsaRequest::FileProviderRegistrations`].
     pub async fn file_provider_registrations(
         &self,
         path: PathBuf,
         fresh_text: Option<String>,
-    ) -> Result<ProviderRegistrationsData, &'static str> {
+    ) -> Result<(ProviderRegistrationsData, ProviderRegistrationsData), &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::FileProviderRegistrations {
@@ -6680,6 +6707,14 @@ pub struct SalsaActor {
     config_version: i32,
     /// Cached Laravel config data (version, data)
     config_cache: Option<(i32, LaravelConfigData)>,
+    /// Per-path registration BASELINE for the save path's diff (#255): the
+    /// contribution as of the last save transaction
+    /// ([`SalsaRequest::FileProviderRegistrations`] with `fresh_text`).
+    /// Deliberately NOT updated by the did_change debounce's eager
+    /// re-registration — that insulation is what keeps the pre-save side of
+    /// the diff pre-edit. Missing entry = empty default (first save
+    /// over-ripples once; fail-safe).
+    registration_baselines: HashMap<PathBuf, ProviderRegistrationsData>,
 
     // === Reference Finding ===
     /// Project files input for reference finding
@@ -6799,6 +6834,7 @@ impl SalsaActor {
                 config_files: HashMap::with_capacity(4),
                 config_version: 0,
                 config_cache: None,
+                registration_baselines: HashMap::new(),
                 // Reference finding
                 project_files: None,
                 project_files_version: 0,
@@ -7090,11 +7126,22 @@ impl SalsaActor {
                     fresh_text,
                     reply,
                 } => {
+                    // `before` comes from the baseline, never the live inputs
+                    // — the did_change debounce has usually already overwritten
+                    // those with the edited text by the time a save runs, which
+                    // would diff empty and leave dependents stale (#255).
+                    let before = self
+                        .registration_baselines
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_default();
+                    let is_save = fresh_text.is_some();
                     if let Some(text) = fresh_text {
-                        // Only re-register a provider the actor already knows —
-                        // a brand-new provider file is the App rescan's job.
-                        if let Some(sp_file) = self.salsa_sp_files.get(&path) {
-                            let priority = sp_file.priority(&self.db);
+                        if self.salsa_sp_files.contains_key(&path) {
+                            // Only re-register a provider the actor already
+                            // knows — a brand-new provider file is the App
+                            // rescan's job.
+                            let priority = self.salsa_sp_files[&path].priority(&self.db);
                             if let Some(root) = self.salsa_sp_root.clone() {
                                 self.handle_register_service_provider_source(
                                     path.clone(),
@@ -7103,9 +7150,31 @@ impl SalsaActor {
                                     root,
                                 );
                             }
+                        } else if self
+                            .config_root
+                            .as_ref()
+                            .is_some_and(|root| path == root.join("config/app.php"))
+                        {
+                            // config/app.php `aliases` live in the SEPARATE
+                            // `config_files` input the provider re-registration
+                            // above never touches — without this the post-save
+                            // alias snapshot reads the same entry as the
+                            // baseline and an alias edit never ripples (#255).
+                            self.handle_update_config_file(path.clone(), text);
                         }
                     }
-                    let _ = reply.send(self.handle_file_provider_registrations(&path));
+                    let after = self.handle_file_provider_registrations(&path);
+                    // Advance the baseline only on a save transaction, and only
+                    // for paths that carry (or carried) a contribution — every
+                    // .php save lands here, and the untracked majority must not
+                    // grow the map.
+                    if is_save
+                        && (after != ProviderRegistrationsData::default()
+                            || self.registration_baselines.contains_key(&path))
+                    {
+                        self.registration_baselines.insert(path, after.clone());
+                    }
+                    let _ = reply.send((before, after));
                 }
                 SalsaRequest::SnapshotImplementers { reply } => {
                     // A cheap clone of the interface→implementors reverse map the

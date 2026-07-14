@@ -490,6 +490,21 @@ pub fn resolve_and_classify(
     project_root: &Path,
     mut deps: Option<&mut HashSet<String>>,
 ) -> Option<ResolvedMemberAccess> {
+    // A container-resolution receiver records its *abstract* binding key as an
+    // attempt dependency BEFORE any resolution — an `app('key')` site whose key
+    // has no registration yet resolves to nothing and would otherwise record no
+    // dependency at all, so the provider save that later ADDS the binding could
+    // never ripple to it (#255). Mirrored branch-for-branch in
+    // [`resolve_recipe_and_classify`].
+    if let Some(d) = deps.as_deref_mut() {
+        if let Some(key) = container_attempt_key(receiver, bytes) {
+            d.insert(format!(
+                "{}{key}",
+                crate::magic_dependency_index::BINDING_DEP_PREFIX
+            ));
+        }
+    }
+
     // Facade interception, checked first for a static-call name receiver —
     // `Auth::check()` — so the "resolved via facade" signal threads cleanly into
     // classification. A `Some` here means the concrete came through the facade
@@ -2345,6 +2360,32 @@ fn helper_receiver_name(receiver: Node, bytes: &[u8]) -> Option<String> {
     helper_binding_key(func).map(|_| func.to_string())
 }
 
+/// The registry-shaped container-binding key a receiver *attempts* — the
+/// `'key'` in `app('key')` / `resolve('key')` ([`container_receiver_key`]) or a
+/// mapped zero-arg helper's binding key ([`helper_binding_key`]) — independent
+/// of whether the key resolves. Contract-shaped helper keys (`response`'s
+/// `Illuminate\Contracts\…` — they carry a `\`) are excluded: the string-keyed
+/// binding registry never holds them, so a registration diff never emits them.
+/// Facade-accessor indirection (`Auth::…` → accessor key) is deliberately NOT
+/// covered: extracting the accessor requires parsing the facade class even on
+/// failed resolutions, and a facade site that resolved records the concrete
+/// FQCN the diff already emits.
+fn container_attempt_key(receiver: Node, bytes: &[u8]) -> Option<String> {
+    container_receiver_key(receiver, bytes).or_else(|| {
+        if receiver.kind() != "function_call_expression" {
+            return None;
+        }
+        let func = receiver
+            .child_by_field_name("function")?
+            .utf8_text(bytes)
+            .ok()?
+            .trim_start_matches('\\');
+        helper_binding_key(func)
+            .filter(|key| !key.contains('\\'))
+            .map(str::to_string)
+    })
+}
+
 /// The shape of [`resolve_gate_closure_user`] — a variable that is a Gate
 /// ability closure's first parameter — without the auth-model lookup.
 fn is_gate_closure_user_shape(var_node: Node, bytes: &[u8]) -> bool {
@@ -2425,6 +2466,25 @@ fn resolve_recipe_and_classify(
     project_root: &Path,
     mut deps: Option<&mut HashSet<String>>,
 ) -> Option<ResolvedMemberAccess> {
+    // Container-binding attempt dependency (see [`resolve_and_classify`]'s
+    // mirror): the abstract key is recorded resolved-or-not, so a provider
+    // save that ADDS the binding ripples to this site (#255).
+    if let Some(d) = deps.as_deref_mut() {
+        let key = match &site.recipe {
+            ReceiverRecipeData::ContainerKey(key) => Some(key.as_str()),
+            ReceiverRecipeData::HelperBinding(name) => {
+                helper_binding_key(name).filter(|key| !key.contains('\\'))
+            }
+            _ => None,
+        };
+        if let Some(key) = key {
+            d.insert(format!(
+                "{}{key}",
+                crate::magic_dependency_index::BINDING_DEP_PREFIX
+            ));
+        }
+    }
+
     // Outer facade interception — a static-name receiver only.
     let facade_concrete = match &site.recipe {
         ReceiverRecipeData::StaticName {
