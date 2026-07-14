@@ -19565,11 +19565,26 @@ return [
 
     /// Route — detail line (verb + URI + action) + the route registration
     /// line from source + link to the `->name(` callsite.
+    ///
+    /// Mirrors the guards in [`Self::route_not_found_diagnostics`] (issue #247):
+    /// an absent or empty index means every route would look missing (the
+    /// startup false-positive), and wildcard names (`players.*`) reference a
+    /// *family* of routes that never appears verbatim in the index (issue
+    /// #209) — all three suppress the hover card entirely (empty string → no
+    /// card) rather than render a false "not found" trailer.
     async fn hover_for_route(&self, name: &str) -> String {
         use laravel_lsp::hover;
+        if name.contains('*') {
+            return String::new();
+        }
         let idx_guard = self.route_index.read().await;
-        let def = idx_guard.as_ref().and_then(|idx| idx.get(name));
-        let Some(def) = def else {
+        let Some(idx) = idx_guard.as_ref() else {
+            return String::new();
+        };
+        if idx.is_empty() {
+            return String::new();
+        }
+        let Some(def) = idx.get(name) else {
             return hover::render(&hover::HoverContent {
                 trailer: Some("*(route not found in index)*"),
                 ..Default::default()
