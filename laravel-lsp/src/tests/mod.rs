@@ -37,6 +37,7 @@ mod query_chain_completion_handler;
 mod rename_integration;
 mod route_binding_resolution;
 mod route_diagnostics;
+mod route_hover;
 mod routes_dir_gate;
 mod scan_dir_containment;
 mod slot_navigation_containment;
