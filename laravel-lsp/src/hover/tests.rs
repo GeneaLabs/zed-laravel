@@ -264,6 +264,9 @@ fn magic_member_card_labels_each_kind() {
     assert_eq!(label(MagicMemberKind::Accessor), "**Eloquent accessor**");
     assert_eq!(label(MagicMemberKind::Column), "**Database column**");
     assert_eq!(label(MagicMemberKind::DynamicFinder), "**Dynamic finder**");
+    assert_eq!(label(MagicMemberKind::Factory), "**Model factory**");
+    assert_eq!(label(MagicMemberKind::FactoryMethod), "**Factory method**");
+    assert_eq!(label(MagicMemberKind::Pivot), "**Pivot model**");
 }
 
 #[test]

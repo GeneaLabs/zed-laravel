@@ -319,6 +319,40 @@ class User extends Model {
 }
 
 #[tokio::test]
+async fn relations_detail_uses_related_models_custom_collection() {
+    // The RELATED model declares `$collectionClass` — the to-many detail
+    // label swaps the default `Collection<Post>` for the custom class
+    // (#30 item 4), driving `collection_class_for` → the `Some` branch of
+    // `relationship_to_php_type_with_collection` end-to-end.
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function posts() {
+        return $this->hasMany(Post::class);
+    }
+}
+"#;
+    let post = r#"<?php
+namespace App\Models;
+use App\Support\PostCollection;
+use Illuminate\Database\Eloquent\Model;
+class Post extends Model {
+    protected $collectionClass = PostCollection::class;
+}
+"#;
+    let (dir, root) = project_with_model("User", user);
+    std::fs::write(dir.path().join("app/Models/Post.php"), post).expect("write Post");
+    let ctx = make_ctx("App\\Models\\User");
+    let items = relations(&ctx, None, &root).await;
+    let posts = items.iter().find(|i| i.label == "posts").expect("posts");
+    assert_eq!(
+        posts.detail.as_deref(),
+        Some("PostCollection<Post> (hasMany)")
+    );
+}
+
+#[tokio::test]
 async fn relations_returns_empty_when_model_file_missing() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
