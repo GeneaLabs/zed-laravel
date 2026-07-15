@@ -366,19 +366,50 @@ pub struct ChainContext {
     /// Relationship method calls the chain walked through *as builders*
     /// (`User::query()->competitions()->whereIn('type', …)`) or a
     /// relationship accessed as a property on the receiver
-    /// (`$user->competitions->where('type', …)`), in source order. Each is a
-    /// method/property name on the *running* `effective_model`; the synchronous
-    /// walker can't read model files, so it records the names here and the
-    /// async finalize step
+    /// (`$user->competitions->where('type', …)`), in source order. Each hop
+    /// names a method/property on the *running* `effective_model`; the
+    /// synchronous walker can't read model files, so it records them here and
+    /// the async finalize step
     /// ([`crate::query_chain::eloquent_completion::apply_relation_method_hops`])
     /// walks them via `resolve_related_model`, advancing `effective_model` on
-    /// each successful hop. A name that doesn't resolve to a relationship is
-    /// skipped (it was an unrecognised builder call), leaving `effective_model`
-    /// unchanged — the `ChainEffect::None` fallback. Empty for the common case.
-    pub pending_relation_hops: Vec<String>,
+    /// each successful hop. What a *failed* hop means depends on its
+    /// [`RelationHopKind`] — see that enum for the split. Empty for the
+    /// common case.
+    pub pending_relation_hops: Vec<RelationHop>,
     /// The quote character the user is typing inside (`'` or `"`). Used so the
     /// completion item doesn't double up quotes when inserting.
     pub quote: char,
+}
+
+/// One deferred relationship hop ([`ChainContext::pending_relation_hops`]):
+/// the method/property name to resolve against the running `effective_model`,
+/// plus how confident the walker is that it *is* a relation — which decides
+/// what a failed resolve means (see [`RelationHopKind`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationHop {
+    pub name: String,
+    pub kind: RelationHopKind,
+}
+
+/// How a pending relation hop was collected, deciding the failure semantics in
+/// [`crate::query_chain::eloquent_completion::apply_relation_method_hops`].
+/// The two kinds share one queue but mean very different things on a miss —
+/// conflating them silenced diagnostics on local-scope chains
+/// (`User::forCurrentTenant()->get()->where('emial', 1)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationHopKind {
+    /// A genuine relation claim, seeded from the
+    /// [`EloquentReceiver::RelationProperty`] receiver — a relationship read
+    /// as a property (`$user->competitions->…`) or an executed relation
+    /// assignment (issue #246). A failed resolve means the collection's
+    /// element type is unknown: `effective_model` is cleared so consumers
+    /// stay quiet rather than false-positiving against the base model.
+    Claim,
+    /// A heuristic guess — any unrecognised method name seen mid-chain in
+    /// `EloquentBuilder` mode (a custom local scope, or a builder method we
+    /// simply don't model). A failed resolve is skipped, leaving the model
+    /// unchanged — the `ChainEffect::None` fallback.
+    Heuristic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

@@ -750,12 +750,16 @@ pub async fn resolve_related_model(
 ///
 /// Each hop resolves against the *running* model via [`resolve_related_model`].
 /// A failed hop (not a relationship, or no readable model file) is handled by
-/// mode:
+/// the hop's [`RelationHopKind`] — NOT the chain's cursor-time mode, which
+/// says nothing about which *hop* missed (a heuristic hop collected in
+/// builder mode is still a heuristic after `->get()` flips the chain to a
+/// Collection):
 ///
-/// - `EloquentBuilder` — the hop was a heuristic guess (any unrecognised
-///   method name mid-chain, e.g. `->limit()`), so a miss is skipped, leaving
-///   the model unchanged — the `ChainEffect::None` fallback.
-/// - `EloquentCollection` — the hop is a genuine relation claim (a
+/// - [`RelationHopKind::Heuristic`] — a guess (any unrecognised method name
+///   mid-chain: a local scope like `->forCurrentTenant()`, or a builder
+///   method we don't model), so a miss is skipped, leaving the model
+///   unchanged — the `ChainEffect::None` fallback.
+/// - [`RelationHopKind::Claim`] — a genuine relation claim (a
 ///   `$user->rel->…` property receiver or an executed relation assignment,
 ///   issue #246), so a miss means the collection's element type is unknown.
 ///   `effective_model` is cleared and consumers stay quiet rather than
@@ -774,13 +778,13 @@ pub async fn apply_relation_method_hops(ctx: &mut ChainContext, project_root: &P
         return;
     };
     for hop in hops {
-        match resolve_related_model(&current, &hop, project_root).await {
+        match resolve_related_model(&current, &hop.name, project_root).await {
             Some(related) => current = related,
-            None if ctx.mode == BuilderMode::EloquentCollection => {
+            None if hop.kind == RelationHopKind::Claim => {
                 ctx.effective_model = None;
                 return;
             }
-            // Builder mode: not a relationship — keep `current`, try the next.
+            // Heuristic miss: not a relationship — keep `current`, try the next.
             None => {}
         }
     }

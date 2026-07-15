@@ -104,6 +104,14 @@ async fn provider_with_table(
     provider
 }
 
+/// Shorthand for seeding `pending_relation_hops` in the tests below.
+fn hop(name: &str, kind: RelationHopKind) -> RelationHop {
+    RelationHop {
+        name: name.to_string(),
+        kind,
+    }
+}
+
 fn make_ctx(class: &str) -> ChainContext {
     ChainContext {
         mode: BuilderMode::EloquentBuilder,
@@ -559,13 +567,73 @@ class Competition extends Model {}
     // The shape the chain walker produces for `$user->competitions->where('|')`.
     let mut ctx = make_ctx("App\\Models\\User");
     ctx.mode = BuilderMode::EloquentCollection;
-    ctx.pending_relation_hops = vec!["competitions".to_string()];
+    ctx.pending_relation_hops = vec![hop("competitions", RelationHopKind::Claim)];
 
     apply_relation_method_hops(&mut ctx, &root).await;
     assert_eq!(
         ctx.effective_model.as_deref(),
         Some("App\\Models\\Competition"),
         "the hop should advance effective_model to the related class"
+    );
+
+    let items = columns_for_collection(&ctx, &db, None, &root).await;
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"type"),
+        "must offer competitions.type; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"name"),
+        "must offer competitions.name; got {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn executed_relation_collection_variable_offers_related_columns() {
+    // Issue #246 AC #5, end-to-end from source: column completion on a
+    // collection variable holding an executed relation query must offer the
+    // *related* model's columns. Unlike the hand-built-ctx test above, this
+    // drives the real extractor → cursor → finalize pipeline, so it also
+    // covers the executed-relation receiver construction (flow.rs).
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function competitions() { return $this->hasMany(Competition::class); }
+}
+"#;
+    let competition = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Competition extends Model {}
+"#;
+    let (_dir, root) =
+        project_with_models_helper(&[("User", user), ("Competition", competition)]).await;
+    let db = provider_with_table(
+        root.clone(),
+        "competitions",
+        vec![("id", "int"), ("type", "string"), ("name", "string")],
+    )
+    .await;
+
+    let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$registeredCompetitions = $user->competitions()->select('competitions.id', 'competitions.type')->get();\n$registeredCompetitions->where('');\n";
+    // Cursor between the quotes of `where('|')`.
+    let pos = source.rfind("where('").expect("fixture") + "where('".len();
+    let tree = crate::parser::parse_php(source).expect("parse");
+    let chains: Vec<std::sync::Arc<BuilderChain>> =
+        crate::query_chain::extract_chains(&tree, source)
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect();
+    let mut ctx = crate::query_chain::cursor::detect_chain_context_at(&chains, pos)
+        .expect("ctx for the collection where('|')");
+    assert_eq!(ctx.mode, BuilderMode::EloquentCollection);
+
+    apply_relation_method_hops(&mut ctx, &root).await;
+    assert_eq!(
+        ctx.effective_model.as_deref(),
+        Some("App\\Models\\Competition"),
+        "the pending claim hop must advance effective_model to the related class"
     );
 
     let items = columns_for_collection(&ctx, &db, None, &root).await;
@@ -604,7 +672,10 @@ class Competition extends Model {}
 
     let mut ctx = make_ctx("App\\Models\\User");
     // `query` is not a relation → skipped; `competitions` resolves.
-    ctx.pending_relation_hops = vec!["query".to_string(), "competitions".to_string()];
+    ctx.pending_relation_hops = vec![
+        hop("query", RelationHopKind::Heuristic),
+        hop("competitions", RelationHopKind::Heuristic),
+    ];
     apply_relation_method_hops(&mut ctx, &root).await;
     assert_eq!(
         ctx.effective_model.as_deref(),
@@ -618,12 +689,12 @@ class Competition extends Model {}
 }
 
 #[tokio::test]
-async fn apply_relation_method_hops_clears_model_on_collection_mode_miss() {
-    // Issue #246 AC: in EloquentCollection mode the hop is a genuine relation
-    // claim ($user->rel->… or an executed relation assignment). When it
-    // doesn't resolve, the element type is unknown — effective_model must be
-    // cleared so consumers stay quiet instead of false-positiving against the
-    // base model's columns.
+async fn apply_relation_method_hops_clears_model_on_claim_miss() {
+    // Issue #246 AC: a Claim hop is a genuine relation claim ($user->rel->…
+    // or an executed relation assignment). When it doesn't resolve, the
+    // collection's element type is unknown — effective_model must be cleared
+    // so consumers stay quiet instead of false-positiving against the base
+    // model's columns.
     let user = r#"<?php
 namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
@@ -635,11 +706,39 @@ class User extends Model {
 
     let mut ctx = make_ctx("App\\Models\\User");
     ctx.mode = BuilderMode::EloquentCollection;
-    ctx.pending_relation_hops = vec!["notARelation".to_string()];
+    ctx.pending_relation_hops = vec![hop("notARelation", RelationHopKind::Claim)];
     apply_relation_method_hops(&mut ctx, &root).await;
     assert_eq!(
         ctx.effective_model, None,
-        "unresolvable collection-mode hop must clear the model"
+        "unresolvable claim hop must clear the model"
+    );
+}
+
+#[tokio::test]
+async fn apply_relation_method_hops_keeps_model_on_heuristic_miss_in_collection_mode() {
+    // Regression (PR #266 review): a Heuristic hop collected in builder mode
+    // (`User::forCurrentTenant()->…` — a local scope) is still a heuristic
+    // after `->get()` flips the chain to EloquentCollection. A miss must be
+    // skipped (the collection's elements are still Users), NOT clear the
+    // model — clearing here silenced typo diagnostics on scope-then-terminator
+    // chains.
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function competitions() { return $this->hasMany(Competition::class); }
+}
+"#;
+    let (_dir, root) = project_with_models_helper(&[("User", user)]).await;
+
+    let mut ctx = make_ctx("App\\Models\\User");
+    ctx.mode = BuilderMode::EloquentCollection;
+    ctx.pending_relation_hops = vec![hop("forCurrentTenant", RelationHopKind::Heuristic)];
+    apply_relation_method_hops(&mut ctx, &root).await;
+    assert_eq!(
+        ctx.effective_model.as_deref(),
+        Some("App\\Models\\User"),
+        "heuristic miss must keep the model even in collection mode"
     );
 }
 

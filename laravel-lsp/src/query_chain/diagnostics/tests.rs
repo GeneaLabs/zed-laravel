@@ -579,6 +579,44 @@ async fn executed_relation_collection_variable_from_static_root() {
 }
 
 #[tokio::test]
+async fn local_scope_before_terminator_still_flags_typo_on_root_table() {
+    // Regression (PR #266 review): `forCurrentTenant` is a local scope, not a
+    // relation — it's queued as a *heuristic* hop, and `->get()` then flips
+    // the chain to EloquentCollection. The heuristic miss must be skipped
+    // (the collection still holds Users), so the `emial` typo stays flagged
+    // on the users table. The strict claim-miss clear must not fire here.
+    let user_with_scope = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopeForCurrentTenant($query) { return $query->where('id', 1); }
+}
+"#;
+    let (_dir, root) = project_with_models(&[("User", user_with_scope)]);
+    let db = provider_with(
+        root.clone(),
+        &[("users", &[("id", "int"), ("email", "string")])],
+    )
+    .await;
+    let source =
+        "<?php\nuse App\\Models\\User;\nUser::forCurrentTenant()->get()->where('emial', 1);\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "typo after a scope-then-terminator chain must still flag: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert!(
+        diags[0].message.contains("users"),
+        "diagnostic should name the users table; got: {}",
+        diags[0].message
+    );
+}
+
+#[tokio::test]
 async fn executed_unknown_relation_collection_stays_quiet() {
     // The detected relation doesn't exist on User — the collection's element
     // type is unknown, so the receiver falls back to no-validation rather

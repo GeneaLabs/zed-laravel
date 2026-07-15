@@ -417,22 +417,31 @@ fn initial_receiver_context(
 }
 
 /// The relationship hops the walker must apply (deferred to async finalize),
-/// assembled in source order: the receiver's property hop first (for a
-/// `$var->relation->…` chain), then every unrecognised method call seen *before*
-/// `up_to_idx` while the chain is still an `EloquentBuilder`. Collecting only in
-/// `EloquentBuilder` mode is deliberate — once the chain flips to a Collection
-/// or base builder, an unknown call is a Collection/array method, not a relation
-/// on the model.
+/// assembled in source order: the receiver's hop first (for a
+/// `$var->relation->…` chain or an executed relation assignment, issue #246),
+/// then every unrecognised method call seen *before* `up_to_idx` while the
+/// chain is still an `EloquentBuilder`. Collecting only in `EloquentBuilder`
+/// mode is deliberate — once the chain flips to a Collection or base builder,
+/// an unknown call is a Collection/array method, not a relation on the model.
+///
+/// The receiver's hop is a [`RelationHopKind::Claim`] (the walker *knows* it
+/// names a relation-shaped access); mid-chain unknowns are
+/// [`RelationHopKind::Heuristic`] guesses (they may be local scopes or
+/// unmodeled builder methods). The finalize step treats a miss differently
+/// per kind — see [`RelationHopKind`].
 fn pending_relation_hops_through(
     chain: &BuilderChain,
     mode: BuilderMode,
     up_to_idx: usize,
-) -> Vec<String> {
+) -> Vec<RelationHop> {
     let mut hops = Vec::new();
     if let ChainReceiver::Eloquent(EloquentReceiver::RelationProperty { relation, .. }) =
         &chain.receiver
     {
-        hops.push(relation.clone());
+        hops.push(RelationHop {
+            name: relation.clone(),
+            kind: RelationHopKind::Claim,
+        });
     }
     let mut running = mode;
     for link in chain.links.iter().take(up_to_idx) {
@@ -447,7 +456,10 @@ fn pending_relation_hops_through(
             ChainEffect::None => {
                 if running == BuilderMode::EloquentBuilder && !is_known_builder_method(&link.method)
                 {
-                    hops.push(link.method.clone());
+                    hops.push(RelationHop {
+                        name: link.method.clone(),
+                        kind: RelationHopKind::Heuristic,
+                    });
                 }
             }
         }
