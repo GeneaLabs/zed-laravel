@@ -222,6 +222,127 @@ class Portfolio extends Model {
     assert_eq!(view.table_name.as_deref(), Some("user_portfolios"));
 }
 
+// ---- Custom collection / pivot overrides (issue #30 item 4) -------------
+
+#[test]
+fn extracts_collection_class_from_property() {
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use App\Support\PortfolioCollection;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    protected $collectionClass = PortfolioCollection::class;
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    assert_eq!(
+        view.collection_class.as_deref(),
+        Some("App\\Support\\PortfolioCollection")
+    );
+}
+
+#[test]
+fn extracts_collection_class_from_new_collection_return_type() {
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use App\Support\PortfolioCollection;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    public function newCollection(array $models = []): PortfolioCollection {
+        return new PortfolioCollection($models);
+    }
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    assert_eq!(
+        view.collection_class.as_deref(),
+        Some("App\\Support\\PortfolioCollection")
+    );
+}
+
+#[test]
+fn extracts_collection_class_from_untyped_new_collection_body() {
+    // No declared return type — the body's `new X(…)` names the collection.
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use App\Support\PortfolioCollection;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    public function newCollection(array $models = []) {
+        return new PortfolioCollection($models);
+    }
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    assert_eq!(
+        view.collection_class.as_deref(),
+        Some("App\\Support\\PortfolioCollection")
+    );
+}
+
+#[test]
+fn bare_collection_return_type_is_not_an_override() {
+    // `newCollection(): Collection` restates the framework default — no
+    // override to surface.
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    public function newCollection(array $models = []): Collection {
+        return new Collection($models);
+    }
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    assert_eq!(view.collection_class, None);
+}
+
+#[test]
+fn extracts_pivot_class_from_property() {
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use App\Models\Pivots\Membership;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    protected $pivotClass = Membership::class;
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    assert_eq!(
+        view.pivot_class.as_deref(),
+        Some("App\\Models\\Pivots\\Membership")
+    );
+}
+
+#[test]
+fn models_without_overrides_default_collection_and_pivot_to_none() {
+    // The common case: no `$collectionClass`, no `newCollection()`, no
+    // `$pivotClass` — both stay `None` so consumers keep default behavior.
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    protected $fillable = ['title'];
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    assert_eq!(view.collection_class, None);
+    assert_eq!(view.pivot_class, None);
+}
+
 #[test]
 fn detects_relationships() {
     let (dir, path) = fixture(

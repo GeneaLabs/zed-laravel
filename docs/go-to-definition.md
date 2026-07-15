@@ -65,7 +65,16 @@ $user->email;
 
 User::whereEmail($value);
 //   ^^^^^^^^^^ dynamic finder → the email column's migration line
+
+User::factory()->suspended()->create();
+//    ^^^^^^^ → database/factories/UserFactory.php  (class UserFactory)
+//               ^^^^^^^^^ → database/factories/UserFactory.php  (public function suspended())
+
+$user->pivot;
+//     ^^^^^ → app/Models/Pivots/Membership.php  (when the model declares $pivotClass)
 ```
+
+`Model::factory()` resolves the model to its factory class — a `newFactory()` override when the model declares one, else Laravel's `Database\Factories\…Factory` convention — and chained calls the factory actually declares (custom states, `state`, …) jump to their declaration in the factory file. `->pivot` jumps to a custom pivot class only when the model declares `protected $pivotClass = …::class;` (the framework default `Pivot` is left alone).
 
 Resolution is inheritance- and trait-aware — a member declared in a trait or a parent model jumps to the file that declares it — and chain-aware: `User::query()->active()`, `self::` / `static::` calls, and `$query->active()` inside scope bodies all resolve. Plain properties and plain method calls are left to your PHP language server (no duplicate results), and factory states sharing a scope's name (`User::factory()->active()`) are correctly NOT treated as scopes. Dynamic finders classify against the model's source-visible column surface (`$casts`, `$fillable`, timestamps) — a `$guarded = []` model that declares neither won't resolve its finders. Not resolved (conservatively dropped rather than guessed): `parent::` receivers, `(new User)->active()`, and relation-hopped chains (`$user->posts()->active()` — that's Post's scope).
 

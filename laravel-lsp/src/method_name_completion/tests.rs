@@ -400,6 +400,8 @@ fn empty_view() -> ClassView {
         relationships: Vec::new(),
         casts: std::collections::HashMap::new(),
         table_name: None,
+        collection_class: None,
+        pivot_class: None,
         column_surface: Vec::new(),
         callstatic_surface: Vec::new(),
     }

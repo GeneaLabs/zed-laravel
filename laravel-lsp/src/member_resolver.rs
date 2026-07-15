@@ -2575,18 +2575,16 @@ fn resolve_recipe_and_classify(
 
     let (fqcn, confidence, via_facade, via_factory) = match facade_concrete.or(helper_concrete) {
         Some((fqcn, confidence)) => (fqcn, confidence, true, false),
-        None => {
-            match eval_receiver(&site.recipe, aliases, resolver, classviews, project_root) {
-                Some((fqcn, confidence)) => (fqcn, confidence, false, false),
-                None if form.is_call() => {
-                    let chain = site.chain.as_ref()?;
-                    let (fqcn, confidence, via_factory) =
-                        eval_chain(chain, aliases, resolver, classviews, project_root)?;
-                    (fqcn, confidence, false, via_factory)
-                }
-                None => return None,
+        None => match eval_receiver(&site.recipe, aliases, resolver, classviews, project_root) {
+            Some((fqcn, confidence)) => (fqcn, confidence, false, false),
+            None if form.is_call() => {
+                let chain = site.chain.as_ref()?;
+                let (fqcn, confidence, via_factory) =
+                    eval_chain(chain, aliases, resolver, classviews, project_root)?;
+                (fqcn, confidence, false, via_factory)
             }
-        }
+            None => return None,
+        },
     };
 
     if let Some(d) = deps.as_deref_mut() {

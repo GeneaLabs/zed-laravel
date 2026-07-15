@@ -76,6 +76,8 @@ $user->
 
 Works with type-hinted variables, PHPDoc annotations, and static chains like `User::find(1)->`.
 
+To-many relationships honor the related model's custom collection — when `Post` declares `protected $collectionClass = PostCollection::class;` (or a `newCollection()` override), `posts` completes as `PostCollection<Post>` instead of the default `Collection<Post>`.
+
 ## 🔗 Eloquent Query Chains
 
 Type a string literal inside a query-builder method and the extension completes it from your schema and model definitions — **columns** inside `where`, `orderBy`, `whereIn`, `pluck`, `select`, … and **relations** inside `with`, `whereHas`, `withCount`, `load`, `has`, …:

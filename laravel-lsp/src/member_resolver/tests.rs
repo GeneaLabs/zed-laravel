@@ -3445,3 +3445,217 @@ class C {
         );
     }
 }
+
+// ─── Factory resolution: `Model::factory()` + factory chains (#30) ─────────
+
+const FACTORY_USER_MODEL: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $fillable = ['email'];
+}
+"#;
+
+const USER_FACTORY_SRC: &str = r#"<?php
+namespace Database\Factories;
+use Illuminate\Database\Eloquent\Factories\Factory;
+class UserFactory extends Factory {
+    public function suspended(): static { return $this->state(['active' => false]); }
+}
+"#;
+
+const FACTORY_CALLER: &str = r#"<?php
+namespace Tests\Feature;
+use App\Models\User;
+class UserTest {
+    public function seed() { return User::factory(); }
+}
+"#;
+
+/// Resolve an instance call `…->{member}()` in `caller` against `resolver` —
+/// the chain-link counterpart of [`resolve_static_call`].
+fn resolve_instance_call(
+    resolver: &impl ClassFileResolver,
+    root: &std::path::Path,
+    caller: &str,
+    member: &str,
+) -> Option<ResolvedMemberAccess> {
+    let tree = parse_php(caller).expect("parse caller");
+    let bytes = caller.as_bytes();
+    let aliases = extract_use_aliases(&tree, caller);
+    let mut stack = vec![tree.root_node()];
+    let mut object = None;
+    while let Some(n) = stack.pop() {
+        if n.kind() == "member_call_expression"
+            && n.child_by_field_name("name")
+                .and_then(|nm| nm.utf8_text(bytes).ok())
+                == Some(member)
+        {
+            object = n.child_by_field_name("object");
+            break;
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    let cache = ClassViewCache::new();
+    resolve_and_classify(
+        object?,
+        member,
+        AccessForm::InstanceCall,
+        bytes,
+        &aliases,
+        resolver,
+        &cache,
+        root,
+        None,
+    )
+}
+
+#[test]
+fn factory_call_resolves_to_conventional_factory() {
+    // `User::factory()` → `Database\Factories\UserFactory` by Laravel's
+    // convention, gated on the factory class actually resolving.
+    let p = project_files(&[
+        ("app/Models/User.php", FACTORY_USER_MODEL),
+        ("database/factories/UserFactory.php", USER_FACTORY_SRC),
+    ]);
+    let r = resolve_static_call(&p.index, &p.root, FACTORY_CALLER, "factory").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::Factory);
+    assert_eq!(r.declaring_fqcn, "Database\\Factories\\UserFactory");
+}
+
+#[test]
+fn factory_call_with_fully_qualified_receiver_resolves() {
+    // `\App\Models\User::factory()` — no `use` import; the written-out
+    // receiver must resolve identically (AC: FQ receiver form).
+    let p = project_files(&[
+        ("app/Models/User.php", FACTORY_USER_MODEL),
+        ("database/factories/UserFactory.php", USER_FACTORY_SRC),
+    ]);
+    let caller = "<?php \\App\\Models\\User::factory();";
+    let r = resolve_static_call(&p.index, &p.root, caller, "factory").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::Factory);
+    assert_eq!(r.declaring_fqcn, "Database\\Factories\\UserFactory");
+}
+
+#[test]
+fn factory_call_honors_new_factory_override() {
+    // A declared `newFactory()` names the factory directly and beats the
+    // conventional candidate.
+    let override_model = r#"<?php
+namespace App\Models;
+use Database\Factories\Custom\AdminFactory;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected static function newFactory(): AdminFactory { return AdminFactory::new(); }
+}
+"#;
+    let admin_factory = r#"<?php
+namespace Database\Factories\Custom;
+use Illuminate\Database\Eloquent\Factories\Factory;
+class AdminFactory extends Factory {}
+"#;
+    let p = project_files(&[
+        ("app/Models/User.php", override_model),
+        ("database/factories/Custom/AdminFactory.php", admin_factory),
+    ]);
+    let r = resolve_static_call(&p.index, &p.root, FACTORY_CALLER, "factory").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::Factory);
+    assert_eq!(
+        r.declaring_fqcn,
+        "Database\\Factories\\Custom\\AdminFactory"
+    );
+}
+
+#[test]
+fn factory_call_without_factory_file_does_not_classify() {
+    // No factory class resolves → no Factory tag, and nothing else on the
+    // model claims `factory` — a dead goto target is worse than none.
+    let p = project_files(&[("app/Models/User.php", FACTORY_USER_MODEL)]);
+    let r = resolve_static_call(&p.index, &p.root, FACTORY_CALLER, "factory");
+    assert!(
+        r.is_none(),
+        "a model with no resolvable factory must not classify; got {r:?}"
+    );
+}
+
+#[test]
+fn factory_chain_declared_state_classifies_as_factory_method() {
+    // `User::factory()->suspended()` — the chain's subject re-targets to the
+    // factory, and a state the factory DECLARES tags FactoryMethod (not a
+    // droppable PlainMember).
+    let p = project_files(&[
+        ("app/Models/User.php", FACTORY_USER_MODEL),
+        ("database/factories/UserFactory.php", USER_FACTORY_SRC),
+    ]);
+    let caller = r#"<?php
+namespace Tests\Feature;
+use App\Models\User;
+class UserTest {
+    public function t() { return User::factory()->suspended(); }
+}
+"#;
+    let r = resolve_instance_call(&p.index, &p.root, caller, "suspended").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::FactoryMethod);
+    assert_eq!(r.declaring_fqcn, "Database\\Factories\\UserFactory");
+}
+
+#[test]
+fn factory_chain_undeclared_member_never_degrades_to_class_line() {
+    // `User::factory()->create()` — `create` lives on the vendor base the
+    // index can't see. Unlike the facade signal, a factory chain never
+    // degrades an undeclared member to the class line: no target beats a
+    // wrong-class target.
+    let p = project_files(&[
+        ("app/Models/User.php", FACTORY_USER_MODEL),
+        ("database/factories/UserFactory.php", USER_FACTORY_SRC),
+    ]);
+    let caller = r#"<?php
+namespace Tests\Feature;
+use App\Models\User;
+class UserTest {
+    public function t() { return User::factory()->create(); }
+}
+"#;
+    let r = resolve_instance_call(&p.index, &p.root, caller, "create");
+    assert!(
+        r.is_none(),
+        "an undeclared factory-chain member must not classify; got {r:?}"
+    );
+}
+
+// ─── Custom pivot classification: `->pivot` (#30 item 4) ───────────────────
+
+#[test]
+fn classifies_pivot_property_with_declared_pivot_class() {
+    let (_d, view) = model(
+        r#"<?php
+namespace App\Models;
+use App\Models\Pivots\Membership;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $pivotClass = Membership::class;
+}
+"#,
+    );
+    let c = classify_member(&view, "pivot", AccessForm::Property).expect("pivot");
+    assert_eq!(c.kind, MagicMemberKind::Pivot);
+    assert_eq!(c.declaring_fqcn, "App\\Models\\Pivots\\Membership");
+}
+
+#[test]
+fn pivot_without_declared_class_does_not_classify() {
+    // The default `Relations\Pivot` is vendor territory — no card, no goto.
+    let (_d, view) = model(
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $fillable = ['email'];
+}
+"#,
+    );
+    assert!(classify_member(&view, "pivot", AccessForm::Property).is_none());
+}
