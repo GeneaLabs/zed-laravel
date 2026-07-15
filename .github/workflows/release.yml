@@ -50,10 +50,22 @@ jobs:
           # surprising out of all of them.
           SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'
           if [[ ! "$VERSION" =~ $SEMVER_RE ]]; then
-            echo "::error::Tag '${TAG}' does not yield a valid semver version (got '${VERSION}')"
+            # Strip CR/LF before interpolating the (unvalidated) values into
+            # the workflow command, so a newline in a workflow_dispatch tag
+            # input can't split the ::error:: annotation and forge an
+            # additional workflow command.
+            SAFE_TAG="${TAG//[$'\n\r']/ }"
+            SAFE_VERSION="${VERSION//[$'\n\r']/ }"
+            echo "::error::Tag '${SAFE_TAG}' does not yield a valid semver version (got '${SAFE_VERSION}')"
             exit 1
           fi
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          # Past the guard, TAG is structurally either VERSION or v${VERSION}
+          # (the '#v' strip removes at most one leading 'v'), so this output is
+          # guard-validated too. Downstream steps consume it instead of the raw
+          # event value, making their injection-safety independent of step
+          # ordering (defense-in-depth follow-up from #243 / PR #261 → #262).
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "Extracted version: ${VERSION}"
 
       - name: Update versions and lock files
@@ -133,7 +145,13 @@ jobs:
       - name: Update tag and release
         if: github.event_name == 'release' && steps.commit_changes.outputs.new_commit_sha != ''
         env:
-          TAG_NAME: ${{ github.event.release.tag_name }}
+          # Consume the guard-validated tag (safe-by-construction) rather than
+          # the raw event value (safe only by same-job step ordering). On a
+          # release event both hold the same string, but this keeps the curl
+          # URL/JSON interpolations hardened even if steps get reordered or
+          # split across jobs. Closes the residual follow-up from Holmes's
+          # review of #243 (PR #261): #262.
+          TAG_NAME: ${{ steps.extract_version.outputs.tag }}
         run: |
           RELEASE_ID="${{ github.event.release.id }}"
           FINAL_COMMIT_SHA="${{ steps.commit_changes.outputs.new_commit_sha }}"
