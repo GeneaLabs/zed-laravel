@@ -112,4 +112,21 @@ async fn found_route_renders_detail_card() {
         rendered.contains("GET"),
         "the detail card must carry the HTTP verb, got: {rendered:?}"
     );
+    // `hover_for_route` formats the detail line as `` `GET /` → `action` `` —
+    // assert the backticked verb+URI pair rather than a bare "/" (which any
+    // source link would satisfy vacuously).
+    assert!(
+        rendered.contains("`GET /`"),
+        "the detail card must carry the URI, got: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("HomeController@index"),
+        "the detail card must carry the action, got: {rendered:?}"
+    );
+    // The source link built via `source_link(&def.file, Some(def.line + 1))`
+    // always displays the originating file path, whatever the link shape.
+    assert!(
+        rendered.contains("routes/web.php"),
+        "the detail card must carry a source link to the route's file, got: {rendered:?}"
+    );
 }
