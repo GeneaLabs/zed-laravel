@@ -1264,20 +1264,16 @@ fn compute_collection_class(
             .value
             .return_type_raw
             .as_deref()
-            .filter(|t| {
-                // A bare `Collection` return type is the framework default,
-                // not an override worth surfacing.
-                t.trim_start_matches('?').rsplit('\\').next() != Some("Collection")
-            })
             .map(str::to_string)
             .or_else(|| m.value.body_source.as_deref().and_then(first_new_class))?;
-        Some(
-            crate::laravel_introspector::model_metadata::resolve_to_fqcn(
-                raw.trim_start_matches('?'),
-                file_namespace,
-                aliases,
-            ),
-        )
+        let fqcn = crate::laravel_introspector::model_metadata::resolve_to_fqcn(
+            raw.trim_start_matches('?'),
+            file_namespace,
+            aliases,
+        );
+        // Restating the framework default — whether in the return type or
+        // the `new X(...)` body — is not an override worth surfacing.
+        (fqcn != "Illuminate\\Database\\Eloquent\\Collection").then_some(fqcn)
     })
 }
 
