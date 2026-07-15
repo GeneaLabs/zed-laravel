@@ -579,6 +579,48 @@ async fn executed_relation_collection_variable_from_static_root() {
 }
 
 #[tokio::test]
+async fn pivot_filtered_relation_collection_validates_against_related_table() {
+    // Round 4 (proactive): `wherePivot` isn't in the recognised-builder
+    // catalog — it must ride the heuristic-hop path (miss → keep the running
+    // model) instead of rejecting the shape, or the exact issue #246 false
+    // positive returns for pivot-filtered BelongsToMany chains.
+    let (_dir, root, db) = competitions_project().await;
+    let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$regs = $user->competitions()->wherePivot('active', 1)->get();\n$regs->whereIn('type', ['league'])->pluck('id');\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "pivot-filtered executed relation must validate against competitions: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_relation_collection_flags_typo_on_related_table() {
+    // Round 4 (proactive): a scope on the *related* model mid-chain
+    // (`->approved()` after `->competitions()`) is a heuristic hop — the
+    // miss keeps Competition as the running model, so a typo in the
+    // collection chain is still flagged against the competitions table (not
+    // silenced, and not validated against users).
+    let (_dir, root, db) = competitions_project().await;
+    let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$regs = $user->competitions()->approved()->get();\n$regs->whereIn('typo', ['league'])->pluck('id');\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "typo after a scoped relation chain still flags: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert!(
+        diags[0].message.contains("competitions"),
+        "diagnostic should name the competitions table; got: {}",
+        diags[0].message
+    );
+}
+
+#[tokio::test]
 async fn local_scope_before_terminator_still_flags_typo_on_root_table() {
     // Regression (PR #266 review): `forCurrentTenant` is a local scope, not a
     // relation — it's queued as a *heuristic* hop, and `->get()` then flips

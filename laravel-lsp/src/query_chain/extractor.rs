@@ -634,8 +634,10 @@ fn member_chain_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> Chai
             // the base model, with the relation queued as a pending hop for
             // the async finalize step. `from_call: true` — the claimed name
             // is a method call, so a finalize miss may still be a local
-            // scope (see [`RelationHopKind::CallClaim`]).
-            if let Some((base_type, relation)) = assignment.and_then(|(rhs, start)| {
+            // scope (see [`RelationHopKind::CallClaim`]). `call_hops` carries
+            // the chain's unrecognised middle calls (scopes, unmodeled
+            // builder methods, further relation hops) as heuristic hops.
+            if let Some((base_type, relation, call_hops)) = assignment.and_then(|(rhs, start)| {
                 super::flow::resolve_collection_relation(rhs, start, bytes, aliases)
             }) {
                 return ChainReceiver::Eloquent(EloquentReceiver::RelationProperty {
@@ -643,6 +645,7 @@ fn member_chain_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> Chai
                     base_type: Some(base_type),
                     relation,
                     from_call: true,
+                    call_hops,
                 });
             }
             // Phase 9: try to resolve `$var`'s declared class via either a
@@ -720,6 +723,7 @@ fn member_access_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> Cha
         base_type,
         relation,
         from_call: false,
+        call_hops: Vec::new(),
     })
 }
 

@@ -150,25 +150,35 @@ pub fn latest_assignment_before<'tree>(
 /// passes the already-fetched latest assignment (`rhs` + `assignment_start`,
 /// from [`latest_assignment_before`]). The shape is: the RHS is a member-call
 /// chain whose deepest call is NOT a recognised builder method (a potential
-/// relation hop), every call in between is a recognised builder method that
-/// *keeps the chain an Eloquent builder* ([`ChainEffect::None`] — a mid-chain
-/// terminator or `toBase()` means the tail of the chain no longer types the
-/// relation query, so the shape doesn't apply), and the outermost call is a
-/// [`COLLECTION_TERMINATORS`] entry (`get`, `pluck`, …). The chain root is a
-/// variable resolvable to a model (via the normal flow walk), an Eloquent
-/// static starter (`User::query()`), or a construction (`(new User)`).
+/// relation hop), no call in between is a recognised builder method that
+/// *changes the chain's mode* (a mid-chain terminator or `toBase()` means the
+/// tail of the chain no longer types the relation query, so the shape doesn't
+/// apply — only [`ChainEffect::None`] builder methods pass through), and the
+/// outermost call is a [`COLLECTION_TERMINATORS`] entry (`get`, `pluck`, …).
+/// The chain root is a variable resolvable to a model (via the normal flow
+/// walk), an Eloquent static starter (`User::query()`), or a construction
+/// (`(new User)`).
 ///
-/// Returns `(base_model_fqcn, relation_name)` so the extractor can emit a
-/// collection-mode receiver with the relation queued as a pending hop — the
-/// relation→related-model resolution needs a model-file read, so it stays
-/// deferred to the async finalize step. `None` means the assignment doesn't
-/// match the shape (callers fall back to plain flow typing).
+/// *Unrecognised* middle calls don't reject the shape — mirroring the inline
+/// cursor collector ([`crate::query_chain::cursor`]), each is a heuristic
+/// relation-hop candidate: a scope on the running model (`->approved()`), a
+/// builder method we don't model (`->wherePivot(…)`), or a further relation
+/// hop (`->organizer()`). They're returned (source order — innermost first)
+/// so the finalize step resolves them after the receiver's claim, with a
+/// miss keeping the running model unchanged.
+///
+/// Returns `(base_model_fqcn, relation_name, heuristic_hops)` so the
+/// extractor can emit a collection-mode receiver with the relation (and any
+/// heuristic candidates) queued as pending hops — the relation→related-model
+/// resolution needs a model-file read, so it stays deferred to the async
+/// finalize step. `None` means the assignment doesn't match the shape
+/// (callers fall back to plain flow typing).
 pub fn resolve_collection_relation(
     rhs: Node,
     assignment_start: usize,
     bytes: &[u8],
     aliases: &UseAliases,
-) -> Option<(String, String)> {
+) -> Option<(String, String, Vec<String>)> {
     let outer = unwrap_parens(rhs);
     if outer.kind() != "member_call_expression" {
         return None;
@@ -190,9 +200,8 @@ pub fn resolve_collection_relation(
     };
 
     // Shape gate: a collection terminator on top, the relation candidate at
-    // the bottom, and in between only recognised builder methods whose
-    // [`ChainEffect`] is `None` — calls that keep the chain a builder on the
-    // relation query. A mid-chain `get()` (FlipToCollection), `toBase()`
+    // the bottom, and no *recognised* middle method whose [`ChainEffect`]
+    // isn't `None`. A mid-chain `get()` (FlipToCollection), `toBase()`
     // (FlipToBase), or `first()` (Terminate) means everything after it
     // operates on a collection / base builder / single model, not the
     // relation query, so typing the variable to the related model would be
@@ -202,12 +211,22 @@ pub fn resolve_collection_relation(
     let (&relation, middle) = rest.split_last()?;
     if !COLLECTION_TERMINATORS.contains(&terminator)
         || is_known_builder_method(relation)
-        || !middle
+        || middle
             .iter()
-            .all(|m| is_known_builder_method(m) && chain_effect(m) == ChainEffect::None)
+            .any(|m| is_known_builder_method(m) && chain_effect(m) != ChainEffect::None)
     {
         return None;
     }
+
+    // Unrecognised middle calls are heuristic hop candidates (see the doc
+    // comment) — collected innermost-first so the finalize step applies them
+    // in source order after the receiver's relation claim.
+    let heuristic_hops: Vec<String> = middle
+        .iter()
+        .rev()
+        .filter(|m| !is_known_builder_method(m))
+        .map(|m| m.to_string())
+        .collect();
 
     // Type the chain root: `$base` via the normal flow walk (bounded at this
     // assignment, so we don't re-find the assignment we're inside), a static
@@ -224,7 +243,7 @@ pub fn resolve_collection_relation(
         "object_creation_expression" => extract_new_class(root, bytes, aliases)?,
         _ => return None,
     };
-    Some((base, relation.to_string()))
+    Some((base, relation.to_string(), heuristic_hops))
 }
 
 /// Like [`resolve`], but also reports the [`Confidence`] tier of the

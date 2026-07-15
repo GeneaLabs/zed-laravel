@@ -557,7 +557,7 @@ function search() {
 
 /// Run [`super::resolve_collection_relation`] against the Nth occurrence of
 /// `$var` in the snippet.
-fn resolve_collection_at(src: &str, var: &str, n: usize) -> Option<(String, String)> {
+fn resolve_collection_at(src: &str, var: &str, n: usize) -> Option<(String, String, Vec<String>)> {
     let wrapped = format!("<?php\n{src}");
     let tree = parse_php(&wrapped).expect("parse");
     let bytes = wrapped.as_bytes();
@@ -565,6 +565,15 @@ fn resolve_collection_at(src: &str, var: &str, n: usize) -> Option<(String, Stri
     let node = find_nth_var(&tree, bytes, var, n)?;
     let (rhs, start) = super::latest_assignment_before(node, bytes, var)?;
     super::resolve_collection_relation(rhs, start, bytes, &aliases)
+}
+
+/// `resolve_collection_at` with no heuristic middle hops expected — the
+/// common assertion shape.
+fn resolve_collection_simple(src: &str, var: &str, n: usize) -> Option<(String, String)> {
+    resolve_collection_at(src, var, n).map(|(base, relation, hops)| {
+        assert!(hops.is_empty(), "expected no heuristic hops, got {hops:?}");
+        (base, relation)
+    })
 }
 
 #[test]
@@ -580,7 +589,7 @@ function run(User $user) {
 }
 "#;
     assert_eq!(
-        resolve_collection_at(src, "regs", 1),
+        resolve_collection_simple(src, "regs", 1),
         Some(("App\\Models\\User".to_string(), "competitions".to_string()))
     );
 }
@@ -594,7 +603,7 @@ function run() {
 }
 "#;
     assert_eq!(
-        resolve_collection_at(src, "regs", 1),
+        resolve_collection_simple(src, "regs", 1),
         Some(("User".to_string(), "competitions".to_string()))
     );
 }
@@ -608,7 +617,7 @@ function run(User $user) {
 }
 "#;
     assert_eq!(
-        resolve_collection_at(src, "ids", 1),
+        resolve_collection_simple(src, "ids", 1),
         Some(("User".to_string(), "competitions".to_string()))
     );
 }
@@ -652,17 +661,63 @@ function run(User $user) {
 }
 
 #[test]
-fn collection_relation_rejects_unrecognised_middle_call() {
-    // A second unrecognised call mid-chain could be another relation hop —
-    // we only model a single hop, so stay out entirely (fall back to the
-    // plain flow path) rather than resolve to the wrong model.
+fn collection_relation_collects_unrecognised_middle_calls_as_hops() {
+    // PR #266 round 4 (proactive): unrecognised middle calls no longer
+    // reject the shape — mirroring the inline cursor collector, each is a
+    // heuristic hop candidate (a scope on the running model, a pivot builder
+    // method we don't model, or a further relation hop), returned in source
+    // order after the relation claim.
     let src = r#"
 function run(User $user) {
-    $x = $user->competitions()->organizer()->get();
+    $x = $user->competitions()->approved()->organizer()->get();
     $x->pluck('id');
 }
 "#;
-    assert_eq!(resolve_collection_at(src, "x", 1), None);
+    assert_eq!(
+        resolve_collection_at(src, "x", 1),
+        Some((
+            "User".to_string(),
+            "competitions".to_string(),
+            vec!["approved".to_string(), "organizer".to_string()]
+        ))
+    );
+}
+
+#[test]
+fn collection_relation_collects_pivot_method_as_hop() {
+    // BelongsToMany pivot builder methods (`wherePivot`, `withPivot`, …)
+    // aren't in the recognised-builder catalog — they must ride the
+    // heuristic-hop path rather than reject the shape, or the exact issue
+    // #246 false positive returns for pivot-filtered chains.
+    let src = r#"
+use App\Models\User;
+function run(User $user) {
+    $regs = $user->competitions()->wherePivot('active', 1)->get();
+    $regs->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(
+        resolve_collection_at(src, "regs", 1),
+        Some((
+            "App\\Models\\User".to_string(),
+            "competitions".to_string(),
+            vec!["wherePivot".to_string()]
+        ))
+    );
+}
+
+#[test]
+fn collection_relation_rejects_mode_flip_with_unrecognised_middle_present() {
+    // The mode-flip gate (round 3) survives the heuristic-middle loosening:
+    // a mid-chain `toBase()` still rejects even when an unrecognised call
+    // also sits mid-chain.
+    let src = r#"
+function run(User $user) {
+    $rows = $user->competitions()->approved()->toBase()->get();
+    $rows->filter();
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "rows", 1), None);
 }
 
 #[test]
@@ -718,7 +773,7 @@ function run() {
 }
 "#;
     assert_eq!(
-        resolve_collection_at(src, "regs", 1),
+        resolve_collection_simple(src, "regs", 1),
         Some(("App\\Models\\User".to_string(), "competitions".to_string()))
     );
 }

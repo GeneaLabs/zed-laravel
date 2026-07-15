@@ -440,6 +440,7 @@ fn pending_relation_hops_through(
     if let ChainReceiver::Eloquent(EloquentReceiver::RelationProperty {
         relation,
         from_call,
+        call_hops,
         ..
     }) = &chain.receiver
     {
@@ -451,6 +452,13 @@ fn pending_relation_hops_through(
                 RelationHopKind::Claim
             },
         });
+        // The executed-relation assignment's unrecognised middle calls
+        // (source order) — heuristic guesses, same as mid-chain unknowns
+        // collected below: a miss keeps the running model.
+        hops.extend(call_hops.iter().map(|name| RelationHop {
+            name: name.clone(),
+            kind: RelationHopKind::Heuristic,
+        }));
     }
     let mut running = mode;
     for link in chain.links.iter().take(up_to_idx) {

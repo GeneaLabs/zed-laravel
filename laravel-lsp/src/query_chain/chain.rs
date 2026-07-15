@@ -109,12 +109,22 @@ pub enum EloquentReceiver {
     /// name that isn't a relation is an unknown collection (stay quiet), but
     /// a *called* name may still be a local scope returning a builder of the
     /// base model itself — see [`RelationHopKind::CallClaim`].
+    ///
+    /// `call_hops` carries the assignment chain's *unrecognised middle
+    /// calls* (executed-relation form only; always empty for the property
+    /// access) in source order — scopes on the running model, pivot builder
+    /// methods we don't model, or further relation hops. The walker queues
+    /// each as a [`RelationHopKind::Heuristic`] hop after the `relation`
+    /// claim, mirroring how the inline cursor collector treats unrecognised
+    /// mid-chain calls.
     RelationProperty {
         var: String,
         base_type: Option<String>,
         relation: String,
         #[serde(default)]
         from_call: bool,
+        #[serde(default)]
+        call_hops: Vec<String>,
     },
 }
 

@@ -1381,10 +1381,15 @@ function run(User $user) {
             base_type,
             from_call: _,
             relation,
+            call_hops,
         }) => {
             assert_eq!(var, "regs");
             assert_eq!(base_type.as_deref(), Some("App\\Models\\User"));
             assert_eq!(relation, "competitions");
+            assert!(
+                call_hops.is_empty(),
+                "select() is a recognised builder method, not a heuristic hop"
+            );
         }
         _ => unreachable!(),
     }
