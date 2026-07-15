@@ -102,10 +102,19 @@ pub enum EloquentReceiver {
     /// ([`ChainContext::pending_relation_hops`]) that the async finalize step
     /// resolves into `effective_model`. `base_type` is `None` when the base
     /// variable's type can't be determined, in which case completion no-ops.
+    ///
+    /// `from_call` records which of the two construction sites produced the
+    /// receiver — `false` for the property access, `true` for the executed
+    /// relation *call*. The distinction matters on a failed hop: a property
+    /// name that isn't a relation is an unknown collection (stay quiet), but
+    /// a *called* name may still be a local scope returning a builder of the
+    /// base model itself — see [`RelationHopKind::CallClaim`].
     RelationProperty {
         var: String,
         base_type: Option<String>,
         relation: String,
+        #[serde(default)]
+        from_call: bool,
     },
 }
 
@@ -393,18 +402,30 @@ pub struct RelationHop {
 
 /// How a pending relation hop was collected, deciding the failure semantics in
 /// [`crate::query_chain::eloquent_completion::apply_relation_method_hops`].
-/// The two kinds share one queue but mean very different things on a miss —
+/// The kinds share one queue but mean very different things on a miss —
 /// conflating them silenced diagnostics on local-scope chains
-/// (`User::forCurrentTenant()->get()->where('emial', 1)`).
+/// (`User::forCurrentTenant()->get()->where('emial', 1)`), first inline
+/// (fixed by the `Claim`/`Heuristic` split) and then in the assigned form
+/// (`$x = $user->forCurrentTenant()->get()`, fixed by `CallClaim`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationHopKind {
-    /// A genuine relation claim, seeded from the
-    /// [`EloquentReceiver::RelationProperty`] receiver — a relationship read
-    /// as a property (`$user->competitions->…`) or an executed relation
-    /// assignment (issue #246). A failed resolve means the collection's
+    /// A genuine relation claim, seeded from a *property* access
+    /// ([`EloquentReceiver::RelationProperty`] with `from_call: false`,
+    /// `$user->competitions->…`). A property that isn't a relation has no
+    /// modelled type at all, so a failed resolve means the collection's
     /// element type is unknown: `effective_model` is cleared so consumers
     /// stay quiet rather than false-positiving against the base model.
     Claim,
+    /// A relation claim seeded from an *executed relation-query assignment*
+    /// ([`EloquentReceiver::RelationProperty`] with `from_call: true`,
+    /// `$x = $user->competitions()->get()`, issue #246). The claimed name is
+    /// a method *call*, so a resolve miss splits further: a **local scope**
+    /// (`scopeForCurrentTenant` / `#[Scope]`) provably returns a builder of
+    /// the *same* model — the collection's element type is the running model,
+    /// which is kept so its columns still validate. Any other miss (an
+    /// undeclared name, or a declared relation whose related model can't be
+    /// resolved — AC #7) clears `effective_model`, same as [`Self::Claim`].
+    CallClaim,
     /// A heuristic guess — any unrecognised method name seen mid-chain in
     /// `EloquentBuilder` mode (a custom local scope, or a builder method we
     /// simply don't model). A failed resolve is skipped, leaving the model

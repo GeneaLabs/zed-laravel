@@ -1379,6 +1379,7 @@ function run(User $user) {
         ChainReceiver::Eloquent(EloquentReceiver::RelationProperty {
             var,
             base_type,
+            from_call: _,
             relation,
         }) => {
             assert_eq!(var, "regs");

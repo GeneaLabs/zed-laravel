@@ -759,11 +759,17 @@ pub async fn resolve_related_model(
 ///   mid-chain: a local scope like `->forCurrentTenant()`, or a builder
 ///   method we don't model), so a miss is skipped, leaving the model
 ///   unchanged — the `ChainEffect::None` fallback.
-/// - [`RelationHopKind::Claim`] — a genuine relation claim (a
-///   `$user->rel->…` property receiver or an executed relation assignment,
-///   issue #246), so a miss means the collection's element type is unknown.
-///   `effective_model` is cleared and consumers stay quiet rather than
-///   false-positiving against the base model's columns.
+/// - [`RelationHopKind::Claim`] — a relation claim from a `$user->rel->…`
+///   *property* receiver, so a miss means the collection's element type is
+///   unknown. `effective_model` is cleared and consumers stay quiet rather
+///   than false-positiving against the base model's columns.
+/// - [`RelationHopKind::CallClaim`] — a relation claim from an executed
+///   relation *call* assignment (`$x = $user->rel()->get()`, issue #246).
+///   A miss splits on what the called name is (PR #266 review): a declared
+///   **local scope** returns a builder of the *same* model, so the running
+///   model is kept and its columns still validate; anything else (an
+///   undeclared name, or a declared relation with no resolvable related
+///   model — AC #7) clears `effective_model`, same as `Claim`.
 ///
 /// The mode is untouched either way: a relationship method returns a builder
 /// of the related model (`EloquentBuilder` stays `EloquentBuilder`), and the
@@ -780,15 +786,50 @@ pub async fn apply_relation_method_hops(ctx: &mut ChainContext, project_root: &P
     for hop in hops {
         match resolve_related_model(&current, &hop.name, project_root).await {
             Some(related) => current = related,
-            None if hop.kind == RelationHopKind::Claim => {
-                ctx.effective_model = None;
-                return;
-            }
-            // Heuristic miss: not a relationship — keep `current`, try the next.
-            None => {}
+            None => match hop.kind {
+                // Heuristic miss: not a relationship — keep `current`, try
+                // the next.
+                RelationHopKind::Heuristic => {}
+                // Property-form claim miss: the element type is unknown —
+                // stay quiet.
+                RelationHopKind::Claim => {
+                    ctx.effective_model = None;
+                    return;
+                }
+                // Call-form claim miss: a declared local scope returns a
+                // builder of the *same* model, so the collection still holds
+                // `current` — keep it. Anything else is an unknown element
+                // type — stay quiet (AC #7).
+                RelationHopKind::CallClaim => {
+                    if !is_local_scope(&current, &hop.name, project_root).await {
+                        ctx.effective_model = None;
+                        return;
+                    }
+                }
+            },
         }
     }
     ctx.effective_model = Some(current);
+}
+
+/// Whether `method_name` is a declared Eloquent local scope on `class` —
+/// either style (`scopeForCurrentTenant` prefix or `#[Scope]` attribute),
+/// inheritance- and trait-aware via the class-chain walk. Drives the
+/// `CallClaim` miss split in [`apply_relation_method_hops`]: a scope call
+/// provably returns a builder of the same model, so the executed collection's
+/// element type is the running model, not an unknown.
+async fn is_local_scope(class: &str, method_name: &str, project_root: &Path) -> bool {
+    let Some(path) = find_php_class_file(class, project_root) else {
+        return false;
+    };
+    let root = project_root.to_path_buf();
+    let name = method_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::laravel_introspector::chain::analyze(&path, &root)
+            .is_some_and(|view| view.scopes.iter().any(|s| s.name == name))
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Phase 6 helper: resolve a model class to its table name.

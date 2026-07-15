@@ -649,6 +649,147 @@ class Competition extends Model {}
 }
 
 #[tokio::test]
+async fn apply_relation_method_hops_keeps_model_on_call_claim_scope_miss() {
+    // PR #266 review (round 3): an executed-relation assignment whose called
+    // name is a declared local scope — the collection holds the *root*
+    // model, so the CallClaim miss keeps effective_model and its columns
+    // still validate.
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopeForCurrentTenant($query) { return $query; }
+}
+"#;
+    let (_dir, root) = project_with_models_helper(&[("User", user)]).await;
+    let mut ctx = make_ctx("App\\Models\\User");
+    ctx.mode = BuilderMode::EloquentCollection;
+    ctx.pending_relation_hops = vec![hop("forCurrentTenant", RelationHopKind::CallClaim)];
+    apply_relation_method_hops(&mut ctx, &root).await;
+    assert_eq!(
+        ctx.effective_model.as_deref(),
+        Some("App\\Models\\User"),
+        "a declared scope keeps the running model on a CallClaim miss"
+    );
+}
+
+#[tokio::test]
+async fn apply_relation_method_hops_clears_model_on_call_claim_unknown_miss() {
+    // The called name is neither a relation nor a declared scope — the
+    // element type is unknown, so the CallClaim miss clears (AC #7).
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {}
+"#;
+    let (_dir, root) = project_with_models_helper(&[("User", user)]).await;
+    let mut ctx = make_ctx("App\\Models\\User");
+    ctx.mode = BuilderMode::EloquentCollection;
+    ctx.pending_relation_hops = vec![hop("missingRelation", RelationHopKind::CallClaim)];
+    apply_relation_method_hops(&mut ctx, &root).await;
+    assert_eq!(
+        ctx.effective_model, None,
+        "an undeclared name clears the model on a CallClaim miss"
+    );
+}
+
+#[tokio::test]
+async fn static_root_executed_relation_collection_offers_related_columns() {
+    // Follow-up (PR #266 review): AC #5 end-to-end for the *static* chain
+    // root — `User::query()->competitions()->get()` — mirroring the
+    // instance-rooted test above.
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function competitions() { return $this->hasMany(Competition::class); }
+}
+"#;
+    let competition = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Competition extends Model {}
+"#;
+    let (_dir, root) =
+        project_with_models_helper(&[("User", user), ("Competition", competition)]).await;
+    let db = provider_with_table(
+        root.clone(),
+        "competitions",
+        vec![("id", "int"), ("type", "string"), ("name", "string")],
+    )
+    .await;
+
+    let source = "<?php\nuse App\\Models\\User;\n$regs = User::query()->competitions()->get();\n$regs->where('');\n";
+    let pos = source.rfind("where('").expect("fixture") + "where('".len();
+    let tree = crate::parser::parse_php(source).expect("parse");
+    let chains: Vec<std::sync::Arc<BuilderChain>> =
+        crate::query_chain::extract_chains(&tree, source)
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect();
+    let mut ctx = crate::query_chain::cursor::detect_chain_context_at(&chains, pos)
+        .expect("ctx for the collection where('|')");
+    assert_eq!(ctx.mode, BuilderMode::EloquentCollection);
+
+    apply_relation_method_hops(&mut ctx, &root).await;
+    assert_eq!(
+        ctx.effective_model.as_deref(),
+        Some("App\\Models\\Competition"),
+        "the pending claim hop must advance effective_model to the related class"
+    );
+
+    let items = columns_for_collection(&ctx, &db, None, &root).await;
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"type"),
+        "must offer competitions.type; got {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_relation_collection_offers_no_completions() {
+    // Follow-up (PR #266 review): AC #7's no-completion half, asserted
+    // directly — an unresolvable relation's collection variable offers an
+    // *empty* completion list, never the root model's columns.
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {}
+"#;
+    let (_dir, root) = project_with_models_helper(&[("User", user)]).await;
+    let db = provider_with_table(
+        root.clone(),
+        "users",
+        vec![("id", "int"), ("email", "string")],
+    )
+    .await;
+
+    let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$things = $user->missingRelation()->get();\n$things->where('');\n";
+    let pos = source.rfind("where('").expect("fixture") + "where('".len();
+    let tree = crate::parser::parse_php(source).expect("parse");
+    let chains: Vec<std::sync::Arc<BuilderChain>> =
+        crate::query_chain::extract_chains(&tree, source)
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect();
+    let mut ctx = crate::query_chain::cursor::detect_chain_context_at(&chains, pos)
+        .expect("ctx for the collection where('|')");
+
+    apply_relation_method_hops(&mut ctx, &root).await;
+    assert_eq!(
+        ctx.effective_model, None,
+        "an unresolvable relation clears the model"
+    );
+
+    let items = columns_for_collection(&ctx, &db, None, &root).await;
+    assert!(
+        items.is_empty(),
+        "no completions for an unknown-relation collection; got {:?}",
+        items.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn apply_relation_method_hops_skips_unresolvable_names() {
     // A hop that isn't a relationship (an unrecognised builder method like
     // `query`) resolves to None and is skipped, leaving the model unchanged —

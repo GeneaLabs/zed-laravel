@@ -563,7 +563,8 @@ fn resolve_collection_at(src: &str, var: &str, n: usize) -> Option<(String, Stri
     let bytes = wrapped.as_bytes();
     let aliases = extract_use_aliases(&tree, &wrapped);
     let node = find_nth_var(&tree, bytes, var, n)?;
-    super::resolve_collection_relation(node, bytes, var, &aliases)
+    let (rhs, start) = super::latest_assignment_before(node, bytes, var)?;
+    super::resolve_collection_relation(rhs, start, bytes, &aliases)
 }
 
 #[test]
@@ -662,6 +663,64 @@ function run(User $user) {
 }
 "#;
     assert_eq!(resolve_collection_at(src, "x", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_mid_chain_collection_terminator() {
+    // PR #266 review (round 3): `get()` mid-chain flips the tail to a
+    // Collection — `pluck('id')` then yields scalars, not related models.
+    // The gate must reject rather than type `$ids` to the related model.
+    let src = r#"
+function run(User $user) {
+    $ids = $user->competitions()->get()->pluck('id');
+    $ids->filter();
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "ids", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_mid_chain_mode_flip() {
+    // PR #266 review (round 3): `toBase()` mid-chain drops to the base
+    // builder — `get()` then yields raw stdClass rows, not hydrated related
+    // models.
+    let src = r#"
+function run(User $user) {
+    $rows = $user->competitions()->toBase()->get();
+    $rows->filter();
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "rows", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_mid_chain_single_model_terminator() {
+    // Same bug class: `first()` mid-chain terminates the query into a single
+    // model — the tail no longer types the relation query.
+    let src = r#"
+function run(User $user) {
+    $x = $user->competitions()->first()->get();
+    $x->filter();
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "x", 1), None);
+}
+
+#[test]
+fn collection_relation_detects_parenthesized_new_root() {
+    // `(new User)` as the chain root — parens are unwrapped during the root
+    // walk and the construction types the base model.
+    let src = r#"
+use App\Models\User;
+function run() {
+    $regs = (new User)->competitions()->get();
+    $regs->pluck('id');
+}
+"#;
+    assert_eq!(
+        resolve_collection_at(src, "regs", 1),
+        Some(("App\\Models\\User".to_string(), "competitions".to_string()))
+    );
 }
 
 #[test]

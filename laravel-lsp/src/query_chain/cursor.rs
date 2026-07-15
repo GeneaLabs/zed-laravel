@@ -424,8 +424,10 @@ fn initial_receiver_context(
 /// mode is deliberate — once the chain flips to a Collection or base builder,
 /// an unknown call is a Collection/array method, not a relation on the model.
 ///
-/// The receiver's hop is a [`RelationHopKind::Claim`] (the walker *knows* it
-/// names a relation-shaped access); mid-chain unknowns are
+/// The receiver's hop is a claim (the walker *knows* it names a
+/// relation-shaped access): [`RelationHopKind::Claim`] for the property form,
+/// [`RelationHopKind::CallClaim`] for the executed-relation call form (whose
+/// miss may still be a local scope). Mid-chain unknowns are
 /// [`RelationHopKind::Heuristic`] guesses (they may be local scopes or
 /// unmodeled builder methods). The finalize step treats a miss differently
 /// per kind — see [`RelationHopKind`].
@@ -435,12 +437,19 @@ fn pending_relation_hops_through(
     up_to_idx: usize,
 ) -> Vec<RelationHop> {
     let mut hops = Vec::new();
-    if let ChainReceiver::Eloquent(EloquentReceiver::RelationProperty { relation, .. }) =
-        &chain.receiver
+    if let ChainReceiver::Eloquent(EloquentReceiver::RelationProperty {
+        relation,
+        from_call,
+        ..
+    }) = &chain.receiver
     {
         hops.push(RelationHop {
             name: relation.clone(),
-            kind: RelationHopKind::Claim,
+            kind: if *from_call {
+                RelationHopKind::CallClaim
+            } else {
+                RelationHopKind::Claim
+            },
         });
     }
     let mut running = mode;

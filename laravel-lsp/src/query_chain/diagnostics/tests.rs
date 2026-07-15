@@ -618,9 +618,12 @@ class User extends Model {
 
 #[tokio::test]
 async fn executed_unknown_relation_collection_stays_quiet() {
-    // The detected relation doesn't exist on User — the collection's element
-    // type is unknown, so the receiver falls back to no-validation rather
-    // than false-positiving against the users table.
+    // The called name is genuinely undeclared on User — not a relation, not
+    // a local scope, not any method — so the collection's element type is
+    // unknown and the receiver falls back to no-validation rather than
+    // false-positiving against the users table (AC #7). Contrast the
+    // assigned_local_scope_* tests below, where a *declared scope* keeps
+    // validating against the root table.
     let (_dir, root, db) = competitions_project().await;
     let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$things = $user->missingRelation()->get();\n$things->whereIn('type', ['league']);\n";
     let chains = chains_of(source);
@@ -629,6 +632,94 @@ async fn executed_unknown_relation_collection_stays_quiet() {
     assert!(
         diags.is_empty(),
         "unknown relation must fall back to quiet, not flag against users: {diags:?}"
+    );
+}
+
+/// `User` with a declared local scope, for the assigned scope-collection
+/// regression pair (PR #266 review, round 3): a scope call returns a builder
+/// of User itself, so the executed collection still holds Users.
+const USER_WITH_TENANT_SCOPE: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopeForCurrentTenant($query) { return $query->where('id', 1); }
+}
+"#;
+
+#[tokio::test]
+async fn assigned_local_scope_collection_still_flags_typo_on_root_table() {
+    // Regression (PR #266 review, round 3): the *assigned* form of the
+    // scope-then-terminator chain. `forCurrentTenant` is a declared local
+    // scope, not a relation — the executed collection still holds Users, so
+    // the `emial` typo stays flagged on the users table. The CallClaim miss
+    // must consult the model's scopes instead of blanket-clearing.
+    let (_dir, root) = project_with_models(&[("User", USER_WITH_TENANT_SCOPE)]);
+    let db = provider_with(
+        root.clone(),
+        &[("users", &[("id", "int"), ("email", "string")])],
+    )
+    .await;
+    let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$x = $user->forCurrentTenant()->get();\n$x->where('emial', 1);\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "typo on an assigned scope collection must still flag: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert!(
+        diags[0].message.contains("users"),
+        "diagnostic should name the users table; got: {}",
+        diags[0].message
+    );
+}
+
+#[tokio::test]
+async fn assigned_local_scope_collection_keeps_valid_columns_quiet() {
+    // Companion positive: a valid users column on the same shape stays quiet
+    // — the kept root model validates, it doesn't blanket-flag.
+    let (_dir, root) = project_with_models(&[("User", USER_WITH_TENANT_SCOPE)]);
+    let db = provider_with(
+        root.clone(),
+        &[("users", &[("id", "int"), ("email", "string")])],
+    )
+    .await;
+    let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$x = $user->forCurrentTenant()->get();\n$x->where('email', 1);\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "valid column on an assigned scope collection must stay quiet: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn assigned_static_scope_collection_still_flags_typo_on_root_table() {
+    // Static-rooted variant of the same regression:
+    // `User::query()->forCurrentTenant()->get()` assigned to a variable.
+    let (_dir, root) = project_with_models(&[("User", USER_WITH_TENANT_SCOPE)]);
+    let db = provider_with(
+        root.clone(),
+        &[("users", &[("id", "int"), ("email", "string")])],
+    )
+    .await;
+    let source = "<?php\nuse App\\Models\\User;\n$x = User::query()->forCurrentTenant()->get();\n$x->where('emial', 1);\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "typo on a static-rooted assigned scope collection must still flag: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert!(
+        diags[0].message.contains("users"),
+        "diagnostic should name the users table; got: {}",
+        diags[0].message
     );
 }
 
