@@ -21,7 +21,9 @@ use super::chain::*;
 use crate::class_locator::find_php_class_file;
 use crate::completion_format::CompletionDoc;
 use crate::database::DatabaseSchemaProvider;
-use crate::laravel_introspector::{map_cast_to_php_type, relationship_to_php_type, ModelMetadata};
+use crate::laravel_introspector::{
+    map_cast_to_php_type, relationship_to_php_type_with_collection, ModelMetadata,
+};
 use std::path::Path;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, CompletionItemLabelDetails};
 use tracing::info;
@@ -627,8 +629,15 @@ pub async fn relations(
         .relationships
         .into_iter()
         .map(|rel| {
-            let php_type =
-                relationship_to_php_type(&rel.relationship_type, rel.related_model.as_deref());
+            // Related model's custom collection, when declared (#30 item 4).
+            let collection_class = rel.related_model.as_deref().and_then(|related| {
+                crate::laravel_introspector::chain::collection_class_for(related, project_root)
+            });
+            let php_type = relationship_to_php_type_with_collection(
+                &rel.relationship_type,
+                rel.related_model.as_deref(),
+                collection_class.as_deref(),
+            );
             let name = rel.method_name;
             let insert_text = match wrap_with_quote {
                 Some(q) => format!("{q}{name}{q}"),

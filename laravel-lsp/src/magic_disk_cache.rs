@@ -69,7 +69,7 @@ use crate::view_var_index::ViewRender;
 /// path), so a warm v3 cache is discarded and the project re-indexed with the
 /// corrected resolver rather than trusting stale entries. Parsing did not
 /// change, so the pattern/config disk caches are intentionally NOT bumped.
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 const CACHE_FILENAME: &str = "magic_cache.bin";
 

@@ -17,7 +17,7 @@
 //! rename/lens can attribute every inheriting model correctly.
 
 use crate::class_hierarchy_index::ClassHierarchyIndex;
-use crate::laravel_introspector::chain::{analyze, ClassView};
+use crate::laravel_introspector::chain::{analyze, ClassView, LaravelClassKind};
 use crate::laravel_introspector::model_metadata::pascal_to_snake;
 use crate::parser::parse_php;
 use crate::query_chain::flow;
@@ -243,6 +243,18 @@ fn classify_property(view: &ClassView, member: &str) -> Option<ClassifiedMember>
             kind: MagicMemberKind::Relationship,
         });
     }
+    // Many-to-many `->pivot` on a model declaring a custom pivot class
+    // (`protected $pivotClass = MembershipPivot::class;`, issue #30 item 4).
+    // Models without the override fall through — the default
+    // `Relations\Pivot` is vendor territory, not worth a card or a goto.
+    if member == "pivot" && view.kind == LaravelClassKind::Model {
+        if let Some(pivot) = &view.pivot_class {
+            return Some(ClassifiedMember {
+                declaring_fqcn: pivot.clone(),
+                kind: MagicMemberKind::Pivot,
+            });
+        }
+    }
     // Database column surfaced as a model attribute.
     if view.column_surface.iter().any(|c| c.name == member) {
         return Some(ClassifiedMember {
@@ -443,11 +455,16 @@ pub fn resolve_member_access_entries(
         // Property-form plain members stay (bounded: declared properties on
         // resolved classes). Facade methods (`Auth::check()`) are likewise
         // unbounded across a codebase; they're a goto/hover surface, not a
-        // find-references one, so they don't index here either.
+        // find-references one, so they don't index here either. Factory
+        // resolutions (`Model::factory()` + chained factory methods) follow
+        // the facade precedent: goto/hover only, no reverse-index entries.
         if m.form.is_call()
             && matches!(
                 resolved.kind,
-                MagicMemberKind::PlainMember | MagicMemberKind::FacadeMethod
+                MagicMemberKind::PlainMember
+                    | MagicMemberKind::FacadeMethod
+                    | MagicMemberKind::Factory
+                    | MagicMemberKind::FactoryMethod
             )
         {
             continue;
@@ -534,18 +551,11 @@ pub fn resolve_and_classify(
         None
     };
 
-    let (fqcn, confidence, via_facade) = match facade_concrete.or(helper_concrete) {
-        Some((fqcn, confidence)) => (fqcn, confidence, true),
+    let (fqcn, confidence, via_facade, via_factory) = match facade_concrete.or(helper_concrete) {
+        Some((fqcn, confidence)) => (fqcn, confidence, true, false),
         None => {
-            let (fqcn, confidence) = match resolve_receiver(
-                receiver,
-                bytes,
-                aliases,
-                resolver,
-                classviews,
-                project_root,
-            ) {
-                Some(r) => r,
+            match resolve_receiver(receiver, bytes, aliases, resolver, classviews, project_root) {
+                Some((fqcn, confidence)) => (fqcn, confidence, false, false),
                 // Call-form receivers are frequently builder CHAINS
                 // (`User::query()->active()`, `User::where(…)->active()`) whose
                 // links the direct resolver can't type. The chain's subject is its
@@ -553,17 +563,19 @@ pub fn resolve_and_classify(
                 // (`User::first()->full_name`) deliberately stay chain-blind: the
                 // column surface makes property terminals a far bigger
                 // false-positive net than the call surfaces gated below.
-                None if form.is_call() => resolve_call_chain_receiver(
-                    receiver,
-                    bytes,
-                    aliases,
-                    resolver,
-                    classviews,
-                    project_root,
-                )?,
+                None if form.is_call() => {
+                    let (fqcn, confidence, via_factory) = resolve_call_chain_receiver(
+                        receiver,
+                        bytes,
+                        aliases,
+                        resolver,
+                        classviews,
+                        project_root,
+                    )?;
+                    (fqcn, confidence, false, via_factory)
+                }
                 None => return None,
-            };
-            (fqcn, confidence, false)
+            }
         }
     };
 
@@ -577,6 +589,7 @@ pub fn resolve_and_classify(
         form,
         confidence,
         via_facade,
+        via_factory,
         resolver,
         classviews,
         project_root,
@@ -607,6 +620,7 @@ pub fn resolve_and_classify(
             form,
             Confidence::Medium,
             false, // a builder retry never comes through a facade
+            false, // …nor through a factory chain
             resolver,
             classviews,
             project_root,
@@ -650,6 +664,15 @@ fn record_macro_decl_dep(
 /// the way a plain `$obj->method()` is. (Magic kinds — scope / accessor /
 /// relationship / finder — still win over the facade tag: those are the
 /// concrete's own Eloquent surfaces and resolve more precisely.)
+///
+/// `via_factory` is the chain analogue for a factory-rooted subject
+/// (`User::factory()->…`, issue #30 item 3): `fqcn` is the resolved factory
+/// class, and a member the factory hierarchy declares (a custom state, the
+/// vendor `state`/`create`) re-tags [`MagicMemberKind::FactoryMethod`] so the
+/// goto/hover consumers own it instead of dropping it as a plain method.
+/// Unlike the facade signal it never degrades an undeclared member to the
+/// class line — factories forward the remainder to the model/builder, and a
+/// wrong-class target is worse than none.
 #[allow(clippy::too_many_arguments)]
 fn classify_against(
     fqcn: &str,
@@ -657,6 +680,7 @@ fn classify_against(
     form: AccessForm,
     confidence: Confidence,
     via_facade: bool,
+    via_factory: bool,
     resolver: &impl ClassFileResolver,
     classviews: &ClassViewCache,
     project_root: &Path,
@@ -664,7 +688,36 @@ fn classify_against(
     // A class the index knows: classify against its real surfaces first.
     if let Some(file_path) = resolver.class_file(fqcn) {
         if let Some(view) = classviews.get_or_build(fqcn, &file_path, project_root) {
+            // `Model::factory()` (issue #30 item 3): the method is vendor
+            // `HasFactory` magic, so classifying it against the model's own
+            // surfaces would at best yield a droppable PlainMember. Resolve
+            // the model → factory FQCN instead (`newFactory()` override or
+            // convention); no resolvable factory falls through to the normal
+            // surfaces. Checked first: a real `factory()` declaration wins
+            // over `__callStatic` magic in PHP, and Eloquent's own dispatch
+            // still lands on the trait method, never a `scopeFactory`.
+            if form.is_call() && member == "factory" && view.kind == LaravelClassKind::Model {
+                if let Some(factory) =
+                    crate::factory_resolver::factory_fqcn_for_model(&view, resolver)
+                {
+                    return Some(ResolvedMemberAccess {
+                        declaring_fqcn: factory,
+                        kind: MagicMemberKind::Factory,
+                        confidence,
+                    });
+                }
+            }
             if let Some(classified) = classify_member(&view, member, form) {
+                // A factory-chain member the factory hierarchy declares
+                // (`->suspended()`, `->state()`) — a real target Intelephense
+                // can't type without ide-helper. Re-tag so consumers keep it.
+                if via_factory && classified.kind == MagicMemberKind::PlainMember {
+                    return Some(ResolvedMemberAccess {
+                        declaring_fqcn: classified.declaring_fqcn,
+                        kind: MagicMemberKind::FactoryMethod,
+                        confidence,
+                    });
+                }
                 // A facade call whose member is just a plain method on the
                 // concrete (`Auth::check()` → `AuthManager::check()`) is a real
                 // goto target — tag it `FacadeMethod` so the consumers don't drop
@@ -739,6 +792,13 @@ fn classify_against(
 /// root re-enters the direct resolver capped at MEDIUM — informational
 /// (consumer gates accept High|Medium alike); the gates above plus
 /// classification are the real safety.
+///
+/// A `Model::factory()` root (issue #30 item 3) is the one deliberate
+/// exception to the first-link gate: instead of refusing, the chain's subject
+/// RE-TARGETS to the model's resolved factory class, and the returned
+/// `via_factory` flag tells [`classify_against`] to tag its declared members
+/// [`MagicMemberKind::FactoryMethod`]. Scope classification on the *model* is
+/// still refused for factory chains — that's what the gate protects.
 fn resolve_call_chain_receiver(
     receiver: Node,
     bytes: &[u8],
@@ -746,7 +806,7 @@ fn resolve_call_chain_receiver(
     resolver: &impl ClassFileResolver,
     classviews: &ClassViewCache,
     project_root: &Path,
-) -> Option<(String, Confidence)> {
+) -> Option<(String, Confidence, bool)> {
     let root = chain_root(receiver);
     if root.kind() == "scoped_call_expression" {
         let scope = root.child_by_field_name("scope")?;
@@ -779,6 +839,14 @@ fn resolve_call_chain_receiver(
         let first = root
             .child_by_field_name("name")
             .and_then(|n| n.utf8_text(bytes).ok())?;
+        // `Model::factory()->…` — the chain's subject is the FACTORY, not the
+        // model. Re-target before the forwarding gate; the model-relationship
+        // bail below doesn't apply (the links are factory members). A model
+        // with no resolvable factory keeps the original refusal.
+        if first == "factory" && view.kind == LaravelClassKind::Model {
+            let factory = crate::factory_resolver::factory_fqcn_for_model(&view, resolver)?;
+            return Some((factory, confidence, true));
+        }
         let first_is_forwarding = crate::query_chain::methods::is_eloquent_static_starter(first)
             || matches!(
                 classify_call(&view, first).map(|c| c.kind),
@@ -790,7 +858,7 @@ fn resolve_call_chain_receiver(
         if has_relationship_link(receiver, bytes, &view) {
             return None;
         }
-        return Some((fqcn, confidence));
+        return Some((fqcn, confidence, false));
     }
     if root.id() != receiver.id() {
         let (fqcn, confidence) =
@@ -809,7 +877,7 @@ fn resolve_call_chain_receiver(
             Confidence::High => Confidence::Medium,
             other => other,
         };
-        return Some((fqcn, capped));
+        return Some((fqcn, capped, false));
     }
     None
 }
@@ -2438,7 +2506,10 @@ pub fn resolve_member_access_entries_with_context(
         if m.form.is_call()
             && matches!(
                 resolved.kind,
-                MagicMemberKind::PlainMember | MagicMemberKind::FacadeMethod
+                MagicMemberKind::PlainMember
+                    | MagicMemberKind::FacadeMethod
+                    | MagicMemberKind::Factory
+                    | MagicMemberKind::FactoryMethod
             )
         {
             continue;
@@ -2502,19 +2573,19 @@ fn resolve_recipe_and_classify(
         None
     };
 
-    let (fqcn, confidence, via_facade) = match facade_concrete.or(helper_concrete) {
-        Some((fqcn, confidence)) => (fqcn, confidence, true),
+    let (fqcn, confidence, via_facade, via_factory) = match facade_concrete.or(helper_concrete) {
+        Some((fqcn, confidence)) => (fqcn, confidence, true, false),
         None => {
-            let (fqcn, confidence) =
-                match eval_receiver(&site.recipe, aliases, resolver, classviews, project_root) {
-                    Some(r) => r,
-                    None if form.is_call() => {
-                        let chain = site.chain.as_ref()?;
-                        eval_chain(chain, aliases, resolver, classviews, project_root)?
-                    }
-                    None => return None,
-                };
-            (fqcn, confidence, false)
+            match eval_receiver(&site.recipe, aliases, resolver, classviews, project_root) {
+                Some((fqcn, confidence)) => (fqcn, confidence, false, false),
+                None if form.is_call() => {
+                    let chain = site.chain.as_ref()?;
+                    let (fqcn, confidence, via_factory) =
+                        eval_chain(chain, aliases, resolver, classviews, project_root)?;
+                    (fqcn, confidence, false, via_factory)
+                }
+                None => return None,
+            }
         }
     };
 
@@ -2528,6 +2599,7 @@ fn resolve_recipe_and_classify(
         form,
         confidence,
         via_facade,
+        via_factory,
         resolver,
         classviews,
         project_root,
@@ -2548,6 +2620,7 @@ fn resolve_recipe_and_classify(
             member,
             form,
             Confidence::Medium,
+            false,
             false,
             resolver,
             classviews,
@@ -2652,7 +2725,7 @@ fn eval_chain(
     resolver: &impl ClassFileResolver,
     classviews: &ClassViewCache,
     project_root: &Path,
-) -> Option<(String, Confidence)> {
+) -> Option<(String, Confidence, bool)> {
     match &chain.root {
         ChainRootData::StaticScope {
             qualified,
@@ -2661,6 +2734,12 @@ fn eval_chain(
         } => {
             let file = resolver.class_file(qualified)?;
             let view = classviews.get_or_build(qualified, &file, project_root)?;
+            // `Model::factory()->…` re-targets to the factory (see
+            // [`resolve_call_chain_receiver`]'s static branch).
+            if first_method == "factory" && view.kind == LaravelClassKind::Model {
+                let factory = crate::factory_resolver::factory_fqcn_for_model(&view, resolver)?;
+                return Some((factory, *confidence, true));
+            }
             let first_is_forwarding =
                 crate::query_chain::methods::is_eloquent_static_starter(first_method)
                     || matches!(
@@ -2673,7 +2752,7 @@ fn eval_chain(
             if chain_links_hit_relationship(&chain.links, &view) {
                 return None;
             }
-            Some((qualified.clone(), *confidence))
+            Some((qualified.clone(), *confidence, false))
         }
         ChainRootData::Var(obj_recipe) => {
             let (fqcn, confidence) =
@@ -2689,7 +2768,7 @@ fn eval_chain(
                 Confidence::High => Confidence::Medium,
                 other => other,
             };
-            Some((fqcn, capped))
+            Some((fqcn, capped, false))
         }
     }
 }

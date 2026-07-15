@@ -13916,7 +13916,7 @@ impl LaravelLanguageServer {
     /// Forms, DTOs, value objects — any class with public properties.
     async fn get_class_properties(&self, class_name: &str) -> Vec<ModelPropertyCompletion> {
         use laravel_lsp::laravel_introspector::{
-            map_cast_to_php_type, relationship_to_php_type, ModelMetadata,
+            map_cast_to_php_type, relationship_to_php_type_with_collection, ModelMetadata,
         };
 
         // Synthetic Blade types — short-circuit before any filesystem lookup so they
@@ -14036,8 +14036,16 @@ impl LaravelLanguageServer {
         //    the trailing `()` so the completion handler picks it up
         //    as the method shape without an extra flag on the struct.
         for rel in &metadata.relationships {
-            let result_type =
-                relationship_to_php_type(&rel.relationship_type, rel.related_model.as_deref());
+            // A to-many result hydrates into the RELATED model's custom
+            // collection when it declares one (issue #30 item 4).
+            let collection_class = rel.related_model.as_deref().and_then(|related| {
+                laravel_lsp::laravel_introspector::chain::collection_class_for(related, &root)
+            });
+            let result_type = relationship_to_php_type_with_collection(
+                &rel.relationship_type,
+                rel.related_model.as_deref(),
+                collection_class.as_deref(),
+            );
             let relation_type = format!(
                 "{}<{}>",
                 rel.relationship_type,
@@ -18856,6 +18864,15 @@ return [
         // method-name token to narrow to on the Macroable host (it's vendor), so
         // jump to the definition's start with a zero-width caret.
         if matches!(data.kind, MagicMemberKind::Macro) {
+            let decl_file = data.decl_file?;
+            return Self::goto_link(&decl_file, data.decl_line.unwrap_or(0), 0, 0);
+        }
+
+        // A model factory (`User::factory()`) or custom pivot (`->pivot`)
+        // resolves to its CLASS — there's no member-named method to narrow to
+        // (the member is vendor-trait / runtime magic). The Salsa side already
+        // located the class line in `decl_file`/`decl_line`.
+        if matches!(data.kind, MagicMemberKind::Factory | MagicMemberKind::Pivot) {
             let decl_file = data.decl_file?;
             return Self::goto_link(&decl_file, data.decl_line.unwrap_or(0), 0, 0);
         }

@@ -72,6 +72,11 @@ pub struct ModelMetadata {
     pub accessors: Vec<AccessorInfo>,
     /// Relationships found in the model
     pub relationships: Vec<RelationshipInfo>,
+    /// Custom Eloquent collection FQCN (`$collectionClass` /
+    /// `newCollection()` override); `None` = framework default.
+    pub collection_class: Option<String>,
+    /// Custom pivot FQCN (`$pivotClass`); `None` = framework default.
+    pub pivot_class: Option<String>,
 }
 
 impl ModelMetadata {
@@ -120,6 +125,8 @@ impl ModelMetadata {
                     related_model: r.related_model.clone(),
                 })
                 .collect(),
+            collection_class: view.collection_class.clone(),
+            pivot_class: view.pivot_class.clone(),
         }
     }
 
@@ -545,6 +552,19 @@ pub fn map_cast_to_php_type(cast: &str) -> String {
 /// completion details should be short, and the model's namespace
 /// rarely adds value at a glance.
 pub fn relationship_to_php_type(rel_type: &str, related_model: Option<&str>) -> String {
+    relationship_to_php_type_with_collection(rel_type, related_model, None)
+}
+
+/// [`relationship_to_php_type`] with the related model's custom collection
+/// class (issue #30 item 4): a to-many result hydrates into the RELATED
+/// model's `newCollection()` / `$collectionClass`, so `collection_class`
+/// (when `Some`) replaces the default `Collection` label. Simple names for
+/// both, same display rule as the model.
+pub fn relationship_to_php_type_with_collection(
+    rel_type: &str,
+    related_model: Option<&str>,
+    collection_class: Option<&str>,
+) -> String {
     let model_full = related_model.unwrap_or("Model");
     let model = model_full.rsplit('\\').next().unwrap_or(model_full);
 
@@ -556,7 +576,10 @@ pub fn relationship_to_php_type(rel_type: &str, related_model: Option<&str>) -> 
         // Collection relationships
         "hasMany" | "belongsToMany" | "morphMany" | "morphToMany" | "morphedByMany"
         | "hasManyThrough" => {
-            format!("Collection<{}>", model)
+            let collection = collection_class
+                .map(|c| c.rsplit('\\').next().unwrap_or(c))
+                .unwrap_or("Collection");
+            format!("{}<{}>", collection, model)
         }
         _ => "mixed".to_string(),
     }

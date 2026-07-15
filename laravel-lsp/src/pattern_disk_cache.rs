@@ -101,7 +101,7 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        mis-decode. The bump also guarantees every restored non-vendor entry
 ///        carries context, so no "refs present but context missing" state can
 ///        exist on the resolve path.
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 12;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 

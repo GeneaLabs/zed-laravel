@@ -413,6 +413,16 @@ pub struct ClassView {
     /// for Eloquent Builder and Query Builder; empty for everything
     /// else.
     pub callstatic_surface: Vec<BuilderMethod>,
+
+    /// Custom Eloquent collection FQCN the model hydrates into —
+    /// `protected $collectionClass = UserCollection::class;` or a
+    /// `newCollection()` override (issue #30 item 4). `None` = the
+    /// framework default `Illuminate\Database\Eloquent\Collection`.
+    pub collection_class: Option<String>,
+    /// Custom pivot FQCN for the model's many-to-many rows —
+    /// `protected $pivotClass = MembershipPivot::class;`. `None` = the
+    /// framework default `Relations\Pivot`.
+    pub pivot_class: Option<String>,
 }
 
 /// Single-file analysis: parse `content` and compute every Laravel
@@ -497,6 +507,13 @@ fn analyze_from_prefixed(content: &str) -> Option<ClassView> {
         table_name: compute_table_name(&all_properties),
         column_surface,
         callstatic_surface: Vec::new(),
+        collection_class: compute_collection_class(
+            &all_methods,
+            &all_properties,
+            &aliases,
+            namespace.as_deref(),
+        ),
+        pivot_class: compute_pivot_class(&all_properties, &aliases, namespace.as_deref()),
         all_methods,
         all_properties,
     })
@@ -566,6 +583,9 @@ pub fn analyze(file_path: &Path, project_root: &Path) -> Option<ClassView> {
     let casts = compute_casts(&all_methods, &all_properties);
     let table_name = compute_table_name(&all_properties);
     let column_surface = compute_column_surface(&all_methods, &all_properties, &casts);
+    let collection_class =
+        compute_collection_class(&all_methods, &all_properties, aliases, namespace.as_deref());
+    let pivot_class = compute_pivot_class(&all_properties, aliases, namespace.as_deref());
     let callstatic_surface = match kind {
         LaravelClassKind::EloquentBuilder | LaravelClassKind::QueryBuilder => {
             compute_callstatic_surface(&all_methods, &fqcn)
@@ -589,6 +609,8 @@ pub fn analyze(file_path: &Path, project_root: &Path) -> Option<ClassView> {
         table_name,
         column_surface,
         callstatic_surface,
+        collection_class,
+        pivot_class,
     })
 }
 
@@ -1222,6 +1244,102 @@ fn compute_table_name(properties: &[ResolvedMember<PhpPropertyInfo>]) -> Option<
     let prop = properties.iter().find(|p| p.value.name == "table")?;
     let default = prop.value.default_value.as_deref()?;
     unquote_string_literal(default)
+}
+
+// ---- Custom collection / pivot overrides (issue #30 item 4) -------------
+
+/// The model's custom Eloquent collection FQCN: a `$collectionClass`
+/// property default first (child-first ordering — first match wins, same
+/// as PHP), else a `newCollection()` override's declared return type or
+/// its `new X(...)` body. `None` when the model uses the framework default.
+fn compute_collection_class(
+    methods: &[ResolvedMember<PhpMethodInfo>],
+    properties: &[ResolvedMember<PhpPropertyInfo>],
+    aliases: &HashMap<String, String>,
+    file_namespace: Option<&str>,
+) -> Option<String> {
+    class_property_override(properties, "collectionClass", aliases, file_namespace).or_else(|| {
+        let m = methods.iter().find(|m| m.value.name == "newCollection")?;
+        let raw = m
+            .value
+            .return_type_raw
+            .as_deref()
+            .filter(|t| {
+                // A bare `Collection` return type is the framework default,
+                // not an override worth surfacing.
+                t.trim_start_matches('?').rsplit('\\').next() != Some("Collection")
+            })
+            .map(str::to_string)
+            .or_else(|| m.value.body_source.as_deref().and_then(first_new_class))?;
+        Some(
+            crate::laravel_introspector::model_metadata::resolve_to_fqcn(
+                raw.trim_start_matches('?'),
+                file_namespace,
+                aliases,
+            ),
+        )
+    })
+}
+
+/// The model's custom pivot FQCN (`protected $pivotClass = X::class;`).
+fn compute_pivot_class(
+    properties: &[ResolvedMember<PhpPropertyInfo>],
+    aliases: &HashMap<String, String>,
+    file_namespace: Option<&str>,
+) -> Option<String> {
+    class_property_override(properties, "pivotClass", aliases, file_namespace)
+}
+
+/// The custom collection FQCN `model_fqcn` hydrates into, if the model (or
+/// an ancestor) declares one. Resolves the model's file through composer
+/// autoload and runs the memoized analysis — the lookup the completion call
+/// sites use per relationship's RELATED model.
+pub fn collection_class_for(model_fqcn: &str, project_root: &Path) -> Option<String> {
+    let path =
+        crate::class_locator::find_php_class_file_in_app_or_vendor(model_fqcn, project_root)?;
+    analyze(&path, project_root)?.collection_class
+}
+
+/// Resolve a `protected $name = X::class;` (or `'App\\…\\X'` string) property
+/// default to an FQCN. Uses the ENTRY file's aliases — the same convention
+/// `compute_relationships` applies to inherited members.
+fn class_property_override(
+    properties: &[ResolvedMember<PhpPropertyInfo>],
+    name: &str,
+    aliases: &HashMap<String, String>,
+    file_namespace: Option<&str>,
+) -> Option<String> {
+    let default = properties
+        .iter()
+        .find(|p| p.value.name == name)?
+        .value
+        .default_value
+        .as_deref()?
+        .trim()
+        .to_string();
+    if let Some(class_ref) = default.strip_suffix("::class") {
+        return Some(
+            crate::laravel_introspector::model_metadata::resolve_to_fqcn(
+                class_ref.trim(),
+                file_namespace,
+                aliases,
+            ),
+        );
+    }
+    // Quoted-string form carries a full class path already.
+    unquote_string_literal(&default).map(|s| s.trim_start_matches('\\').to_string())
+}
+
+/// The class named by the first `new X(...)` in a method body — the
+/// body-strategy counterpart of a declared return type (same `contains`-level
+/// heuristic `compute_relationships` uses for relationship bodies).
+fn first_new_class(body: &str) -> Option<String> {
+    let idx = body.find("new ")?;
+    let token: String = body[idx + 4..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '\\')
+        .collect();
+    (!token.is_empty()).then_some(token)
 }
 
 // ---- __callStatic surface (Builder) ------------------------------------

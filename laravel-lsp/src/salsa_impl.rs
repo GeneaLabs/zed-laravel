@@ -3290,6 +3290,23 @@ pub enum MagicMemberKind {
     /// which the consumers drop as Intelephense's territory — because a facade
     /// call is precisely what Intelephense CAN'T see through, so we own it.
     FacadeMethod,
+    /// A model's `factory()` call (`User::factory()`). The method itself is
+    /// `HasFactory::factory()` — vendor trait magic no PHP LSP resolves to the
+    /// project's factory class without ide-helper. `declaring_fqcn` is the
+    /// resolved factory FQCN (`newFactory()` override or Laravel convention);
+    /// the goto/hover target is that factory class's declaration line.
+    Factory,
+    /// A method called on a factory-rooted chain (`User::factory()->state(…)`,
+    /// a custom state like `->suspended()`). `declaring_fqcn` is the class that
+    /// actually declares the method (the project factory, or the vendor
+    /// `Factories\Factory` base). Distinct from `PlainMember` — which consumers
+    /// drop as Intelephense's — because the chain's factory subject is exactly
+    /// what Intelephense can't type without ide-helper.
+    FactoryMethod,
+    /// A many-to-many `->pivot` attribute on a model that declares a custom
+    /// pivot class (`protected $pivotClass = MembershipPivot::class;`).
+    /// `declaring_fqcn` is that pivot FQCN; the target is its class line.
+    Pivot,
     /// Generic (non-magic) property on a resolved class.
     PlainMember,
 }

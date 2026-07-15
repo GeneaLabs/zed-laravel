@@ -253,6 +253,12 @@ pub fn magic_member_card(
         // concrete the facade forwards to. Worth a card precisely because
         // Intelephense can't see through the proxy.
         MagicMemberKind::FacadeMethod => "Facade method",
+        // `Model::factory()` — declaring_fqcn is the resolved factory class.
+        MagicMemberKind::Factory => "Model factory",
+        // A method on a factory-rooted chain (custom state, vendor `state`).
+        MagicMemberKind::FactoryMethod => "Factory method",
+        // `->pivot` on a model with a custom `$pivotClass`.
+        MagicMemberKind::Pivot => "Pivot model",
         // Generic property — Intelephense already covers it. Don't duplicate.
         MagicMemberKind::PlainMember => return String::new(),
     };
