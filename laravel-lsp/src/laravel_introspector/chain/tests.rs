@@ -326,6 +326,42 @@ class Portfolio extends Model {
 }
 
 #[test]
+fn restated_default_collection_property_is_not_an_override() {
+    // `$collectionClass = \Illuminate\…\Collection::class;` restates the
+    // framework default — the property path honors the same no-override
+    // contract as the `newCollection()` return-type path.
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    protected $collectionClass = \Illuminate\Database\Eloquent\Collection::class;
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    assert_eq!(view.collection_class, None);
+}
+
+#[test]
+fn restated_default_pivot_property_is_not_an_override() {
+    // Same contract for `$pivotClass = Pivot::class;` — a restated default
+    // must not surface a "custom" pivot pointing into vendor code.
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Relations\Pivot;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    protected $pivotClass = Pivot::class;
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    assert_eq!(view.pivot_class, None);
+}
+
+#[test]
 fn models_without_overrides_default_collection_and_pivot_to_none() {
     // The common case: no `$collectionClass`, no `newCollection()`, no
     // `$pivotClass` — both stay `None` so consumers keep default behavior.

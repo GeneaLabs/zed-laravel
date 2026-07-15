@@ -3582,6 +3582,33 @@ fn factory_call_without_factory_file_does_not_classify() {
 }
 
 #[test]
+fn phantom_new_factory_override_does_not_classify() {
+    // `newFactory()` names a class with no file on disk. The declared
+    // override is authoritative (no convention fallback), and a phantom
+    // FQCN must not surface as a Factory tag — hover would render a card
+    // for a class that isn't there.
+    let override_model = r#"<?php
+namespace App\Models;
+use Database\Factories\Custom\GhostFactory;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected static function newFactory() { return GhostFactory::new(); }
+}
+"#;
+    let p = project_files(&[
+        ("app/Models/User.php", override_model),
+        // A conventional factory EXISTS on disk — proving the phantom
+        // override refuses rather than silently falling back to it.
+        ("database/factories/UserFactory.php", USER_FACTORY_SRC),
+    ]);
+    let r = resolve_static_call(&p.index, &p.root, FACTORY_CALLER, "factory");
+    assert!(
+        r.is_none(),
+        "a phantom newFactory target must not classify; got {r:?}"
+    );
+}
+
+#[test]
 fn factory_chain_declared_state_classifies_as_factory_method() {
     // `User::factory()->suspended()` — the chain's subject re-targets to the
     // factory, and a state the factory DECLARES tags FactoryMethod (not a

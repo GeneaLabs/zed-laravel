@@ -1258,32 +1258,39 @@ fn compute_collection_class(
     aliases: &HashMap<String, String>,
     file_namespace: Option<&str>,
 ) -> Option<String> {
-    class_property_override(properties, "collectionClass", aliases, file_namespace).or_else(|| {
-        let m = methods.iter().find(|m| m.value.name == "newCollection")?;
-        let raw = m
-            .value
-            .return_type_raw
-            .as_deref()
-            .map(str::to_string)
-            .or_else(|| m.value.body_source.as_deref().and_then(first_new_class))?;
-        let fqcn = crate::laravel_introspector::model_metadata::resolve_to_fqcn(
-            raw.trim_start_matches('?'),
-            file_namespace,
-            aliases,
-        );
-        // Restating the framework default — whether in the return type or
-        // the `new X(...)` body — is not an override worth surfacing.
-        (fqcn != "Illuminate\\Database\\Eloquent\\Collection").then_some(fqcn)
-    })
+    class_property_override(properties, "collectionClass", aliases, file_namespace)
+        .or_else(|| {
+            let m = methods.iter().find(|m| m.value.name == "newCollection")?;
+            let raw = m
+                .value
+                .return_type_raw
+                .as_deref()
+                .map(str::to_string)
+                .or_else(|| m.value.body_source.as_deref().and_then(first_new_class))?;
+            Some(
+                crate::laravel_introspector::model_metadata::resolve_to_fqcn(
+                    raw.trim_start_matches('?'),
+                    file_namespace,
+                    aliases,
+                ),
+            )
+        })
+        // Restating the framework default — in the property, the return
+        // type, or the `new X(...)` body — is not an override worth
+        // surfacing; the filter sits outside both paths so they share it.
+        .filter(|fqcn| fqcn != "Illuminate\\Database\\Eloquent\\Collection")
 }
 
 /// The model's custom pivot FQCN (`protected $pivotClass = X::class;`).
+/// `None` when the model uses the framework default — a restated default
+/// is filtered the same way as the collection path above.
 fn compute_pivot_class(
     properties: &[ResolvedMember<PhpPropertyInfo>],
     aliases: &HashMap<String, String>,
     file_namespace: Option<&str>,
 ) -> Option<String> {
     class_property_override(properties, "pivotClass", aliases, file_namespace)
+        .filter(|fqcn| fqcn != "Illuminate\\Database\\Eloquent\\Relations\\Pivot")
 }
 
 /// The custom collection FQCN `model_fqcn` hydrates into, if the model (or

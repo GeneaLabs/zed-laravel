@@ -41,7 +41,11 @@ pub fn factory_fqcn_for_model(
                 .ok()
                 .and_then(|src| factory_from_new_factory(&src))
             {
-                return Some(fqcn);
+                // The declared override is authoritative — no convention
+                // fallback — but it honors the same gate as the convention
+                // branch: a named class with no file on disk is a dead
+                // target (goto AND hover), so it yields `None`.
+                return resolver.class_file(&fqcn).map(|_| fqcn);
             }
         }
     }
@@ -119,8 +123,8 @@ fn find_method<'t>(
     None
 }
 
-/// The first class name referenced inside `node` as `X::…` (scoped call /
-/// `::class` constant) or `new X(…)`.
+/// The first class name referenced inside `node` — in document order — as
+/// `X::…` (scoped call / `::class` constant) or `new X(…)`.
 fn first_class_token(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
@@ -140,8 +144,12 @@ fn first_class_token(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
                 }
             }
         }
+        // Push children REVERSED so the LIFO stack pops siblings
+        // left-to-right — a plain forward push would visit them in
+        // reverse and return the LAST reference for multi-branch bodies.
         let mut cursor = n.walk();
-        for ch in n.children(&mut cursor) {
+        let children: Vec<_> = n.children(&mut cursor).collect();
+        for ch in children.into_iter().rev() {
             stack.push(ch);
         }
     }
@@ -219,5 +227,29 @@ class User {
     fn no_new_factory_method_yields_none() {
         let src = "<?php namespace App\\Models; class User {}";
         assert_eq!(factory_from_new_factory(src), None);
+    }
+
+    #[test]
+    fn new_factory_multi_reference_body_yields_first_in_document_order() {
+        // A conditional override references two factories; the FIRST in
+        // source order wins (regression: the DFS used to pop siblings
+        // right-to-left and returned the last).
+        let src = r#"<?php
+namespace App\Models;
+use Database\Factories\FirstFactory;
+use Database\Factories\SecondFactory;
+class User {
+    protected static function newFactory() {
+        if (app()->environment('testing')) {
+            return FirstFactory::new();
+        }
+        return SecondFactory::new();
+    }
+}
+"#;
+        assert_eq!(
+            factory_from_new_factory(src).as_deref(),
+            Some("Database\\Factories\\FirstFactory")
+        );
     }
 }
