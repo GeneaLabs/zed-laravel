@@ -1855,7 +1855,7 @@ fn foreach_parts<'t>(foreach: Node<'t>, bytes: &[u8]) -> Option<(Node<'t>, Strin
 /// FQCN of the class lexically enclosing `node`, or `None` when `node` isn't
 /// inside a class (e.g. a free function, or a `$this` inside a trait — whose
 /// runtime class is unknowable statically).
-fn enclosing_class_fqcn(node: Node, bytes: &[u8]) -> Option<String> {
+pub(crate) fn enclosing_class_fqcn(node: Node, bytes: &[u8]) -> Option<String> {
     let class = enclosing_class_node(node)?;
     let class_name = class
         .child_by_field_name("name")

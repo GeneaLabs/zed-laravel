@@ -65,6 +65,7 @@ use super::methods::{
     chain_effect, is_eloquent_static_starter, is_known_builder_method, COLLECTION_TERMINATORS,
 };
 use super::use_aliases::{resolve_class_name, UseAliases};
+use crate::member_resolver::enclosing_class_fqcn;
 use crate::salsa_impl::Confidence;
 
 /// Cap how many `$a = $b->...; $b = $a->...; ...` hops we'll follow.
@@ -156,8 +157,10 @@ pub fn latest_assignment_before<'tree>(
 /// apply — only [`ChainEffect::None`] builder methods pass through), and the
 /// outermost call is a [`COLLECTION_TERMINATORS`] entry (`get`, `pluck`, …).
 /// The chain root is a variable resolvable to a model (via the normal flow
-/// walk), an Eloquent static starter (`User::query()`), or a construction
-/// (`(new User)`).
+/// walk), an Eloquent static starter (`User::query()`), a construction
+/// (`(new User)`), `$this` (the enclosing class's model), or a `$this->prop`
+/// relation-property access (`$this->user->competitions()->get()`). Chain
+/// links may be joined by `->` or nullsafe `?->` interchangeably.
 ///
 /// *Unrecognised* middle calls don't reject the shape — mirroring the inline
 /// cursor collector ([`crate::query_chain::cursor`]), each is a heuristic
@@ -167,31 +170,34 @@ pub fn latest_assignment_before<'tree>(
 /// so the finalize step resolves them after the receiver's claim, with a
 /// miss keeping the running model unchanged.
 ///
-/// Returns `(base_model_fqcn, relation_name, heuristic_hops)` so the
-/// extractor can emit a collection-mode receiver with the relation (and any
-/// heuristic candidates) queued as pending hops — the relation→related-model
-/// resolution needs a model-file read, so it stays deferred to the async
-/// finalize step. `None` means the assignment doesn't match the shape
-/// (callers fall back to plain flow typing).
+/// Returns a [`CollectionRelation`] so the extractor can emit a
+/// collection-mode receiver with the relation (and any heuristic candidates)
+/// queued as pending hops — the relation→related-model resolution needs a
+/// model-file read, so it stays deferred to the async finalize step. `None`
+/// means the assignment doesn't match the shape (callers fall back to plain
+/// flow typing).
 pub fn resolve_collection_relation(
     rhs: Node,
     assignment_start: usize,
     bytes: &[u8],
     aliases: &UseAliases,
-) -> Option<(String, String, Vec<String>)> {
+) -> Option<CollectionRelation> {
     let outer = unwrap_parens(rhs);
-    if outer.kind() != "member_call_expression" {
+    if !is_member_call(outer) {
         return None;
     }
 
     // Collect the chain's method names outermost → innermost, stopping at
     // the first non-call node (the chain root). Parens along the way are
     // syntactic wrapping, not chain structure — unwrap them so a
-    // `(new User)->competitions()->get()` root is still reached.
+    // `(new User)->competitions()->get()` root is still reached. Nullsafe
+    // links (`?->`) are chain structure like plain `->` — a null root
+    // short-circuits the whole chain at runtime, so the non-null result
+    // still types to the related collection.
     let mut methods: Vec<&str> = Vec::new();
     let mut node = outer;
     let root = loop {
-        if node.kind() == "member_call_expression" {
+        if is_member_call(node) {
             methods.push(node_text(node.child_by_field_name("name")?, bytes)?);
             node = unwrap_parens(node.child_by_field_name("object")?);
         } else {
@@ -199,18 +205,72 @@ pub fn resolve_collection_relation(
         }
     };
 
-    // Shape gate: a collection terminator on top, the relation candidate at
-    // the bottom, and no *recognised* middle method whose [`ChainEffect`]
-    // isn't `None`. A mid-chain `get()` (FlipToCollection), `toBase()`
-    // (FlipToBase), or `first()` (Terminate) means everything after it
-    // operates on a collection / base builder / single model, not the
-    // relation query, so typing the variable to the related model would be
-    // wrong. Table-qualified column strings in the middle links are just
-    // arguments — they never affect this method-name walk.
+    // Split terminator (outermost) off, then pick the relation claim by root
+    // shape. For call-rooted chains (`$user->…`, `User::query()->…`,
+    // `(new User)->…`, `$this->…`) the claim is the deepest *call*. For a
+    // `$this->prop` root the claim is the *property* itself — the deepest
+    // call then rides the heuristic-hop queue like any other middle call.
     let (&terminator, rest) = methods.split_first()?;
-    let (&relation, middle) = rest.split_last()?;
+    let (base, relation, from_call, middle) = match root.kind() {
+        // `$this->user->competitions()->get()` — a relation accessed as a
+        // property on `$this`, resolved against the enclosing class's model.
+        // Only a bare-`$this` object is handled; the runtime class of
+        // `$other->prop` would itself need resolving first.
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            let object = root.child_by_field_name("object")?;
+            if object.kind() != "variable_name" || node_text(object, bytes)? != "$this" {
+                return None;
+            }
+            let relation = node_text(root.child_by_field_name("name")?, bytes)?;
+            let base = enclosing_class_fqcn(root, bytes)?;
+            (base, relation, false, rest)
+        }
+        _ => {
+            let (&relation, middle) = rest.split_last()?;
+            if is_known_builder_method(relation) {
+                return None;
+            }
+            // Type the chain root: `$this` is the enclosing class; `$base`
+            // goes via the normal flow walk (bounded at this assignment, so
+            // we don't re-find the assignment we're inside); a static
+            // Eloquent starter (`User::query()->relation()->get()`) or a
+            // construction (`(new User)->relation()->get()` — parens already
+            // unwrapped by the walk above) classify directly.
+            let base = match root.kind() {
+                "variable_name" if node_text(root, bytes)? == "$this" => {
+                    enclosing_class_fqcn(root, bytes)?
+                }
+                "variable_name" => {
+                    let raw = node_text(root, bytes)?;
+                    let base_var = raw.trim_start_matches('$').to_string();
+                    resolve_with_boundary(
+                        root,
+                        assignment_start,
+                        bytes,
+                        &base_var,
+                        aliases,
+                        0,
+                        None,
+                    )?
+                    .0
+                }
+                "scoped_call_expression" => classify_scoped_call(root, bytes, aliases)?,
+                "object_creation_expression" => extract_new_class(root, bytes, aliases)?,
+                _ => return None,
+            };
+            (base, relation, true, middle)
+        }
+    };
+
+    // Shape gate: a collection terminator on top, and no *recognised* middle
+    // method whose [`ChainEffect`] isn't `None`. A mid-chain `get()`
+    // (FlipToCollection), `toBase()` (FlipToBase), or `first()` (Terminate)
+    // means everything after it operates on a collection / base builder /
+    // single model, not the relation query, so typing the variable to the
+    // related model would be wrong. Table-qualified column strings in the
+    // middle links are just arguments — they never affect this method-name
+    // walk.
     if !COLLECTION_TERMINATORS.contains(&terminator)
-        || is_known_builder_method(relation)
         || middle
             .iter()
             .any(|m| is_known_builder_method(m) && chain_effect(m) != ChainEffect::None)
@@ -228,22 +288,35 @@ pub fn resolve_collection_relation(
         .map(|m| m.to_string())
         .collect();
 
-    // Type the chain root: `$base` via the normal flow walk (bounded at this
-    // assignment, so we don't re-find the assignment we're inside), a static
-    // Eloquent starter (`User::query()->relation()->get()`), or a
-    // construction (`(new User)->relation()->get()` — parens already
-    // unwrapped by the walk above).
-    let base = match root.kind() {
-        "variable_name" => {
-            let raw = node_text(root, bytes)?;
-            let base_var = raw.trim_start_matches('$').to_string();
-            resolve_with_boundary(root, assignment_start, bytes, &base_var, aliases, 0, None)?.0
-        }
-        "scoped_call_expression" => classify_scoped_call(root, bytes, aliases)?,
-        "object_creation_expression" => extract_new_class(root, bytes, aliases)?,
-        _ => return None,
-    };
-    Some((base, relation.to_string(), heuristic_hops))
+    Some(CollectionRelation {
+        base,
+        relation: relation.to_string(),
+        from_call,
+        heuristic_hops,
+    })
+}
+
+/// A detected executed-relation-collection assignment
+/// ([`resolve_collection_relation`]): the resolved base model, the relation
+/// claim to defer, whether the claim was a method *call* (`false` for the
+/// `$this->prop->…` property form — the split decides miss semantics, see
+/// [`super::chain::RelationHopKind`]), and the chain's unrecognised middle
+/// calls in source order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionRelation {
+    pub base: String,
+    pub relation: String,
+    pub from_call: bool,
+    pub heuristic_hops: Vec<String>,
+}
+
+/// Whether `node` is a member call joined by `->` or `?->` — both are chain
+/// structure for the walks in this module.
+fn is_member_call(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "member_call_expression" | "nullsafe_member_call_expression"
+    )
 }
 
 /// Like [`resolve`], but also reports the [`Confidence`] tier of the

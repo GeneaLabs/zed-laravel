@@ -620,6 +620,219 @@ async fn scoped_relation_collection_flags_typo_on_related_table() {
     );
 }
 
+// ---- nullsafe / $this-rooted / scope-before-relation shapes (issue #272) --
+
+#[tokio::test]
+async fn nullsafe_relation_collection_validates_against_related_table() {
+    // `$user?->competitions()?->get()` — nullsafe links are chain structure
+    // like plain `->` (a null root short-circuits at runtime), so the
+    // collection still validates against the related table.
+    let (_dir, root, db) = competitions_project().await;
+    let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$regs = $user?->competitions()?->get();\n$regs->whereIn('type', ['league'])->pluck('id');\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "nullsafe executed relation must validate against competitions: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn nullsafe_relation_collection_flags_typo_on_related_table() {
+    // Companion negative: the nullsafe detection narrows the table, it does
+    // not silence diagnostics — `typo` still flags against competitions.
+    let (_dir, root, db) = competitions_project().await;
+    let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$regs = $user?->competitions()?->get();\n$regs->whereIn('typo', ['league'])->pluck('id');\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "typo in the nullsafe collection chain still flags: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert!(
+        diags[0].message.contains("competitions"),
+        "diagnostic should name the competitions table; got: {}",
+        diags[0].message
+    );
+}
+
+#[tokio::test]
+async fn this_rooted_relation_collection_validates_against_related_table() {
+    // `$this->competitions()->get()` inside a model method — the relation
+    // resolves against the enclosing class's model (User), so the collection
+    // validates against competitions.
+    let (_dir, root, db) = competitions_project().await;
+    let source = "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass User extends Model {\n    public function run() {\n        $regs = $this->competitions()->get();\n        $regs->whereIn('type', ['league'])->pluck('id');\n    }\n}\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "$this-rooted executed relation must validate against competitions: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn this_rooted_relation_collection_flags_typo_on_related_table() {
+    // Companion negative for the $this root: `typo` isn't a competitions
+    // column — flagged, and against the competitions table.
+    let (_dir, root, db) = competitions_project().await;
+    let source = "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass User extends Model {\n    public function run() {\n        $regs = $this->competitions()->get();\n        $regs->whereIn('typo', ['league'])->pluck('id');\n    }\n}\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "typo in the $this-rooted collection chain still flags: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert!(
+        diags[0].message.contains("competitions"),
+        "diagnostic should name the competitions table; got: {}",
+        diags[0].message
+    );
+}
+
+/// A `Registration` model with a `user` belongsTo relation — the
+/// `$this->user->…` property-rooted fixture (issue #272).
+const REGISTRATION_MODEL: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Registration extends Model {
+    public function user() { return $this->belongsTo(User::class); }
+}
+"#;
+
+/// Seed the property-rooted fixture set: Registration → user → User →
+/// competitions → Competition, with users/competitions tables.
+async fn registrations_project() -> (TempDir, PathBuf, DatabaseSchemaProvider) {
+    let (dir, root) = project_with_models(&[
+        ("Registration", REGISTRATION_MODEL),
+        ("User", USER_WITH_COMPETITIONS),
+        ("Competition", COMPETITION_MODEL),
+    ]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("email", "string")]),
+            ("competitions", &[("id", "int"), ("type", "string")]),
+        ],
+    )
+    .await;
+    (dir, root, db)
+}
+
+#[tokio::test]
+async fn this_property_rooted_relation_collection_validates_against_related_table() {
+    // `$this->user->competitions()->get()` — the `user` property claim hops
+    // to User, then `competitions` rides the heuristic queue to Competition,
+    // so the collection validates against competitions.
+    let (_dir, root, db) = registrations_project().await;
+    let source = "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Registration extends Model {\n    public function run() {\n        $regs = $this->user->competitions()->get();\n        $regs->whereIn('type', ['league'])->pluck('id');\n    }\n}\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "$this->prop-rooted executed relation must validate against competitions: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn this_property_rooted_relation_collection_flags_typo_on_related_table() {
+    // Companion negative for the $this->prop root: still flagged, against
+    // the competitions table (two hops from Registration).
+    let (_dir, root, db) = registrations_project().await;
+    let source = "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Registration extends Model {\n    public function run() {\n        $regs = $this->user->competitions()->get();\n        $regs->whereIn('typo', ['league'])->pluck('id');\n    }\n}\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "typo in the $this->prop-rooted collection chain still flags: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert!(
+        diags[0].message.contains("competitions"),
+        "diagnostic should name the competitions table; got: {}",
+        diags[0].message
+    );
+}
+
+/// `User` with a local scope AND a `competitions` relation — the
+/// root-scope-before-relation fixture (issue #272 AC #4).
+const USER_WITH_TENANT_SCOPE_AND_COMPETITIONS: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopeForCurrentTenant($query) { return $query->where('id', 1); }
+    public function competitions() { return $this->hasMany(Competition::class); }
+}
+"#;
+
+/// Seed the scope-before-relation fixture set.
+async fn tenant_competitions_project() -> (TempDir, PathBuf, DatabaseSchemaProvider) {
+    let (dir, root) = project_with_models(&[
+        ("User", USER_WITH_TENANT_SCOPE_AND_COMPETITIONS),
+        ("Competition", COMPETITION_MODEL),
+    ]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("email", "string")]),
+            ("competitions", &[("id", "int"), ("type", "string")]),
+        ],
+    )
+    .await;
+    (dir, root, db)
+}
+
+#[tokio::test]
+async fn root_scope_before_relation_collection_validates_against_related_table() {
+    // Issue #272 AC #4: `$user->forCurrentTenant()->competitions()->get()` —
+    // the seed call `forCurrentTenant` is a scope CallClaim whose miss keeps
+    // the running model (User), then `competitions` rides a heuristic hop to
+    // Competition. Each primitive is unit-tested; this pins the composed
+    // end-to-end shape.
+    let (_dir, root, db) = tenant_competitions_project().await;
+    let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$regs = $user->forCurrentTenant()->competitions()->get();\n$regs->whereIn('type', ['league'])->pluck('id');\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "scope-before-relation executed chain must validate against competitions: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn root_scope_before_relation_collection_flags_typo_on_related_table() {
+    // Companion negative: the composed shape narrows the table, it does not
+    // silence diagnostics — `typo` flags against competitions, not users.
+    let (_dir, root, db) = tenant_competitions_project().await;
+    let source = "<?php\nuse App\\Models\\User;\n/** @var User $user */\n$regs = $user->forCurrentTenant()->competitions()->get();\n$regs->whereIn('typo', ['league'])->pluck('id');\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "typo after a scope-before-relation chain still flags: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert!(
+        diags[0].message.contains("competitions"),
+        "diagnostic should name the competitions table; got: {}",
+        diags[0].message
+    );
+}
+
 #[tokio::test]
 async fn local_scope_before_terminator_still_flags_typo_on_root_table() {
     // Regression (PR #266 review): `forCurrentTenant` is a local scope, not a

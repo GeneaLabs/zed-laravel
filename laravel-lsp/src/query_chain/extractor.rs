@@ -632,20 +632,21 @@ fn member_chain_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> Chai
             // assignment shape first and emit the same receiver as the
             // property-access form (`$base->relation->…`): collection mode at
             // the base model, with the relation queued as a pending hop for
-            // the async finalize step. `from_call: true` — the claimed name
-            // is a method call, so a finalize miss may still be a local
-            // scope (see [`RelationHopKind::CallClaim`]). `call_hops` carries
-            // the chain's unrecognised middle calls (scopes, unmodeled
-            // builder methods, further relation hops) as heuristic hops.
-            if let Some((base_type, relation, call_hops)) = assignment.and_then(|(rhs, start)| {
+            // the async finalize step. `from_call` distinguishes a claimed
+            // method call (a finalize miss may still be a local scope, see
+            // [`RelationHopKind::CallClaim`]) from the `$this->prop->…`
+            // property claim (issue #272). `call_hops` carries the chain's
+            // unrecognised middle calls (scopes, unmodeled builder methods,
+            // further relation hops) as heuristic hops.
+            if let Some(cr) = assignment.and_then(|(rhs, start)| {
                 super::flow::resolve_collection_relation(rhs, start, bytes, aliases)
             }) {
                 return ChainReceiver::Eloquent(EloquentReceiver::RelationProperty {
                     var,
-                    base_type: Some(base_type),
-                    relation,
-                    from_call: true,
-                    call_hops,
+                    base_type: Some(cr.base),
+                    relation: cr.relation,
+                    from_call: cr.from_call,
+                    call_hops: cr.heuristic_hops,
                 });
             }
             // Phase 9: try to resolve `$var`'s declared class via either a

@@ -557,7 +557,7 @@ function search() {
 
 /// Run [`super::resolve_collection_relation`] against the Nth occurrence of
 /// `$var` in the snippet.
-fn resolve_collection_at(src: &str, var: &str, n: usize) -> Option<(String, String, Vec<String>)> {
+fn resolve_collection_full(src: &str, var: &str, n: usize) -> Option<super::CollectionRelation> {
     let wrapped = format!("<?php\n{src}");
     let tree = parse_php(&wrapped).expect("parse");
     let bytes = wrapped.as_bytes();
@@ -565,6 +565,17 @@ fn resolve_collection_at(src: &str, var: &str, n: usize) -> Option<(String, Stri
     let node = find_nth_var(&tree, bytes, var, n)?;
     let (rhs, start) = super::latest_assignment_before(node, bytes, var)?;
     super::resolve_collection_relation(rhs, start, bytes, &aliases)
+}
+
+/// [`resolve_collection_full`] projected to the `(base, relation, hops)`
+/// triple the pre-#272 assertions were written against, with the call-claim
+/// flag asserted (every shape here claims a method *call*; the property-claim
+/// form has its own dedicated tests).
+fn resolve_collection_at(src: &str, var: &str, n: usize) -> Option<(String, String, Vec<String>)> {
+    resolve_collection_full(src, var, n).map(|cr| {
+        assert!(cr.from_call, "expected a call claim, got a property claim");
+        (cr.base, cr.relation, cr.heuristic_hops)
+    })
 }
 
 /// `resolve_collection_at` with no heuristic middle hops expected — the
@@ -801,4 +812,145 @@ function run() {
 }
 "#;
     assert_eq!(resolve_collection_at(src, "x", 1), None);
+}
+
+// ---- nullsafe (`?->`) and `$this`-rooted chains (issue #272) --------------
+
+#[test]
+fn collection_relation_detects_nullsafe_chain() {
+    // `?->` links are chain structure like `->`: a null root short-circuits
+    // at runtime, so the non-null result still types to the related
+    // collection.
+    let src = r#"
+use App\Models\User;
+function run(User $user) {
+    $regs = $user?->competitions()?->get();
+    $regs->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(
+        resolve_collection_simple(src, "regs", 1),
+        Some(("App\\Models\\User".to_string(), "competitions".to_string()))
+    );
+}
+
+#[test]
+fn collection_relation_detects_mixed_nullsafe_and_plain_links() {
+    // Operators can mix mid-chain (`$user?->competitions()->get()`).
+    let src = r#"
+use App\Models\User;
+function run(User $user) {
+    $regs = $user?->competitions()->get();
+    $regs->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(
+        resolve_collection_simple(src, "regs", 1),
+        Some(("App\\Models\\User".to_string(), "competitions".to_string()))
+    );
+}
+
+#[test]
+fn collection_relation_nullsafe_still_rejects_mid_chain_mode_flip() {
+    // The mode-flip gate applies to nullsafe chains the same as plain ones.
+    let src = r#"
+use App\Models\User;
+function run(User $user) {
+    $rows = $user?->competitions()?->toBase()?->get();
+    $rows->filter();
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "rows", 1), None);
+}
+
+#[test]
+fn collection_relation_detects_this_rooted_chain() {
+    // `$this->competitions()->get()` inside a class method — the relation
+    // resolves against the enclosing class's model (a call claim, same as
+    // the bare-`$var` form).
+    let src = r#"
+namespace App\Models;
+class User {
+    public function run() {
+        $regs = $this->competitions()->get();
+        $regs->whereIn('type', ['league']);
+    }
+}
+"#;
+    let cr = resolve_collection_full(src, "regs", 1).expect("detected");
+    assert_eq!(cr.base, "App\\Models\\User");
+    assert_eq!(cr.relation, "competitions");
+    assert!(cr.from_call, "a called relation is a call claim");
+    assert!(
+        cr.heuristic_hops.is_empty(),
+        "no hops: {:?}",
+        cr.heuristic_hops
+    );
+}
+
+#[test]
+fn collection_relation_detects_this_property_rooted_chain() {
+    // `$this->user->competitions()->get()` — the `user` *property* is the
+    // relation claim (from_call: false — a property can't be a scope, so a
+    // finalize miss must clear rather than consult scopes); the deepest call
+    // (`competitions`) rides the heuristic-hop queue.
+    let src = r#"
+namespace App\Models;
+class Registration {
+    public function run() {
+        $regs = $this->user->competitions()->get();
+        $regs->whereIn('type', ['league']);
+    }
+}
+"#;
+    let cr = resolve_collection_full(src, "regs", 1).expect("detected");
+    assert_eq!(cr.base, "App\\Models\\Registration");
+    assert_eq!(cr.relation, "user");
+    assert!(!cr.from_call, "a property claim is not a call claim");
+    assert_eq!(cr.heuristic_hops, vec!["competitions".to_string()]);
+}
+
+#[test]
+fn collection_relation_rejects_this_root_outside_class() {
+    // `$this` in a free function has no enclosing class — nothing to resolve
+    // against, so detection must not fire.
+    let src = r#"
+function run() {
+    $regs = $this->competitions()->get();
+    $regs->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "regs", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_this_root_known_builder_call() {
+    // `$this->where(...)->get()` — the deepest call is a recognised builder
+    // method, so the collection holds the enclosing model itself, not a
+    // relation's model. Same gate as the bare-`$var` form.
+    let src = r#"
+namespace App\Models;
+class User {
+    public function run() {
+        $rows = $this->where('active', 1)->get();
+        $rows->pluck('id');
+    }
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "rows", 1), None);
+}
+
+#[test]
+fn collection_relation_rejects_non_this_property_root() {
+    // `$user->profile->competitions()->get()` — a property root on anything
+    // but `$this` would need the object's runtime class resolved first;
+    // detection stays out rather than guessing.
+    let src = r#"
+use App\Models\User;
+function run(User $user) {
+    $regs = $user->profile->competitions()->get();
+    $regs->whereIn('type', ['league']);
+}
+"#;
+    assert_eq!(resolve_collection_at(src, "regs", 1), None);
 }
