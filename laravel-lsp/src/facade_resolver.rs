@@ -215,8 +215,10 @@ pub fn resolve_facade_fqcn(
 
     // Otherwise it's a bare / root-`\` token relying on the global alias. Match
     // it (case-insensitively, like the rest of the alias machinery) against our
-    // facade map.
-    let token = global_alias_token(receiver, aliases, is_namespaced)?;
+    // facade map. Reuse the `via_use` we just resolved rather than resolving a
+    // second time inside `global_alias_token` — the common bare-facade path
+    // (`Auth::user()` with no `use`) must resolve once (#267).
+    let token = global_alias_token_resolved(receiver, via_use, is_namespaced)?;
     facade_aliases
         .iter()
         .find(|(alias, _)| alias.eq_ignore_ascii_case(&token))
@@ -239,18 +241,34 @@ pub fn global_alias_token(
     aliases: &UseAliases,
     is_namespaced: bool,
 ) -> Option<String> {
+    global_alias_token_resolved(
+        receiver,
+        resolve_class_name(receiver, aliases),
+        is_namespaced,
+    )
+}
+
+/// [`global_alias_token`] over an ALREADY-resolved class name — the same gate,
+/// factored so `resolve_facade_fqcn`'s common bare-facade path (which has just
+/// computed `resolve_class_name`) resolves once rather than twice (#267).
+/// `resolved` MUST be `resolve_class_name(receiver, aliases)` for `receiver`;
+/// passing any other value silently changes the gate.
+fn global_alias_token_resolved(
+    receiver: &str,
+    resolved: String,
+    is_namespaced: bool,
+) -> Option<String> {
     // A leading `\` forces global resolution regardless of the file's namespace.
     let is_root_qualified = receiver.starts_with('\\');
-    let via_use = resolve_class_name(receiver, aliases);
     // A receiver that resolves into the facade namespace via a `use` import is a
     // direct facade reference, not a global-alias lookup — retargeting the
     // `config/app.php` alias can't change it, so it holds no `alias:` attempt.
-    if via_use.starts_with(FACADE_NAMESPACE) {
+    if resolved.starts_with(FACADE_NAMESPACE) {
         return None;
     }
     // A token that itself contains a namespace separator is a real class
     // reference, not a facade alias (`App\Foo::bar()`).
-    if via_use.contains('\\') {
+    if resolved.contains('\\') {
         return None;
     }
     // PHP class-name rule: a bare (non-`\`-qualified) token in a namespaced file
@@ -259,7 +277,7 @@ pub fn global_alias_token(
     if !is_root_qualified && is_namespaced {
         return None;
     }
-    Some(via_use)
+    Some(resolved)
 }
 
 /// The container binding key a facade proxies — its `getFacadeAccessor()`
