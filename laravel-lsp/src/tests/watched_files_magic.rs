@@ -424,6 +424,180 @@ class CacheUser {
     );
 }
 
+/// #267 AC2 (branch-switch vector), end-to-end through the WATCHED-FILES batch:
+/// a provider-body macro rename that arrives via `did_change_watched_files`
+/// (`FileChangeType::CHANGED`) for a NON-OPEN provider — a `git checkout`, say —
+/// must re-resolve dependent call sites, exactly as the interactive save does.
+/// This is the test that drives the registration snapshot/diff block in
+/// `run_magic_batch_once` (`main.rs`) with a real service-provider fixture: a
+/// body-only edit leaves the class-surface diff empty, so ONLY that block can
+/// ripple it — revert the block and this fails. The first save merely primes the
+/// registration baseline (the sibling save-path tests do the same, and it does
+/// not open the document); the edit-under-test and its ripple run entirely
+/// through the batch.
+#[tokio::test]
+async fn provider_body_macro_rename_ripples_dependent_via_watched_files() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let backend = backend_for(root).await;
+    write_file(root, "composer.json", COMPOSER);
+
+    let provider_v1 = r#"<?php
+namespace App\Providers;
+use Illuminate\Support\Str;
+use Illuminate\Support\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Str::macro('slugify', fn () => 'x');
+    }
+}
+"#;
+    let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_v1);
+    backend
+        .salsa
+        .register_config_files(root.to_path_buf(), None, None, None)
+        .await
+        .unwrap();
+    backend
+        .salsa
+        .register_service_provider_source(
+            provider.clone(),
+            provider_v1.to_string(),
+            2,
+            root.to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+    // The dependent call site, in ANOTHER file.
+    let consumer_src = r#"<?php
+namespace App\Support;
+use Illuminate\Support\Str;
+class Ids {
+    public function make(): string { return Str::slugify(); }
+}
+"#;
+    let consumer = write_file(root, "app/Support/Ids.php", consumer_src);
+    seed(&backend, &consumer, consumer_src).await;
+    assert!(
+        member_names(&backend, &consumer).await.contains("slugify"),
+        "seed: the consumer's macro call must classify while the macro exists",
+    );
+
+    // Prime the provider's registration baseline (v1). The sibling save-path
+    // tests establish it the same way; `refresh_magic_on_save` only READS the
+    // documents map, so the provider stays NON-OPEN and the later watched-files
+    // event is not skipped as an open doc.
+    let uri = Url::from_file_path(&provider).unwrap();
+    backend.refresh_magic_on_save(&uri, provider_v1).await;
+    drain_ripple(&backend).await;
+
+    // Branch switch: the macro is renamed on disk while the provider is NOT
+    // open, so the edit arrives ONLY through the watched-files batch — the save
+    // path never runs. before = v1 baseline, after = v2: the batch's
+    // registration diff must ripple the removed `slugify` host key.
+    let provider_v2 = provider_v1.replace("'slugify'", "'sluggish'");
+    fs::write(&provider, &provider_v2).unwrap();
+    backend
+        .did_change_watched_files(watched(&provider, FileChangeType::CHANGED))
+        .await;
+    drain_batch(&backend).await;
+
+    let after = member_names(&backend, &consumer).await;
+    assert!(
+        !after.contains("slugify"),
+        "the dependent's stale macro classification must clear on the watched-files provider edit; got {after:?}"
+    );
+}
+
+/// #267 AC2 (branch-switch vector), facade-alias kind, first-save edge — through
+/// the WATCHED-FILES batch: a `config/app.php` alias retarget that arrives via
+/// `did_change_watched_files` (a `git checkout` of a non-open config), on the
+/// FIRST pass so the registration baseline is still empty, must still re-resolve
+/// the OLD target's dependent sites. This exercises the OTHER glue branch of the
+/// batch's registration block (the `config/app.php` path, not the provider
+/// re-register path Test-macro covers) and pins the `alias:<token>` attempt key
+/// (#267 AC1) end-to-end through `run_magic_batch_once`: the old target FQCN is
+/// never in the empty→config diff, so `alias:cache` is the sole key that can
+/// reach the stale site. Revert the batch registration block and this fails.
+#[tokio::test]
+async fn config_alias_retarget_ripples_dependent_via_watched_files() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let backend = backend_for(root).await;
+    write_file(root, "composer.json", COMPOSER);
+
+    // A provider binds the `cache` accessor to a concrete carrying a `boom`
+    // macro, so the default `Cache` facade alias resolves through to it.
+    let provider_src = r#"<?php
+namespace App\Providers;
+use Illuminate\Support\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        \App\Services\CacheImpl::macro('boom', fn () => 'x');
+        $this->app->singleton('cache', \App\Services\CacheImpl::class);
+    }
+}
+"#;
+    let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_src);
+    backend
+        .salsa
+        .register_config_files(root.to_path_buf(), None, None, None)
+        .await
+        .unwrap();
+    backend
+        .salsa
+        .register_service_provider_source(
+            provider.clone(),
+            provider_src.to_string(),
+            2,
+            root.to_path_buf(),
+        )
+        .await
+        .unwrap();
+    backend
+        .salsa
+        .register_service_provider_registry(
+            HashMap::new(),
+            HashMap::new(),
+            singleton_registry("cache", "App\\Services\\CacheImpl"),
+        )
+        .await
+        .unwrap();
+
+    // Global-namespace consumer using the BARE `Cache` token — the global-alias
+    // path, so it records `alias:cache` (a `use`-import would not).
+    let consumer_src = r#"<?php
+class CacheUser {
+    public function go(): string { return Cache::boom(); }
+}
+"#;
+    let consumer = write_file(root, "app/CacheUser.php", consumer_src);
+    seed(&backend, &consumer, consumer_src).await;
+    assert!(
+        member_names(&backend, &consumer).await.contains("boom"),
+        "seed: the consumer's macro call must classify while `Cache` aliases the default facade",
+    );
+
+    // Branch switch: `config/app.php` appears on disk retargeting `Cache` to a
+    // facade with no resolvable accessor, delivered via the watched-files batch
+    // (config is never opened). Baseline empty → the diff carries only the NEW
+    // target; `alias:cache` (recorded resolved-or-not at the consumer) is the
+    // only key that can clear the stale classification.
+    let config_src = "<?php\nreturn [\n    'aliases' => [\n        'Cache' => App\\Facades\\Nothing::class,\n    ],\n];\n";
+    let config = write_file(root, "config/app.php", config_src);
+    backend
+        .did_change_watched_files(watched(&config, FileChangeType::CHANGED))
+        .await;
+    drain_batch(&backend).await;
+
+    let after = member_names(&backend, &consumer).await;
+    assert!(
+        !after.contains("boom"),
+        "the old alias target's stale classification must clear on the watched-files retarget; got {after:?}"
+    );
+}
+
 fn post_with_accessors(accessors: &[&str]) -> String {
     let methods: String = accessors
         .iter()
