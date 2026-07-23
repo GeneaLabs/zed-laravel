@@ -3744,68 +3744,84 @@ class AppServiceProvider extends ServiceProvider {
 
 #[tokio::test]
 async fn equal_priority_collision_resolves_to_smallest_provider_path() {
-    // #255 Bug B regression: two providers at the SAME priority register the
-    // same macro key and the same binding key. `salsa_sp_files` is a HashMap
-    // (unspecified iteration order), so before the sorted merge the winner
-    // was whichever provider the map happened to yield first — flipping
-    // across LSP restarts. The documented rule: the lexicographically
-    // smallest provider path wins on an equal-priority collision, in BOTH
-    // registries (`sorted_sp_files`).
+    // #255 Bug B regression: providers at the SAME priority register the same
+    // macro key and the same binding key. `salsa_sp_files` is a HashMap
+    // (unspecified iteration order), so before the sorted merge the winner was
+    // whichever provider the map happened to yield first — flipping across LSP
+    // restarts. The documented rule: the lexicographically smallest provider
+    // path wins on an equal-priority collision, in BOTH registries
+    // (`sorted_sp_files`).
+    //
+    // The old 2-provider form caught a reverted (raw-HashMap) `sorted_sp_files`
+    // only ~50% of the time — the per-process seed decided the winner. This form
+    // is deterministic instead: it asserts `sorted_sp_files`' full ORDER via
+    // `snapshot_sorted_provider_paths`, so a reverted sort yields the raw HashMap
+    // order and matches the sorted order only 1/N! of the time — negligible at
+    // N=6 (~0.14%) — while still checking both registries' merge winners (#267).
     use tempfile::TempDir;
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
 
-    let first = root.join("app/Providers/AaServiceProvider.php");
-    let first_src = r#"<?php
+    // Six colliding providers whose class names sort A→F. `P0` is the
+    // documented winner; every provider registers the same macro + binding key
+    // with a distinct concrete, so a wrong merge order is observable.
+    let names = ["Aa", "Bb", "Cc", "Dd", "Ee", "Ff"];
+    let providers: Vec<(PathBuf, String, String)> = names
+        .iter()
+        .map(|n| {
+            let path = root.join(format!("app/Providers/{n}ServiceProvider.php"));
+            let concrete = format!("App\\Services\\{n}Impl");
+            let src = format!(
+                r#"<?php
 namespace App\Providers;
 use Illuminate\Support\Str;
 use Illuminate\Support\ServiceProvider;
-class AaServiceProvider extends ServiceProvider {
-    public function boot(): void {
-        Str::macro('shared', fn () => 'aa');
-        $this->app->singleton('svc', \App\Services\AaImpl::class);
-    }
-}
-"#;
-    let second = root.join("app/Providers/ZzServiceProvider.php");
-    let second_src = r#"<?php
-namespace App\Providers;
-use Illuminate\Support\Str;
-use Illuminate\Support\ServiceProvider;
-class ZzServiceProvider extends ServiceProvider {
-    public function boot(): void {
-        Str::macro('shared', fn () => 'zz');
-        $this->app->singleton('svc', \App\Services\ZzImpl::class);
-    }
-}
-"#;
+class {n}ServiceProvider extends ServiceProvider {{
+    public function boot(): void {{
+        Str::macro('shared', fn () => '{n}');
+        $this->app->singleton('svc', \{concrete}::class);
+    }}
+}}
+"#
+            );
+            (path, src, concrete)
+        })
+        .collect();
 
     let handle = SalsaActor::spawn();
     handle
         .register_config_files(root.clone(), None, None, None)
         .await
         .unwrap();
-    // Registration order is deliberately the REVERSE of the documented
-    // winner's, so an insertion-ordered merge would fail this test too.
-    handle
-        .register_service_provider_source(second.clone(), second_src.to_string(), 2, root.clone())
-        .await
-        .unwrap();
-    handle
-        .register_service_provider_source(first.clone(), first_src.to_string(), 2, root.clone())
-        .await
-        .unwrap();
+    // Register in the REVERSE of the winning order (F→A), so an insertion-ordered
+    // merge would pick the wrong provider and a raw-HashMap merge could.
+    for (path, src, _) in providers.iter().rev() {
+        handle
+            .register_service_provider_source(path.clone(), src.clone(), 2, root.clone())
+            .await
+            .unwrap();
+    }
 
-    // The reversed registration order above is the actual nondeterminism
-    // guard: an insertion-ordered merge would pick Zz, and an unsorted
-    // HashMap merge could. (Re-querying an unmutated map can't change its
-    // iteration order, so repeating the assertions would prove nothing.)
+    // Deterministic sort assertion: the paths in merge order MUST be the
+    // lexicographically sorted paths. A reverted `sorted_sp_files` yields raw
+    // HashMap order, which equals the sorted order only 1/6! of the time.
+    let mut expected_order: Vec<PathBuf> = providers.iter().map(|(p, ..)| p.clone()).collect();
+    expected_order.sort();
+    let sorted_paths = handle.snapshot_sorted_provider_paths().await.unwrap();
+    assert_eq!(
+        sorted_paths, expected_order,
+        "sorted_sp_files must merge providers in lexicographically ascending path order",
+    );
+
+    // …and both registries' winners must be the smallest path (`P0` = Aa).
+    let (smallest_path, _, smallest_concrete) = &providers[0];
+
     let macros = handle.snapshot_macros().await.unwrap();
     let (decl_file, _) = macros
         .get(&("Illuminate\\Support\\Str".to_string(), "shared".to_string()))
         .expect("colliding macro key must still resolve");
     assert_eq!(
-        decl_file, &first,
+        decl_file, smallest_path,
         "equal-priority macro collision must resolve to the lexicographically smallest provider path",
     );
 
@@ -3816,7 +3832,7 @@ class ZzServiceProvider extends ServiceProvider {
         .expect("colliding binding key must still resolve");
     assert_eq!(
         svc.concrete_class.trim_start_matches('\\'),
-        "App\\Services\\AaImpl",
+        smallest_concrete.as_str(),
         "equal-priority binding collision must resolve to the lexicographically smallest provider path",
     );
 }
@@ -3944,6 +3960,13 @@ fn registration_ripple_keys_alias_retarget_emits_both_targets() {
     let keys = registration_ripple_keys(&before, &after, Path::new("/prov.php"));
     assert!(keys.contains(&"Illuminate\\Support\\Str".to_string()));
     assert!(keys.contains(&"App\\Support\\MyStr".to_string()));
+    // …and the stable `alias:<token>` attempt key both sides share, which is the
+    // ONLY key that reaches the old target's sites on a first (empty-baseline)
+    // save (#267). Lower-cased to match the case-insensitive facade matching.
+    assert!(
+        keys.contains(&"alias:str".to_string()),
+        "an alias retarget must emit the alias:<token> attempt key; got {keys:?}",
+    );
 }
 
 #[tokio::test]

@@ -197,11 +197,6 @@ pub fn resolve_facade_fqcn(
     facade_aliases: &HashMap<String, String>,
     is_namespaced: bool,
 ) -> Option<String> {
-    // Distinguish a root-`\` receiver from a bare one BEFORE `resolve_class_name`
-    // strips the leading `\` and collapses the two cases. A leading `\` forces
-    // global resolution regardless of the file's namespace.
-    let is_root_qualified = receiver.starts_with('\\');
-
     // A receiver that resolves into `Illuminate\Support\Facades\*` IS a facade —
     // whether through a `use` import (`use …\Facades\Auth; Auth::…`) or written
     // inline fully-qualified (`\Illuminate\Support\Facades\Auth::…`). Return it as
@@ -220,28 +215,51 @@ pub fn resolve_facade_fqcn(
 
     // Otherwise it's a bare / root-`\` token relying on the global alias. Match
     // it (case-insensitively, like the rest of the alias machinery) against our
-    // facade map — the leading `\` is already stripped by `resolve_class_name`,
-    // and `via_use` is the unresolved token when no import matched.
-    let token = via_use.as_str();
-    // A token that itself contains a namespace separator is a real class
-    // reference, not a facade alias (`App\Foo::bar()`), so it can't be a
-    // root-namespace facade alias — bail.
-    if token.contains('\\') {
+    // facade map.
+    let token = global_alias_token(receiver, aliases, is_namespaced)?;
+    facade_aliases
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(&token))
+        .map(|(_, fqcn)| fqcn.clone())
+}
+
+/// The bare global-alias token a receiver would look up in the facade alias map,
+/// independent of whether that map currently holds it — `Some("Auth")` for a
+/// bare/root-qualified `Auth` / `\Auth`, `None` for a `use`-imported facade, a
+/// namespaced class reference, or a bare token in a namespaced file with no
+/// import.
+///
+/// This is the exact gate [`resolve_facade_fqcn`]'s global-alias branch applies
+/// *before* consulting the map, factored out so the `alias:<token>` reverse-index
+/// attempt key ([`crate::magic_dependency_index::ALIAS_DEP_PREFIX`]) is recorded
+/// resolved-or-not against the same tokens — the two must never drift, or an
+/// alias retarget would ripple keys no call site recorded (#267).
+pub fn global_alias_token(
+    receiver: &str,
+    aliases: &UseAliases,
+    is_namespaced: bool,
+) -> Option<String> {
+    // A leading `\` forces global resolution regardless of the file's namespace.
+    let is_root_qualified = receiver.starts_with('\\');
+    let via_use = resolve_class_name(receiver, aliases);
+    // A receiver that resolves into the facade namespace via a `use` import is a
+    // direct facade reference, not a global-alias lookup — retargeting the
+    // `config/app.php` alias can't change it, so it holds no `alias:` attempt.
+    if via_use.starts_with(FACADE_NAMESPACE) {
         return None;
     }
-
+    // A token that itself contains a namespace separator is a real class
+    // reference, not a facade alias (`App\Foo::bar()`).
+    if via_use.contains('\\') {
+        return None;
+    }
     // PHP class-name rule: a bare (non-`\`-qualified) token in a namespaced file
     // with no matching `use` import resolves against the current namespace, NOT
-    // the global alias. Only honor the global alias for a leading-`\` token or a
-    // file with no namespace declaration.
+    // the global alias.
     if !is_root_qualified && is_namespaced {
         return None;
     }
-
-    facade_aliases
-        .iter()
-        .find(|(alias, _)| alias.eq_ignore_ascii_case(token))
-        .map(|(_, fqcn)| fqcn.clone())
+    Some(via_use)
 }
 
 /// The container binding key a facade proxies — its `getFacadeAccessor()`

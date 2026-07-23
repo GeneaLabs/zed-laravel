@@ -31,6 +31,30 @@ use std::path::{Path, PathBuf};
 /// no concrete-FQCN dependency the registration diff could otherwise reach.
 pub const BINDING_DEP_PREFIX: &str = "binding:";
 
+/// Key-space prefix for a *facade-alias attempt* dependency: a site whose
+/// receiver is a bare/root-qualified facade token resolved through the global
+/// alias map (`Auth::check()`, `\Cache::get()`) records `alias:<token>` — the
+/// alias token lower-cased, resolved or not. The colon keeps the space disjoint
+/// from FQCNs, and the analogue to `BINDING_DEP_PREFIX` is deliberate: recording
+/// the stable *token* (not the resolved concrete) is what lets an alias
+/// **retarget** ripple the OLD target's dependent sites on the very first save of
+/// a session, when the registration baseline is still empty and the diff only
+/// sees the new target added (#267). The lower-casing mirrors the
+/// case-insensitive facade-alias matching in [`crate::facade_resolver`], so both
+/// the call site and the registration diff agree on the key regardless of
+/// source casing.
+pub const ALIAS_DEP_PREFIX: &str = "alias:";
+
+/// Build the `alias:<token>` attempt key for a facade alias `token`, lower-cased
+/// to match the case-insensitive facade matching in [`crate::facade_resolver`].
+/// Both the call-site recorder ([`crate::member_resolver`]) and the registration
+/// diff ([`crate::salsa_impl::registration_ripple_keys`]) MUST build the key
+/// through this one function, or the two would drift and an alias retarget would
+/// ripple keys no call site recorded (#267).
+pub fn alias_dep_key(token: &str) -> String {
+    format!("{ALIAS_DEP_PREFIX}{}", token.to_ascii_lowercase())
+}
+
 #[derive(Default, Debug)]
 pub struct MagicDependencyIndex {
     /// fqcn → files that resolved a receiver against it.

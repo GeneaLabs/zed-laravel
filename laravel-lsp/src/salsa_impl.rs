@@ -4336,11 +4336,14 @@ pub struct ProviderRegistrationsData {
 ///   reaches the sites that previously resolved to nothing — plus the
 ///   concrete FQCN from both sides, which finds sites already referencing
 ///   the target directly.
-/// - **facade alias**: the target FQCN from both sides of the diff — a site
-///   that resolved through an alias recorded the concrete it landed on, so
-///   the old target finds the now-stale sites. (An alias site that never
-///   resolved recorded nothing and converges on the next full pass; it holds
-///   no stale classification either.)
+/// - **facade alias**: the `alias:<token>` attempt key
+///   ([`crate::magic_dependency_index::ALIAS_DEP_PREFIX`]) from both sides of the
+///   diff — every global-alias facade site (`Auth::check()`) records it
+///   resolved-or-not, so an alias RETARGET reaches the OLD target's sites even on
+///   the first save of a session, when the empty baseline makes the diff see only
+///   the new target added (#267) — plus the target FQCN from both sides, which
+///   finds any site referencing the aliased class directly (a `use`-import or
+///   type-hint recording).
 /// - **the provider's own path**: macro classifications record the macro's
 ///   declaration file as a dependency ([`crate::member_resolver`]), which for
 ///   inline `::macro()` registrations is the registering provider itself.
@@ -4374,7 +4377,14 @@ pub fn registration_ripple_keys(
             ]
         },
     ));
-    keys.extend(changed(&before.aliases, &after.aliases).map(|(_, target)| target.clone()));
+    keys.extend(
+        changed(&before.aliases, &after.aliases).flat_map(|(token, target)| {
+            [
+                crate::magic_dependency_index::alias_dep_key(token),
+                target.clone(),
+            ]
+        }),
+    );
     if keys.is_empty() {
         return Vec::new();
     }
@@ -5075,6 +5085,15 @@ pub enum SalsaRequest {
     /// it does on the live query path. Mirrors [`Self::SnapshotBindings`].
     SnapshotMacros {
         reply: oneshot::Sender<Arc<std::collections::HashMap<(String, String), (PathBuf, u32)>>>,
+    },
+    /// Snapshot the registered service-provider paths in the deterministic merge
+    /// order (`sorted_sp_files`): lexicographically ascending, which is what
+    /// makes an equal-priority collision resolve to the smallest path in BOTH
+    /// registries. Test-observability for the #255 Bug B guard — asserts the sort
+    /// directly, so a reverted (raw-`HashMap`) `sorted_sp_files` fails reliably
+    /// rather than by chance seed (#267).
+    SnapshotSortedProviderPaths {
+        reply: oneshot::Sender<Vec<PathBuf>>,
     },
     /// One provider file's `(before, after)` registration contribution
     /// (macros / bindings / facade aliases), for the save path's registration
@@ -5829,6 +5848,20 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::SnapshotMacros { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Snapshot the registered service-provider paths in `sorted_sp_files` merge
+    /// order (lexicographically ascending). Test-observability for the #255 Bug B
+    /// guard — the deterministic sort both registries merge in.
+    pub async fn snapshot_sorted_provider_paths(&self) -> Result<Vec<PathBuf>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SnapshotSortedProviderPaths { reply: reply_tx })
             .await
             .map_err(|_| "Salsa actor disconnected")?;
         reply_rx
@@ -7137,6 +7170,17 @@ impl SalsaActor {
                         map.insert(key.clone(), (data.decl_file.clone(), data.decl_line));
                     }
                     let _ = reply.send(Arc::new(map));
+                }
+                SalsaRequest::SnapshotSortedProviderPaths { reply } => {
+                    // Route through the real `sorted_sp_files` so a reverted sort
+                    // surfaces here as raw-HashMap order — the whole point of the
+                    // Bug B guard (#267).
+                    let paths = self
+                        .sorted_sp_files()
+                        .into_iter()
+                        .map(|sp_file| sp_file.path(&self.db).clone())
+                        .collect();
+                    let _ = reply.send(paths);
                 }
                 SalsaRequest::FileProviderRegistrations {
                     path,

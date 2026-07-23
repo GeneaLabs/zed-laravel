@@ -7115,7 +7115,10 @@ impl LaravelLanguageServer {
     ///
     /// - **present, non-vendor** files are re-resolved in full
     ///   (`refresh_file_magic`) — own contribution + per-file changed views —
-    ///   exactly as a save would;
+    ///   AND have their provider-body registrations snapshot/diffed
+    ///   (`file_provider_registrations` → `registration_ripple_keys`) so a
+    ///   body-only registration edit from a branch switch ripples to dependents
+    ///   without a restart (#267), exactly as a save would;
     /// - **present, vendor** files get a surfaces-only pass (parse + hierarchy
     ///   update via `get_patterns`, no own-contribution resolution) so a vendor
     ///   base-class change still ripples to app subclasses, without eagerly
@@ -7179,6 +7182,29 @@ impl LaravelLanguageServer {
             }
 
             // Present, non-vendor: full per-file refresh, same as a save.
+            //
+            // Registration snapshot/diff FIRST, mirroring the save path
+            // (`refresh_magic_on_save`): a provider-body registration edit that
+            // arrives here — a `git checkout` of a non-open provider, say —
+            // leaves the class-surface diff below empty just as an interactive
+            // edit does, so without this a body-only external edit never ripples
+            // to dependents until a restart or manual save (#267). `Some(content)`
+            // re-registers the fresh source (provider or config/app.php input)
+            // before `after` is read and advances the baseline; `before` is the
+            // actor-kept baseline. Taken before the per-file refresh so that pass
+            // already sees the fresh registries. Cheap for the non-provider
+            // majority: an untracked path yields empty defaults.
+            let (old_registrations, new_registrations) = self
+                .salsa
+                .file_provider_registrations(path.clone(), Some(content.clone()))
+                .await
+                .unwrap_or_default();
+            changed_classes.extend(registration_ripple_keys(
+                &old_registrations,
+                &new_registrations,
+                &path,
+            ));
+
             let views = self.refresh_file_magic(&path, &content).await;
             let new_surfaces = self
                 .salsa
