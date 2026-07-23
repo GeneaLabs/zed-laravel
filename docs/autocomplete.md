@@ -153,6 +153,8 @@ Variables are resolved from:
 - `@props(['title' => string])` in Blade components
 - Livewire component public properties
 
+A variable typed from a query-builder terminal (`$users = User::all();`, `User::where(...)->get()`, …) honors the model's custom collection — when `User` declares `protected $collectionClass = UserCollection::class;` (or a `newCollection()` override), `$users` resolves as `UserCollection<User>` instead of the default `Collection<User>`, matching the relationship-completion behavior above.
+
 ## 🔄 Loop Variables (Scope-Aware)
 
 Variables from loop directives are available **only inside** the loop block:

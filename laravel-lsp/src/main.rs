@@ -11112,7 +11112,7 @@ impl LaravelLanguageServer {
                 continue;
             }
 
-            self.search_php_files_for_view_vars(dir, view_name, &mut vars, &mut seen);
+            self.search_php_files_for_view_vars(root, dir, view_name, &mut vars, &mut seen);
         }
 
         vars
@@ -11121,6 +11121,7 @@ impl LaravelLanguageServer {
     /// Recursively search PHP files in a directory for view variable assignments
     fn search_php_files_for_view_vars(
         &self,
+        project_root: &std::path::Path,
         dir: &std::path::Path,
         view_name: &str,
         vars: &mut Vec<(String, String)>,
@@ -11135,7 +11136,7 @@ impl LaravelLanguageServer {
 
             if path.is_dir() {
                 // Recurse into subdirectories
-                self.search_php_files_for_view_vars(&path, view_name, vars, seen);
+                self.search_php_files_for_view_vars(project_root, &path, view_name, vars, seen);
                 continue;
             }
 
@@ -11152,13 +11153,14 @@ impl LaravelLanguageServer {
                 continue;
             }
 
-            self.extract_view_vars_from_content(&content, view_name, vars, seen);
+            self.extract_view_vars_from_content(project_root, &content, view_name, vars, seen);
         }
     }
 
     /// Extract variables from file content for a specific view
     fn extract_view_vars_from_content(
         &self,
+        project_root: &std::path::Path,
         content: &str,
         view_name: &str,
         vars: &mut Vec<(String, String)>,
@@ -11174,7 +11176,13 @@ impl LaravelLanguageServer {
         if let Ok(re) = regex::Regex::new(&compact_in_view) {
             for cap in re.captures_iter(content) {
                 if let Some(compact_args) = cap.get(1) {
-                    self.extract_vars_from_compact(content, compact_args.as_str(), vars, seen);
+                    self.extract_vars_from_compact(
+                        content,
+                        compact_args.as_str(),
+                        vars,
+                        seen,
+                        project_root,
+                    );
                 }
             }
         }
@@ -11184,7 +11192,13 @@ impl LaravelLanguageServer {
         if let Ok(re) = regex::Regex::new(&array_in_view) {
             for cap in re.captures_iter(content) {
                 if let Some(array_content) = cap.get(1) {
-                    self.extract_vars_from_array(content, array_content.as_str(), vars, seen);
+                    self.extract_vars_from_array(
+                        content,
+                        array_content.as_str(),
+                        vars,
+                        seen,
+                        project_root,
+                    );
                 }
             }
         }
@@ -11198,7 +11212,13 @@ impl LaravelLanguageServer {
         if let Ok(re) = regex::Regex::new(&with_array_pattern) {
             for cap in re.captures_iter(content) {
                 if let Some(array_content) = cap.get(1) {
-                    self.extract_vars_from_array(content, array_content.as_str(), vars, seen);
+                    self.extract_vars_from_array(
+                        content,
+                        array_content.as_str(),
+                        vars,
+                        seen,
+                        project_root,
+                    );
                 }
             }
         }
@@ -11211,7 +11231,7 @@ impl LaravelLanguageServer {
         if let Ok(re) = regex::Regex::new(&with_single_pattern) {
             for cap in re.captures_iter(content) {
                 let full_match = cap.get(0).map(|m| m.as_str()).unwrap_or("");
-                self.extract_vars_from_with_chain(content, full_match, vars, seen);
+                self.extract_vars_from_with_chain(content, full_match, vars, seen, project_root);
             }
         }
 
@@ -11223,7 +11243,13 @@ impl LaravelLanguageServer {
         if let Ok(re) = regex::Regex::new(&with_compact_pattern) {
             for cap in re.captures_iter(content) {
                 if let Some(compact_args) = cap.get(1) {
-                    self.extract_vars_from_compact(content, compact_args.as_str(), vars, seen);
+                    self.extract_vars_from_compact(
+                        content,
+                        compact_args.as_str(),
+                        vars,
+                        seen,
+                        project_root,
+                    );
                 }
             }
         }
@@ -11252,18 +11278,25 @@ impl LaravelLanguageServer {
                                     compact_args.as_str(),
                                     vars,
                                     seen,
+                                    project_root,
                                 );
                             }
                         }
                     } else if arg_str.starts_with('[') || arg_str.contains("=>") {
-                        self.extract_vars_from_array(content, arg_str, vars, seen);
+                        self.extract_vars_from_array(content, arg_str, vars, seen, project_root);
                     }
                 }
 
                 // Check for ->with chain
                 let full_match = cap.get(0).map(|m| m.as_str()).unwrap_or("");
                 if full_match.contains("->with") {
-                    self.extract_vars_from_with_chain(content, full_match, vars, seen);
+                    self.extract_vars_from_with_chain(
+                        content,
+                        full_match,
+                        vars,
+                        seen,
+                        project_root,
+                    );
                 }
             }
         }
@@ -11276,6 +11309,7 @@ impl LaravelLanguageServer {
         compact_args: &str,
         vars: &mut Vec<(String, String)>,
         seen: &mut std::collections::HashSet<String>,
+        project_root: &std::path::Path,
     ) {
         let var_re = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]"#).ok();
         if let Some(re) = var_re {
@@ -11283,9 +11317,12 @@ impl LaravelLanguageServer {
                 if let Some(var_name) = var_cap.get(1) {
                     let name = var_name.as_str().to_string();
                     if seen.insert(name.clone()) {
-                        let var_type =
-                            Self::find_variable_type_in_content(content, var_name.as_str())
-                                .unwrap_or_else(|| "mixed".to_string());
+                        let var_type = Self::find_variable_type_in_content(
+                            content,
+                            var_name.as_str(),
+                            project_root,
+                        )
+                        .unwrap_or_else(|| "mixed".to_string());
                         vars.push((name, var_type));
                     }
                 }
@@ -11300,6 +11337,7 @@ impl LaravelLanguageServer {
         array_content: &str,
         vars: &mut Vec<(String, String)>,
         seen: &mut std::collections::HashSet<String>,
+        project_root: &std::path::Path,
     ) {
         // Match 'key' => $this->property or 'key' => $variable
         let array_re = regex::Regex::new(
@@ -11320,7 +11358,11 @@ impl LaravelLanguageServer {
                             )
                         } else if let Some(var_match) = arr_cap.get(3) {
                             // It's $variable
-                            Self::find_variable_type_in_content(content, var_match.as_str())
+                            Self::find_variable_type_in_content(
+                                content,
+                                var_match.as_str(),
+                                project_root,
+                            )
                         } else {
                             None
                         }
@@ -11353,6 +11395,7 @@ impl LaravelLanguageServer {
         chain_str: &str,
         vars: &mut Vec<(String, String)>,
         seen: &mut std::collections::HashSet<String>,
+        project_root: &std::path::Path,
     ) {
         // Match ->with('key', $value) or ->with('key', $this->property) pattern
         let single_with_re = regex::Regex::new(
@@ -11373,7 +11416,11 @@ impl LaravelLanguageServer {
                             )
                         } else if let Some(var_match) = cap.get(4) {
                             // It's $variable - look up the variable type
-                            Self::find_variable_type_in_content(content, var_match.as_str())
+                            Self::find_variable_type_in_content(
+                                content,
+                                var_match.as_str(),
+                                project_root,
+                            )
                         } else {
                             None
                         }
@@ -11389,7 +11436,13 @@ impl LaravelLanguageServer {
         if let Some(re) = array_with_re {
             for cap in re.captures_iter(chain_str) {
                 if let Some(array_content) = cap.get(1) {
-                    self.extract_vars_from_array(content, array_content.as_str(), vars, seen);
+                    self.extract_vars_from_array(
+                        content,
+                        array_content.as_str(),
+                        vars,
+                        seen,
+                        project_root,
+                    );
                 }
             }
         }
@@ -11400,7 +11453,13 @@ impl LaravelLanguageServer {
         if let Some(re) = compact_with_re {
             for cap in re.captures_iter(chain_str) {
                 if let Some(compact_args) = cap.get(1) {
-                    self.extract_vars_from_compact(content, compact_args.as_str(), vars, seen);
+                    self.extract_vars_from_compact(
+                        content,
+                        compact_args.as_str(),
+                        vars,
+                        seen,
+                        project_root,
+                    );
                 }
             }
         }
@@ -11414,7 +11473,17 @@ impl LaravelLanguageServer {
     /// - Query chains: `$user = User::where(...)->first()`
     /// - Function parameters: `function show(User $user)`
     /// - PHPDoc: `@var User $user` or `@param User $user`
-    fn find_variable_type_in_content(content: &str, var_name: &str) -> Option<String> {
+    ///
+    /// `project_root` is threaded through so the collection-terminal patterns
+    /// (`::all()`/`::get()` and their query-chain forms) can resolve the
+    /// model's file and honor a custom `$collectionClass` / `newCollection()`
+    /// override instead of always labelling the result `Collection<Model>`
+    /// (issue #271). The other patterns don't consult it.
+    fn find_variable_type_in_content(
+        content: &str,
+        var_name: &str,
+        project_root: &std::path::Path,
+    ) -> Option<String> {
         let escaped_var = regex::escape(var_name);
 
         // 1. PHPDoc @var annotation: /** @var User $user */
@@ -11501,8 +11570,11 @@ impl LaravelLanguageServer {
             .and_then(|re| re.captures(content))
         {
             if let Some(model) = caps.get(1) {
+                let collection =
+                    Self::collection_label_for_model(content, model.as_str(), project_root);
                 return Some(format!(
-                    "Collection<{}>",
+                    "{}<{}>",
+                    collection,
                     laravel_lsp::php_class::simplify_type(model.as_str())
                 ));
             }
@@ -11532,8 +11604,11 @@ impl LaravelLanguageServer {
             .and_then(|re| re.captures(content))
         {
             if let Some(model) = caps.get(1) {
+                let collection =
+                    Self::collection_label_for_model(content, model.as_str(), project_root);
                 return Some(format!(
-                    "Collection<{}>",
+                    "{}<{}>",
+                    collection,
                     laravel_lsp::php_class::simplify_type(model.as_str())
                 ));
             }
@@ -11559,6 +11634,29 @@ impl LaravelLanguageServer {
         }
 
         None
+    }
+
+    /// The collection label a query-builder terminal (`Model::all()`,
+    /// `Model::where(...)->get()`, …) hydrates its result into: the model's
+    /// custom `$collectionClass` / `newCollection()` override (simple name)
+    /// when it declares one, else the default `Collection`. `content` supplies
+    /// the `use` + `namespace` context to resolve the `model` reference to an
+    /// FQCN; `project_root` locates the model's file so `collection_class_for`
+    /// can read the override. This is the Blade-variable-inference counterpart
+    /// of the relationship path's custom-collection handling (issue #271;
+    /// mechanism first added for relationships in #30 item 4).
+    fn collection_label_for_model(
+        content: &str,
+        model: &str,
+        project_root: &std::path::Path,
+    ) -> String {
+        use laravel_lsp::laravel_introspector::ModelMetadata;
+        let aliases = ModelMetadata::extract_use_aliases_from_php(content);
+        let namespace = ModelMetadata::extract_namespace(content);
+        let fqcn = ModelMetadata::resolve_to_fqcn(model, namespace.as_deref(), &aliases);
+        laravel_lsp::laravel_introspector::chain::collection_class_for(&fqcn, project_root)
+            .map(|c| laravel_lsp::php_class::simplify_type(&c))
+            .unwrap_or_else(|| "Collection".to_string())
     }
 
     // `simplify_type`, `find_property_type_in_content`, `extract_method_return_type`,
