@@ -31,7 +31,7 @@ Every guide for **Laravel (Community Edition) for Zed**, grouped by what you're 
 
 | Guide | What it covers |
 |---|---|
-| [⚖️ Comparison](comparison.md) | Which to pick — Community Edition vs. the official Laravel extension (and why you probably want just one running), plus Laravel tooling across editors, architecture, LSP capabilities, and per-feature depth |
+| [⚖️ Comparison](comparison.md) | Laravel tooling across editors, plus the architecture, LSP capabilities, and per-feature depth behind the README's Community Edition vs. official-extension decision table |
 
 ## 🩺 Help
 

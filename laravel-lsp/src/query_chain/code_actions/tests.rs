@@ -32,16 +32,69 @@ fn uri() -> Url {
 //
 // `main.rs`'s `code_action` is an async LSP trait method and can't be
 // exercised without a live server, so this predicate is where its routing
-// contract is actually pinned. The path-based case below is the important
-// one: it fails if someone widens the gate back to a bare `source` check,
-// which would silently stop the create-view/component quick-fixes from ever
-// being offered.
+// contract is actually pinned. The path-based cases below are the important
+// ones: they fail if someone widens the gate back to a bare `source` check —
+// or back to `source` + `data.is_some()`, which misroutes any future
+// payload-carrying diagnostic — either of which silently stops the
+// create-view/component quick-fixes from ever being offered.
 
 #[test]
 fn chain_diagnostic_with_payload_is_routed_to_chain_actions() {
     assert!(is_chain_diagnostic(&diag(
         json!({"kind": "column", "name": "emial"})
     )));
+}
+
+#[test]
+fn every_producer_kind_is_routed_to_chain_actions() {
+    // The whitelist is only correct if it accepts everything the producer
+    // emits — over-tightening starves the chain fixes exactly as widening
+    // starves the path-based ones.
+    for kind in crate::query_chain::diagnostics::CHAIN_DIAG_KINDS {
+        assert!(
+            is_chain_diagnostic(&diag(json!({"kind": kind, "name": "emial"}))),
+            "kind {kind:?} is produced but not routed to the chain actions"
+        );
+    }
+}
+
+#[test]
+fn our_diagnostic_with_a_foreign_payload_is_not_a_chain_diagnostic() {
+    // The forward-looking half of the gate: our own source, a `data` payload,
+    // but a `kind` no chain-diagnostic constructor emits. Nothing else on this
+    // server attaches `data` to a diagnostic *today*, so a bare
+    // `data.is_some()` gate happens to be right — until some other feature
+    // grows a payload for its own reason, at which point that gate would
+    // swallow it into the chain arm and silently strip its quick-fixes.
+    let foreign_payload = Diagnostic {
+        source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
+        message: "View file not found: 'welcome'".to_string(),
+        data: Some(json!({"kind": "missing-view", "view": "welcome"})),
+        ..Default::default()
+    };
+    assert!(!is_chain_diagnostic(&foreign_payload));
+}
+
+#[test]
+fn our_diagnostic_with_a_kindless_payload_is_not_a_chain_diagnostic() {
+    // Same trap, payload shape the gate can't classify at all: no `kind` key
+    // (and the non-string case, which `as_str()` must reject rather than
+    // stringify).
+    for data in [
+        json!({"view": "welcome"}),
+        json!({"kind": 7}),
+        json!("column"),
+    ] {
+        let kindless = Diagnostic {
+            source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
+            data: Some(data.clone()),
+            ..Default::default()
+        };
+        assert!(
+            !is_chain_diagnostic(&kindless),
+            "payload {data} carries no recognisable chain kind"
+        );
+    }
 }
 
 #[test]

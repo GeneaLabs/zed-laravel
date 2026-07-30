@@ -383,6 +383,73 @@ async fn no_chain_diagnostic_carries_a_code() {
     }
 }
 
+/// The quick-fix gate ([`crate::query_chain::code_actions::is_chain_diagnostic`])
+/// recognises a chain diagnostic by matching its `data.kind` against
+/// [`CHAIN_DIAG_KINDS`]. That whitelist lives beside the constructors but is
+/// still hand-maintained, so this walks every construction site — the three
+/// [`DiagKind`] variants via `make_diagnostic`, the dynamic-`where` builder,
+/// and the ambiguous-column builder — and asserts each product actually
+/// passes the gate. Add a `kind` to a constructor without adding it to the
+/// list and its rename / qualify / create-migration fixes would silently
+/// never be offered; this fails instead.
+#[tokio::test]
+async fn every_chain_diagnostic_is_recognised_by_the_gate() {
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            (
+                "users",
+                &[("id", "int"), ("email", "string"), ("name", "string")],
+            ),
+            ("orders", &[("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+
+    let sources = [
+        (
+            "unknown column",
+            "<?php\nuse App\\Models\\User;\nUser::where('emial', 1)->get();\n",
+        ),
+        (
+            "unknown relation",
+            "<?php\nuse App\\Models\\User;\nUser::with('postss')->get();\n",
+        ),
+        ("unknown table", "<?php\nDB::table('user')->get();\n"),
+        (
+            "dynamic where",
+            "<?php\nuse App\\Models\\User;\nUser::whereEmaaail('x');\n",
+        ),
+        (
+            "ambiguous column",
+            "<?php\nDB::table('users')->join('orders', 'orders.user_id', '=', 'users.id')->where('id', 1)->get();\n",
+        ),
+    ];
+
+    for (label, source) in sources {
+        let diags = chain_diagnostics(
+            &chains_of(source),
+            &db,
+            &root,
+            source,
+            DiagnosticSeverity::WARNING,
+        )
+        .await;
+        assert!(
+            !diags.is_empty(),
+            "{label}: fixture produced no diagnostic, so the gate assertion below would be vacuous"
+        );
+        for d in &diags {
+            assert!(
+                crate::query_chain::code_actions::is_chain_diagnostic(d),
+                "{label}: produced diagnostic is not routed to the chain quick-fixes, data = {:?}",
+                d.data
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn valid_column_produces_no_diagnostic() {
     let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);

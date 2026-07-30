@@ -52,11 +52,26 @@ struct ChainDiagData {
 /// diagnostic, the create-file quick-fixes below it would silently stop being
 /// offered — no compile error, no panic, just a lightbulb that never appears.
 ///
+/// So the payload half is matched *positively*, against
+/// [`super::diagnostics::CHAIN_DIAG_KINDS`] — the exact `kind` values the
+/// producer stamps — not merely "has a `data` field". Today nothing else on
+/// this server attaches `data` to a diagnostic, but the day something does
+/// (for its own unrelated reason) a `data.is_some()` gate would swallow it
+/// into the chain arm and silently strip its quick-fixes. Recognising only
+/// our own kinds fails closed instead: an unknown payload falls through to
+/// the path-based arm, which is where every non-chain diagnostic belongs.
+///
 /// Extracted here (rather than inlined at the call site) precisely so that
 /// contract is pinned by tests: `code_action` is an async LSP trait method
 /// that can't be exercised without a live server.
 pub fn is_chain_diagnostic(diagnostic: &Diagnostic) -> bool {
-    diagnostic.source.as_deref() == Some(crate::DIAGNOSTIC_SOURCE) && diagnostic.data.is_some()
+    diagnostic.source.as_deref() == Some(crate::DIAGNOSTIC_SOURCE)
+        && diagnostic
+            .data
+            .as_ref()
+            .and_then(|data| data.get("kind"))
+            .and_then(|kind| kind.as_str())
+            .is_some_and(|kind| super::diagnostics::CHAIN_DIAG_KINDS.contains(&kind))
 }
 
 /// Pull the `data` payload off a chain diagnostic. Returns `None` for any

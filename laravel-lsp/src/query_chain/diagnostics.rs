@@ -68,6 +68,17 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 /// is flagged — which is exactly what we want.
 const COLUMN_DIAG_DENY: &[&str] = &["having"];
 
+/// Every `kind` value the chain-diagnostic constructors in this module stamp
+/// into their `data` payload: the three [`DiagKind`] variants rendered by
+/// [`make_diagnostic`] (also used by the dynamic-`where` builder, which is
+/// always a column) plus [`ambiguous_column_diagnostic`]'s own kind.
+///
+/// This is the whitelist [`super::code_actions::is_chain_diagnostic`] routes
+/// on, so a new kind added below must be added here too or its quick-fixes
+/// never get offered. `every_chain_diagnostic_is_recognised_by_the_gate` in
+/// this module's tests fails on that drift.
+pub const CHAIN_DIAG_KINDS: &[&str] = &["column", "relation", "table", "ambiguous-column"];
+
 /// What kind of identifier a link's first string arg names. Derived from the
 /// link's `ArgKind`, collapsed to the three things we can validate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
