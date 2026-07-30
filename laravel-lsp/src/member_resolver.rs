@@ -522,6 +522,17 @@ pub fn resolve_and_classify(
         }
     }
 
+    // A facade-alias receiver records its `alias:<token>` attempt dependency —
+    // resolved-or-not, the exact analogue of the container branch above — so an
+    // alias RETARGET ripples the OLD target's sites on the first save of a
+    // session, when the empty registration baseline makes the diff see only the
+    // new target added (#267). Mirrored in [`resolve_recipe_and_classify`].
+    if let Some(d) = deps.as_deref_mut() {
+        if let Some(key) = facade_alias_attempt_key(receiver, bytes, aliases) {
+            d.insert(key);
+        }
+    }
+
     // Facade interception, checked first for a static-call name receiver —
     // `Auth::check()` — so the "resolved via facade" signal threads cleanly into
     // classification. A `Some` here means the concrete came through the facade
@@ -1855,7 +1866,7 @@ fn foreach_parts<'t>(foreach: Node<'t>, bytes: &[u8]) -> Option<(Node<'t>, Strin
 /// FQCN of the class lexically enclosing `node`, or `None` when `node` isn't
 /// inside a class (e.g. a free function, or a `$this` inside a trait — whose
 /// runtime class is unknowable statically).
-fn enclosing_class_fqcn(node: Node, bytes: &[u8]) -> Option<String> {
+pub(crate) fn enclosing_class_fqcn(node: Node, bytes: &[u8]) -> Option<String> {
     let class = enclosing_class_node(node)?;
     let class_name = class
         .child_by_field_name("name")
@@ -2454,6 +2465,25 @@ fn container_attempt_key(receiver: Node, bytes: &[u8]) -> Option<String> {
     })
 }
 
+/// The `alias:<token>` reverse-index attempt key for a facade receiver that
+/// resolves through the global alias map (`Auth::check()`, `\Cache::get()`), or
+/// `None` for any other receiver shape. The token comes from
+/// [`crate::facade_resolver::global_alias_token`] — the exact gate
+/// `resolve_facade_fqcn` applies — so the key is recorded against the same tokens
+/// the registration diff emits, and resolved-or-not (independent of whether the
+/// token is a registered alias today) so a retarget reaches this site on the
+/// first empty-baseline save (#267). Mirrors [`container_attempt_key`] for the
+/// facade-alias kind.
+fn facade_alias_attempt_key(receiver: Node, bytes: &[u8], aliases: &UseAliases) -> Option<String> {
+    if !matches!(receiver.kind(), "name" | "qualified_name") {
+        return None;
+    }
+    let raw = receiver.utf8_text(bytes).ok()?;
+    let is_namespaced = file_namespace(receiver, bytes).is_some();
+    crate::facade_resolver::global_alias_token(raw, aliases, is_namespaced)
+        .map(|token| crate::magic_dependency_index::alias_dep_key(&token))
+}
+
 /// The shape of [`resolve_gate_closure_user`] — a variable that is a Gate
 /// ability closure's first parameter — without the auth-model lookup.
 fn is_gate_closure_user_shape(var_node: Node, bytes: &[u8]) -> bool {
@@ -2553,6 +2583,22 @@ fn resolve_recipe_and_classify(
                 "{}{key}",
                 crate::magic_dependency_index::BINDING_DEP_PREFIX
             ));
+        }
+    }
+
+    // Facade-alias attempt dependency (see [`resolve_and_classify`]'s mirror):
+    // the `alias:<token>` key is recorded resolved-or-not so an alias retarget
+    // ripples this site on the first (empty-baseline) save (#267).
+    if let Some(d) = deps.as_deref_mut() {
+        if let ReceiverRecipeData::StaticName {
+            raw, is_namespaced, ..
+        } = &site.recipe
+        {
+            if let Some(token) =
+                crate::facade_resolver::global_alias_token(raw, aliases, *is_namespaced)
+            {
+                d.insert(crate::magic_dependency_index::alias_dep_key(&token));
+            }
         }
     }
 

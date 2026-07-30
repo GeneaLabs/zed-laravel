@@ -623,6 +623,32 @@ fn member_chain_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> Chai
                 return ChainReceiver::Unknown;
             };
             let var = raw.trim_start_matches('$').to_string();
+            // One innermost-scope assignment fetch feeds both the issue-#246
+            // shape detection and the plain flow-typing fallback below.
+            let assignment = super::flow::latest_assignment_before(node, bytes, &var);
+            // Issue #246: `$var = $base->relation()->…->get()` — the variable
+            // holds a hydrated Collection of the *related* model, not a
+            // builder on the base model. Detect the executed-relation
+            // assignment shape first and emit the same receiver as the
+            // property-access form (`$base->relation->…`): collection mode at
+            // the base model, with the relation queued as a pending hop for
+            // the async finalize step. `from_call` distinguishes a claimed
+            // method call (a finalize miss may still be a local scope, see
+            // [`RelationHopKind::CallClaim`]) from the `$this->prop->…`
+            // property claim (issue #272). `call_hops` carries the chain's
+            // unrecognised middle calls (scopes, unmodeled builder methods,
+            // further relation hops) as heuristic hops.
+            if let Some(cr) = assignment.and_then(|(rhs, start)| {
+                super::flow::resolve_collection_relation(rhs, start, bytes, aliases)
+            }) {
+                return ChainReceiver::Eloquent(EloquentReceiver::RelationProperty {
+                    var,
+                    base_type: Some(cr.base),
+                    relation: cr.relation,
+                    from_call: cr.from_call,
+                    call_hops: cr.heuristic_hops,
+                });
+            }
             // Phase 9: try to resolve `$var`'s declared class via either a
             // typed function parameter (`function show(User $user)`) or an
             // `@var` docblock immediately above the variable's assignment.
@@ -630,7 +656,10 @@ fn member_chain_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> Chai
             // and Livewire components. `None` is acceptable — receiver
             // resolution will still fall back to Phase 8's closure-scope
             // path if applicable; otherwise completion silently no-ops.
-            let php_type = super::var_type::resolve(node, bytes, &var, aliases);
+            // The pre-fetched assignment is threaded through so the flow
+            // walk's first scope iteration doesn't re-scan for it.
+            let php_type =
+                super::flow::resolve_with_assignment(node, bytes, &var, aliases, assignment);
             ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, php_type })
         }
         // `(new self)->with(...)` / `(new User)->where(...)` etc. — the
@@ -694,6 +723,8 @@ fn member_access_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> Cha
         var,
         base_type,
         relation,
+        from_call: false,
+        call_hops: Vec::new(),
     })
 }
 

@@ -2,6 +2,7 @@ mod array_context_detection;
 mod asset_path_resolution;
 mod blade_component_context;
 mod blade_directive_context;
+mod blade_var_collection_typing;
 mod blade_var_rename_handler;
 mod byte_offset_panic_hardening;
 mod cast_type_context;

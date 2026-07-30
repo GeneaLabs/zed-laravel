@@ -1347,3 +1347,80 @@ fn non_subquery_methods_have_no_subquery_columns() {
         }
     }
 }
+
+// ---- Executed-relation collection receivers (issue #246) ----------------
+
+#[test]
+fn executed_relation_assignment_yields_relation_property_receiver() {
+    // `$regs = $user->competitions()->select(…)->get()` then `$regs->whereIn(…)`
+    // — the use-site chain's receiver must be the collection-mode
+    // RelationProperty shape (base model + pending relation), NOT an
+    // InstanceVar typed as the root model in builder mode.
+    let chains = extract(
+        r#"
+use App\Models\User;
+function run(User $user) {
+    $regs = $user->competitions()->select('competitions.id', 'competitions.type')->get();
+    $regs->whereIn('type', ['league']);
+}
+"#,
+    );
+    let chain = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::RelationProperty { var, .. })
+                    if var == "regs"
+            )
+        })
+        .expect("use-site chain should have a RelationProperty receiver");
+    match &chain.receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::RelationProperty {
+            var,
+            base_type,
+            from_call: _,
+            relation,
+            call_hops,
+        }) => {
+            assert_eq!(var, "regs");
+            assert_eq!(base_type.as_deref(), Some("App\\Models\\User"));
+            assert_eq!(relation, "competitions");
+            assert!(
+                call_hops.is_empty(),
+                "select() is a recognised builder method, not a heuristic hop"
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn plain_collection_assignment_keeps_instance_var_receiver() {
+    // No relation hop in the assignment chain — the variable is a collection
+    // of the ROOT model and must keep the existing InstanceVar typing.
+    let chains = extract(
+        r#"
+function run() {
+    $users = User::query()->where('active', 1)->get();
+    $users->pluck('id');
+}
+"#,
+    );
+    let chain = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. })
+                    if var == "users"
+            )
+        })
+        .expect("use-site chain should keep an InstanceVar receiver");
+    match &chain.receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { php_type, .. }) => {
+            assert_eq!(php_type.as_deref(), Some("User"));
+        }
+        _ => unreachable!(),
+    }
+}

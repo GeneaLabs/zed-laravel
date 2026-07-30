@@ -758,13 +758,32 @@ pub async fn resolve_related_model(
 ///   whose `competitions` property hop is seeded as the first pending hop.
 ///
 /// Each hop resolves against the *running* model via [`resolve_related_model`].
-/// A hop that doesn't name a relationship (an unrecognised builder method like
-/// `->limit()`, or a non-relation property) returns `None` and is skipped,
-/// leaving the model unchanged — the `ChainEffect::None` fallback. The mode is
-/// untouched: a relationship method returns a builder of the related model
-/// (`EloquentBuilder` stays `EloquentBuilder`), and the property form already
-/// entered the walker as `EloquentCollection`. No-op when there are no hops or
-/// the chain has no resolved model to start from.
+/// A failed hop (not a relationship, or no readable model file) is handled by
+/// the hop's [`RelationHopKind`] — NOT the chain's cursor-time mode, which
+/// says nothing about which *hop* missed (a heuristic hop collected in
+/// builder mode is still a heuristic after `->get()` flips the chain to a
+/// Collection):
+///
+/// - [`RelationHopKind::Heuristic`] — a guess (any unrecognised method name
+///   mid-chain: a local scope like `->forCurrentTenant()`, or a builder
+///   method we don't model), so a miss is skipped, leaving the model
+///   unchanged — the `ChainEffect::None` fallback.
+/// - [`RelationHopKind::Claim`] — a relation claim from a `$user->rel->…`
+///   *property* receiver, so a miss means the collection's element type is
+///   unknown. `effective_model` is cleared and consumers stay quiet rather
+///   than false-positiving against the base model's columns.
+/// - [`RelationHopKind::CallClaim`] — a relation claim from an executed
+///   relation *call* assignment (`$x = $user->rel()->get()`, issue #246).
+///   A miss splits on what the called name is (PR #266 review): a declared
+///   **local scope** returns a builder of the *same* model, so the running
+///   model is kept and its columns still validate; anything else (an
+///   undeclared name, or a declared relation with no resolvable related
+///   model — AC #7) clears `effective_model`, same as `Claim`.
+///
+/// The mode is untouched either way: a relationship method returns a builder
+/// of the related model (`EloquentBuilder` stays `EloquentBuilder`), and the
+/// collection forms already entered the walker as `EloquentCollection`. No-op
+/// when there are no hops or the chain has no resolved model to start from.
 pub async fn apply_relation_method_hops(ctx: &mut ChainContext, project_root: &Path) {
     if ctx.pending_relation_hops.is_empty() {
         return;
@@ -774,12 +793,52 @@ pub async fn apply_relation_method_hops(ctx: &mut ChainContext, project_root: &P
         return;
     };
     for hop in hops {
-        if let Some(related) = resolve_related_model(&current, &hop, project_root).await {
-            current = related;
+        match resolve_related_model(&current, &hop.name, project_root).await {
+            Some(related) => current = related,
+            None => match hop.kind {
+                // Heuristic miss: not a relationship — keep `current`, try
+                // the next.
+                RelationHopKind::Heuristic => {}
+                // Property-form claim miss: the element type is unknown —
+                // stay quiet.
+                RelationHopKind::Claim => {
+                    ctx.effective_model = None;
+                    return;
+                }
+                // Call-form claim miss: a declared local scope returns a
+                // builder of the *same* model, so the collection still holds
+                // `current` — keep it. Anything else is an unknown element
+                // type — stay quiet (AC #7).
+                RelationHopKind::CallClaim => {
+                    if !is_local_scope(&current, &hop.name, project_root).await {
+                        ctx.effective_model = None;
+                        return;
+                    }
+                }
+            },
         }
-        // `None` → not a relationship; keep `current` and try the next hop.
     }
     ctx.effective_model = Some(current);
+}
+
+/// Whether `method_name` is a declared Eloquent local scope on `class` —
+/// either style (`scopeForCurrentTenant` prefix or `#[Scope]` attribute),
+/// inheritance- and trait-aware via the class-chain walk. Drives the
+/// `CallClaim` miss split in [`apply_relation_method_hops`]: a scope call
+/// provably returns a builder of the same model, so the executed collection's
+/// element type is the running model, not an unknown.
+async fn is_local_scope(class: &str, method_name: &str, project_root: &Path) -> bool {
+    let Some(path) = find_php_class_file(class, project_root) else {
+        return false;
+    };
+    let root = project_root.to_path_buf();
+    let name = method_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::laravel_introspector::chain::analyze(&path, &root)
+            .is_some_and(|view| view.scopes.iter().any(|s| s.name == name))
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Phase 6 helper: resolve a model class to its table name.

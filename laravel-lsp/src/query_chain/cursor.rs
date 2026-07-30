@@ -417,22 +417,48 @@ fn initial_receiver_context(
 }
 
 /// The relationship hops the walker must apply (deferred to async finalize),
-/// assembled in source order: the receiver's property hop first (for a
-/// `$var->relation->…` chain), then every unrecognised method call seen *before*
-/// `up_to_idx` while the chain is still an `EloquentBuilder`. Collecting only in
-/// `EloquentBuilder` mode is deliberate — once the chain flips to a Collection
-/// or base builder, an unknown call is a Collection/array method, not a relation
-/// on the model.
+/// assembled in source order: the receiver's hop first (for a
+/// `$var->relation->…` chain or an executed relation assignment, issue #246),
+/// then every unrecognised method call seen *before* `up_to_idx` while the
+/// chain is still an `EloquentBuilder`. Collecting only in `EloquentBuilder`
+/// mode is deliberate — once the chain flips to a Collection or base builder,
+/// an unknown call is a Collection/array method, not a relation on the model.
+///
+/// The receiver's hop is a claim (the walker *knows* it names a
+/// relation-shaped access): [`RelationHopKind::Claim`] for the property form,
+/// [`RelationHopKind::CallClaim`] for the executed-relation call form (whose
+/// miss may still be a local scope). Mid-chain unknowns are
+/// [`RelationHopKind::Heuristic`] guesses (they may be local scopes or
+/// unmodeled builder methods). The finalize step treats a miss differently
+/// per kind — see [`RelationHopKind`].
 fn pending_relation_hops_through(
     chain: &BuilderChain,
     mode: BuilderMode,
     up_to_idx: usize,
-) -> Vec<String> {
+) -> Vec<RelationHop> {
     let mut hops = Vec::new();
-    if let ChainReceiver::Eloquent(EloquentReceiver::RelationProperty { relation, .. }) =
-        &chain.receiver
+    if let ChainReceiver::Eloquent(EloquentReceiver::RelationProperty {
+        relation,
+        from_call,
+        call_hops,
+        ..
+    }) = &chain.receiver
     {
-        hops.push(relation.clone());
+        hops.push(RelationHop {
+            name: relation.clone(),
+            kind: if *from_call {
+                RelationHopKind::CallClaim
+            } else {
+                RelationHopKind::Claim
+            },
+        });
+        // The executed-relation assignment's unrecognised middle calls
+        // (source order) — heuristic guesses, same as mid-chain unknowns
+        // collected below: a miss keeps the running model.
+        hops.extend(call_hops.iter().map(|name| RelationHop {
+            name: name.clone(),
+            kind: RelationHopKind::Heuristic,
+        }));
     }
     let mut running = mode;
     for link in chain.links.iter().take(up_to_idx) {
@@ -447,7 +473,10 @@ fn pending_relation_hops_through(
             ChainEffect::None => {
                 if running == BuilderMode::EloquentBuilder && !is_known_builder_method(&link.method)
                 {
-                    hops.push(link.method.clone());
+                    hops.push(RelationHop {
+                        name: link.method.clone(),
+                        kind: RelationHopKind::Heuristic,
+                    });
                 }
             }
         }

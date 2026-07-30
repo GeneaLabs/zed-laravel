@@ -542,18 +542,27 @@ fn eloquent_static_with_first_arg_resolves_to_relation_completion() {
 
 // ---- relation hops (issue #211) ------------------------------------------
 
+/// Shorthand for the expected-hops assertions below.
+fn hop(name: &str, kind: RelationHopKind) -> RelationHop {
+    RelationHop {
+        name: name.to_string(),
+        kind,
+    }
+}
+
 #[test]
 fn unknown_relation_method_call_queues_a_pending_hop() {
     // `competitions()` isn't a known builder method, so in EloquentBuilder mode
-    // the walker queues it as a relation hop to resolve against the model. Mode
-    // stays EloquentBuilder (a relation method returns a builder).
+    // the walker queues it as a relation hop to resolve against the model — as
+    // a Heuristic guess (it could equally be a local scope). Mode stays
+    // EloquentBuilder (a relation method returns a builder).
     let ctx = detect("User::query()->competitions()->whereIn('ty|pe', ['x']);").expect("ctx");
     assert_eq!(ctx.mode, BuilderMode::EloquentBuilder);
     assert_eq!(ctx.effective_model.as_deref(), Some("User"));
     assert!(
         ctx.pending_relation_hops
-            .contains(&"competitions".to_string()),
-        "competitions() should be queued as a relation hop; got {:?}",
+            .contains(&hop("competitions", RelationHopKind::Heuristic)),
+        "competitions() should be queued as a heuristic relation hop; got {:?}",
         ctx.pending_relation_hops
     );
 }
@@ -581,7 +590,7 @@ fn eloquent_static_starter_methods_do_not_queue_relation_hops() {
             .expect("ctx");
     assert_eq!(
         ctx.pending_relation_hops,
-        vec!["competitions".to_string()],
+        vec![hop("competitions", RelationHopKind::Heuristic)],
         "only the relation accessor should be queued; got {:?}",
         ctx.pending_relation_hops
     );
@@ -591,14 +600,18 @@ fn eloquent_static_starter_methods_do_not_queue_relation_hops() {
 fn relation_property_receiver_starts_collection_with_pending_hop() {
     // `$user->competitions->where('|')` — the relation read as a property is a
     // Collection of the related model; the property name is the first pending
-    // hop and the chain runs in EloquentCollection mode.
+    // hop (a genuine Claim, not a heuristic guess) and the chain runs in
+    // EloquentCollection mode.
     let ctx = detect(
         "use App\\Models\\User;\n/** @var User $user */\n$user->competitions->where('ty|pe', 'x');",
     )
     .expect("ctx");
     assert_eq!(ctx.mode, BuilderMode::EloquentCollection);
     assert_eq!(ctx.effective_model.as_deref(), Some("App\\Models\\User"));
-    assert_eq!(ctx.pending_relation_hops, vec!["competitions".to_string()]);
+    assert_eq!(
+        ctx.pending_relation_hops,
+        vec![hop("competitions", RelationHopKind::Claim)]
+    );
 }
 
 #[test]

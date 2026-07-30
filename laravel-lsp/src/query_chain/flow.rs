@@ -60,8 +60,12 @@
 
 use tree_sitter::Node;
 
-use super::methods::is_eloquent_static_starter;
+use super::chain::ChainEffect;
+use super::methods::{
+    chain_effect, is_eloquent_static_starter, is_known_builder_method, COLLECTION_TERMINATORS,
+};
 use super::use_aliases::{resolve_class_name, UseAliases};
+use crate::member_resolver::enclosing_class_fqcn;
 use crate::salsa_impl::Confidence;
 
 /// Cap how many `$a = $b->...; $b = $a->...; ...` hops we'll follow.
@@ -120,6 +124,201 @@ pub fn resolve_expression(
     classify_rhs(node, bytes, aliases, 0, node.start_byte())
 }
 
+/// Find the latest `$var_name = <rhs>` assignment in the use site's innermost
+/// enclosing scope, strictly before the use site. One shared fetch: the
+/// extractor runs this once and threads the result into both
+/// [`resolve_collection_relation`] (the issue-#246 shape detection) and
+/// [`resolve_with_assignment`] (the plain flow-typing fallback), so the
+/// scope-subtree scan isn't done twice per bare-`$var` receiver.
+pub fn latest_assignment_before<'tree>(
+    use_site: Node<'tree>,
+    bytes: &[u8],
+    var_name: &str,
+) -> Option<(Node<'tree>, usize)> {
+    let scope = enclosing_scope(use_site)?;
+    latest_assignment_rhs(scope, bytes, var_name, use_site.start_byte())
+}
+
+/// Detect an executed-relation-query assignment (issue #246):
+///
+/// ```php
+/// $registeredCompetitions = $user->competitions()->select('competitions.id')->get();
+/// $registeredCompetitions->whereIn('type', …);  // ← use site
+/// ```
+///
+/// The variable holds a hydrated `Collection` of the *related* model
+/// (`Competition`), not a builder on the root model (`User`). The caller
+/// passes the already-fetched latest assignment (`rhs` + `assignment_start`,
+/// from [`latest_assignment_before`]). The shape is: the RHS is a member-call
+/// chain whose deepest call is NOT a recognised builder method (a potential
+/// relation hop), no call in between is a recognised builder method that
+/// *changes the chain's mode* (a mid-chain terminator or `toBase()` means the
+/// tail of the chain no longer types the relation query, so the shape doesn't
+/// apply — only [`ChainEffect::None`] builder methods pass through), and the
+/// outermost call is a [`COLLECTION_TERMINATORS`] entry (`get`, `pluck`, …).
+/// The chain root is a variable resolvable to a model (via the normal flow
+/// walk), an Eloquent static starter (`User::query()`), a construction
+/// (`(new User)`), `$this` (the enclosing class's model), or a `$this->prop`
+/// relation-property access (`$this->user->competitions()->get()`). Chain
+/// links may be joined by `->` or nullsafe `?->` interchangeably.
+///
+/// *Unrecognised* middle calls don't reject the shape — mirroring the inline
+/// cursor collector ([`crate::query_chain::cursor`]), each is a heuristic
+/// relation-hop candidate: a scope on the running model (`->approved()`), a
+/// builder method we don't model (`->wherePivot(…)`), or a further relation
+/// hop (`->organizer()`). They're returned (source order — innermost first)
+/// so the finalize step resolves them after the receiver's claim, with a
+/// miss keeping the running model unchanged.
+///
+/// Returns a [`CollectionRelation`] so the extractor can emit a
+/// collection-mode receiver with the relation (and any heuristic candidates)
+/// queued as pending hops — the relation→related-model resolution needs a
+/// model-file read, so it stays deferred to the async finalize step. `None`
+/// means the assignment doesn't match the shape (callers fall back to plain
+/// flow typing).
+pub fn resolve_collection_relation(
+    rhs: Node,
+    assignment_start: usize,
+    bytes: &[u8],
+    aliases: &UseAliases,
+) -> Option<CollectionRelation> {
+    let outer = unwrap_parens(rhs);
+    if !is_member_call(outer) {
+        return None;
+    }
+
+    // Collect the chain's method names outermost → innermost, stopping at
+    // the first non-call node (the chain root). Parens along the way are
+    // syntactic wrapping, not chain structure — unwrap them so a
+    // `(new User)->competitions()->get()` root is still reached. Nullsafe
+    // links (`?->`) are chain structure like plain `->` — a null root
+    // short-circuits the whole chain at runtime, so the non-null result
+    // still types to the related collection.
+    let mut methods: Vec<&str> = Vec::new();
+    let mut node = outer;
+    let root = loop {
+        if is_member_call(node) {
+            methods.push(node_text(node.child_by_field_name("name")?, bytes)?);
+            node = unwrap_parens(node.child_by_field_name("object")?);
+        } else {
+            break node;
+        }
+    };
+
+    // Split terminator (outermost) off, then pick the relation claim by root
+    // shape. For call-rooted chains (`$user->…`, `User::query()->…`,
+    // `(new User)->…`, `$this->…`) the claim is the deepest *call*. For a
+    // `$this->prop` root the claim is the *property* itself — the deepest
+    // call then rides the heuristic-hop queue like any other middle call.
+    let (&terminator, rest) = methods.split_first()?;
+    let (base, relation, from_call, middle) = match root.kind() {
+        // `$this->user->competitions()->get()` — a relation accessed as a
+        // property on `$this`, resolved against the enclosing class's model.
+        // Only a bare-`$this` object is handled; the runtime class of
+        // `$other->prop` would itself need resolving first.
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            let object = root.child_by_field_name("object")?;
+            if object.kind() != "variable_name" || node_text(object, bytes)? != "$this" {
+                return None;
+            }
+            let relation = node_text(root.child_by_field_name("name")?, bytes)?;
+            let base = enclosing_class_fqcn(root, bytes)?;
+            (base, relation, false, rest)
+        }
+        _ => {
+            let (&relation, middle) = rest.split_last()?;
+            if is_known_builder_method(relation) {
+                return None;
+            }
+            // Type the chain root: `$this` is the enclosing class; `$base`
+            // goes via the normal flow walk (bounded at this assignment, so
+            // we don't re-find the assignment we're inside); a static
+            // Eloquent starter (`User::query()->relation()->get()`) or a
+            // construction (`(new User)->relation()->get()` — parens already
+            // unwrapped by the walk above) classify directly.
+            let base = match root.kind() {
+                "variable_name" if node_text(root, bytes)? == "$this" => {
+                    enclosing_class_fqcn(root, bytes)?
+                }
+                "variable_name" => {
+                    let raw = node_text(root, bytes)?;
+                    let base_var = raw.trim_start_matches('$').to_string();
+                    resolve_with_boundary(
+                        root,
+                        assignment_start,
+                        bytes,
+                        &base_var,
+                        aliases,
+                        0,
+                        None,
+                    )?
+                    .0
+                }
+                "scoped_call_expression" => classify_scoped_call(root, bytes, aliases)?,
+                "object_creation_expression" => extract_new_class(root, bytes, aliases)?,
+                _ => return None,
+            };
+            (base, relation, true, middle)
+        }
+    };
+
+    // Shape gate: a collection terminator on top, and no *recognised* middle
+    // method whose [`ChainEffect`] isn't `None`. A mid-chain `get()`
+    // (FlipToCollection), `toBase()` (FlipToBase), or `first()` (Terminate)
+    // means everything after it operates on a collection / base builder /
+    // single model, not the relation query, so typing the variable to the
+    // related model would be wrong. Table-qualified column strings in the
+    // middle links are just arguments — they never affect this method-name
+    // walk.
+    if !COLLECTION_TERMINATORS.contains(&terminator)
+        || middle
+            .iter()
+            .any(|m| is_known_builder_method(m) && chain_effect(m) != ChainEffect::None)
+    {
+        return None;
+    }
+
+    // Unrecognised middle calls are heuristic hop candidates (see the doc
+    // comment) — collected innermost-first so the finalize step applies them
+    // in source order after the receiver's relation claim.
+    let heuristic_hops: Vec<String> = middle
+        .iter()
+        .rev()
+        .filter(|m| !is_known_builder_method(m))
+        .map(|m| m.to_string())
+        .collect();
+
+    Some(CollectionRelation {
+        base,
+        relation: relation.to_string(),
+        from_call,
+        heuristic_hops,
+    })
+}
+
+/// A detected executed-relation-collection assignment
+/// ([`resolve_collection_relation`]): the resolved base model, the relation
+/// claim to defer, whether the claim was a method *call* (`false` for the
+/// `$this->prop->…` property form — the split decides miss semantics, see
+/// [`super::chain::RelationHopKind`]), and the chain's unrecognised middle
+/// calls in source order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionRelation {
+    pub base: String,
+    pub relation: String,
+    pub from_call: bool,
+    pub heuristic_hops: Vec<String>,
+}
+
+/// Whether `node` is a member call joined by `->` or `?->` — both are chain
+/// structure for the walks in this module.
+fn is_member_call(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "member_call_expression" | "nullsafe_member_call_expression"
+    )
+}
+
 /// Like [`resolve`], but also reports the [`Confidence`] tier of the
 /// resolution. The magic-member engine (M3) uses this so each resolved site
 /// can be confidence-gated by consumers (find-references/lens take HIGH+MEDIUM;
@@ -131,7 +330,33 @@ pub fn resolve_with_confidence(
     aliases: &UseAliases,
 ) -> Option<(String, Confidence)> {
     let before_byte = use_site.start_byte();
-    resolve_with_boundary(use_site, before_byte, bytes, var_name, aliases, 0)
+    resolve_with_boundary(use_site, before_byte, bytes, var_name, aliases, 0, None)
+}
+
+/// Like [`resolve`], but takes the innermost scope's latest-assignment lookup
+/// pre-fetched by the caller (from [`latest_assignment_before`], including a
+/// `None` "no assignment found" result), so the first scope iteration reuses
+/// it instead of re-scanning the scope subtree. The extractor's bare-`$var`
+/// receiver path fetches once and feeds both [`resolve_collection_relation`]
+/// and this fallback.
+pub fn resolve_with_assignment(
+    use_site: Node,
+    bytes: &[u8],
+    var_name: &str,
+    aliases: &UseAliases,
+    assignment: Option<(Node, usize)>,
+) -> Option<String> {
+    let before_byte = use_site.start_byte();
+    resolve_with_boundary(
+        use_site,
+        before_byte,
+        bytes,
+        var_name,
+        aliases,
+        0,
+        Some(assignment),
+    )
+    .map(|(fqcn, _)| fqcn)
 }
 
 /// Like `resolve`, but the caller specifies the byte boundary explicitly.
@@ -143,13 +368,19 @@ pub fn resolve_with_confidence(
 /// Because the boundary strictly decreases with each recursive call (or
 /// stays the same only when we walk into an outer scope, where it
 /// becomes the closure node's own start), cycles terminate naturally.
-fn resolve_with_boundary(
-    use_site: Node,
+/// `prefetched` carries the innermost scope's latest-assignment lookup when
+/// the caller already ran it (`Some(result)`, consumed by the first loop
+/// iteration only — outer-scope iterations and recursive calls always scan);
+/// `None` means "not pre-fetched, compute here".
+#[allow(clippy::too_many_arguments)]
+fn resolve_with_boundary<'tree>(
+    use_site: Node<'tree>,
     mut before_byte: usize,
     bytes: &[u8],
     var_name: &str,
     aliases: &UseAliases,
     depth: usize,
+    mut prefetched: Option<Option<(Node<'tree>, usize)>>,
 ) -> Option<(String, Confidence)> {
     if depth > MAX_RECURSION_DEPTH {
         return None;
@@ -166,9 +397,11 @@ fn resolve_with_boundary(
         // fall through to declared types (`typed_param` / `docblock`),
         // because those represent the user's stated intent — they're
         // not silently invalidated by an unrecognised reassignment.
-        if let Some((rhs, assignment_start)) =
-            latest_assignment_rhs(scope, bytes, var_name, before_byte)
-        {
+        let assignment = match prefetched.take() {
+            Some(pre) => pre,
+            None => latest_assignment_rhs(scope, bytes, var_name, before_byte),
+        };
+        if let Some((rhs, assignment_start)) = assignment {
             if let Some(resolved) = classify_rhs(rhs, bytes, aliases, depth, assignment_start) {
                 return Some(resolved);
             }
@@ -358,7 +591,15 @@ fn classify_rhs(
                     let inner = raw.trim_start_matches('$').to_string();
                     // Resolving another variable is an extra flow hop — the
                     // deeper recursion carries the (lower) confidence.
-                    resolve_with_boundary(root, boundary_before, bytes, &inner, aliases, depth + 1)
+                    resolve_with_boundary(
+                        root,
+                        boundary_before,
+                        bytes,
+                        &inner,
+                        aliases,
+                        depth + 1,
+                        None,
+                    )
                 }
                 "parenthesized_expression" => {
                     // Unwrapping parens is syntactic, not a flow hop — keep the
