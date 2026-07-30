@@ -1,6 +1,6 @@
 id = "laravel"
-name = "Laravel"
-description = "Laravel support for Zed — go-to-definition, hover & find-references for Blade, Livewire, Flux, views, routes, and config. 📖 See the README for setup & configuration; custom PHP/Blade language servers need a one-line settings tweak."
+name = "Laravel (Community Edition)"
+description = "Laravel (Community Edition) support for Zed — go-to-definition, hover & find-references for Blade, Livewire, Flux, views, routes, and config. Community-maintained, not affiliated with Laravel LLC. 📖 See the README for setup & configuration; custom PHP/Blade language servers need a one-line settings tweak."
 version = "0.6.0"
 schema_version = 1
 authors = ["Mike Bronner <mike.bronner@icloud.com>"]
@@ -11,7 +11,8 @@ kind = "Rust"
 version = "0.6.0"
 
 [language_servers.laravel-lsp]
-name = "Laravel"
+# Short form: this is Zed's compact status-bar / language-server-list slot.
+name = "Laravel CE"
 # XML: for phpunit.xml env var autocomplete
 # Shell Script: Zed treats .env files as Shell Script (see bash/config.toml path_suffixes)
 languages = ["PHP", "Blade", "XML", "Shell Script"]

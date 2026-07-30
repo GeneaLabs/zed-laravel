@@ -1,4 +1,4 @@
-# Contributing to Laravel for Zed
+# Contributing to Laravel (Community Edition) for Zed
 
 [← Back to README](README.md)
 
