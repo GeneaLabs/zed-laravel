@@ -71,12 +71,17 @@ const COLUMN_DIAG_DENY: &[&str] = &["having"];
 /// Diagnostic codes — stable strings the code-action handler keys off to offer
 /// the matching quick-fix. Kept here so the producer and the consumer share a
 /// single source of truth.
-pub const CODE_UNKNOWN_COLUMN: &str = "laravel-lsp.unknown-column";
-pub const CODE_UNKNOWN_RELATION: &str = "laravel-lsp.unknown-relation";
-pub const CODE_UNKNOWN_TABLE: &str = "laravel-lsp.unknown-table";
+///
+/// Deliberately *unprefixed*: Zed renders a diagnostic's `source` and `code`
+/// concatenated as `(source code)`, and the brand tag already lives in
+/// [`crate::DIAGNOSTIC_SOURCE`] — re-prefixing here would surface as
+/// `(laravel-ce laravel-ce.unknown-table)`. Zed does not dedupe the repeat.
+pub const CODE_UNKNOWN_COLUMN: &str = "unknown-column";
+pub const CODE_UNKNOWN_RELATION: &str = "unknown-relation";
+pub const CODE_UNKNOWN_TABLE: &str = "unknown-table";
 /// A bare column that exists on more than one accessible table (issue #24) —
 /// the query would be ambiguous at runtime, so the user must qualify it.
-pub const CODE_AMBIGUOUS_COLUMN: &str = "laravel-lsp.ambiguous-column";
+pub const CODE_AMBIGUOUS_COLUMN: &str = "ambiguous-column";
 
 /// What kind of identifier a link's first string arg names. Derived from the
 /// link's `ArgKind`, collapsed to the three things we can validate.
@@ -772,7 +777,7 @@ fn make_dynamic_where_diagnostic(
         range,
         severity: Some(severity),
         code: Some(NumberOrString::String(CODE_UNKNOWN_COLUMN.to_string())),
-        source: Some("laravel-lsp".to_string()),
+        source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
         message,
         data: Some(data),
         ..Default::default()
@@ -958,7 +963,7 @@ fn needle_range(lit_span: (usize, usize), needle: &str, content: &str) -> Range 
     }
 }
 
-/// Build the `laravel-lsp.ambiguous-column` diagnostic for a bare column that
+/// Build the `ambiguous-column` diagnostic for a bare column that
 /// exists on more than one accessible table (issue #24). `tables` are the
 /// tables that define it; the message suggests qualifying with the first.
 fn ambiguous_column_diagnostic(
@@ -985,7 +990,7 @@ fn ambiguous_column_diagnostic(
         range,
         severity: Some(severity),
         code: Some(NumberOrString::String(CODE_AMBIGUOUS_COLUMN.to_string())),
-        source: Some("laravel-lsp".to_string()),
+        source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
         message,
         data: Some(data),
         ..Default::default()
@@ -1043,7 +1048,7 @@ fn make_diagnostic(
         range,
         severity: Some(severity),
         code: Some(NumberOrString::String(code.to_string())),
-        source: Some("laravel-lsp".to_string()),
+        source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
         message,
         data: Some(data),
         ..Default::default()

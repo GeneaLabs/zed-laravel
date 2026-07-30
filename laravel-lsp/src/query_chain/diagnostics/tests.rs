@@ -275,6 +275,68 @@ async fn flags_unknown_column_with_suggestion() {
     assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
 }
 
+/// The `source` and `code` are both rendered parenthesised after the message
+/// (`… (laravel-ce unknown-column)`), so both are user-facing attribution tags
+/// — pinned to their literals here so a rename can't silently regress them
+/// (the constant-comparison assertions elsewhere would stay green through any
+/// relabelling). The `code` carries no brand prefix of its own on purpose:
+/// Zed concatenates the two fields verbatim, so prefixing it would render the
+/// brand twice.
+///
+/// The `data` assertion guards a second, subtler contract: `main.rs`'s
+/// `code_action` now tells a chain diagnostic from a path-based one by the
+/// presence of this payload, because both families share one `source`. Lose
+/// `data` here and the rename / qualify / create-migration quick-fixes stop
+/// being offered.
+#[tokio::test]
+async fn chain_diagnostic_carries_the_attribution_tags_and_a_data_payload() {
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(
+        root.clone(),
+        &[("users", &[("id", "int"), ("email", "string")])],
+    )
+    .await;
+    let source = "<?php\nuse App\\Models\\User;\nUser::where('emial', 1)->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+
+    assert_eq!(diags.len(), 1, "exactly one unknown-column diagnostic");
+    assert_eq!(diags[0].source.as_deref(), Some("laravel-ce"));
+    assert_eq!(code_of(&diags[0]), "unknown-column");
+    assert!(
+        diags[0].data.is_some(),
+        "the structured payload is what routes this to the query-chain \
+         quick-fixes now that every diagnostic shares one source"
+    );
+}
+
+/// The test above pins only the unknown-column literal, and every other code
+/// assertion in this file compares against the constant itself — tautological
+/// through a relabelling. So pin all four literals here: re-prefixing any of
+/// them would otherwise sail through the whole suite green, which is exactly
+/// how `(laravel-ce laravel-ce.unknown-table)` reached a release build.
+///
+/// The `starts_with` half is the invariant behind the literals: Zed renders
+/// `source` and `code` concatenated as `(source code)` without deduping, so a
+/// code that repeats the brand tag doubles it in every tooltip.
+#[test]
+fn diagnostic_codes_carry_no_brand_prefix() {
+    let codes = [
+        (super::CODE_UNKNOWN_COLUMN, "unknown-column"),
+        (super::CODE_UNKNOWN_RELATION, "unknown-relation"),
+        (super::CODE_UNKNOWN_TABLE, "unknown-table"),
+        (super::CODE_AMBIGUOUS_COLUMN, "ambiguous-column"),
+    ];
+    for (actual, expected) in codes {
+        assert_eq!(actual, expected);
+        assert!(
+            !actual.starts_with(crate::DIAGNOSTIC_SOURCE),
+            "code {actual:?} repeats the source tag — Zed would render it twice"
+        );
+    }
+}
+
 #[tokio::test]
 async fn valid_column_produces_no_diagnostic() {
     let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);

@@ -39,10 +39,30 @@ struct ChainDiagData {
     tables: Vec<String>,
 }
 
+/// Is this one of *our* query-chain diagnostics — the kind that carries a
+/// structured payload and can be offered rename / qualify / create-migration
+/// quick-fixes?
+///
+/// Both halves matter. Every diagnostic this server publishes shares a single
+/// [`crate::DIAGNOSTIC_SOURCE`] (it's a brand string the user reads, so it
+/// can't also encode which engine produced it), so the `data` payload is the
+/// only thing separating a chain diagnostic from a path-based one such as
+/// "View file not found". `main.rs`'s `code_action` routes on this: its
+/// chain arm `continue`s, so if this ever returned `true` for a path-based
+/// diagnostic, the create-file quick-fixes below it would silently stop being
+/// offered — no compile error, no panic, just a lightbulb that never appears.
+///
+/// Extracted here (rather than inlined at the call site) precisely so that
+/// contract is pinned by tests: `code_action` is an async LSP trait method
+/// that can't be exercised without a live server.
+pub fn is_chain_diagnostic(diagnostic: &Diagnostic) -> bool {
+    diagnostic.source.as_deref() == Some(crate::DIAGNOSTIC_SOURCE) && diagnostic.data.is_some()
+}
+
 /// Pull the `data` payload off a chain diagnostic. Returns `None` for any
 /// diagnostic that isn't one of ours (wrong source, missing/foreign data).
 fn parse(diagnostic: &Diagnostic) -> Option<ChainDiagData> {
-    if diagnostic.source.as_deref() != Some("laravel-lsp") {
+    if !is_chain_diagnostic(diagnostic) {
         return None;
     }
     let data = diagnostic.data.as_ref()?;

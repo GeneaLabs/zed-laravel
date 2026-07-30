@@ -856,6 +856,26 @@ fn toast_rejected_points_at_credentials_and_carries_detail() {
     assert!(msg.contains("MySQL rejected the credentials"), "got: {msg}");
 }
 
+/// Every toast we raise has to name *this* extension — Zed shows toasts
+/// from all attached servers in the same place, and "Laravel" alone would
+/// be ambiguous next to Laravel's official extension. Covers all three
+/// notifying classes, so a prefix missed on one of them fails here.
+#[test]
+fn every_outage_toast_carries_the_short_brand_prefix() {
+    for class in [
+        OutageClass::Unreachable,
+        OutageClass::Rejected,
+        OutageClass::Other,
+    ] {
+        let msg = outage_toast_message(class, "detail")
+            .unwrap_or_else(|| panic!("{class:?} must notify"));
+        assert!(
+            msg.starts_with("Laravel CE: "),
+            "{class:?} toast must be attributable to this extension, got: {msg}"
+        );
+    }
+}
+
 #[test]
 fn toast_not_configured_is_silent() {
     assert!(

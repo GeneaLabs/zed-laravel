@@ -7,7 +7,7 @@
 //! an LSP server *does* have is a `source`-kind code action carrying a
 //! `workspace/executeCommand` command: Zed shows it in the code-actions menu
 //! (`cmd-.`) for any file the server is attached to, regardless of cursor
-//! position or diagnostics. So "Laravel: Reindex project" is offered as a
+//! position or diagnostics. So "Laravel CE: Reindex project" is offered as a
 //! global code action in every PHP/Blade file, and selecting it sends the
 //! `laravel.reindexProject` command back to us, which runs the full cold
 //! reindex (see `trigger_reindex` in `main.rs`).
@@ -57,9 +57,12 @@ pub const REINDEX_COMMAND: &str = "laravel.reindexProject";
 /// specific tail lets a client target exactly this action if it wants to.
 pub const REINDEX_ACTION_KIND: CodeActionKind = CodeActionKind::new("source.reindexProject");
 
-/// The user-visible menu label. Prefixed with "Laravel:" because Zed's
-/// code-actions menu mixes actions from every attached language server.
-pub const REINDEX_ACTION_TITLE: &str = "Laravel: Reindex project";
+/// The user-visible menu label. Prefixed with "Laravel CE:" because Zed's
+/// code-actions menu mixes actions from every attached language server —
+/// including, potentially, Laravel's official extension, so the prefix has
+/// to name *this* extension unambiguously. Short form: menu labels are a
+/// tight slot.
+pub const REINDEX_ACTION_TITLE: &str = "Laravel CE: Reindex project";
 
 /// The `execute_command_provider` server capability: the exact list of
 /// commands this server implements. Kept here (next to the command id)
@@ -73,7 +76,7 @@ pub fn execute_command_options() -> ExecuteCommandOptions {
 
 /// The always-available code actions for a `textDocument/codeAction` request.
 ///
-/// Returns the "Laravel: Reindex project" action when the file is PHP/Blade
+/// Returns the "Laravel CE: Reindex project" action when the file is PHP/Blade
 /// and the request's `only` filter (if any) admits `source`-kind actions;
 /// otherwise an empty vec. Position within the file is deliberately ignored —
 /// the action is global by design, so it's reachable from anywhere.

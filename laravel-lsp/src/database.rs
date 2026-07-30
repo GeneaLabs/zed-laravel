@@ -404,18 +404,18 @@ pub fn outage_toast_message(class: OutageClass, detail: &str) -> Option<String> 
     match class {
         OutageClass::NotConfigured => None,
         OutageClass::Unreachable => Some(format!(
-            "Laravel: can't reach the database — is it running? DB-aware \
+            "Laravel CE: can't reach the database — is it running? DB-aware \
              completions and diagnostics are disabled until it's reachable \
              (the LSP retries every {retry}s). {detail}"
         )),
         OutageClass::Rejected => Some(format!(
-            "Laravel: reached the database but the connection was rejected — \
+            "Laravel CE: reached the database but the connection was rejected — \
              check the credentials and that the database exists. DB-aware \
              completions and diagnostics are disabled until it connects \
              (the LSP retries every {retry}s). {detail}"
         )),
         OutageClass::Other => Some(format!(
-            "Laravel: database connection failed, so DB-aware completions \
+            "Laravel CE: database connection failed, so DB-aware completions \
              and diagnostics are disabled until it recovers (the LSP \
              retries every {retry}s). {detail}"
         )),

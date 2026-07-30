@@ -29,6 +29,19 @@ pub const INDEXING_TOKEN: &str = "laravel-lsp/indexing";
 /// Token identifier for the class-rename progress.
 pub const RENAME_TOKEN: &str = "laravel-lsp/rename";
 
+/// The title every `$/progress` entry this server opens is branded with.
+///
+/// Zed's status bar can host several LSP progress entries at once, so an
+/// unbranded title would be ambiguous — the descriptive part ("Indexing
+/// 12,345 of 40,589 files") lives in the `message` instead, keeping the
+/// title short. Short form ("CE", not "Community Edition") because the
+/// status bar is the tightest slot in the UI; the marketplace listing
+/// spells the name out in full.
+///
+/// Single-sourced so the three call sites (startup indexing, reindex,
+/// rename) can't drift apart.
+pub const PROGRESS_TITLE: &str = "Laravel CE";
+
 /// Minimum interval between `$/progress` report notifications. Faster
 /// than this and we'd just be spamming the editor for sub-frame updates
 /// the user can't see anyway. Slower and the bar feels jumpy.
@@ -317,6 +330,15 @@ impl Drop for IndexingProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status-bar title is a public brand surface: it's how a user
+    /// tells this extension's progress entry apart from the official
+    /// Laravel extension's when both are installed. Pinned to the exact
+    /// literal so a rename can't silently regress it.
+    #[test]
+    fn progress_title_is_the_short_brand_name() {
+        assert_eq!(PROGRESS_TITLE, "Laravel CE");
+    }
 
     #[test]
     fn phase_one_fills_zero_to_parse_span() {

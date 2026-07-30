@@ -32,9 +32,10 @@ use crate::{FileAction, FileActionType};
 use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-/// A minimal `laravel`-source diagnostic. `build_code_action` only clones it into
-/// the emitted `CodeAction`; the containment backstop runs before it is read, so
-/// its contents are irrelevant to what these tests assert.
+/// A minimal diagnostic carrying our own source. `build_code_action` only
+/// clones it into the emitted `CodeAction`; the containment backstop runs
+/// before it is read, so its contents are irrelevant to what these tests
+/// assert.
 fn diagnostic() -> Diagnostic {
     Diagnostic {
         range: Range {
@@ -49,7 +50,7 @@ fn diagnostic() -> Diagnostic {
         },
         severity: Some(DiagnosticSeverity::WARNING),
         code: None,
-        source: Some("laravel".to_string()),
+        source: Some(laravel_lsp::DIAGNOSTIC_SOURCE.to_string()),
         message: "View file not found: 'welcome'".to_string(),
         related_information: None,
         tags: None,

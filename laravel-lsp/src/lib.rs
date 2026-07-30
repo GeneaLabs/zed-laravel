@@ -9,6 +9,35 @@
 // worthwhile follow-up refactor — tracked separately from CI hardening.
 #![allow(clippy::type_complexity)]
 
+/// The `source` stamped on every LSP `Diagnostic` this server publishes.
+///
+/// This is a **user-visible** string, not an internal id: Zed renders a
+/// diagnostic's source parenthesised after the message (`Table "orders"
+/// does not exist. (laravel-ce)`), the same way it shows `(eslint)`.
+///
+/// A lowercase kebab-case slug rather than the Title Case brand, matching
+/// how every other server's attribution tag reads in that slot — `eslint`,
+/// `rust-analyzer`, `phpstan`. The Title Case "Laravel CE" is for prose
+/// labels the user reads as a name (status-bar progress titles, the
+/// code-action menu entry, the language-server list); this is a tag.
+///
+/// Single-sourced because it is read as well as written. The code-action
+/// layer decides whether a diagnostic is ours by comparing against this
+/// value (`main.rs`'s `code_action`, `query_chain::code_actions::parse`),
+/// and a write site that drifted from the read sites would silently stop
+/// offering quick-fixes — diagnostics would still render, but clicking
+/// one would offer no fix, with nothing failing to compile.
+pub const DIAGNOSTIC_SOURCE: &str = "laravel-ce";
+
+#[cfg(test)]
+mod diagnostic_source_tests {
+    /// Pins the attribution tag the user actually reads in the editor.
+    #[test]
+    fn diagnostic_source_is_the_lowercase_slug() {
+        assert_eq!(super::DIAGNOSTIC_SOURCE, "laravel-ce");
+    }
+}
+
 // Core modules
 pub mod alpine;
 pub mod blade_directive_tokens;

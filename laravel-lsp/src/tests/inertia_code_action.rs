@@ -47,7 +47,14 @@ fn missing_page_emits_error_diagnostic() {
         .expect("a missing page must yield a diagnostic");
 
     assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-    assert_eq!(diag.source.as_deref(), Some("laravel"));
+    // Pinned to the literal, not the constant: Zed renders the source to the
+    // user, so it's an attribution tag they read. A constant-comparison would
+    // stay green through any relabelling.
+    assert_eq!(diag.source.as_deref(), Some("laravel-ce"));
+    // No structured payload — that absence is what routes a path-based
+    // diagnostic to the create-file quick-fixes rather than the query-chain
+    // ones, now that both families share a single `source`.
+    assert!(diag.data.is_none());
     assert!(diag.message.contains("Auth/Login"), "{}", diag.message);
     assert!(
         diag.message.contains("resources/js/Pages/Auth/Login.vue"),

@@ -137,7 +137,7 @@ impl LaravelExtension {
 
         // Download and extract
         zed::download_file(&release_url, version_dir, file_type)
-            .map_err(|e| format!("Failed to download Laravel LSP binary: {}", e))?;
+            .map_err(|e| format!("Failed to download Laravel CE LSP binary: {}", e))?;
 
         // Verify extraction succeeded
         if fs::metadata(&binary_path).is_err() {
@@ -150,7 +150,7 @@ impl LaravelExtension {
         // Make the binary executable via the Zed host (extensions run as WASM,
         // so std::os::unix::fs is unavailable here).
         zed::make_file_executable(&binary_path)
-            .map_err(|e| format!("Failed to make Laravel LSP binary executable: {}", e))?;
+            .map_err(|e| format!("Failed to make Laravel CE LSP binary executable: {}", e))?;
 
         Ok(binary_path)
     }

@@ -16,6 +16,15 @@ fn only_action(actions: Vec<CodeActionOrCommand>) -> CodeAction {
     }
 }
 
+/// The other tests here compare against the constant, so they'd stay green
+/// through any relabelling. This one pins the literal: the "Laravel CE:"
+/// prefix is what distinguishes our entry in a code-actions menu that may
+/// also carry Laravel's official extension's actions.
+#[test]
+fn reindex_action_label_carries_the_short_brand_prefix() {
+    assert_eq!(REINDEX_ACTION_TITLE, "Laravel CE: Reindex project");
+}
+
 #[test]
 fn capability_declares_the_reindex_command() {
     let options = execute_command_options();

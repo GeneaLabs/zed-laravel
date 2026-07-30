@@ -15,7 +15,7 @@ fn diag(code: &str, data: serde_json::Value) -> Diagnostic {
                 character: 18,
             },
         },
-        source: Some("laravel-lsp".to_string()),
+        source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
         code: Some(NumberOrString::String(code.to_string())),
         data: Some(data),
         ..Default::default()
@@ -24,6 +24,48 @@ fn diag(code: &str, data: serde_json::Value) -> Diagnostic {
 
 fn uri() -> Url {
     Url::parse("file:///app/Http/Controllers/UserController.php").unwrap()
+}
+
+// ---- is_chain_diagnostic: the code-action routing gate --------------------
+//
+// `main.rs`'s `code_action` is an async LSP trait method and can't be
+// exercised without a live server, so this predicate is where its routing
+// contract is actually pinned. The path-based case below is the important
+// one: it fails if someone widens the gate back to a bare `source` check,
+// which would silently stop the create-view/component quick-fixes from ever
+// being offered.
+
+#[test]
+fn chain_diagnostic_with_payload_is_routed_to_chain_actions() {
+    assert!(is_chain_diagnostic(&diag(
+        "unknown-column",
+        json!({"kind": "column", "name": "emial"})
+    )));
+}
+
+#[test]
+fn our_path_based_diagnostic_is_not_a_chain_diagnostic() {
+    // Same source as a chain diagnostic — they share one brand string — but no
+    // structured payload. This is a "View file not found"-shaped diagnostic,
+    // and routing it into the chain arm would starve the create-file fixes.
+    let path_based = Diagnostic {
+        source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
+        message: "View file not found: 'welcome'".to_string(),
+        data: None,
+        ..Default::default()
+    };
+    assert!(!is_chain_diagnostic(&path_based));
+}
+
+#[test]
+fn foreign_diagnostic_is_not_a_chain_diagnostic() {
+    // Another server's diagnostic that happens to carry a `data` payload.
+    let foreign = Diagnostic {
+        source: Some("intelephense".to_string()),
+        data: Some(json!({"kind": "column", "name": "emial"})),
+        ..Default::default()
+    };
+    assert!(!is_chain_diagnostic(&foreign));
 }
 
 // ---- format_migration_timestamp / civil_from_days -------------------------
@@ -180,7 +222,7 @@ fn into_action(a: CodeActionOrCommand) -> tower_lsp::lsp_types::CodeAction {
 #[test]
 fn rename_action_replaces_diagnostic_range() {
     let d = diag(
-        "laravel-lsp.unknown-column",
+        "unknown-column",
         json!({"kind": "column", "name": "emial", "replacement": "email", "replacementLabel": "email", "table": "users"}),
     );
     let action = into_action(rename_action(&d, &uri()).expect("a rename action"));
@@ -200,7 +242,7 @@ fn rename_action_for_dynamic_uses_studly_replacement_and_method_label() {
     // Dynamic where{Column}: the range covers the studly portion, so the edit
     // inserts `Email`, but the title shows the whole corrected method.
     let d = diag(
-        "laravel-lsp.unknown-column",
+        "unknown-column",
         json!({"kind": "column", "name": "emaaaail", "dynamic": true,
                "replacement": "Email", "replacementLabel": "whereEmail", "table": "users"}),
     );
@@ -214,7 +256,7 @@ fn rename_action_for_dynamic_uses_studly_replacement_and_method_label() {
 fn rename_action_none_without_replacement() {
     // No suggestion was close enough → no replacement → no rename action.
     let d = diag(
-        "laravel-lsp.unknown-column",
+        "unknown-column",
         json!({"kind": "column", "name": "zzzzz", "replacement": null, "table": "users"}),
     );
     assert!(rename_action(&d, &uri()).is_none());
@@ -223,7 +265,7 @@ fn rename_action_none_without_replacement() {
 #[test]
 fn rename_action_none_for_foreign_source() {
     let mut d = diag(
-        "laravel-lsp.unknown-column",
+        "unknown-column",
         json!({"kind": "column", "name": "emial", "replacement": "email"}),
     );
     d.source = Some("intelephense".to_string());
@@ -258,7 +300,7 @@ fn create_file_content(action: &tower_lsp::lsp_types::CodeAction) -> String {
 #[test]
 fn migration_action_creates_timestamped_file_with_stub() {
     let d = diag(
-        "laravel-lsp.unknown-column",
+        "unknown-column",
         json!({"kind": "column", "name": "phone", "table": "users"}),
     );
     let root = Path::new("/srv/app");
@@ -287,7 +329,7 @@ fn migration_action_creates_timestamped_file_with_stub() {
 #[test]
 fn migration_action_none_for_relation() {
     let d = diag(
-        "laravel-lsp.unknown-relation",
+        "unknown-relation",
         json!({"kind": "relation", "name": "postss", "replacement": "posts"}),
     );
     assert!(migration_action(&d, Path::new("/srv/app"), "2026_05_29_120000").is_none());
@@ -296,7 +338,7 @@ fn migration_action_none_for_relation() {
 #[test]
 fn migration_action_none_without_table() {
     let d = diag(
-        "laravel-lsp.unknown-column",
+        "unknown-column",
         json!({"kind": "column", "name": "phone"}), // no table
     );
     assert!(migration_action(&d, Path::new("/srv/app"), "2026_05_29_120000").is_none());
@@ -307,7 +349,7 @@ fn migration_action_none_without_table() {
 #[test]
 fn qualify_actions_one_per_candidate_table() {
     let d = diag(
-        "laravel-lsp.ambiguous-column",
+        "ambiguous-column",
         json!({"kind": "ambiguous-column", "name": "id", "tables": ["users", "orders"]}),
     );
     let actions: Vec<_> = qualify_actions(&d, &uri())
@@ -328,7 +370,7 @@ fn qualify_actions_one_per_candidate_table() {
 fn qualify_actions_uses_alias_qualifier() {
     // For an aliased join the candidate is the alias the user must type.
     let d = diag(
-        "laravel-lsp.ambiguous-column",
+        "ambiguous-column",
         json!({"kind": "ambiguous-column", "name": "id", "tables": ["u", "o"]}),
     );
     let actions: Vec<_> = qualify_actions(&d, &uri())
@@ -342,7 +384,7 @@ fn qualify_actions_uses_alias_qualifier() {
 #[test]
 fn qualify_actions_empty_for_non_ambiguity_diagnostic() {
     let d = diag(
-        "laravel-lsp.unknown-column",
+        "unknown-column",
         json!({"kind": "column", "name": "emial", "replacement": "email", "table": "users"}),
     );
     assert!(qualify_actions(&d, &uri()).is_empty());
