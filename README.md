@@ -24,12 +24,13 @@
 
 <p align="center">
 <sub>A community extension — not affiliated with Laravel LLC.<br>
-Listed on the Zed marketplace as <strong>Laravel (Community Edition)</strong>; abbreviated to <strong>Laravel CE</strong> wherever Zed's UI is tight (status bar, language-server list, progress titles).</sub>
+Listed on the Zed marketplace as <strong>Laravel (Community Edition)</strong>; abbreviated to <strong>Laravel CE</strong> or <strong>laravel-ce</strong> wherever Zed's UI is tight (status bar, language-server list, progress titles).</sub>
 </p>
 
 ## Contents
 
 - [❤️ Why we built this](#️-why-we-built-this)
+- [⚖️ Which one should you use?](#️-which-one-should-you-use)
 - [✨ Features](#-features)
 - [📦 Install](#-install)
 - [⚙️ Configuration](#️-configuration)
@@ -51,12 +52,22 @@ Everything is parsed statically with tree-sitter: the extension reads your files
 
 **⚡ Indexing performance.** The extension indexes every PHP and Blade file in your project (including `vendor/`) at startup so find-references and goto-definition return instantly. A persistent on-disk cache makes subsequent project opens near-instant — only files whose `mtime` has changed since they were last indexed get re-parsed. External changes (a `git pull`, a `composer install`, a formatter running outside Zed) are picked up live via `workspace/didChangeWatchedFiles`. The status bar shows progress during the initial warmup.
 
+## ⚖️ Which one should you use?
 
-### How this compares
+Laravel now ships an **official Zed extension** of its own. Both are good tools that answer the same questions in different ways: the official server boots your app via `artisan tinker` and asks the framework directly; this one reads your code and never runs it. Pick on that split — it's the part that won't change. Feature lists on both sides move every release.
 
-Laravel developers are spoiled for choice — every major editor has strong framework-aware tooling, and Laravel now ships an **official Zed extension** of its own. Neither it nor this one is a strict superset of the other: the official server boots your app via `artisan tinker` to gather project data, while this one never runs your code. Dirty branches and WIP migrations favour static analysis; genuinely runtime-only state favours booting the app.
+> ⚠️ **You probably shouldn't run both at the same time.** Both register a language server for PHP and Blade, and both answer the same requests for the same patterns. Zed merges what every attached server returns, so running the pair tends to show you everything twice: two hover cards on one `view()` call, duplicate completion entries, two diagnostics for a single missing view. Nothing breaks — it's just noisy, the same way running three PHP LSPs at once is. If you'd rather keep both installed, disable one with a `"!"` prefix in your PHP / Blade [`language_servers`](docs/configuration.md) list.
 
-⚖️ **[Full comparison →](docs/comparison.md)** — Laravel tooling across editors, plus architecture, LSP capabilities, and per-feature depth against the official extension.
+| Choose **Laravel CE** — reads your code, never runs it | Choose the **official extension** — asks your running app directly |
+|---|---|
+| You spend time on branches where the app isn't always runnable: a half-applied migration, a missing `.env`, an unregistered provider, a database you're not connected to. Parsing carries on regardless. | Your app boots cleanly on demand, and you'd like Laravel itself to be the source of truth |
+| You open packages, libraries, and shared component sets — repos with no application at the root | You work on full applications, where running the app is already part of the loop |
+| You like knowing your editor only ever reads: no provider `boot()`, no container, nothing executed on your behalf | You're glad to have the editor run `artisan tinker` for you — it's what you'd type by hand to answer the same question |
+| You want what's **written** — the code on disk right now, including edits you haven't run yet | You want what's **resolved** — runtime-registered routes, computed config, and container state only a booted kernel can report |
+| You want re-indexing to stay cheap and incremental: an mtime-based cache, only changed files re-parsed | You want each index gathered fresh from the framework, so what you see matches what your app would do right now |
+| You want tooling that works the moment you clone a repo, with no PHP runtime to locate first | Your PHP environment is set up and humming (Herd / Valet / Sail / Lando / DDEV), and you want tooling that runs on the very same runtime your app does |
+
+⚖️ **[Full comparison →](docs/comparison.md)** — Laravel tooling across editors, plus architecture, LSP capabilities, and a feature-by-feature snapshot against the official extension.
 
 ## ✨ Features
 
@@ -78,6 +89,8 @@ Each feature has a focused reference under [`docs/`](docs/) — click through to
 ## 📦 Install
 
 Search **"Laravel"** in Zed Extensions and install **Laravel (Community Edition)**.
+
+The official **Laravel** extension shows up in the same search results — you'll [probably want just one of the two](#️-which-one-should-you-use).
 
 ### 🤝 Recommended companions
 

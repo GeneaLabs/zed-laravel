@@ -18,11 +18,28 @@ Laravel developers are spoiled for choice — every major editor has a strong wa
 
 ## Community Edition vs. the official Laravel extension
 
-Laravel now ships an official Zed extension of its own, powered by the `laravel/lsp` language server ([zed-industries/extensions#6996](https://github.com/zed-industries/extensions/pull/6996)). Both extensions are listed separately and can be installed side by side. Neither is a strict superset of the other — they're built on genuinely different architectures, and which one fits you depends on how you work.
+Laravel now ships an official Zed extension of its own, powered by the `laravel/lsp` language server ([zed-industries/extensions#6996](https://github.com/zed-industries/extensions/pull/6996)). Both are listed separately in Zed's extension registry. Neither is a strict superset of the other — they're built on genuinely different architectures, and which one fits you depends on how you work.
+
+> ⚠️ **You probably shouldn't run both at the same time.** Each registers a language server for PHP and Blade, and both answer `hover`, `completion`, `documentLink`, and diagnostics for the same patterns. Zed merges the results of every attached server, so running the pair tends to double what you see: two hover cards on one `view()` call, duplicate completion entries, two diagnostics for a single missing view. Nothing breaks — it's noise, not conflict, the same kind you'd get from running Intelephense, Phpactor, and PhpTools together. If you want both installed so you can switch between them, disable one per-language with a `"!"` prefix in [`language_servers`](configuration.md).
+
+**Which one to pick**
+
+Both are good tools. Choose on architecture, not on today's feature lists — those move every release on both sides. The architectural split is the part that stays true.
+
+| Choose Community Edition — reads your code, never runs it | Choose the official extension — asks your running app directly |
+|---|---|
+| You spend time on branches where the app isn't always runnable: a half-applied migration, a missing `.env`, an unregistered provider, a database you're not connected to. Parsing carries on regardless. | Your app boots cleanly on demand, and you'd like Laravel itself to be the source of truth |
+| You open packages, libraries, and shared component sets — repos with no application at the root | You work on full applications, where running the app is already part of the loop |
+| You like knowing your editor only ever reads: no provider `boot()`, no container, nothing executed on your behalf | You're glad to have the editor run `artisan tinker` for you — it's what you'd type by hand to answer the same question |
+| You want what's **written** — the code on disk right now, including edits you haven't run yet | You want what's **resolved** — runtime-registered routes, computed config, and container state only a booted kernel can report |
+| You want re-indexing to stay cheap and incremental: an mtime-based cache, only changed files re-parsed | You want each index gathered fresh from the framework, so what you see matches what your app would do right now |
+| You want tooling that works the moment you clone a repo, with no PHP runtime to locate first | Your PHP environment is set up and humming (Herd / Valet / Sail / Lando / DDEV), and you want tooling that runs on the very same runtime your app does |
+
+The rest of this page is the detail behind that split — including a feature-by-feature snapshot, which is exactly the part that will drift as both projects ship.
 
 **The core difference is how project data gets gathered.** The official server invokes `artisan tinker --execute` per data category to collect routes, config, translations, env, middleware, auth policies, the Mix manifest, and models — which boots your full Laravel kernel, service providers included, on every project (re)index. This extension never runs your app: everything comes from static tree-sitter parsing.
 
-Neither approach wins outright. Booting the app surfaces genuinely runtime-only information that static analysis can't see. Static analysis keeps working precisely when the app *won't* boot — a half-applied migration, a missing `.env`, an unregistered provider, a database the editor can't reach — costs less per refresh, and never executes your application code (including whatever a provider's `boot()`/`register()` does). It also works in any PHP or Blade file in any repo, including packages and libraries with no bootable app at the root. Dirty branches and WIP migrations favour static analysis; genuinely dynamic runtime state favours booting the app.
+Neither approach wins outright — the table above is the short version. The boundary worth spelling out is where static analysis stops: declared Eloquent magic (scopes, accessors, relationships, columns, dynamic finders) *is* resolved here, through a project-wide semantic index, but truly runtime-only behaviour — dynamic member *names* like `$model->$attribute`, routes registered at runtime, config computed during boot — stays out of reach, and ambiguous sites are dropped rather than guessed. Booting the app is how you see that last category. Not booting it is how you keep working when the app can't.
 
 **Architecture**
 
