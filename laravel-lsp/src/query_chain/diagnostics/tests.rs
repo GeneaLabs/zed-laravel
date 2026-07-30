@@ -663,7 +663,7 @@ async fn executed_relation_collection_variable_flags_typo_on_related_table() {
         1,
         "typo in the collection chain still flags: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(
         diags[0].message.contains("competitions"),
         "diagnostic should name the competitions table; got: {}",
@@ -720,7 +720,7 @@ async fn scoped_relation_collection_flags_typo_on_related_table() {
         1,
         "typo after a scoped relation chain still flags: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(
         diags[0].message.contains("competitions"),
         "diagnostic should name the competitions table; got: {}",
@@ -760,7 +760,7 @@ async fn nullsafe_relation_collection_flags_typo_on_related_table() {
         1,
         "typo in the nullsafe collection chain still flags: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(
         diags[0].message.contains("competitions"),
         "diagnostic should name the competitions table; got: {}",
@@ -798,7 +798,7 @@ async fn this_rooted_relation_collection_flags_typo_on_related_table() {
         1,
         "typo in the $this-rooted collection chain still flags: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(
         diags[0].message.contains("competitions"),
         "diagnostic should name the competitions table; got: {}",
@@ -865,7 +865,7 @@ async fn this_property_rooted_relation_collection_flags_typo_on_related_table() 
         1,
         "typo in the $this->prop-rooted collection chain still flags: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(
         diags[0].message.contains("competitions"),
         "diagnostic should name the competitions table; got: {}",
@@ -933,7 +933,7 @@ async fn root_scope_before_relation_collection_flags_typo_on_related_table() {
         1,
         "typo after a scope-before-relation chain still flags: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(
         diags[0].message.contains("competitions"),
         "diagnostic should name the competitions table; got: {}",
@@ -971,7 +971,7 @@ class User extends Model {
         1,
         "typo after a scope-then-terminator chain must still flag: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(
         diags[0].message.contains("users"),
         "diagnostic should name the users table; got: {}",
@@ -1031,7 +1031,7 @@ async fn assigned_local_scope_collection_still_flags_typo_on_root_table() {
         1,
         "typo on an assigned scope collection must still flag: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(
         diags[0].message.contains("users"),
         "diagnostic should name the users table; got: {}",
@@ -1078,7 +1078,7 @@ async fn assigned_static_scope_collection_still_flags_typo_on_root_table() {
         1,
         "typo on a static-rooted assigned scope collection must still flag: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(
         diags[0].message.contains("users"),
         "diagnostic should name the users table; got: {}",
