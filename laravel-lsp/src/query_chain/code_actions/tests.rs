@@ -1,9 +1,12 @@
 use super::*;
 use serde_json::json;
 use tempfile::TempDir;
-use tower_lsp::lsp_types::{CodeActionOrCommand, Diagnostic, NumberOrString, Range};
+use tower_lsp::lsp_types::{CodeActionOrCommand, Diagnostic, Range};
 
-fn diag(code: &str, data: serde_json::Value) -> Diagnostic {
+/// A chain diagnostic exactly as the producer builds it: `source` + a `data`
+/// payload, and no `code` — the family is identified by `data.kind`, which is
+/// what every handler under test branches on.
+fn diag(data: serde_json::Value) -> Diagnostic {
     Diagnostic {
         range: Range {
             start: Position {
@@ -16,7 +19,6 @@ fn diag(code: &str, data: serde_json::Value) -> Diagnostic {
             },
         },
         source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
-        code: Some(NumberOrString::String(code.to_string())),
         data: Some(data),
         ..Default::default()
     }
@@ -38,7 +40,6 @@ fn uri() -> Url {
 #[test]
 fn chain_diagnostic_with_payload_is_routed_to_chain_actions() {
     assert!(is_chain_diagnostic(&diag(
-        "unknown-column",
         json!({"kind": "column", "name": "emial"})
     )));
 }
@@ -222,7 +223,6 @@ fn into_action(a: CodeActionOrCommand) -> tower_lsp::lsp_types::CodeAction {
 #[test]
 fn rename_action_replaces_diagnostic_range() {
     let d = diag(
-        "unknown-column",
         json!({"kind": "column", "name": "emial", "replacement": "email", "replacementLabel": "email", "table": "users"}),
     );
     let action = into_action(rename_action(&d, &uri()).expect("a rename action"));
@@ -242,7 +242,6 @@ fn rename_action_for_dynamic_uses_studly_replacement_and_method_label() {
     // Dynamic where{Column}: the range covers the studly portion, so the edit
     // inserts `Email`, but the title shows the whole corrected method.
     let d = diag(
-        "unknown-column",
         json!({"kind": "column", "name": "emaaaail", "dynamic": true,
                "replacement": "Email", "replacementLabel": "whereEmail", "table": "users"}),
     );
@@ -255,19 +254,13 @@ fn rename_action_for_dynamic_uses_studly_replacement_and_method_label() {
 #[test]
 fn rename_action_none_without_replacement() {
     // No suggestion was close enough → no replacement → no rename action.
-    let d = diag(
-        "unknown-column",
-        json!({"kind": "column", "name": "zzzzz", "replacement": null, "table": "users"}),
-    );
+    let d = diag(json!({"kind": "column", "name": "zzzzz", "replacement": null, "table": "users"}));
     assert!(rename_action(&d, &uri()).is_none());
 }
 
 #[test]
 fn rename_action_none_for_foreign_source() {
-    let mut d = diag(
-        "unknown-column",
-        json!({"kind": "column", "name": "emial", "replacement": "email"}),
-    );
+    let mut d = diag(json!({"kind": "column", "name": "emial", "replacement": "email"}));
     d.source = Some("intelephense".to_string());
     assert!(rename_action(&d, &uri()).is_none());
 }
@@ -299,10 +292,7 @@ fn create_file_content(action: &tower_lsp::lsp_types::CodeAction) -> String {
 
 #[test]
 fn migration_action_creates_timestamped_file_with_stub() {
-    let d = diag(
-        "unknown-column",
-        json!({"kind": "column", "name": "phone", "table": "users"}),
-    );
+    let d = diag(json!({"kind": "column", "name": "phone", "table": "users"}));
     let root = Path::new("/srv/app");
     let action =
         into_action(migration_action(&d, root, "2026_05_29_120000").expect("a migration action"));
@@ -328,17 +318,13 @@ fn migration_action_creates_timestamped_file_with_stub() {
 
 #[test]
 fn migration_action_none_for_relation() {
-    let d = diag(
-        "unknown-relation",
-        json!({"kind": "relation", "name": "postss", "replacement": "posts"}),
-    );
+    let d = diag(json!({"kind": "relation", "name": "postss", "replacement": "posts"}));
     assert!(migration_action(&d, Path::new("/srv/app"), "2026_05_29_120000").is_none());
 }
 
 #[test]
 fn migration_action_none_without_table() {
     let d = diag(
-        "unknown-column",
         json!({"kind": "column", "name": "phone"}), // no table
     );
     assert!(migration_action(&d, Path::new("/srv/app"), "2026_05_29_120000").is_none());
@@ -348,10 +334,7 @@ fn migration_action_none_without_table() {
 
 #[test]
 fn qualify_actions_one_per_candidate_table() {
-    let d = diag(
-        "ambiguous-column",
-        json!({"kind": "ambiguous-column", "name": "id", "tables": ["users", "orders"]}),
-    );
+    let d = diag(json!({"kind": "ambiguous-column", "name": "id", "tables": ["users", "orders"]}));
     let actions: Vec<_> = qualify_actions(&d, &uri())
         .into_iter()
         .map(into_action)
@@ -369,10 +352,7 @@ fn qualify_actions_one_per_candidate_table() {
 #[test]
 fn qualify_actions_uses_alias_qualifier() {
     // For an aliased join the candidate is the alias the user must type.
-    let d = diag(
-        "ambiguous-column",
-        json!({"kind": "ambiguous-column", "name": "id", "tables": ["u", "o"]}),
-    );
+    let d = diag(json!({"kind": "ambiguous-column", "name": "id", "tables": ["u", "o"]}));
     let actions: Vec<_> = qualify_actions(&d, &uri())
         .into_iter()
         .map(into_action)
@@ -383,9 +363,7 @@ fn qualify_actions_uses_alias_qualifier() {
 
 #[test]
 fn qualify_actions_empty_for_non_ambiguity_diagnostic() {
-    let d = diag(
-        "unknown-column",
-        json!({"kind": "column", "name": "emial", "replacement": "email", "table": "users"}),
-    );
+    let d =
+        diag(json!({"kind": "column", "name": "emial", "replacement": "email", "table": "users"}));
     assert!(qualify_actions(&d, &uri()).is_empty());
 }

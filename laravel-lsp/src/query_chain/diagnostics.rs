@@ -55,7 +55,7 @@ use crate::laravel_introspector::{
 };
 use std::path::Path;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 
 /// Column methods whose first string arg we deliberately DON'T validate.
 /// `having` filters on aggregate *aliases* (`having('total', '>', 5)` after a
@@ -67,21 +67,6 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range
 /// [`is_simple_identifier`] guard, so only a bare typo like `select('emial')`
 /// is flagged — which is exactly what we want.
 const COLUMN_DIAG_DENY: &[&str] = &["having"];
-
-/// Diagnostic codes — stable strings the code-action handler keys off to offer
-/// the matching quick-fix. Kept here so the producer and the consumer share a
-/// single source of truth.
-///
-/// Deliberately *unprefixed*: Zed renders a diagnostic's `source` and `code`
-/// concatenated as `(source code)`, and the brand tag already lives in
-/// [`crate::DIAGNOSTIC_SOURCE`] — re-prefixing here would surface as
-/// `(laravel-ce laravel-ce.unknown-table)`. Zed does not dedupe the repeat.
-pub const CODE_UNKNOWN_COLUMN: &str = "unknown-column";
-pub const CODE_UNKNOWN_RELATION: &str = "unknown-relation";
-pub const CODE_UNKNOWN_TABLE: &str = "unknown-table";
-/// A bare column that exists on more than one accessible table (issue #24) —
-/// the query would be ambiguous at runtime, so the user must qualify it.
-pub const CODE_AMBIGUOUS_COLUMN: &str = "ambiguous-column";
 
 /// What kind of identifier a link's first string arg names. Derived from the
 /// link's `ArgKind`, collapsed to the three things we can validate.
@@ -776,7 +761,6 @@ fn make_dynamic_where_diagnostic(
     Diagnostic {
         range,
         severity: Some(severity),
-        code: Some(NumberOrString::String(CODE_UNKNOWN_COLUMN.to_string())),
         source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
         message,
         data: Some(data),
@@ -989,7 +973,6 @@ fn ambiguous_column_diagnostic(
     Diagnostic {
         range,
         severity: Some(severity),
-        code: Some(NumberOrString::String(CODE_AMBIGUOUS_COLUMN.to_string())),
         source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
         message,
         data: Some(data),
@@ -1014,10 +997,10 @@ fn make_diagnostic(
 ) -> Diagnostic {
     let range = needle_range(lit_span, needle, content);
 
-    let (code, data_kind) = match kind {
-        DiagKind::Column => (CODE_UNKNOWN_COLUMN, "column"),
-        DiagKind::Relation => (CODE_UNKNOWN_RELATION, "relation"),
-        DiagKind::Table => (CODE_UNKNOWN_TABLE, "table"),
+    let data_kind = match kind {
+        DiagKind::Column => "column",
+        DiagKind::Relation => "relation",
+        DiagKind::Table => "table",
     };
 
     // `subject` is the raw table name (Column), the model FQCN (Relation), or
@@ -1047,7 +1030,6 @@ fn make_diagnostic(
     Diagnostic {
         range,
         severity: Some(severity),
-        code: Some(NumberOrString::String(code.to_string())),
         source: Some(crate::DIAGNOSTIC_SOURCE.to_string()),
         message,
         data: Some(data),

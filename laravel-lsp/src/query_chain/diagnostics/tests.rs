@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
-use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString};
+use tower_lsp::lsp_types::DiagnosticSeverity;
 
 // ---- levenshtein ----------------------------------------------------------
 
@@ -243,11 +243,16 @@ class Competition extends Model {
 }
 "#;
 
-fn code_of(diag: &tower_lsp::lsp_types::Diagnostic) -> &str {
-    match &diag.code {
-        Some(NumberOrString::String(s)) => s.as_str(),
-        _ => "",
-    }
+/// The `kind` discriminator out of a diagnostic's `data` payload. Chain
+/// diagnostics carry no `code`, so this is the field that actually says which
+/// family a diagnostic belongs to — and it's the one the code-action handler
+/// branches on, so pinning it here pins the real contract.
+fn data_kind_of(diag: &tower_lsp::lsp_types::Diagnostic) -> &str {
+    diag.data
+        .as_ref()
+        .and_then(|d| d.get("kind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
 }
 
 #[tokio::test]
@@ -264,7 +269,7 @@ async fn flags_unknown_column_with_suggestion() {
     let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
 
     assert_eq!(diags.len(), 1, "exactly one unknown-column diagnostic");
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(diags[0].message.contains("emial"));
     assert!(diags[0].message.contains("table \"users\""));
     assert!(
@@ -275,13 +280,10 @@ async fn flags_unknown_column_with_suggestion() {
     assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
 }
 
-/// The `source` and `code` are both rendered parenthesised after the message
-/// (`… (laravel-ce unknown-column)`), so both are user-facing attribution tags
-/// — pinned to their literals here so a rename can't silently regress them
-/// (the constant-comparison assertions elsewhere would stay green through any
-/// relabelling). The `code` carries no brand prefix of its own on purpose:
-/// Zed concatenates the two fields verbatim, so prefixing it would render the
-/// brand twice.
+/// `source` is rendered parenthesised after the message (`… (laravel-ce)`), so
+/// it's the user-facing attribution tag — pinned to its literal here so a
+/// rename can't silently regress it (a constant-comparison assertion would
+/// stay green through any relabelling).
 ///
 /// The `data` assertion guards a second, subtler contract: `main.rs`'s
 /// `code_action` now tells a chain diagnostic from a path-based one by the
@@ -289,7 +291,7 @@ async fn flags_unknown_column_with_suggestion() {
 /// `data` here and the rename / qualify / create-migration quick-fixes stop
 /// being offered.
 #[tokio::test]
-async fn chain_diagnostic_carries_the_attribution_tags_and_a_data_payload() {
+async fn chain_diagnostic_carries_the_attribution_tag_and_a_data_payload() {
     let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
     let db = provider_with(
         root.clone(),
@@ -303,7 +305,6 @@ async fn chain_diagnostic_carries_the_attribution_tags_and_a_data_payload() {
 
     assert_eq!(diags.len(), 1, "exactly one unknown-column diagnostic");
     assert_eq!(diags[0].source.as_deref(), Some("laravel-ce"));
-    assert_eq!(code_of(&diags[0]), "unknown-column");
     assert!(
         diags[0].data.is_some(),
         "the structured payload is what routes this to the query-chain \
@@ -311,29 +312,74 @@ async fn chain_diagnostic_carries_the_attribution_tags_and_a_data_payload() {
     );
 }
 
-/// The test above pins only the unknown-column literal, and every other code
-/// assertion in this file compares against the constant itself — tautological
-/// through a relabelling. So pin all four literals here: re-prefixing any of
-/// them would otherwise sail through the whole suite green, which is exactly
-/// how `(laravel-ce laravel-ce.unknown-table)` reached a release build.
+/// Chain diagnostics deliberately carry **no** `code`. Nothing in the server
+/// reads the field — the quick-fixes route off `source` + `data` (see
+/// `code_actions::is_chain_diagnostic`) — while Zed renders `source` and
+/// `code` concatenated as `(source code)`, so a code is pure tooltip clutter
+/// (`(laravel-ce unknown-table)`) with no behaviour behind it. Every other
+/// diagnostic this server emits sets only `source`; the four query-chain ones
+/// now match.
 ///
-/// The `starts_with` half is the invariant behind the literals: Zed renders
-/// `source` and `code` concatenated as `(source code)` without deduping, so a
-/// code that repeats the brand tag doubles it in every tooltip.
-#[test]
-fn diagnostic_codes_carry_no_brand_prefix() {
-    let codes = [
-        (super::CODE_UNKNOWN_COLUMN, "unknown-column"),
-        (super::CODE_UNKNOWN_RELATION, "unknown-relation"),
-        (super::CODE_UNKNOWN_TABLE, "unknown-table"),
-        (super::CODE_AMBIGUOUS_COLUMN, "ambiguous-column"),
+/// One source per diagnostic family, which between them hit all three
+/// construction sites — `make_diagnostic` (column / relation / table), the
+/// dynamic-`where` builder, and the ambiguous-column builder — so re-adding a
+/// code at any of them fails here. The non-empty assertion keeps a fixture
+/// that stops producing diagnostics from passing vacuously.
+#[tokio::test]
+async fn no_chain_diagnostic_carries_a_code() {
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            (
+                "users",
+                &[("id", "int"), ("email", "string"), ("name", "string")],
+            ),
+            ("orders", &[("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+
+    let sources = [
+        (
+            "unknown column",
+            "<?php\nuse App\\Models\\User;\nUser::where('emial', 1)->get();\n",
+        ),
+        (
+            "unknown relation",
+            "<?php\nuse App\\Models\\User;\nUser::with('postss')->get();\n",
+        ),
+        ("unknown table", "<?php\nDB::table('user')->get();\n"),
+        (
+            "dynamic where",
+            "<?php\nuse App\\Models\\User;\nUser::whereEmaaail('x');\n",
+        ),
+        (
+            "ambiguous column",
+            "<?php\nDB::table('users')->join('orders', 'orders.user_id', '=', 'users.id')->where('id', 1)->get();\n",
+        ),
     ];
-    for (actual, expected) in codes {
-        assert_eq!(actual, expected);
+
+    for (label, source) in sources {
+        let diags = chain_diagnostics(
+            &chains_of(source),
+            &db,
+            &root,
+            source,
+            DiagnosticSeverity::WARNING,
+        )
+        .await;
         assert!(
-            !actual.starts_with(crate::DIAGNOSTIC_SOURCE),
-            "code {actual:?} repeats the source tag — Zed would render it twice"
+            !diags.is_empty(),
+            "{label}: fixture produced no diagnostic, so the code assertion below would be vacuous"
         );
+        for d in &diags {
+            assert!(
+                d.code.is_none(),
+                "{label}: chain diagnostics carry no code, got {:?}",
+                d.code
+            );
+        }
     }
 }
 
@@ -463,7 +509,7 @@ async fn flags_unknown_relation() {
 
     let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
     assert_eq!(diags.len(), 1, "one unknown-relation diagnostic: {diags:?}");
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_RELATION);
+    assert_eq!(data_kind_of(&diags[0]), "relation");
     assert!(diags[0].message.contains("postss"));
     assert!(diags[0].message.contains("App\\Models\\User"));
     assert!(diags[0].message.contains("Did you mean \"posts\"?"));
@@ -537,7 +583,7 @@ async fn relationship_method_hop_still_flags_unknown_column_on_related_table() {
         1,
         "unknown column on competitions still flags: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(
         diags[0].message.contains("competitions"),
         "diagnostic should name the competitions table; got: {}",
@@ -578,7 +624,7 @@ async fn relationship_property_receiver_still_flags_unknown_column_on_related_ta
         1,
         "unknown column on competitions still flags via property access: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(
         diags[0].message.contains("competitions"),
         "diagnostic should name the competitions table; got: {}",
@@ -595,7 +641,7 @@ async fn flags_unknown_table_in_db_table() {
 
     let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
     assert_eq!(diags.len(), 1, "one unknown-table diagnostic: {diags:?}");
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_TABLE);
+    assert_eq!(data_kind_of(&diags[0]), "table");
     assert!(diags[0].message.contains("Table \"user\" does not exist"));
     assert!(diags[0].message.contains("Did you mean \"users\"?"));
 }
@@ -746,7 +792,7 @@ async fn flags_dynamic_where_unknown_column() {
 
     let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
     assert_eq!(diags.len(), 1, "dynamic where typo should flag: {diags:?}");
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
     assert!(
         diags[0].message.contains("emaaail"),
         "msg: {}",
@@ -1006,7 +1052,7 @@ async fn array_relation_flags_unknown_element() {
     let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
     assert_eq!(diags.len(), 1, "only the typo should flag: {diags:?}");
     assert!(diags[0].message.contains("postss"));
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_RELATION);
+    assert_eq!(data_kind_of(&diags[0]), "relation");
 }
 
 #[tokio::test]
@@ -1124,7 +1170,7 @@ async fn typo_still_flagged_with_joins_present() {
         1,
         "real typo should still be flagged: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "column");
 }
 
 #[tokio::test]
@@ -1209,7 +1255,7 @@ async fn ambiguous_bare_column_is_flagged() {
         1,
         "ambiguous column should be flagged: {diags:?}"
     );
-    assert_eq!(code_of(&diags[0]), super::CODE_AMBIGUOUS_COLUMN);
+    assert_eq!(data_kind_of(&diags[0]), "ambiguous-column");
     assert!(
         diags[0].message.contains("ambiguous"),
         "{}",
