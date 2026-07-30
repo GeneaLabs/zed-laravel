@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-When LSP outlines are enabled (see [Configuration](../README.md#️-configuration)), Zed's outline panel and breadcrumbs surface Laravel-aware structure that no PHP language server can see.
+When LSP outlines are enabled (see [Configuration](configuration.md#outline-panel)), Zed's outline panel and breadcrumbs surface Laravel-aware structure that no PHP language server can see.
 
 **Route files** show each definition with HTTP verb, URI, and route name. Nested `Route::group(...)` calls become hierarchical containers labelled with the group's prefix and name; prefix and route-name chains inherit from the enclosing group:
 
@@ -47,4 +47,4 @@ Recognised constructs: `@extends`, `@section`/`@endsection`, `@push`/`@endpush`,
 If your PHP class outline isn't appearing, make sure:
 
 1. The official [**PHP**](https://github.com/zed-extensions/php) Zed extension is installed and one of its LSPs (Intelephense, Phpactor, PhpTools) is active for the file.
-2. Your settings include `"document_symbols": "on"` under `languages.PHP` (see [Configuration](../README.md#️-configuration)).
+2. Your settings include `"document_symbols": "on"` under `languages.PHP` (see [Configuration](configuration.md#all-settings)).

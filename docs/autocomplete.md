@@ -119,7 +119,7 @@ DB::table('orders')->join('users', ...)->where('users.');
 
 Columns are read live from your database (cast-aware), so completions reflect the *actual* schema. Relations come from the model's relation methods, walking parent classes and traits. Works in PHP **and** in Blade-embedded expressions (`@php`, `{{ }}`). Raw-SQL methods (`whereRaw`, `havingRaw`, `selectRaw`, `DB::raw`, …) are deliberately left to your PHP language server — their arguments are opaque SQL, not column names.
 
-> 🗄️ Column and relation completion needs a working database connection (see [Configuration](../README.md#️-configuration)). Without one, the chain still parses — you just won't get column suggestions.
+> 🗄️ Column and relation completion needs a working database connection (see [Configuration](configuration.md#database-connection)). Without one, the chain still parses — you just won't get column suggestions.
 
 ## 🧰 Query Builder Methods
 

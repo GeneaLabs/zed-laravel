@@ -43,4 +43,4 @@ Cmd+Click works on both opening AND closing tags:
 {{--      ^^^^^^^            ^^^^^^^ Both navigate to Livewire class --}}
 ```
 
-> **Note:** Blade syntax highlighting is provided by the separate [**Laravel Blade**](https://github.com/bajrangCoder/zed-laravel-blade) Zed extension. Install it alongside this extension for full Blade support. For enhanced directive highlighting — including correct coloring of custom directives that tree-sitter doesn't recognize — enable semantic tokens in your settings. See the [Configuration](../README.md#️-configuration) section in the README.
+> **Note:** Blade syntax highlighting is provided by the separate [**Laravel Blade**](https://github.com/bajrangCoder/zed-laravel-blade) Zed extension. Install it alongside this extension for full Blade support. For enhanced directive highlighting — including correct coloring of custom directives that tree-sitter doesn't recognize — enable semantic tokens in your settings. See the [Configuration guide](configuration.md#all-settings).
