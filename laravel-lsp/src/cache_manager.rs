@@ -4,12 +4,11 @@
 //! Caches middleware, bindings, and component data to disk.
 //!
 //! Cache location follows XDG Base Directory Specification:
-//! - Linux: ~/.cache/laravel-lsp/{project-hash}/cache.json
-//! - macOS: ~/Library/Caches/org.mike-bronner.laravel-lsp/{project-hash}/cache.json
-//! - Windows: %LOCALAPPDATA%\mike-bronner\laravel-lsp\cache\{project-hash}\cache.json
+//! - Linux: ~/.cache/laravel-ce-lsp/{project-hash}/cache.json
+//! - macOS: ~/Library/Caches/org.mike-bronner.laravel-ce-lsp/{project-hash}/cache.json
+//! - Windows: %LOCALAPPDATA%\mike-bronner\laravel-ce-lsp\cache\{project-hash}\cache.json
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -38,13 +37,12 @@ const CACHE_VERSION: u32 = 5;
 /// Get the XDG-compliant cache directory for a project
 ///
 /// Returns platform-specific cache directory:
-/// - Linux: ~/.cache/laravel-lsp/{project-hash}/
-/// - macOS: ~/Library/Caches/org.mike-bronner.laravel-lsp/{project-hash}/
-/// - Windows: %LOCALAPPDATA%\mike-bronner\laravel-lsp\cache\{project-hash}\
+/// - Linux: ~/.cache/laravel-ce-lsp/{project-hash}/
+/// - macOS: ~/Library/Caches/org.mike-bronner.laravel-ce-lsp/{project-hash}/
+/// - Windows: %LOCALAPPDATA%\mike-bronner\laravel-ce-lsp\cache\{project-hash}\
 fn get_cache_dir(project_root: &Path) -> Option<PathBuf> {
     // Get platform-specific cache directory
-    let proj_dirs = ProjectDirs::from("org", "mike-bronner", "laravel-lsp")?;
-    let cache_base = proj_dirs.cache_dir();
+    let cache_base = crate::cache_root::cache_root()?;
 
     // Create unique hash for this project based on its absolute path
     let canonical = project_root

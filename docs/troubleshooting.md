@@ -28,10 +28,10 @@ The running servers show under the **lightning-bolt icon** in the status bar. Fo
 The extension downloads its server binary from GitHub releases on first use. If that download is blocked (proxy, firewall, offline), drop the binary on your `PATH` instead — Zed will find it there. Grab the archive for your platform from the [latest release](https://github.com/mike-bronner/zed-laravel/releases/latest), then (macOS x86_64 shown):
 
 ```bash
-tar -xzf ~/Downloads/laravel-lsp-macos-x64.tar.gz
-mkdir -p ~/.local/bin && mv laravel-lsp-macos-x64 ~/.local/bin/laravel-lsp
-chmod +x ~/.local/bin/laravel-lsp
-xattr -d com.apple.quarantine ~/.local/bin/laravel-lsp 2>/dev/null
+tar -xzf ~/Downloads/laravel-ce-lsp-macos-x64.tar.gz
+mkdir -p ~/.local/bin && mv laravel-ce-lsp-macos-x64 ~/.local/bin/laravel-ce-lsp
+chmod +x ~/.local/bin/laravel-ce-lsp
+xattr -d com.apple.quarantine ~/.local/bin/laravel-ce-lsp 2>/dev/null
 # ensure ~/.local/bin is on your PATH, then fully restart Zed
 ```
 

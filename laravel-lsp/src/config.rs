@@ -412,8 +412,7 @@ fn vendor_cache_path(root: &Path) -> Option<PathBuf> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let proj_dirs = directories::ProjectDirs::from("org", "mike-bronner", "laravel-lsp")?;
-    let cache_base = proj_dirs.cache_dir();
+    let cache_base = crate::cache_root::cache_root()?;
 
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut hasher = DefaultHasher::new();

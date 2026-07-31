@@ -4,6 +4,17 @@ use zed_extension_api::{self as zed, Result};
 /// Extension version - used for versioned binary directory
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Unsuffixed binary names to look for on the user's `PATH`, in preference
+/// order, when the automatic download is blocked and they've placed the
+/// server there by hand (see `docs/troubleshooting.md`).
+///
+/// The pre-rebrand `laravel-lsp` stays as a fallback: the published
+/// troubleshooting doc told users to install under that name for every
+/// release before the "Laravel CE" rename, and silently failing to find a
+/// binary they already installed would look exactly like the download
+/// problem they worked around in the first place.
+const PATH_BINARY_NAMES: [&str; 2] = ["laravel-ce-lsp", "laravel-lsp"];
+
 /// The main struct for our Laravel extension
 struct LaravelExtension {
     /// Cached path to the language server binary
@@ -97,8 +108,8 @@ impl LaravelExtension {
             return Ok(path);
         }
 
-        // Also try generic name in PATH
-        if let Some(path) = worktree.which("laravel-lsp") {
+        // Also try the unsuffixed names in PATH, current name first.
+        if let Some(path) = Self::which_generic(|name| worktree.which(name)) {
             self.cached_binary_path = Some(path.clone());
             return Ok(path);
         }
@@ -169,19 +180,31 @@ impl LaravelExtension {
     fn platform_binary_name(os: zed::Os, arch: zed::Architecture) -> String {
         match (os, arch) {
             (zed::Os::Windows, zed::Architecture::X8664) => {
-                "laravel-lsp-windows-x64.exe".to_string()
+                "laravel-ce-lsp-windows-x64.exe".to_string()
             }
             (zed::Os::Windows, zed::Architecture::Aarch64) => {
-                "laravel-lsp-windows-arm64.exe".to_string()
+                "laravel-ce-lsp-windows-arm64.exe".to_string()
             }
-            (zed::Os::Windows, _) => "laravel-lsp.exe".to_string(),
-            (zed::Os::Mac, zed::Architecture::Aarch64) => "laravel-lsp-macos-arm64".to_string(),
-            (zed::Os::Mac, zed::Architecture::X8664) => "laravel-lsp-macos-x64".to_string(),
-            (zed::Os::Mac, _) => "laravel-lsp".to_string(),
-            (zed::Os::Linux, zed::Architecture::X8664) => "laravel-lsp-linux-x64".to_string(),
-            (zed::Os::Linux, zed::Architecture::Aarch64) => "laravel-lsp-linux-arm64".to_string(),
-            (zed::Os::Linux, _) => "laravel-lsp".to_string(),
+            (zed::Os::Windows, _) => "laravel-ce-lsp.exe".to_string(),
+            (zed::Os::Mac, zed::Architecture::Aarch64) => "laravel-ce-lsp-macos-arm64".to_string(),
+            (zed::Os::Mac, zed::Architecture::X8664) => "laravel-ce-lsp-macos-x64".to_string(),
+            (zed::Os::Mac, _) => "laravel-ce-lsp".to_string(),
+            (zed::Os::Linux, zed::Architecture::X8664) => "laravel-ce-lsp-linux-x64".to_string(),
+            (zed::Os::Linux, zed::Architecture::Aarch64) => {
+                "laravel-ce-lsp-linux-arm64".to_string()
+            }
+            (zed::Os::Linux, _) => "laravel-ce-lsp".to_string(),
         }
+    }
+
+    /// Resolve the server binary from the user's `PATH` by its unsuffixed
+    /// name, trying each of [`PATH_BINARY_NAMES`] in order.
+    ///
+    /// Takes the lookup as a closure rather than a `&Worktree` so the
+    /// preference order is testable — `Worktree` is a host-provided handle
+    /// that can't be constructed outside a running Zed.
+    fn which_generic(mut which: impl FnMut(&str) -> Option<String>) -> Option<String> {
+        PATH_BINARY_NAMES.iter().find_map(|name| which(name))
     }
 }
 
@@ -194,11 +217,11 @@ mod tests {
     fn linux_names() {
         assert_eq!(
             LaravelExtension::platform_binary_name(Os::Linux, Architecture::X8664),
-            "laravel-lsp-linux-x64"
+            "laravel-ce-lsp-linux-x64"
         );
         assert_eq!(
             LaravelExtension::platform_binary_name(Os::Linux, Architecture::Aarch64),
-            "laravel-lsp-linux-arm64"
+            "laravel-ce-lsp-linux-arm64"
         );
     }
 
@@ -206,19 +229,69 @@ mod tests {
     fn mac_and_windows_names() {
         assert_eq!(
             LaravelExtension::platform_binary_name(Os::Mac, Architecture::Aarch64),
-            "laravel-lsp-macos-arm64"
+            "laravel-ce-lsp-macos-arm64"
         );
         assert_eq!(
             LaravelExtension::platform_binary_name(Os::Mac, Architecture::X8664),
-            "laravel-lsp-macos-x64"
+            "laravel-ce-lsp-macos-x64"
         );
         assert_eq!(
             LaravelExtension::platform_binary_name(Os::Windows, Architecture::X8664),
-            "laravel-lsp-windows-x64.exe"
+            "laravel-ce-lsp-windows-x64.exe"
         );
         assert_eq!(
             LaravelExtension::platform_binary_name(Os::Windows, Architecture::Aarch64),
-            "laravel-lsp-windows-arm64.exe"
+            "laravel-ce-lsp-windows-arm64.exe"
+        );
+    }
+
+    /// A `worktree.which()` stand-in that only knows about `present`.
+    fn path_with(present: &'static [&'static str]) -> impl FnMut(&str) -> Option<String> {
+        move |name| present.contains(&name).then(|| format!("/usr/bin/{name}"))
+    }
+
+    #[test]
+    fn path_lookup_finds_the_current_name() {
+        assert_eq!(
+            LaravelExtension::which_generic(path_with(&["laravel-ce-lsp"])),
+            Some("/usr/bin/laravel-ce-lsp".to_string())
+        );
+    }
+
+    #[test]
+    fn path_lookup_falls_back_to_the_pre_rebrand_name() {
+        assert_eq!(
+            LaravelExtension::which_generic(path_with(&["laravel-lsp"])),
+            Some("/usr/bin/laravel-lsp".to_string()),
+            "a binary installed under the old name must keep working"
+        );
+    }
+
+    #[test]
+    fn path_lookup_prefers_the_current_name_over_the_legacy_one() {
+        assert_eq!(
+            LaravelExtension::which_generic(path_with(&["laravel-lsp", "laravel-ce-lsp"])),
+            Some("/usr/bin/laravel-ce-lsp".to_string()),
+            "with both on PATH the rebranded binary wins"
+        );
+    }
+
+    #[test]
+    fn path_lookup_reports_nothing_when_no_binary_is_installed() {
+        assert_eq!(LaravelExtension::which_generic(path_with(&[])), None);
+    }
+
+    #[test]
+    fn path_lookup_stops_at_the_first_hit() {
+        let mut probed = Vec::new();
+        LaravelExtension::which_generic(|name| {
+            probed.push(name.to_string());
+            (name == "laravel-ce-lsp").then(|| name.to_string())
+        });
+        assert_eq!(
+            probed,
+            ["laravel-ce-lsp"],
+            "the legacy name must not be probed once the current one resolves"
         );
     }
 }

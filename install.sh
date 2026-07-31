@@ -33,9 +33,9 @@ echo ""
 
 # Install LSP binary
 echo -e "${BLUE}📦 Installing Laravel LSP binary...${NC}"
-if cp laravel-lsp-binary ~/.local/bin/laravel-lsp; then
-    chmod +x ~/.local/bin/laravel-lsp
-    echo -e "${GREEN}✅ Laravel LSP installed to ~/.local/bin/laravel-lsp${NC}"
+if cp laravel-lsp-binary ~/.local/bin/laravel-ce-lsp; then
+    chmod +x ~/.local/bin/laravel-ce-lsp
+    echo -e "${GREEN}✅ Laravel LSP installed to ~/.local/bin/laravel-ce-lsp${NC}"
 else
     echo -e "${RED}❌ Failed to install Laravel LSP binary${NC}"
     exit 1
@@ -44,7 +44,7 @@ echo ""
 
 # Verify LSP binary
 echo -e "${BLUE}🔍 Verifying LSP installation...${NC}"
-if ~/.local/bin/laravel-lsp --help >/dev/null 2>&1; then
+if ~/.local/bin/laravel-ce-lsp --help >/dev/null 2>&1; then
     echo -e "${GREEN}✅ Laravel LSP binary is working${NC}"
 else
     echo -e "${YELLOW}⚠️  LSP binary test failed, but this might be normal${NC}"
@@ -82,7 +82,7 @@ echo "📊 Installation Summary"
 echo "=========================================="
 echo ""
 echo -e "${YELLOW}Laravel LSP Binary:${NC}"
-ls -lh ~/.local/bin/laravel-lsp | awk '{print "  Location: " $9 "\n  Size: " $5}'
+ls -lh ~/.local/bin/laravel-ce-lsp | awk '{print "  Location: " $9 "\n  Size: " $5}'
 
 echo -e "${YELLOW}Extension WASM:${NC}"
 ls -lh extension.wasm | awk '{print "  Location: $(pwd)/" $9 "\n  Size: " $5}'

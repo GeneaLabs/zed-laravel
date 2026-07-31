@@ -47,7 +47,6 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::symbol_index::MagicMemberEntry;
@@ -97,19 +96,14 @@ struct CacheFile {
 /// per-project-hash directory so both live side by side. `None` only if the
 /// user's home dir can't be resolved.
 fn cache_file_path(project_root: &Path) -> Option<PathBuf> {
-    let proj_dirs = ProjectDirs::from("org", "mike-bronner", "laravel-lsp")?;
+    let cache_base = crate::cache_root::cache_root()?;
     let canonical = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
     let mut hasher = DefaultHasher::new();
     canonical.hash(&mut hasher);
     let project_hash = format!("{:x}", hasher.finish());
-    Some(
-        proj_dirs
-            .cache_dir()
-            .join(project_hash)
-            .join(CACHE_FILENAME),
-    )
+    Some(cache_base.join(project_hash).join(CACHE_FILENAME))
 }
 
 /// Load the resolved magic-member data previously saved for `project_root`.

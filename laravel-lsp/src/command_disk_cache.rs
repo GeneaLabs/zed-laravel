@@ -41,7 +41,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -83,19 +82,14 @@ struct CachedEntry {
 /// practice. Hashes the canonical root path so the location matches
 /// [`crate::pattern_disk_cache`]'s per-project directory.
 fn cache_file_path(project_root: &Path) -> Option<PathBuf> {
-    let proj_dirs = ProjectDirs::from("org", "mike-bronner", "laravel-lsp")?;
+    let cache_base = crate::cache_root::cache_root()?;
     let canonical = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
     let mut hasher = DefaultHasher::new();
     canonical.hash(&mut hasher);
     let project_hash = format!("{:x}", hasher.finish());
-    Some(
-        proj_dirs
-            .cache_dir()
-            .join(project_hash)
-            .join(CACHE_FILENAME),
-    )
+    Some(cache_base.join(project_hash).join(CACHE_FILENAME))
 }
 
 /// Decompose a `SystemTime` into `(secs, nanos)` relative to UNIX_EPOCH.

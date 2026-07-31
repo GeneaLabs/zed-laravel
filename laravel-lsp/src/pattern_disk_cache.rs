@@ -37,7 +37,6 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use directories::ProjectDirs;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -159,19 +158,14 @@ pub struct LoadProgress {
 /// only if the user's home directory can't be resolved — every modern
 /// OS we support has one, so this is effectively infallible in practice.
 fn cache_file_path(project_root: &Path) -> Option<PathBuf> {
-    let proj_dirs = ProjectDirs::from("org", "mike-bronner", "laravel-lsp")?;
+    let cache_base = crate::cache_root::cache_root()?;
     let canonical = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
     let mut hasher = DefaultHasher::new();
     canonical.hash(&mut hasher);
     let project_hash = format!("{:x}", hasher.finish());
-    Some(
-        proj_dirs
-            .cache_dir()
-            .join(project_hash)
-            .join(CACHE_FILENAME),
-    )
+    Some(cache_base.join(project_hash).join(CACHE_FILENAME))
 }
 
 /// Decompose a `SystemTime` into `(secs, nanos)` relative to UNIX_EPOCH.
