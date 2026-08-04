@@ -5610,13 +5610,27 @@ impl LaravelLanguageServer {
     /// and incremental updates automatically.
     ///
     /// Priority: .env.example=0, .env.local=1, .env=2 (higher wins)
+    ///
+    /// Each path runs through `resolve_worktree_fallback`: `.env`/`.env.local`
+    /// are gitignored, so a linked worktree never has its own copy — fall
+    /// back to the main worktree's file rather than resolving env() calls
+    /// against nothing.
     async fn register_env_files_with_salsa(&self, root: &Path) {
         // Define env files with their priorities
         // Priority: 0=.env.example, 1=.env.local, 2=.env
         let env_files = [
-            (root.join(".env.example"), 0u8),
-            (root.join(".env.local"), 1u8),
-            (root.join(".env"), 2u8),
+            (
+                laravel_lsp::config::resolve_worktree_fallback(root, ".env.example"),
+                0u8,
+            ),
+            (
+                laravel_lsp::config::resolve_worktree_fallback(root, ".env.local"),
+                1u8,
+            ),
+            (
+                laravel_lsp::config::resolve_worktree_fallback(root, ".env"),
+                2u8,
+            ),
         ];
 
         let documents = self.documents.read().await;

@@ -76,6 +76,100 @@ fn same_git_repo_false_for_distinct_repo_nested_underneath() {
     assert!(!is_same_git_repo(&outer, &inner));
 }
 
+#[test]
+fn worktree_fallback_prefers_local_file_when_present() {
+    let tmp = TempDir::new().unwrap();
+    let main_root = tmp.path().join("project");
+    fs::create_dir_all(main_root.join(".git")).unwrap();
+    fs::write(main_root.join(".env"), "MAIN=1\n").unwrap();
+
+    let worktree_root = tmp.path().join("worktree");
+    link_worktree(&main_root, &worktree_root, "feature-branch");
+    fs::write(worktree_root.join(".env"), "LOCAL=1\n").unwrap();
+
+    assert_eq!(
+        resolve_worktree_fallback(&worktree_root, ".env"),
+        worktree_root.join(".env"),
+        "a file that exists locally must never be shadowed by the main worktree's copy"
+    );
+}
+
+#[test]
+fn worktree_fallback_reaches_main_worktree_when_local_file_is_gitignored_absent() {
+    // The motivating case: `.env` is gitignored, so `git worktree add` never
+    // copies it — a fresh worktree has none, even though the project does.
+    let tmp = TempDir::new().unwrap();
+    let main_root = tmp.path().join("project");
+    fs::create_dir_all(main_root.join(".git")).unwrap();
+    fs::write(main_root.join(".env"), "DB_HOST=mysql\n").unwrap();
+
+    let worktree_root = main_root
+        .join(".claude")
+        .join("worktrees")
+        .join("gifted-heisenberg-3c0899");
+    link_worktree(&main_root, &worktree_root, "gifted-heisenberg-3c0899");
+    // No .env written under worktree_root — exactly the gitignored-absence case.
+
+    // The resolved main root comes back canonicalized (derived from
+    // `git_common_dir`, which canonicalizes to prove repo identity) — on
+    // macOS that's `/private/var/...`, not the `/var/...` symlink `TempDir`
+    // hands back, so compare against the canonical form.
+    assert_eq!(
+        resolve_worktree_fallback(&worktree_root, ".env"),
+        main_root.canonicalize().unwrap().join(".env"),
+        "a file missing locally must fall back to the main worktree's copy"
+    );
+}
+
+#[test]
+fn worktree_fallback_returns_local_path_when_absent_everywhere() {
+    let tmp = TempDir::new().unwrap();
+    let main_root = tmp.path().join("project");
+    fs::create_dir_all(main_root.join(".git")).unwrap();
+    // No .env anywhere, main root included.
+
+    let worktree_root = tmp.path().join("worktree");
+    link_worktree(&main_root, &worktree_root, "feature-branch");
+
+    assert_eq!(
+        resolve_worktree_fallback(&worktree_root, ".env"),
+        worktree_root.join(".env"),
+        "with no copy anywhere, callers must see the same 'missing' local path as before"
+    );
+}
+
+#[test]
+fn worktree_fallback_is_a_noop_outside_any_worktree() {
+    // A plain checkout (no linked worktree involved) with a missing file
+    // must behave exactly as a bare `root.join(relative)` always did — no
+    // git plumbing means no fallback candidate to try.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    assert_eq!(resolve_worktree_fallback(&root, ".env"), root.join(".env"));
+}
+
+#[test]
+fn worktree_fallback_is_a_noop_for_the_main_worktree_itself() {
+    // Calling the resolver FROM the main worktree (not a linked one) must
+    // not try to fall back to itself — `git_main_worktree_root` returns
+    // `None` when `path` already IS the main root.
+    let tmp = TempDir::new().unwrap();
+    let main_root = tmp.path().join("project");
+    fs::create_dir_all(main_root.join(".git")).unwrap();
+
+    let worktree_root = tmp.path().join("worktree");
+    link_worktree(&main_root, &worktree_root, "feature-branch");
+
+    // No .env anywhere; querying the MAIN root (not the worktree) for a
+    // missing file must just return the local (main-root) path.
+    assert_eq!(
+        resolve_worktree_fallback(&main_root, ".env"),
+        main_root.join(".env")
+    );
+}
+
 /// Extract base_path(...) calls from a line (test helper)
 fn extract_base_path(line: &str) -> Option<&str> {
     // Match: base_path('some/path') or base_path("some/path")

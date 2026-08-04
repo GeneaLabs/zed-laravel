@@ -1417,7 +1417,7 @@ impl DatabaseSchemaProvider {
     /// whatever line followed), which was sent as the literal password
     /// to MySQL and rejected as bad credentials.
     fn resolve_env(&self, key: &str) -> Option<String> {
-        let env_path = self.project_root.join(".env");
+        let env_path = crate::config::resolve_worktree_fallback(&self.project_root, ".env");
         let content = match std::fs::read_to_string(&env_path) {
             Ok(c) => c,
             Err(e) => {
@@ -1858,7 +1858,7 @@ impl DatabaseSchemaProvider {
         filenames: &[&str],
     ) -> Option<DetectedEndpoint> {
         for filename in filenames {
-            let path = self.project_root.join(filename);
+            let path = crate::config::resolve_worktree_fallback(&self.project_root, filename);
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };

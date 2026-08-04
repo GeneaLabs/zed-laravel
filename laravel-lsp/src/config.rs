@@ -127,6 +127,56 @@ pub fn is_same_git_repo(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// The main worktree root for `path`'s repository — the checkout `git
+/// worktree add` was run from, found by taking [`git_common_dir`]'s parent
+/// (the shared `.git` directory always lives directly under the main
+/// worktree). Returns `None` when `path` isn't a git repo at all, or is
+/// already the main worktree itself (nothing to fall back to).
+fn git_main_worktree_root(path: &Path) -> Option<PathBuf> {
+    let main_root = git_common_dir(path)?.parent()?.to_path_buf();
+    let path_canonical = path.canonicalize().ok()?;
+    if path_canonical == main_root {
+        None
+    } else {
+        Some(main_root)
+    }
+}
+
+/// Resolve `relative` under `root`, falling back to the same relative path
+/// under the main worktree root when `root` is a linked worktree and the
+/// file isn't present locally.
+///
+/// A linked worktree only gets git-tracked files — `git worktree add` never
+/// copies anything gitignored, so local dev config the project deliberately
+/// keeps untracked (`.env`, `docker-compose.override.yml`) is simply absent
+/// from a fresh worktree, even though the project it belongs to has one.
+/// Falling back to the main worktree's copy is safe specifically *because*
+/// the file is untracked: there's no tracked-file divergence between
+/// branches to accidentally paper over, only a copy that was never there to
+/// begin with.
+///
+/// Returns `root.join(relative)` unchanged when that exists, or when no
+/// fallback applies (not a worktree, or absent everywhere) — every existing
+/// caller's "file missing" handling keeps working as before.
+pub fn resolve_worktree_fallback(root: &Path, relative: &str) -> PathBuf {
+    let local = root.join(relative);
+    if local.exists() {
+        return local;
+    }
+
+    match git_main_worktree_root(root) {
+        Some(main_root) => {
+            let shared = main_root.join(relative);
+            if shared.exists() {
+                shared
+            } else {
+                local
+            }
+        }
+        None => local,
+    }
+}
+
 /// Load Blade component aliases from all known sources.
 ///
 /// Three independent sources are merged into a single `HashMap<alias, view-dot-path>`,
