@@ -77,6 +77,27 @@ fn same_git_repo_false_for_distinct_repo_nested_underneath() {
 }
 
 #[test]
+fn is_main_worktree_true_for_the_main_checkout() {
+    let tmp = TempDir::new().unwrap();
+    let main_root = tmp.path().join("project");
+    fs::create_dir_all(main_root.join(".git")).unwrap();
+
+    assert!(is_main_worktree(&main_root));
+}
+
+#[test]
+fn is_main_worktree_false_for_a_linked_worktree() {
+    let tmp = TempDir::new().unwrap();
+    let main_root = tmp.path().join("project");
+    fs::create_dir_all(main_root.join(".git")).unwrap();
+
+    let worktree_root = tmp.path().join("worktree");
+    link_worktree(&main_root, &worktree_root, "feature-branch");
+
+    assert!(!is_main_worktree(&worktree_root));
+}
+
+#[test]
 fn worktree_fallback_prefers_local_file_when_present() {
     let tmp = TempDir::new().unwrap();
     let main_root = tmp.path().join("project");

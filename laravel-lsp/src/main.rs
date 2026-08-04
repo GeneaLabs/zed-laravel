@@ -7532,11 +7532,34 @@ impl LaravelLanguageServer {
                 // any in-flight DB connection for no reason: it's the same
                 // project.
                 if is_same_git_repo(&discovered_root, current) {
-                    debug!(
-                        "Discovered root {:?} is a worktree of the current repo {:?} — keeping current root",
-                        discovered_root, current
-                    );
-                    false
+                    // Same repo, different worktree — don't thrash between
+                    // them (that's the case above). But an asymmetric
+                    // exception: self-correct BACK to the main worktree if
+                    // the active root has drifted onto a linked one. A
+                    // linked worktree is a point-in-time snapshot — a class
+                    // added on `main` after the worktree branched off is
+                    // invisible from inside it (confirmed live: a model
+                    // class only main had went unresolved for every hover/
+                    // goto while root sat on a Claude Code agent worktree),
+                    // so once stuck there nothing else would ever pull it
+                    // back. Never the other direction: switching FROM main
+                    // TO a linked worktree is exactly the original
+                    // disruptive hijack this guard exists to prevent.
+                    if !laravel_lsp::config::is_main_worktree(current)
+                        && laravel_lsp::config::is_main_worktree(&discovered_root)
+                    {
+                        info!(
+                            "Discovered root {:?} is the main worktree — correcting back from linked worktree {:?}",
+                            discovered_root, current
+                        );
+                        true
+                    } else {
+                        debug!(
+                            "Discovered root {:?} is a worktree of the current repo {:?} — keeping current root",
+                            discovered_root, current
+                        );
+                        false
+                    }
                 } else {
                     // Check if file is outside current root
                     let file_outside_root = !file_path.starts_with(current);

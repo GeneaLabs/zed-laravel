@@ -142,6 +142,22 @@ fn git_main_worktree_root(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// True if `path` is the MAIN worktree of its repository (not a linked one).
+///
+/// Only meaningful once the caller already knows `path` is *some* worktree
+/// of a repo whose identity matters — e.g. after [`is_same_git_repo`]
+/// confirmed two candidates share a repo, this tells them apart. Used to
+/// prefer the main checkout over a linked worktree when both resolve the
+/// same project: a linked worktree only gets what its branch happened to
+/// have at creation time (issue: a model class added on `main` after a
+/// Claude Code agent worktree branched off was invisible from inside that
+/// worktree — `git worktree add` is a point-in-time snapshot, not a live
+/// mirror), so once the active root drifts onto a linked worktree it should
+/// self-correct back to main, never the other way around.
+pub fn is_main_worktree(path: &Path) -> bool {
+    git_main_worktree_root(path).is_none()
+}
+
 /// Resolve `relative` under `root`, falling back to the same relative path
 /// under the main worktree root when `root` is a linked worktree and the
 /// file isn't present locally.
