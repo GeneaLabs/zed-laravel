@@ -1,4 +1,80 @@
 use super::*;
+use tempfile::TempDir;
+
+/// Turns `worktree_root` into a linked worktree of `main_root`, reproducing
+/// the on-disk layout `git worktree add` produces: a `.git` *file* in the
+/// worktree pointing at an admin dir under the main repo's
+/// `.git/worktrees/<name>/`, which names the shared `.git` dir via a
+/// `commondir` file (test helper for `is_same_git_repo`).
+fn link_worktree(main_root: &Path, worktree_root: &Path, name: &str) {
+    let admin_dir = main_root.join(".git").join("worktrees").join(name);
+    fs::create_dir_all(&admin_dir).unwrap();
+    fs::write(admin_dir.join("commondir"), "../..\n").unwrap();
+
+    fs::create_dir_all(worktree_root).unwrap();
+    fs::write(
+        worktree_root.join(".git"),
+        format!("gitdir: {}\n", admin_dir.display()),
+    )
+    .unwrap();
+}
+
+#[test]
+fn same_git_repo_true_for_main_and_linked_worktree() {
+    let tmp = TempDir::new().unwrap();
+    let main_root = tmp.path().join("project");
+    fs::create_dir_all(main_root.join(".git")).unwrap();
+
+    let worktree_root = tmp.path().join("worktree");
+    link_worktree(&main_root, &worktree_root, "feature-branch");
+
+    assert!(is_same_git_repo(&main_root, &worktree_root));
+    assert!(
+        is_same_git_repo(&worktree_root, &main_root),
+        "the check must be symmetric"
+    );
+}
+
+#[test]
+fn same_git_repo_false_for_two_unrelated_repos() {
+    let tmp = TempDir::new().unwrap();
+    let repo_a = tmp.path().join("repo-a");
+    let repo_b = tmp.path().join("repo-b");
+    fs::create_dir_all(repo_a.join(".git")).unwrap();
+    fs::create_dir_all(repo_b.join(".git")).unwrap();
+
+    assert!(!is_same_git_repo(&repo_a, &repo_b));
+}
+
+#[test]
+fn same_git_repo_false_when_neither_is_a_git_repo() {
+    // No git plumbing at all on either side (e.g. a plain nested Laravel
+    // project that isn't version-controlled) — must not be treated as a
+    // worktree pair, and existing "nested project" discovery is unaffected.
+    let tmp = TempDir::new().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+
+    assert!(!is_same_git_repo(&a, &b));
+}
+
+#[test]
+fn same_git_repo_false_for_distinct_repo_nested_underneath() {
+    // A nested Laravel project that happens to be its own git repository
+    // (e.g. a submodule) must NOT be mistaken for a worktree of the outer
+    // project just because it's physically nested underneath it — only a
+    // shared git common dir means "same project".
+    let tmp = TempDir::new().unwrap();
+    let outer = tmp.path().join("outer");
+    fs::create_dir_all(outer.join(".git")).unwrap();
+
+    let inner = outer.join("packages").join("billing");
+    fs::create_dir_all(inner.join(".git")).unwrap();
+
+    assert!(!is_same_git_repo(&outer, &inner));
+}
 
 /// Extract base_path(...) calls from a line (test helper)
 fn extract_base_path(line: &str) -> Option<&str> {

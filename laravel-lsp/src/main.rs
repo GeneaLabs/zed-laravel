@@ -24,7 +24,7 @@ use laravel_lsp::cache_manager::{
 };
 use laravel_lsp::command_index::{build_command_index, CommandIndex};
 use laravel_lsp::completion_format::CompletionDoc;
-use laravel_lsp::config::find_project_root;
+use laravel_lsp::config::{find_project_root, is_same_git_repo};
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
 use laravel_lsp::migration_index::{build_migration_index, MigrationIndex};
 use laravel_lsp::path_containment::{
@@ -7507,32 +7507,50 @@ impl LaravelLanguageServer {
                 true
             }
             Some(current) => {
-                // Check if file is outside current root
-                let file_outside_root = !file_path.starts_with(current);
-
-                // Check if discovered root is more specific (nested within current root)
-                let more_specific =
-                    discovered_root.starts_with(current) && discovered_root != *current;
-
-                if file_outside_root {
-                    info!(
-                        "File {:?} is outside current root {:?}, switching to discovered root: {:?}",
-                        file_path, current, discovered_root
-                    );
-                    true
-                } else if more_specific {
-                    info!(
-                        "Discovered more specific Laravel root {:?} (current: {:?})",
+                // A linked git worktree is a full checkout, so it carries its
+                // own composer.json + artisan — indistinguishable, by marker
+                // alone, from a genuinely separate/nested Laravel project.
+                // Without this check, opening a file inside a worktree (e.g.
+                // one of Claude Code's `.claude/worktrees/<name>/`, or any
+                // manually-created sibling worktree) would look like either
+                // "more specific" or "outside root" below and hijack the
+                // active project root, forcing a full re-index and aborting
+                // any in-flight DB connection for no reason: it's the same
+                // project.
+                if is_same_git_repo(&discovered_root, current) {
+                    debug!(
+                        "Discovered root {:?} is a worktree of the current repo {:?} — keeping current root",
                         discovered_root, current
                     );
-                    true
-                } else {
-                    // File is within current root and discovered isn't more specific
-                    debug!(
-                        "Keeping current root {:?} for file {:?}",
-                        current, file_path
-                    );
                     false
+                } else {
+                    // Check if file is outside current root
+                    let file_outside_root = !file_path.starts_with(current);
+
+                    // Check if discovered root is more specific (nested within current root)
+                    let more_specific =
+                        discovered_root.starts_with(current) && discovered_root != *current;
+
+                    if file_outside_root {
+                        info!(
+                            "File {:?} is outside current root {:?}, switching to discovered root: {:?}",
+                            file_path, current, discovered_root
+                        );
+                        true
+                    } else if more_specific {
+                        info!(
+                            "Discovered more specific Laravel root {:?} (current: {:?})",
+                            discovered_root, current
+                        );
+                        true
+                    } else {
+                        // File is within current root and discovered isn't more specific
+                        debug!(
+                            "Keeping current root {:?} for file {:?}",
+                            current, file_path
+                        );
+                        false
+                    }
                 }
             }
         };

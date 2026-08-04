@@ -67,6 +67,66 @@ pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolve a directory's real git "common dir" — the directory holding the
+/// repository's shared object database and refs.
+///
+/// For an ordinary checkout this is just `<root>/.git`. For a **linked
+/// worktree** (`git worktree add`), `.git` is a *file* (not a directory)
+/// containing a `gitdir: <path>` pointer into the main checkout's
+/// `.git/worktrees/<name>/` admin directory, which itself contains a
+/// `commondir` file naming the actual shared `.git` directory (typically
+/// `../..`, relative to that admin directory). Following both hops and
+/// canonicalizing lands on the same path for every worktree of one repo,
+/// linked or main.
+fn git_common_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let meta = fs::symlink_metadata(&dot_git).ok()?;
+
+    let git_dir = if meta.is_dir() {
+        dot_git
+    } else {
+        let contents = fs::read_to_string(&dot_git).ok()?;
+        let pointer = contents.trim().strip_prefix("gitdir:")?.trim();
+        let pointer_path = PathBuf::from(pointer);
+        if pointer_path.is_absolute() {
+            pointer_path
+        } else {
+            root.join(pointer_path)
+        }
+    };
+
+    let commondir_file = git_dir.join("commondir");
+    let common_dir = if commondir_file.is_file() {
+        let contents = fs::read_to_string(&commondir_file).ok()?;
+        let relative = PathBuf::from(contents.trim());
+        if relative.is_absolute() {
+            relative
+        } else {
+            git_dir.join(relative)
+        }
+    } else {
+        git_dir
+    };
+
+    common_dir.canonicalize().ok()
+}
+
+/// True if `a` and `b` are two worktrees (linked or main) of the same git
+/// repository.
+///
+/// Every worktree is a full checkout, so it carries its own `composer.json`
+/// and `artisan` — indistinguishable, by [`find_project_root`]'s markers
+/// alone, from a genuinely separate nested Laravel project. This check lets
+/// callers tell the two apart: a discovered root that's just another
+/// worktree of the project already open should never be treated as a
+/// distinct project root.
+pub fn is_same_git_repo(a: &Path, b: &Path) -> bool {
+    match (git_common_dir(a), git_common_dir(b)) {
+        (Some(dir_a), Some(dir_b)) => dir_a == dir_b,
+        _ => false,
+    }
+}
+
 /// Load Blade component aliases from all known sources.
 ///
 /// Three independent sources are merged into a single `HashMap<alias, view-dot-path>`,
