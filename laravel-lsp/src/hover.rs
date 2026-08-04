@@ -259,6 +259,11 @@ pub fn magic_member_card(
         MagicMemberKind::FactoryMethod => "Factory method",
         // `->pivot` on a model with a custom `$pivotClass`.
         MagicMemberKind::Pivot => "Pivot model",
+        // A `__call`-forwarded Eloquent/Query builder method (`orderByDesc`,
+        // `where`, …) — real vendor signature, sourced without ide-helper.
+        // Worth a card for the same reason `FacadeMethod` is: Intelephense
+        // can't see the forwarding either, ide-helper or not.
+        MagicMemberKind::BuilderMethod => "Query builder method",
         // Generic property — Intelephense already covers it. Don't duplicate.
         MagicMemberKind::PlainMember => return String::new(),
     };

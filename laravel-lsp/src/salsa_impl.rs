@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::config::kebab_to_pascal_case;
 use crate::middleware_parser::middleware_base_alias;
@@ -3307,6 +3307,18 @@ pub enum MagicMemberKind {
     /// pivot class (`protected $pivotClass = MembershipPivot::class;`).
     /// `declaring_fqcn` is that pivot FQCN; the target is its class line.
     Pivot,
+    /// A query/Eloquent builder method reached via `__call`/`forwardCallTo`
+    /// (`Model::orderByDesc(...)`, `->where(...)`) that isn't declared on the
+    /// model or its class hierarchy at all. Unlike `PlainMember`, this is
+    /// deliberately NOT dropped as Intelephense's territory: without a
+    /// generated `_ide_helper.php`, Intelephense has no way to see the
+    /// `Model`/`Eloquent\Builder` → `Query\Builder` forwarding either, so
+    /// hovering these is a real gap this LSP can close on its own —
+    /// `declaring_fqcn` names the REAL vendor class the method lives on
+    /// (`Illuminate\Database\Query\Builder`, usually), sourced straight from
+    /// vendor code via [`crate::laravel_introspector::BuilderMethodIndex`],
+    /// no ide-helper stubs required.
+    BuilderMethod,
     /// Generic (non-magic) property on a resolved class.
     PlainMember,
 }
@@ -3689,6 +3701,15 @@ pub struct MagicMemberHoverData {
     /// so invisible to the source-only `ClassView`). The main side must confirm
     /// it against migrations/DB before rendering, and skip the card otherwise.
     pub tentative: bool,
+    /// For `MagicMemberKind::BuilderMethod` only: the real vendor signature
+    /// (e.g. `public function orderByDesc($column, $order = 'desc')`), pulled
+    /// straight from `BuilderMethodIndex` — no `decl_file`/`decl_line` snippet
+    /// extraction applies here, the text is already extracted. `None` for
+    /// every other kind.
+    pub builder_signature: Option<String>,
+    /// For `MagicMemberKind::BuilderMethod` only: the method's PHPDoc summary
+    /// line, if vendor source has one. `None` for every other kind.
+    pub builder_summary: Option<String>,
 }
 
 /// Resolution result for renaming a magic member (M7). Crosses the async
@@ -5182,6 +5203,12 @@ pub enum SalsaRequest {
         path: PathBuf,
         line: u32,
         column: u32,
+        /// The caller's already-cached per-root builder-method surface (real
+        /// vendor signatures for `__call`-forwarded Eloquent/Query builder
+        /// methods), so a builder-forwarded member like `orderByDesc` can get
+        /// a real hover card instead of nothing. `None` when the caller
+        /// couldn't build one (e.g. vendor/ absent).
+        builder_index: Option<Arc<crate::laravel_introspector::BuilderMethodIndex>>,
         reply: oneshot::Sender<Option<MagicMemberHoverData>>,
     },
 
@@ -6056,11 +6083,18 @@ impl SalsaHandle {
 
     /// Resolve + classify the magic member at `(line, column)` for a hover card
     /// (M6). `Ok(None)` when the position isn't a resolvable magic member.
+    ///
+    /// `builder_index`: the caller's cached per-root builder-method surface
+    /// (see `Backend::get_builder_method_index`), passed through so a
+    /// `__call`-forwarded Eloquent/Query builder method (`orderByDesc`, …)
+    /// can render a real card. `None` when the caller has none available or
+    /// doesn't want the fallback (goto/rename/references never do).
     pub async fn resolve_magic_member_at(
         &self,
         path: PathBuf,
         line: u32,
         column: u32,
+        builder_index: Option<Arc<crate::laravel_introspector::BuilderMethodIndex>>,
     ) -> Result<Option<MagicMemberHoverData>, &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
@@ -6068,6 +6102,7 @@ impl SalsaHandle {
                 path,
                 line,
                 column,
+                builder_index,
                 reply: reply_tx,
             })
             .await
@@ -7299,9 +7334,15 @@ impl SalsaActor {
                     path,
                     line,
                     column,
+                    builder_index,
                     reply,
                 } => {
-                    let result = self.handle_resolve_magic_member_at(&path, line, column);
+                    let result = self.handle_resolve_magic_member_at(
+                        &path,
+                        line,
+                        column,
+                        builder_index.as_deref(),
+                    );
                     let _ = reply.send(result);
                 }
                 SalsaRequest::ResolveFacadeReceiverAt {
@@ -8925,6 +8966,8 @@ impl SalsaActor {
                 &resolver,
                 &classviews,
                 &project_root,
+                None, // find-references never wants a builder-method fallback —
+                // vendor-forwarded methods aren't renameable/referenceable.
                 None, // query-time path — no dependency recording
             ) {
                 // find-references threshold: HIGH + MEDIUM.
@@ -8964,12 +9007,25 @@ impl SalsaActor {
         path: &PathBuf,
         line: u32,
         column: u32,
+        builder_index: Option<&crate::laravel_introspector::BuilderMethodIndex>,
     ) -> Option<MagicMemberHoverData> {
         let patterns = self.handle_get_patterns(path)?;
         let member_ref = match patterns.find_at_position(line, column) {
             Some(PatternAtPosition::MemberAccess(m)) => m,
-            _ => return None,
+            _ => {
+                info!(
+                    "🪄 hover_for_magic_member: no MemberAccess pattern at {:?}:{line}:{column}",
+                    path
+                );
+                return None;
+            }
         };
+        info!(
+            "🪄 hover_for_magic_member: member='{}' form={:?} builder_index={}",
+            member_ref.member,
+            member_ref.form,
+            builder_index.is_some()
+        );
         let project_root = self.config_root.clone()?;
 
         self.ensure_file_registered(path);
@@ -9001,15 +9057,28 @@ impl SalsaActor {
                 &resolver,
                 &classviews,
                 &project_root,
+                builder_index,
                 None, // query-time path — no dependency recording
             ) {
                 Some(r) if matches!(r.confidence, Confidence::High | Confidence::Medium) => {
                     (r.declaring_fqcn, r.kind, r.confidence, false)
                 }
-                Some(_) => return None,
+                Some(r) => {
+                    info!(
+                        "🪄 hover_for_magic_member: classified as {:?} but confidence {:?} too low, dropping",
+                        r.kind, r.confidence
+                    );
+                    return None;
+                }
                 // An unclassified CALL can't be a column — the tentative-column
                 // fallback below is a property-read concept.
-                None if member_ref.form.is_call() => return None,
+                None if member_ref.form.is_call() => {
+                    info!(
+                        "🪄 hover_for_magic_member: '{}' did not classify at all (call-form, no column fallback)",
+                        member_ref.member
+                    );
+                    return None;
+                }
                 None => {
                     let (fqcn, confidence) = crate::member_resolver::resolve_expression_type(
                         receiver,
@@ -9046,6 +9115,46 @@ impl SalsaActor {
                 decl_line,
                 decl_end_line: None,
                 tentative: false,
+                builder_signature: None,
+                builder_summary: None,
+            });
+        }
+
+        // A builder-forwarded method (`Model::orderByDesc(...)`, `->where(...)`):
+        // no real declaration site in the project — `declaring_fqcn` already
+        // names the real vendor class (`classify_against`'s fallback set it to
+        // the matched `ParsedMethod::source_class`), and the signature/summary
+        // come straight from `builder_index`, not a file+line snippet. Look the
+        // method back up by name (a second, cheap linear scan over the ~30-200
+        // entry merged surface) to pull those strings — `ResolvedMemberAccess`
+        // has no room to carry them through the classify step itself.
+        if kind == MagicMemberKind::BuilderMethod {
+            let (builder_signature, builder_summary) = builder_index
+                .and_then(|index| {
+                    index
+                        .merged_surface()
+                        .into_iter()
+                        .find(|m| m.name == member_ref.member)
+                })
+                .map(|m| (Some(m.signature.clone()), m.summary.clone()))
+                .unwrap_or((None, None));
+            info!(
+                "🪄 hover_for_magic_member: '{}' classified as BuilderMethod (declaring={}), signature_found={}",
+                member_ref.member,
+                declaring_fqcn,
+                builder_signature.is_some()
+            );
+            return Some(MagicMemberHoverData {
+                declaring_fqcn,
+                member: member_ref.member.clone(),
+                kind,
+                confidence,
+                decl_file: None,
+                decl_line: None,
+                decl_end_line: None,
+                tentative: false,
+                builder_signature,
+                builder_summary,
             });
         }
 
@@ -9113,6 +9222,8 @@ impl SalsaActor {
             decl_line,
             decl_end_line,
             tentative,
+            builder_signature: None,
+            builder_summary: None,
         })
     }
 
@@ -9229,6 +9340,8 @@ impl SalsaActor {
             &resolver,
             &classviews,
             &project_root,
+            None, // rename never wants a builder-method fallback — a
+            // vendor-forwarded method has no declaration here to rewrite.
             None, // query-time path — no dependency recording
         )?;
         if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {

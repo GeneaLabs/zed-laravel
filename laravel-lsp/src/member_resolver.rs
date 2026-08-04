@@ -19,6 +19,7 @@
 use crate::class_hierarchy_index::ClassHierarchyIndex;
 use crate::laravel_introspector::chain::{analyze, ClassView, LaravelClassKind};
 use crate::laravel_introspector::model_metadata::pascal_to_snake;
+use crate::laravel_introspector::BuilderMethodIndex;
 use crate::parser::parse_php;
 use crate::query_chain::flow;
 use crate::query_chain::use_aliases::{extract_use_aliases, resolve_class_name, UseAliases};
@@ -441,6 +442,9 @@ pub fn resolve_member_access_entries(
             resolver,
             classviews,
             project_root,
+            None, // index population never wants a builder-method fallback —
+            // vendor-forwarded methods stay out of rename/references, same as
+            // PlainMember.
             deps.as_deref_mut(),
         ) else {
             continue;
@@ -505,6 +509,7 @@ pub fn resolve_and_classify(
     resolver: &impl ClassFileResolver,
     classviews: &ClassViewCache,
     project_root: &Path,
+    builder_index: Option<&BuilderMethodIndex>,
     mut deps: Option<&mut HashSet<String>>,
 ) -> Option<ResolvedMemberAccess> {
     // A container-resolution receiver records its *abstract* binding key as an
@@ -604,6 +609,7 @@ pub fn resolve_and_classify(
         resolver,
         classviews,
         project_root,
+        builder_index,
     ) {
         record_macro_decl_dep(&resolved, &fqcn, member, resolver, deps.as_deref_mut());
         return Some(resolved);
@@ -635,6 +641,7 @@ pub fn resolve_and_classify(
             resolver,
             classviews,
             project_root,
+            builder_index,
         )?;
         record_macro_decl_dep(&resolved, &model, member, resolver, deps);
         return Some(resolved);
@@ -695,6 +702,7 @@ fn classify_against(
     resolver: &impl ClassFileResolver,
     classviews: &ClassViewCache,
     project_root: &Path,
+    builder_index: Option<&BuilderMethodIndex>,
 ) -> Option<ResolvedMemberAccess> {
     // A class the index knows: classify against its real surfaces first.
     if let Some(file_path) = resolver.class_file(fqcn) {
@@ -746,6 +754,29 @@ fn classify_against(
                     kind: classified.kind,
                     confidence,
                 });
+            }
+            // Builder-forwarded fallback: nothing in the model's own hierarchy
+            // declares `member` — for an Eloquent model that's the common case
+            // for `__call`/`forwardCallTo`-forwarded Builder methods
+            // (`orderByDesc`, `where`, `first`, …). Intelephense can't see that
+            // forwarding without a generated `_ide_helper.php`, so unlike a
+            // genuine `PlainMember` this is NOT Intelephense's covered
+            // territory — `builder_index` sources the real signature from
+            // vendor source directly, ide-helper or not.
+            if form.is_call() && view.kind == LaravelClassKind::Model {
+                if let Some(index) = builder_index {
+                    if let Some(m) = index
+                        .merged_surface()
+                        .into_iter()
+                        .find(|m| m.name == member)
+                    {
+                        return Some(ResolvedMemberAccess {
+                            declaring_fqcn: m.source_class.clone(),
+                            kind: MagicMemberKind::BuilderMethod,
+                            confidence,
+                        });
+                    }
+                }
             }
         }
         // A facade call whose member is NOT declared on the concrete — the
@@ -2525,6 +2556,9 @@ pub fn resolve_member_access_entries_with_context(
             resolver,
             classviews,
             project_root,
+            None, // index population never wants a builder-method fallback —
+            // vendor-forwarded methods stay out of rename/references, same as
+            // PlainMember.
             deps.as_deref_mut(),
         ) else {
             continue;
@@ -2565,6 +2599,7 @@ fn resolve_recipe_and_classify(
     resolver: &impl ClassFileResolver,
     classviews: &ClassViewCache,
     project_root: &Path,
+    builder_index: Option<&BuilderMethodIndex>,
     mut deps: Option<&mut HashSet<String>>,
 ) -> Option<ResolvedMemberAccess> {
     // Container-binding attempt dependency (see [`resolve_and_classify`]'s
@@ -2647,6 +2682,7 @@ fn resolve_recipe_and_classify(
         resolver,
         classviews,
         project_root,
+        builder_index,
     ) {
         record_macro_decl_dep(&resolved, &fqcn, member, resolver, deps.as_deref_mut());
         return Some(resolved);
@@ -2669,6 +2705,7 @@ fn resolve_recipe_and_classify(
             resolver,
             classviews,
             project_root,
+            builder_index,
         )?;
         record_macro_decl_dep(&resolved, &model, member, resolver, deps);
         return Some(resolved);

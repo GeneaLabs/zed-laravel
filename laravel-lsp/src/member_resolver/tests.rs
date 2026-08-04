@@ -348,6 +348,7 @@ fn resolve_in(p: &Project, caller: &str, member: &str) -> Option<ResolvedMemberA
         &cache,
         &p.root,
         None,
+        None,
     )
 }
 
@@ -406,6 +407,7 @@ fn resolve_with(
         resolver,
         &cache,
         root,
+        None,
         None,
     )
 }
@@ -629,6 +631,7 @@ fn resolve_static_call(
         &cache,
         root,
         None,
+        None,
     )
 }
 
@@ -846,6 +849,7 @@ fn resolve_call_member(
         resolver,
         &cache,
         root,
+        None,
         None,
     )
 }
@@ -2390,6 +2394,222 @@ class C {
 }
 
 #[test]
+fn population_indexes_chain_rooted_on_order_by_desc() {
+    // Regression: `orderByDesc` was missing from `ELOQUENT_STATIC_STARTERS`
+    // (query_chain/methods.rs) even though its `orderBy` sibling was present,
+    // so `resolve_call_chain_receiver`'s static-scope branch bailed before
+    // classifying anything chained after it — `active` never resolved for
+    // hover/goto/rename on a chain rooted this way.
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function a() { return User::orderByDesc('name')->active()->get(); }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &ClassViewCache::new(),
+        &p.root,
+        None,
+    );
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "a chain rooted on `orderByDesc` must still resolve later scope calls; got {entries:?}"
+    );
+}
+
+// ─── Builder-method hover fallback (`classify_against`'s new branch) ──────
+//
+// `orderByDesc` (and friends) aren't declared anywhere in a model's own
+// class hierarchy — they're `__call`-forwarded to the underlying query
+// builder. Without `ide-helper`-generated stubs, Intelephense can't see that
+// forwarding either, so this LSP fills the gap itself using the real vendor
+// signature from `BuilderMethodIndex`, sourced independent of ide-helper.
+
+const FAKE_ELOQUENT_BUILDER: &str = r#"<?php
+namespace Illuminate\Database\Eloquent;
+class Builder
+{
+}
+"#;
+
+const FAKE_QUERY_BUILDER: &str = r#"<?php
+namespace Illuminate\Database\Query;
+class Builder
+{
+    /**
+     * Add an "order by" clause in descending order to the query.
+     */
+    public function orderByDesc($column)
+    {
+        return $this;
+    }
+}
+"#;
+
+/// Write minimal fake vendor Eloquent + Query Builder classes into `root`
+/// (real files on disk — `parse_builder_methods` reads them, exactly like
+/// production) and build the real `BuilderMethodIndex` from them.
+fn fake_builder_index(root: &std::path::Path) -> crate::laravel_introspector::BuilderMethodIndex {
+    use crate::laravel_introspector::{ELOQUENT_BUILDER_REL_PATH, QUERY_BUILDER_REL_PATH};
+    let eloquent_path = root.join(ELOQUENT_BUILDER_REL_PATH);
+    fs::create_dir_all(eloquent_path.parent().unwrap()).unwrap();
+    fs::write(&eloquent_path, FAKE_ELOQUENT_BUILDER).unwrap();
+    let query_path = root.join(QUERY_BUILDER_REL_PATH);
+    fs::create_dir_all(query_path.parent().unwrap()).unwrap();
+    fs::write(&query_path, FAKE_QUERY_BUILDER).unwrap();
+    crate::laravel_introspector::parse_builder_methods(root)
+        .expect("fake vendor Builder files should parse")
+}
+
+/// Find the `scope` of the `scoped_call_expression` named `member` (the
+/// `<scope>::{member}()` receiver) — mirrors `resolve_static_call`'s internal
+/// lookup, inlined here so this test alone can pass a `builder_index` without
+/// widening that shared helper's signature across its ~14 other call sites.
+fn static_call_scope<'t>(
+    tree: &'t tree_sitter::Tree,
+    bytes: &[u8],
+    member: &str,
+) -> Option<tree_sitter::Node<'t>> {
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "scoped_call_expression"
+            && n.child_by_field_name("name")
+                .and_then(|nm| nm.utf8_text(bytes).ok())
+                == Some(member)
+        {
+            return n.child_by_field_name("scope");
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    None
+}
+
+#[test]
+fn builder_method_fallback_resolves_forwarded_call() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let index = fake_builder_index(&p.root);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function a() { return User::orderByDesc('name'); }
+}
+"#;
+    let tree = parse_php(caller).expect("parse caller");
+    let bytes = caller.as_bytes();
+    let aliases = extract_use_aliases(&tree, caller);
+    let receiver = static_call_scope(&tree, bytes, "orderByDesc").expect("find receiver");
+    let cache = ClassViewCache::new();
+
+    let resolved = resolve_and_classify(
+        receiver,
+        "orderByDesc",
+        AccessForm::StaticCall,
+        bytes,
+        &aliases,
+        &p.index,
+        &cache,
+        &p.root,
+        Some(&index),
+        None,
+    )
+    .expect("orderByDesc should resolve via the builder-index fallback");
+
+    assert_eq!(resolved.kind, MagicMemberKind::BuilderMethod);
+    assert_eq!(
+        resolved.declaring_fqcn,
+        "Illuminate\\Database\\Query\\Builder"
+    );
+}
+
+#[test]
+fn builder_method_fallback_absent_without_index() {
+    // Same call site as above, but `builder_index: None` (the "vendor/
+    // missing, or caller doesn't want the fallback" case — goto/rename/
+    // references all pass `None`) — must fall back to today's behavior: no
+    // classification at all, not a guess.
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function a() { return User::orderByDesc('name'); }
+}
+"#;
+    let tree = parse_php(caller).expect("parse caller");
+    let bytes = caller.as_bytes();
+    let aliases = extract_use_aliases(&tree, caller);
+    let receiver = static_call_scope(&tree, bytes, "orderByDesc").expect("find receiver");
+    let cache = ClassViewCache::new();
+
+    let resolved = resolve_and_classify(
+        receiver,
+        "orderByDesc",
+        AccessForm::StaticCall,
+        bytes,
+        &aliases,
+        &p.index,
+        &cache,
+        &p.root,
+        None,
+        None,
+    );
+
+    assert_eq!(
+        resolved, None,
+        "without a builder_index the fallback must not fire — no card, same as before this feature"
+    );
+}
+
+#[test]
+fn builder_method_fallback_ignores_property_form() {
+    // Builder methods are always calls in Laravel — a property-form read of
+    // the same name (however contrived) must not be misclassified as one,
+    // even with a matching builder_index. Proves the `form.is_call()` gate.
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let index = fake_builder_index(&p.root);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function a(User $user) { return $user->orderByDesc; }
+}
+"#;
+    let tree = parse_php(caller).expect("parse caller");
+    let bytes = caller.as_bytes();
+    let aliases = extract_use_aliases(&tree, caller);
+    let receiver = receiver_of(&tree, bytes, "orderByDesc").expect("find receiver");
+    let cache = ClassViewCache::new();
+
+    let resolved = resolve_and_classify(
+        receiver,
+        "orderByDesc",
+        AccessForm::Property,
+        bytes,
+        &aliases,
+        &p.index,
+        &cache,
+        &p.root,
+        Some(&index),
+        None,
+    );
+
+    assert_eq!(
+        resolved, None,
+        "a property-form access must not trigger the call-only builder-method fallback"
+    );
+}
+
+#[test]
 fn population_indexes_builder_param_scope_body_calls() {
     // `$query->active()` inside another scope's body — the receiver types as
     // the Eloquent Builder (no scopes declared there); resolution retries
@@ -3509,6 +3729,7 @@ fn resolve_instance_call(
         resolver,
         &cache,
         root,
+        None,
         None,
     )
 }

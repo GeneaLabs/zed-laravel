@@ -373,6 +373,8 @@ pub const ELOQUENT_STATIC_STARTERS: &[&str] = &[
     "latest",
     "oldest",
     "orderBy",
+    "orderByDesc",
+    "orderByRaw",
     "groupBy",
     "having",
     "select",

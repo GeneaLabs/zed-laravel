@@ -137,6 +137,11 @@ fn is_eloquent_static_starter_recognises_idiomatic_forms() {
     assert!(is_eloquent_static_starter("with"));
     assert!(is_eloquent_static_starter("create"));
     assert!(is_eloquent_static_starter("count"));
+    // Regression: `orderBy` was recognised but its `Desc`/`Raw` siblings
+    // weren't, silently breaking chain-root propagation for anything chained
+    // after `Model::orderByDesc(...)` / `Model::orderByRaw(...)`.
+    assert!(is_eloquent_static_starter("orderByDesc"));
+    assert!(is_eloquent_static_starter("orderByRaw"));
 }
 
 #[test]

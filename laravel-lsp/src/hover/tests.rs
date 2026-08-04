@@ -267,6 +267,31 @@ fn magic_member_card_labels_each_kind() {
     assert_eq!(label(MagicMemberKind::Factory), "**Model factory**");
     assert_eq!(label(MagicMemberKind::FactoryMethod), "**Factory method**");
     assert_eq!(label(MagicMemberKind::Pivot), "**Pivot model**");
+    assert_eq!(
+        label(MagicMemberKind::BuilderMethod),
+        "**Query builder method**"
+    );
+}
+
+#[test]
+fn magic_member_card_builder_method_renders_vendor_signature_and_summary() {
+    // The builder-method fallback has no decl_file to slice — its
+    // signature/summary come pre-extracted from `BuilderMethodIndex` and are
+    // passed straight through the existing `definition`/`description` slots.
+    let card = magic_member_card(
+        MagicMemberKind::BuilderMethod,
+        "orderByDesc",
+        "Illuminate\\Database\\Query\\Builder",
+        Confidence::High,
+        Some("public function orderByDesc($column)"),
+        None,
+        Some("Add an \"order by\" clause in descending order to the query."),
+        None,
+    );
+    assert!(card.contains("**Query builder method**"));
+    assert!(card.contains("`orderByDesc` on `Illuminate\\Database\\Query\\Builder`"));
+    assert!(card.contains("public function orderByDesc($column)"));
+    assert!(card.contains("Add an \"order by\" clause in descending order to the query."));
 }
 
 #[test]

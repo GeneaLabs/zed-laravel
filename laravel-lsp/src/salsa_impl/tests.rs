@@ -2804,7 +2804,7 @@ async fn resolve_magic_member_at_classifies_static_scope_call() {
     let (line, col) = position_of(SCOPE_CALLER_SRC, "active");
 
     let data = handle
-        .resolve_magic_member_at(caller_path, line, col)
+        .resolve_magic_member_at(caller_path, line, col, None)
         .await
         .unwrap()
         .expect("scope call should resolve");
@@ -2873,7 +2873,7 @@ class C {
 
     let (line, col) = position_of(caller_src, "somethingUnknown");
     let data = handle
-        .resolve_magic_member_at(caller_path, line, col)
+        .resolve_magic_member_at(caller_path, line, col, None)
         .await
         .unwrap();
     assert!(
@@ -2928,7 +2928,7 @@ class C {
     let (line, col) = position_of(caller_src, "whereEmail");
     // Precondition: the finder itself resolves (hover/goto see it)...
     let hover = handle
-        .resolve_magic_member_at(caller_path.clone(), line, col)
+        .resolve_magic_member_at(caller_path.clone(), line, col, None)
         .await
         .unwrap()
         .expect("finder should classify for hover/goto");
@@ -2985,7 +2985,7 @@ class C {
 
     let (line, col) = position_of(caller_src, "active");
     let data = handle
-        .resolve_magic_member_at(caller_path.clone(), line, col)
+        .resolve_magic_member_at(caller_path.clone(), line, col, None)
         .await
         .unwrap()
         .expect("mid-chain scope call should resolve");
@@ -4084,7 +4084,7 @@ class Ids {
     // Cursor on the `uuid7` member token.
     let (line, col) = position_of(caller_src, "uuid7");
     let data = handle
-        .resolve_magic_member_at(caller_path, line, col)
+        .resolve_magic_member_at(caller_path, line, col, None)
         .await
         .unwrap()
         .expect("a registered macro call should resolve");
@@ -4235,7 +4235,7 @@ async fn assert_facade_method_resolves(caller_body: &str, member: &str) -> Magic
     let (_dir, handle, caller_path, caller_src) = auth_facade_e2e_project(caller_body).await;
     let (line, col) = position_of(&caller_src, member);
     let data = handle
-        .resolve_magic_member_at(caller_path, line, col)
+        .resolve_magic_member_at(caller_path, line, col, None)
         .await
         .unwrap()
         .unwrap_or_else(|| {
@@ -4371,7 +4371,7 @@ class AboutController {
     // none — `check` appears only in the call).
     let (line, col) = position_of(caller_src, "check");
     let data = handle
-        .resolve_magic_member_at(caller_path, line, col)
+        .resolve_magic_member_at(caller_path, line, col, None)
         .await
         .unwrap()
         .expect("imported `Auth::check()` must resolve, not None");
@@ -4390,7 +4390,7 @@ async fn facade_e2e_undeclared_method_degrades_to_class_never_none() {
         auth_facade_e2e_project(r#"\Auth::guard();"#).await;
     let (line, col) = position_of(&caller_src, "guard");
     let data = handle
-        .resolve_magic_member_at(caller_path, line, col)
+        .resolve_magic_member_at(caller_path, line, col, None)
         .await
         .unwrap()
         .expect("undeclared facade method must degrade, not return None");
@@ -4492,7 +4492,7 @@ class AboutController {{
 
     let (line, col) = position_of(&caller_src, member);
     let data = handle
-        .resolve_magic_member_at(caller_path, line, col)
+        .resolve_magic_member_at(caller_path, line, col, None)
         .await
         .unwrap()
         .unwrap_or_else(|| panic!("`{caller_body}` must resolve to a facade method, got None"));
@@ -4675,7 +4675,7 @@ async fn helper_chain_e2e_view_make_resolves_to_concrete_factory() {
         view_helper_e2e_project(r#"view()->make('welcome');"#).await;
     let (line, col) = position_of(&caller_src, "make");
     let data = handle
-        .resolve_magic_member_at(caller_path, line, col)
+        .resolve_magic_member_at(caller_path, line, col, None)
         .await
         .unwrap()
         .expect("`view()->make()` must resolve, not None");
@@ -4698,7 +4698,7 @@ async fn helper_chain_e2e_two_hop_render_resolves_to_concrete_implementor() {
         view_helper_e2e_project(r#"view()->make('welcome')->render();"#).await;
     let (line, col) = position_of(&caller_src, "render");
     let data = handle
-        .resolve_magic_member_at(caller_path, line, col)
+        .resolve_magic_member_at(caller_path, line, col, None)
         .await
         .unwrap()
         .expect("two-hop `view()->make()->render()` must resolve, not None");
