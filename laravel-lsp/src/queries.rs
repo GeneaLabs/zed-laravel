@@ -1435,10 +1435,14 @@ pub fn extract_all_blade_patterns<'a>(
 
                 // Calculate string column positions for view-referencing, translation, and feature directives
                 // Use the actual parameter column from tree-sitter for accurate positioning
+                //
+                // `use` carries a class FQCN rather than a view name — the span
+                // is what makes `@use('App\Support\Foo')` navigable and what
+                // the class-reference index keys off.
                 let (string_column, string_end_column) = match (directive_name, &param_info) {
                     (
                         "extends" | "include" | "slot" | "component" | "lang" | "feature"
-                        | "livewire",
+                        | "livewire" | "use",
                         Some(info),
                     ) => calculate_string_column_range(info.column, info.text)
                         .unwrap_or((directive_column, directive_end_column)),

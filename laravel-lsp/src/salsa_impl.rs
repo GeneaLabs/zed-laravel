@@ -1133,6 +1133,38 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                 // Note: route_refs, url_refs, action_refs are extracted in handle_get_patterns
                 // to keep ParsedPatterns field count under Salsa's 12-element limit
             }
+
+            // Component / Livewire tags built as PHP string literals — markup a
+            // job or mailer assembles and renders later. Appended AFTER the
+            // query-extracted patterns to match the order
+            // `pattern_indexer::push_string_tags` produces, so a file's entries
+            // never depend on which constructor built them.
+            for tag in crate::php_string_components::scan_php_string_tags(&tree, text) {
+                match tag.kind {
+                    crate::php_string_components::StringTagKind::Component => {
+                        let name = ComponentName::new(db, tag.name);
+                        let full = ComponentName::new(db, tag.tag_name);
+                        components.push(ComponentReference::new(
+                            db,
+                            name,
+                            full,
+                            tag.line,
+                            tag.column,
+                            tag.end_column,
+                        ));
+                    }
+                    crate::php_string_components::StringTagKind::Livewire => {
+                        let name = LivewireName::new(db, tag.name);
+                        livewire_refs.push(LivewireReference::new(
+                            db,
+                            name,
+                            tag.line,
+                            tag.column,
+                            tag.end_column,
+                        ));
+                    }
+                }
+            }
         }
     } // end if !is_blade
 
@@ -3134,6 +3166,17 @@ pub struct ConfigReferenceData {
     pub end_column: u32,
 }
 
+/// A class FQCN referenced from a Blade `@use` directive. Positions span the
+/// name's characters INSIDE the quotes, so navigation and highlight land on the
+/// class rather than on the whole directive.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClassReferenceData {
+    pub name: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
 /// Livewire reference data for transfer across async boundaries
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LivewireReferenceData {
@@ -4220,6 +4263,14 @@ pub enum SymbolRefData {
     Livewire(String),
     Middleware(String),
     Binding(String),
+    /// A PHP class referenced by fully-qualified name from a Blade `@use`
+    /// directive. Keyed by the FQCN as written, with any `\\` collapsed, so
+    /// `@use('App\Models\Flight')` and `@use('App\\Models\\Flight')` agree.
+    ///
+    /// Blade `@use` is currently the only producer: PHP `use` statements are
+    /// not indexed as class references, so find-references on a class reports
+    /// its Blade imports, not every import project-wide.
+    Class(String),
     /// An Eloquent magic member (accessor / column / relationship / scope /
     /// dynamic finder) or a plain class member, keyed by its inheritance-
     /// resolved declaring class FQCN + member name. Unlike the literal kinds
@@ -4688,6 +4739,17 @@ pub struct ParsedPatternsData {
     /// bincode is non-self-describing, so stale slim entries re-parse.
     #[serde(default)]
     pub member_context: Option<Box<MemberContextData>>,
+    /// Class FQCNs imported by Blade `@use` directives. Derived from
+    /// `directives` by [`class_refs_from_directives`] rather than extracted
+    /// separately — the directive already carries the name and its in-quote
+    /// span. Stored here rather than as a `ParsedPatterns` Salsa field because
+    /// that struct is at its 12-element tuple-Hash cap. Empty for `.php` files.
+    ///
+    /// `#[serde(default)]` so older disk-cache entries deserialize with an
+    /// empty list; the `pattern_disk_cache` SCHEMA_VERSION bump makes them
+    /// re-parse anyway.
+    #[serde(default)]
+    pub class_refs: Vec<Arc<ClassReferenceData>>,
     /// Sorted index of all patterns by (line, column) for O(log n) lookup.
     /// Skipped during (de)serialization — when loading from the on-disk
     /// cache, the caller must invoke `build_position_index()` to rebuild
@@ -4709,6 +4771,14 @@ pub enum PatternAtPosition {
     Inertia(Arc<InertiaReferenceData>),
     Component(Arc<ComponentReferenceData>),
     Directive(Arc<DirectiveReferenceData>),
+    /// A class FQCN at an import site — a PHP `use` statement, or the name
+    /// inside a Blade `@use`.
+    ///
+    /// In a Blade file the enclosing `Directive` entry starts earlier on the
+    /// line and so wins `find_at_position`; its classifier arm yields the same
+    /// `SymbolRef::Class`, so both routes agree. This variant is what a cursor
+    /// on a PHP `use` resolves through, where no directive covers it.
+    Class(Arc<ClassReferenceData>),
     EnvRef(Arc<EnvReferenceData>),
     ConfigRef(Arc<ConfigReferenceData>),
     Livewire(Arc<LivewireReferenceData>),
@@ -4755,6 +4825,15 @@ impl ParsedPatternsData {
         }
 
         for dir in &self.directives {
+            // `@use` names a class, and `class_refs` already carries that name
+            // at its exact span. Emitting a directive entry too would shadow it
+            // — the directive starts at column 0, so it wins `find_at_position`
+            // for every cursor inside the call — and a single directive entry
+            // cannot distinguish the members of a group import. Skipping it
+            // makes class refs the one route for `@use`, in Blade and PHP alike.
+            if dir.name == "use" {
+                continue;
+            }
             entries.push(PositionEntry {
                 line: dir.line,
                 column: dir.column,
@@ -4886,6 +4965,15 @@ impl ParsedPatternsData {
                 column: member.column,
                 end_column: member.end_column,
                 pattern: PatternAtPosition::MemberAccess(member.clone()),
+            });
+        }
+
+        for class_ref in &self.class_refs {
+            entries.push(PositionEntry {
+                line: class_ref.line,
+                column: class_ref.column,
+                end_column: class_ref.end_column,
+                pattern: PatternAtPosition::Class(class_ref.clone()),
             });
         }
 
@@ -7770,7 +7858,10 @@ impl SalsaActor {
             })
             .collect();
 
-        let directives = patterns
+        // Annotated because `class_refs_from_directives(&directives)` below
+        // borrows this as a slice, which otherwise leaves the collect's target
+        // type unconstrained.
+        let directives: Vec<Arc<DirectiveReferenceData>> = patterns
             .directives(&self.db)
             .iter()
             .map(|d| {
@@ -8231,11 +8322,18 @@ impl SalsaActor {
             }
         }
 
+        // Class FQCNs this file imports — Blade `@use` scanned from source, PHP
+        // `use` off the tree already parsed for the M1 capture. Same helper
+        // `pattern_indexer` uses, so the two constructors emit identical
+        // entries.
+        let class_refs = class_refs_for(path, php_tree.as_ref(), text);
+
         let mut data = ParsedPatternsData {
             views,
             inertia_refs,
             components,
             directives,
+            class_refs,
             env_refs,
             config_refs,
             livewire_refs,
@@ -10237,6 +10335,109 @@ pub fn collect_source_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Derive a file's class references from its imports.
+///
+/// Blade templates contribute their `@use` directives, scanned from the source
+/// because the class names live inside string literals; `.php` files contribute
+/// their `use` statements off `php_tree` — the full-file parse both constructors
+/// already hold for the M1 capture, so this costs no extra pass. `path` selects
+/// the branch, so a `.php` file containing the *text* `@use('…')` inside a
+/// string is never mistaken for a Blade import.
+///
+/// A Blade file's embedded PHP regions are scanned for `use` statements too.
+/// In practice that means a Volt single-file component's `<?php … ?>` front
+/// matter, which the Blade-directive scan cannot see — leaving it out would let
+/// a class rename miss a Volt component's imports entirely.
+///
+/// Shared by both `ParsedPatternsData` constructors (`handle_get_patterns` and
+/// `pattern_indexer::parse_owned_with_hierarchy`) so a file's class refs never
+/// depend on which one built it.
+pub fn class_refs_for(
+    path: &Path,
+    php_tree: Option<&tree_sitter::Tree>,
+    text: &str,
+) -> Vec<Arc<ClassReferenceData>> {
+    let mut out: Vec<Arc<ClassReferenceData>> = Vec::new();
+
+    if path.to_string_lossy().ends_with(".blade.php") {
+        for import in crate::query_chain::use_aliases::blade_use_imports(text) {
+            let (line, column) = byte_line_col(text, import.name.0);
+            let (_, end_column) = byte_line_col(text, import.name.1);
+            out.push(Arc::new(ClassReferenceData {
+                name: import.fqcn,
+                line,
+                column,
+                end_column,
+            }));
+        }
+        // A Blade file's embedded PHP regions — chiefly a Volt single-file
+        // component's `<?php … ?>` front matter, which carries real PHP `use`
+        // statements. Skipping them would let a class rename miss a Volt
+        // component's imports entirely.
+        let prefix = crate::blade_embedded_php::PHP_WRAPPER_PREFIX_LEN;
+        for region in crate::blade_embedded_php::extract_php_regions(text) {
+            let wrapped = format!("<?php {}", region.content);
+            let Ok(tree) = crate::parser::parse_php(&wrapped) else {
+                continue;
+            };
+            for i in crate::query_chain::use_aliases::php_use_class_refs(&tree, &wrapped) {
+                let (line, column) = crate::blade_embedded_php::adjust_inner_position(
+                    i.line,
+                    i.column,
+                    region.row,
+                    region.column,
+                );
+                // `adjust_inner_position` only un-shifts the wrapper on row 0;
+                // the end column needs the same treatment to stay paired.
+                let end_column = if i.line == 0 {
+                    region.column + i.end_column.saturating_sub(prefix)
+                } else {
+                    i.end_column
+                };
+                out.push(Arc::new(ClassReferenceData {
+                    name: i.fqcn,
+                    line,
+                    column,
+                    end_column,
+                }));
+            }
+        }
+    } else if let Some(tree) = php_tree {
+        out.extend(
+            crate::query_chain::use_aliases::php_use_class_refs(tree, text)
+                .into_iter()
+                .map(|i| {
+                    Arc::new(ClassReferenceData {
+                        name: i.fqcn,
+                        line: i.line,
+                        column: i.column,
+                        end_column: i.end_column,
+                    })
+                }),
+        );
+    }
+
+    out.sort_by_key(|c| (c.line, c.column));
+    out
+}
+
+/// 0-based (line, **byte** column) of `offset` in `text`.
+///
+/// Deliberately not `query_chain::byte_offset_to_position`, which counts chars
+/// for the LSP wire format: every pattern position in this module is a byte
+/// column, matching tree-sitter `Point`s.
+fn byte_line_col(text: &str, offset: usize) -> (u32, u32) {
+    let clamped = offset.min(text.len());
+    let before = &text[..clamped];
+    match before.rfind('\n') {
+        Some(nl) => (
+            before.matches('\n').count() as u32,
+            (clamped - nl - 1) as u32,
+        ),
+        None => (0, clamped as u32),
+    }
+}
+
 /// Append every parser-classified reference in `patterns` that matches `symbol`
 /// into `out`. Only the pattern collection corresponding to the symbol kind is
 /// scanned — a `SymbolRef::Route` never matches a coincidental config-key
@@ -10283,6 +10484,13 @@ fn collect_matches_for_symbol(
             for r in &patterns.route_refs {
                 if r.name == *name {
                     push(out, r.line, r.column, r.end_column);
+                }
+            }
+        }
+        SymbolRefData::Class(fqcn) => {
+            for c in &patterns.class_refs {
+                if c.name == *fqcn {
+                    push(out, c.line, c.column, c.end_column);
                 }
             }
         }

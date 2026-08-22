@@ -184,3 +184,294 @@ fn resolve_strips_leading_backslash() {
         "Illuminate\\Support\\Facades\\DB"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Blade `@use` directives — a Blade file's file-level imports.
+// ---------------------------------------------------------------------------
+
+fn blade(src: &str) -> UseAliases {
+    blade_use_aliases(src)
+}
+
+/// The reported case: the short name in the template must resolve to the FQCN
+/// the `@use` imported.
+#[test]
+fn blade_use_binds_the_short_class_name() {
+    let map = blade("@use(\"App\\Support\\Reader\\VerseMarkerResolver\")\n<div></div>");
+
+    assert_eq!(
+        map.get("VerseMarkerResolver").map(String::as_str),
+        Some("App\\Support\\Reader\\VerseMarkerResolver")
+    );
+}
+
+#[test]
+fn blade_use_accepts_single_quotes() {
+    let map = blade("@use('App\\Models\\Flight')");
+
+    assert_eq!(
+        map.get("Flight").map(String::as_str),
+        Some("App\\Models\\Flight")
+    );
+}
+
+#[test]
+fn blade_use_honours_an_explicit_alias() {
+    let map = blade("@use('App\\Models\\Flight', 'FlightModel')");
+
+    assert_eq!(
+        map.get("FlightModel").map(String::as_str),
+        Some("App\\Models\\Flight")
+    );
+    assert!(
+        !map.contains_key("Flight"),
+        "the aliased import must not also bind the short name"
+    );
+}
+
+#[test]
+fn blade_use_expands_a_group_import() {
+    let map = blade("@use('App\\Models\\{Flight, Airport as Field}')");
+
+    assert_eq!(
+        map.get("Flight").map(String::as_str),
+        Some("App\\Models\\Flight")
+    );
+    assert_eq!(
+        map.get("Field").map(String::as_str),
+        Some("App\\Models\\Airport")
+    );
+}
+
+#[test]
+fn blade_use_collapses_double_escaped_separators() {
+    let map = blade("@use('App\\\\Models\\\\Flight')");
+
+    assert_eq!(
+        map.get("Flight").map(String::as_str),
+        Some("App\\Models\\Flight"),
+        "`App\\\\Models\\\\Flight` names the same class as `App\\Models\\Flight`"
+    );
+}
+
+/// Function and const imports bind no class — same exclusion the PHP path makes.
+#[test]
+fn blade_use_skips_function_and_const_imports() {
+    assert!(blade("@use('function App\\Helpers\\fmt')").is_empty());
+    assert!(blade("@use('const App\\Constants\\MAX')").is_empty());
+}
+
+#[test]
+fn blade_use_collects_every_directive_in_the_file() {
+    let map = blade("@use('App\\Models\\Flight')\n@use('App\\Models\\Airport')\n<div></div>");
+
+    assert_eq!(map.len(), 2, "got {map:?}");
+}
+
+// --- guards -----------------------------------------------------------------
+
+#[test]
+fn blade_use_ignores_directives_inside_comments() {
+    assert!(
+        blade("{{-- @use('App\\Models\\Flight') --}}").is_empty(),
+        "a Blade comment is not a declaration"
+    );
+    assert!(
+        blade("<!-- @use('App\\Models\\Flight') -->").is_empty(),
+        "an HTML comment is not a declaration"
+    );
+}
+
+/// `@use` must not match a longer word that merely starts with it.
+#[test]
+fn blade_use_ignores_a_longer_directive_name() {
+    assert!(blade("@usesomething('App\\Models\\Flight')").is_empty());
+}
+
+#[test]
+fn blade_use_ignores_an_empty_argument_list() {
+    assert!(blade("@use()").is_empty());
+    assert!(blade("@use('')").is_empty());
+}
+
+#[test]
+fn file_without_use_directives_yields_no_aliases() {
+    assert!(blade("<div>{{ $x }}</div>").is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Positioned PHP `use` imports — the class-reference index's PHP source.
+// ---------------------------------------------------------------------------
+
+fn php_imports(src: &str) -> Vec<PhpUseImport> {
+    let wrapped = format!("<?php\n{src}");
+    let tree = parse_php(&wrapped).expect("parse");
+    php_use_class_refs(&tree, &wrapped)
+}
+
+/// The source text the reported span covers — the class name as written at
+/// that site.
+fn slice(src: &str, i: &PhpUseImport) -> String {
+    let wrapped = format!("<?php\n{src}");
+    let line = wrapped.lines().nth(i.line as usize).expect("line in range");
+    line[i.column as usize..i.end_column as usize].to_string()
+}
+
+#[test]
+fn php_use_is_positioned_on_the_name_as_written() {
+    let src = "use App\\Models\\Flight;";
+    let found = php_imports(src);
+
+    assert_eq!(found.len(), 1, "got {found:?}");
+    assert_eq!(found[0].fqcn, r"App\Models\Flight");
+    assert_eq!(found[0].line, 1, "line 0 is `<?php`");
+    assert_eq!(
+        slice(src, &found[0]),
+        r"App\Models\Flight",
+        "a flat import spells the whole FQCN, so the span covers it"
+    );
+}
+
+#[test]
+fn aliased_php_use_is_positioned_on_the_class_not_the_alias() {
+    let src = "use App\\Models\\Flight as F;";
+    let found = php_imports(src);
+
+    assert_eq!(found.len(), 1, "got {found:?}");
+    assert_eq!(found[0].fqcn, r"App\Models\Flight");
+    assert_eq!(
+        slice(src, &found[0]),
+        r"App\Models\Flight",
+        "the span stops before `as F` — the alias is a local binding, not a \
+         reference to the class name"
+    );
+}
+
+#[test]
+fn grouped_php_use_yields_one_entry_per_clause() {
+    let src = "use App\\Models\\{Flight, Airport as Field};";
+    let found = php_imports(src);
+
+    assert_eq!(
+        found.iter().map(|i| i.fqcn.as_str()).collect::<Vec<_>>(),
+        [r"App\Models\Flight", r"App\Models\Airport"],
+        "prefix applied to each clause"
+    );
+    assert_eq!(
+        slice(src, &found[0]),
+        "Flight",
+        "a grouped clause spells only its own leaf, so that is the span"
+    );
+    assert_eq!(slice(src, &found[1]), "Airport");
+}
+
+#[test]
+fn php_use_entries_come_back_in_source_order() {
+    let src = "use App\\Models\\Airport;\nuse App\\Models\\Flight;";
+    let found = php_imports(src);
+
+    assert_eq!(
+        found.iter().map(|i| i.fqcn.as_str()).collect::<Vec<_>>(),
+        [r"App\Models\Airport", r"App\Models\Flight"]
+    );
+    assert_eq!(found[0].line, 1);
+    assert_eq!(found[1].line, 2);
+}
+
+#[test]
+fn php_function_and_const_imports_are_not_class_refs() {
+    assert!(php_imports("use function App\\Helpers\\fmt;").is_empty());
+    assert!(php_imports("use const App\\Constants\\MAX;").is_empty());
+}
+
+/// A leading `\` is not part of the name — the FQCN must match the key the
+/// index and the alias map already use.
+#[test]
+fn leading_separator_is_stripped_from_the_fqcn() {
+    let found = php_imports("use \\App\\Models\\Flight;");
+
+    assert_eq!(found.len(), 1, "got {found:?}");
+    assert_eq!(found[0].fqcn, r"App\Models\Flight");
+}
+
+#[test]
+fn file_without_imports_yields_nothing() {
+    assert!(php_imports("class Foo {}").is_empty());
+}
+
+/// Trait `use` inside a class body binds a trait, not an import — it is not a
+/// `namespace_use_declaration` and must not be collected.
+#[test]
+fn trait_use_inside_a_class_is_not_an_import() {
+    let found = php_imports("class Foo {\n    use SomeTrait;\n}");
+
+    assert!(found.is_empty(), "got {found:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Blade `@use` site locations — the class rename rewrites inside these spans.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn blade_use_site_span_covers_the_content_inside_the_quotes() {
+    let src = "@use('App\\Models\\Flight')\n<div></div>";
+    let sites = blade_use_sites(src);
+
+    assert_eq!(sites.len(), 1, "got {sites:?}");
+    assert_eq!(
+        &src[sites[0].raw_start..sites[0].raw_end],
+        r"App\Models\Flight",
+        "span excludes the quotes and the parentheses"
+    );
+}
+
+#[test]
+fn blade_use_site_span_handles_double_quotes_and_whitespace() {
+    let src = "@use( \"App\\Models\\Flight\" )";
+    let sites = blade_use_sites(src);
+
+    assert_eq!(sites.len(), 1, "got {sites:?}");
+    assert_eq!(
+        &src[sites[0].raw_start..sites[0].raw_end],
+        r"App\Models\Flight"
+    );
+}
+
+#[test]
+fn blade_use_site_span_survives_an_alias_second_argument() {
+    let src = "@use('App\\Models\\Flight', 'FlightModel')";
+    let sites = blade_use_sites(src);
+
+    assert_eq!(sites.len(), 1, "got {sites:?}");
+    assert_eq!(
+        &src[sites[0].raw_start..sites[0].raw_end],
+        r"App\Models\Flight",
+        "the span tracks the first argument only"
+    );
+    assert_eq!(sites[0].alias.as_deref(), Some("FlightModel"));
+}
+
+#[test]
+fn blade_use_site_spans_are_correct_for_several_directives() {
+    let src = "@use('App\\Models\\Airport')\n@use('App\\Models\\Flight')\n";
+    let sites = blade_use_sites(src);
+
+    let spans: Vec<&str> = sites.iter().map(|s| &src[s.raw_start..s.raw_end]).collect();
+    assert_eq!(spans, [r"App\Models\Airport", r"App\Models\Flight"]);
+}
+
+/// The raw span is the source text, so a double-escaped import keeps its
+/// escaping in the span while `import` is normalised.
+#[test]
+fn blade_use_site_keeps_raw_text_while_import_is_normalised() {
+    let src = "@use('App\\\\Models\\\\Flight')";
+    let sites = blade_use_sites(src);
+
+    assert_eq!(sites.len(), 1, "got {sites:?}");
+    assert_eq!(sites[0].import, r"App\Models\Flight", "normalised");
+    assert_eq!(
+        &src[sites[0].raw_start..sites[0].raw_end],
+        r"App\\Models\\Flight",
+        "raw span is verbatim source"
+    );
+}

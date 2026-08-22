@@ -15721,6 +15721,37 @@ return [
     }
 
     /// Helper to create a LocationLink for a directive
+    /// Goto target for a class import site — a PHP `use` statement (Blade's
+    /// `@use` resolves through the directive handler instead). Resolves the
+    /// FQCN through the same locator the rest of the class navigation uses and
+    /// highlights the name as written.
+    async fn create_class_location_from_salsa(
+        &self,
+        class_ref: &laravel_lsp::salsa_impl::ClassReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
+        let root = self.root_path.read().await.clone()?;
+        let path = laravel_lsp::class_locator::find_php_class_file(&class_ref.name, &root)?;
+        if !path_within_root(&path, &root) {
+            return None;
+        }
+        let target_uri = Url::from_file_path(&path).ok()?;
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: Some(Range {
+                start: Position {
+                    line: class_ref.line,
+                    character: class_ref.column,
+                },
+                end: Position {
+                    line: class_ref.line,
+                    character: class_ref.end_column,
+                },
+            }),
+            target_uri,
+            target_range: Range::default(),
+            target_selection_range: Range::default(),
+        }]))
+    }
+
     fn create_location_link(
         &self,
         dir: &DirectiveReferenceData,
@@ -16746,7 +16777,9 @@ return [
             .get(uri)
             .map(|(c, _)| c.clone())?;
         let byte = position_to_byte_offset(&content, position.line, position.character)?;
-        let (fqcn, span) = laravel_lsp::class_rename::class_at_cursor(&content, byte)?;
+        let file_path = uri.to_file_path().ok()?;
+        let (fqcn, span) =
+            laravel_lsp::class_rename::class_at_cursor_for(&file_path, &content, byte)?;
         let root = self.initialized_root.read().await.clone()?;
         let decl = laravel_lsp::class_locator::find_php_class_file(&fqcn, &root)?;
         if laravel_lsp::class_rename::is_dependency_path(&decl) {
@@ -16778,7 +16811,12 @@ return [
         else {
             return Ok(None);
         };
-        let Some((fqcn, _span)) = laravel_lsp::class_rename::class_at_cursor(&content, byte) else {
+        let Some(file_path) = uri.to_file_path().ok() else {
+            return Ok(None);
+        };
+        let Some((fqcn, _span)) =
+            laravel_lsp::class_rename::class_at_cursor_for(&file_path, &content, byte)
+        else {
             return Ok(None);
         };
         let Some(root) = self.initialized_root.read().await.clone() else {
@@ -16850,7 +16888,8 @@ return [
                         return None;
                     }
                     parsed += 1;
-                    let spans = laravel_lsp::class_rename::reference_spans(&c, &fqcn2, &old2);
+                    let spans =
+                        laravel_lsp::class_rename::reference_spans_for(&p, &c, &fqcn2, &old2);
                     if spans.is_empty() {
                         None
                     } else {
@@ -18776,7 +18815,12 @@ return [
                 card
             }
             // Patterns we don't yet surface in hover — silently drop.
+            // `Class` is a PHP `use` statement (Blade's `@use` resolves through
+            // the `Directive` entry): a general PHP language server already
+            // hovers those, and the repo's policy is to suppress duplicates at
+            // the source rather than stack two cards.
             PatternAtPosition::Directive(_)
+            | PatternAtPosition::Class(_)
             | PatternAtPosition::Action(_)
             | PatternAtPosition::Feature(_) => return None,
         };
@@ -20699,6 +20743,7 @@ fn pattern_range_at(
         laravel_lsp::salsa_impl::PatternAtPosition::Directive(d) => {
             (d.line, d.string_column, d.string_end_column)
         }
+        laravel_lsp::salsa_impl::PatternAtPosition::Class(c) => (c.line, c.column, c.end_column),
         // Other patterns aren't renameable; range still useful for highlights.
         laravel_lsp::salsa_impl::PatternAtPosition::Asset(a) => (a.line, a.column, a.end_column),
         laravel_lsp::salsa_impl::PatternAtPosition::Url(u) => (u.line, u.column, u.end_column),
@@ -22897,6 +22942,10 @@ impl LanguageServer for LaravelLanguageServer {
                 debug!("Laravel: Found route: {}", route.name);
                 self.create_route_location_from_salsa(&route).await
             }
+            PatternAtPosition::Class(class_ref) => {
+                debug!("Laravel: Found class import: {}", class_ref.name);
+                self.create_class_location_from_salsa(&class_ref).await
+            }
             // Curated helper identifiers are a hover-only feature (#58) — no
             // goto target (the synopsis card carries a source link instead).
             PatternAtPosition::HelperIdentifier(helper) => {
@@ -23386,6 +23435,19 @@ impl LanguageServer for LaravelLanguageServer {
             return Err(laravel_lsp::rename::unsupported_rename_error(&symbol));
         }
 
+        // A class import site renames through the project-wide class rename,
+        // not through this handler's call-site + declaration machinery: the
+        // class-refs index holds import sites only, while the class rename
+        // rewrites every reference shape and moves the declaring file. Its
+        // range is the basename — the segment that actually changes — for a
+        // PHP `use` and a Blade `@use` alike.
+        if matches!(&symbol, laravel_lsp::references::SymbolRef::Class(_)) {
+            return Ok(self
+                .prepare_class_rename(uri, position)
+                .await
+                .map(PrepareRenameResponse::Range));
+        }
+
         // For declaration-cursor cases, the pattern range from
         // `pattern_range_at` is None (the parser didn't classify the
         // position). Fall back to the locator-reported decl range.
@@ -23518,6 +23580,13 @@ impl LanguageServer for LaravelLanguageServer {
             // — match the same user-facing error rather than no-op.
             debug!("rename: can_rename rejected {:?}", symbol);
             return Err(laravel_lsp::rename::unsupported_rename_error(&symbol));
+        }
+
+        // See the matching branch in `prepare_rename`: a class import site
+        // delegates to the project-wide class rename, which is a superset of
+        // what the call-site machinery below could produce.
+        if matches!(&symbol, laravel_lsp::references::SymbolRef::Class(_)) {
+            return self.class_rename_edit(uri, position, &new_name).await;
         }
 
         // Call-site references via Salsa. These are always parser-classified.
@@ -24211,6 +24280,12 @@ impl LanguageServer for LaravelLanguageServer {
                     new_text: trimmed_new.to_string(),
                 });
             }
+            // Unreachable: a class import site returned above, straight into
+            // the project-wide class rename, so it never reaches the
+            // declaration-site walkers. Kept explicit rather than as a `_`
+            // catch-all so adding a symbol kind still fails to compile here
+            // until its rename behaviour is decided.
+            laravel_lsp::references::SymbolRef::Class(_) => {}
         }
 
         let edit = laravel_lsp::rename::build_rename_workspace_edit(&targets, &file_renames);

@@ -70,6 +70,10 @@ pub struct EditTarget {
 ///   [`crate::middleware_binding_locator`])
 /// - Binding (container binding name rewrite at registration + call
 ///   sites via [`crate::middleware_binding_locator`])
+/// - Class (PHP `use` / Blade `@use` import sites — the odd one out: it does
+///   NOT rewrite the indexed sites, but routes to the project-wide class
+///   rename in [`crate::class_rename`], which rewrites every reference shape
+///   and moves the declaring file)
 pub fn can_rename(symbol: &SymbolRef) -> bool {
     matches!(
         symbol,
@@ -82,6 +86,7 @@ pub fn can_rename(symbol: &SymbolRef) -> bool {
             | SymbolRef::Livewire(_)
             | SymbolRef::Middleware(_)
             | SymbolRef::Binding(_)
+            | SymbolRef::Class(_)
     )
 }
 
@@ -115,12 +120,12 @@ pub fn rename_error(message: impl Into<std::borrow::Cow<'static, str>>) -> jsonr
 /// case. Cursor positions that don't classify as any Laravel pattern at
 /// all still return `Ok(None)` — silent is correct UX for F2 on whitespace.
 pub fn unsupported_rename_error(_symbol: &SymbolRef) -> jsonrpc::Error {
-    // Phase 3e wired up Middleware + Binding, so every SymbolRef variant
-    // we classify is renameable today. This branch survives as a
-    // defensive fallback for the (impossible-by-`can_rename`-gating)
-    // case where a future symbol kind is added without updating the
-    // gate. Generic message so we don't claim a specific kind is
-    // unsupported when in fact it's just unknown.
+    // Phase 3e wired up Middleware + Binding, and `Class` routes to the
+    // project-wide PHP class rename, so every classified symbol kind is
+    // renameable today. This branch survives as a defensive fallback for the
+    // (impossible-by-`can_rename`-gating) case where a future symbol kind is
+    // added without updating the gate. Generic message so we don't claim a
+    // specific kind is unsupported when in fact it's just unknown.
     jsonrpc::Error {
         code: jsonrpc::ErrorCode::ServerError(1),
         message: format!(

@@ -258,3 +258,145 @@ fn symbol_ref_to_data_round_trip() {
     assert!(matches!(s.to_data(), SymbolRefData::Route(n) if n == "home"));
     assert_eq!(s.name(), "home");
 }
+
+// ---------------------------------------------------------------------------
+// `@use` — a Blade file's class imports. Classification runs through the
+// `class_refs` position index, not through the directive entry: `@use` has no
+// directive entry, so one route serves Blade and PHP alike.
+// ---------------------------------------------------------------------------
+
+/// End-to-end from real Blade source, so the directive scan, the span
+/// computation, and the position index are all exercised together.
+fn classify_in_blade(src: &str, line: u32, column: u32) -> Option<SymbolRef> {
+    let path = std::path::PathBuf::from("/fixture/resources/views/page.blade.php");
+    let data = crate::pattern_indexer::parse_owned(&path, src);
+    classify_pattern_at_cursor(&data, line, column)
+}
+
+#[test]
+fn blade_use_classifies_as_a_class_symbol() {
+    let src = "@use(\"App\\Support\\Reader\\VerseMarkerResolver\")\n";
+    let col = src.find("Reader").expect("offset") as u32;
+
+    assert_eq!(
+        classify_in_blade(src, 0, col),
+        Some(SymbolRef::Class(
+            r"App\Support\Reader\VerseMarkerResolver".into()
+        ))
+    );
+}
+
+#[test]
+fn blade_use_with_an_alias_classifies_on_the_imported_class() {
+    let src = "@use('App\\Models\\Flight', 'FlightModel')\n";
+    let col = src.find("Flight'").expect("offset") as u32;
+
+    assert_eq!(
+        classify_in_blade(src, 0, col),
+        Some(SymbolRef::Class(r"App\Models\Flight".into())),
+        "the alias names the binding, not the class being referenced"
+    );
+}
+
+/// Each member of a group import classifies as its own class.
+#[test]
+fn blade_group_import_classifies_per_member() {
+    let src = "@use('App\\Models\\{Flight, Airport}')\n";
+
+    assert_eq!(
+        classify_in_blade(src, 0, src.find("Flight").expect("offset") as u32),
+        Some(SymbolRef::Class(r"App\Models\Flight".into()))
+    );
+    assert_eq!(
+        classify_in_blade(src, 0, src.find("Airport").expect("offset") as u32),
+        Some(SymbolRef::Class(r"App\Models\Airport".into()))
+    );
+}
+
+#[test]
+fn blade_function_import_classifies_as_nothing() {
+    let src = "@use('function App\\Helpers\\fmt')\n";
+    let col = src.find("Helpers").expect("offset") as u32;
+
+    assert_eq!(classify_in_blade(src, 0, col), None, "binds no class");
+}
+
+/// A `@use` must never fall through to the view classifier — a class FQCN is
+/// not a dotted view name and resolving it as one would navigate somewhere
+/// wrong.
+#[test]
+fn blade_use_never_classifies_as_a_view() {
+    let src = "@use('App\\Models\\Flight')\n";
+    let got = classify_in_blade(src, 0, src.find("Models").expect("offset") as u32);
+
+    assert!(!matches!(got, Some(SymbolRef::View(_))), "got {got:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Class import sites — PHP `use` resolves through the position index; a Blade
+// `@use` resolves through its enclosing directive. Both must answer `Class`.
+// ---------------------------------------------------------------------------
+
+fn with_class_ref(fqcn: &str, line: u32, col: u32) -> ParsedPatternsData {
+    let mut p = empty_patterns();
+    p.class_refs
+        .push(Arc::new(crate::salsa_impl::ClassReferenceData {
+            name: fqcn.to_string(),
+            line,
+            column: col,
+            end_column: col + fqcn.len() as u32,
+        }));
+    p.build_position_index();
+    p
+}
+
+#[test]
+fn php_use_statement_classifies_as_a_class_symbol() {
+    let p = with_class_ref(r"App\Models\Flight", 3, 4);
+
+    assert_eq!(
+        classify_pattern_at_cursor(&p, 3, 8),
+        Some(SymbolRef::Class(r"App\Models\Flight".into()))
+    );
+}
+
+#[test]
+fn a_cursor_off_the_import_span_classifies_as_nothing() {
+    let p = with_class_ref(r"App\Models\Flight", 3, 4);
+
+    assert_eq!(classify_pattern_at_cursor(&p, 3, 2), None);
+    assert_eq!(classify_pattern_at_cursor(&p, 4, 8), None);
+}
+
+/// `@use` must contribute no directive entry to the position index. It spans
+/// the whole call and starts at column 0, so it would win `find_at_position`
+/// for every cursor inside the parentheses and shadow the class ref — and a
+/// single directive entry cannot tell the members of a group import apart.
+#[test]
+fn use_directive_does_not_shadow_the_class_ref_in_the_position_index() {
+    let args = r#"('App\Models\Flight')"#;
+    let mut p = empty_patterns();
+    p.directives.push(Arc::new(DirectiveReferenceData {
+        name: "use".to_string(),
+        arguments: Some(args.to_string()),
+        line: 0,
+        column: 0,
+        end_column: 4 + args.len() as u32,
+        string_column: 6,
+        string_end_column: 6 + r"App\Models\Flight".len() as u32,
+    }));
+    p.class_refs
+        .push(Arc::new(crate::salsa_impl::ClassReferenceData {
+            name: r"App\Models\Flight".to_string(),
+            line: 0,
+            column: 6,
+            end_column: 6 + r"App\Models\Flight".len() as u32,
+        }));
+    p.build_position_index();
+
+    assert_eq!(
+        classify_pattern_at_cursor(&p, 0, 10),
+        Some(SymbolRef::Class(r"App\Models\Flight".into())),
+        "whichever entry wins, the classified symbol is the same"
+    );
+}

@@ -92,6 +92,7 @@ pub mod path_containment;
 pub mod pattern_disk_cache;
 pub mod pattern_indexer;
 pub mod php_class;
+pub mod php_string_components;
 // php_outline was consolidated into `laravel_introspector::walker`.
 pub mod php_variable_rename;
 pub mod queries;

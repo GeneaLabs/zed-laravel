@@ -4833,3 +4833,152 @@ async fn handle_get_patterns_skips_capture_for_vendor() {
         "a vendor file must capture no context through the actor either"
     );
 }
+
+// ─── Two-constructor parity ───────────────────────────────────────────────
+//
+// A file's patterns must not depend on which constructor built them — the warm
+// path (`pattern_indexer::parse_owned`) and the on-demand / save-refresh path
+// (`handle_get_patterns`) both feed the same index, so any divergence shows up
+// as reference counts that change when a file happens to be edited.
+
+/// Component tags built as PHP string literals must be emitted identically by
+/// both constructors — same names, same spans, same order.
+#[tokio::test]
+async fn both_constructors_agree_on_string_built_component_tags() {
+    let path = std::path::PathBuf::from("/proj/app/Jobs/Render.php");
+    let src = "<?php\nclass Render {\n    public function html(int $id): string {\n        return \"<x-reader.cross-reference :id=\\\"{$id}\\\" />\" . '<livewire:counter />';\n    }\n}\n";
+
+    let handle = SalsaActor::spawn();
+    handle
+        .update_file(path.clone(), 1, src.to_string())
+        .await
+        .unwrap();
+    let actor = handle
+        .get_patterns(path.clone())
+        .await
+        .unwrap()
+        .expect("patterns");
+    let warm = crate::pattern_indexer::parse_owned(&path, src);
+
+    let shape = |p: &ParsedPatternsData| {
+        (
+            p.components
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        c.tag_name.clone(),
+                        c.line,
+                        c.column,
+                        c.end_column,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            p.livewire_refs
+                .iter()
+                .map(|l| (l.name.clone(), l.line, l.column, l.end_column))
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    let (components, livewire) = shape(&warm);
+    assert_eq!(
+        components.len(),
+        1,
+        "the string-built component tag must be captured, got {components:?}"
+    );
+    assert_eq!(components[0].0, "reader.cross-reference");
+    assert_eq!(livewire.len(), 1, "got {livewire:?}");
+    assert_eq!(livewire[0].0, "counter");
+    assert_eq!(
+        shape(&actor),
+        shape(&warm),
+        "warm and on-demand constructors disagree"
+    );
+}
+
+/// Same parity requirement for the `@use` class references derived from a
+/// Blade file's directives.
+#[tokio::test]
+async fn both_constructors_agree_on_blade_use_class_refs() {
+    let path = std::path::PathBuf::from("/proj/resources/views/page.blade.php");
+    let src = "@use(\"App\\Support\\Reader\\VerseMarkerResolver\")\n@use('App\\Models\\Flight', 'FlightModel')\n<div></div>\n";
+
+    let handle = SalsaActor::spawn();
+    handle
+        .update_file(path.clone(), 1, src.to_string())
+        .await
+        .unwrap();
+    let actor = handle
+        .get_patterns(path.clone())
+        .await
+        .unwrap()
+        .expect("patterns");
+    let warm = crate::pattern_indexer::parse_owned(&path, src);
+
+    let shape = |p: &ParsedPatternsData| {
+        p.class_refs
+            .iter()
+            .map(|c| (c.name.clone(), c.line, c.column, c.end_column))
+            .collect::<Vec<_>>()
+    };
+
+    let warm_refs = shape(&warm);
+    assert_eq!(
+        warm_refs.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+        [
+            r"App\Support\Reader\VerseMarkerResolver",
+            r"App\Models\Flight"
+        ],
+        "both imports captured, in source order"
+    );
+    assert_eq!(
+        shape(&actor),
+        warm_refs,
+        "warm and on-demand constructors disagree"
+    );
+}
+
+/// Parity for the PHP side of the class-reference index: `use` statements are
+/// derived off each constructor's own full-file parse, so they are the most
+/// likely of the three sources to drift.
+#[tokio::test]
+async fn both_constructors_agree_on_php_use_class_refs() {
+    let path = std::path::PathBuf::from("/proj/app/Http/Controllers/FlightController.php");
+    let src = "<?php\nnamespace App\\Http\\Controllers;\n\nuse App\\Models\\Flight;\nuse App\\Models\\{Airport, Gate as G};\nuse function App\\Helpers\\fmt;\n\nclass FlightController {}\n";
+
+    let handle = SalsaActor::spawn();
+    handle
+        .update_file(path.clone(), 1, src.to_string())
+        .await
+        .unwrap();
+    let actor = handle
+        .get_patterns(path.clone())
+        .await
+        .unwrap()
+        .expect("patterns");
+    let warm = crate::pattern_indexer::parse_owned(&path, src);
+
+    let shape = |p: &ParsedPatternsData| {
+        p.class_refs
+            .iter()
+            .map(|c| (c.name.clone(), c.line, c.column, c.end_column))
+            .collect::<Vec<_>>()
+    };
+
+    let warm_refs = shape(&warm);
+    assert_eq!(
+        warm_refs.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+        [
+            r"App\Models\Flight",
+            r"App\Models\Airport",
+            r"App\Models\Gate"
+        ],
+        "grouped clauses expand; the `function` import binds no class"
+    );
+    assert_eq!(
+        shape(&actor),
+        warm_refs,
+        "warm and on-demand constructors disagree"
+    );
+}

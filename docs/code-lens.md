@@ -74,4 +74,5 @@ It under-warns on purpose:
 
 - **Worded as a question, severity warning** — a zero count can also mean dynamic or by-convention usage static analysis can't see (a URL-hit route, a `$model->$dynamic` access).
 - **Vendor-aware** — before flagging a member, the inheritance chain (parents + traits, including `vendor/`) is checked for framework reads, so a model's `$timestamps` (read by `HasTimestamps`, never by app code) is not flagged.
+- **Sees Blade markup built as PHP strings** — a component whose only usages are string-built tags (a job producing `"<x-reader.cross-reference :id=\"{$id}\" />"`, a mailer building `'<x-mail::button>'`) counts those as references and is not flagged. Tags inside single-quoted, double-quoted, heredoc, and nowdoc literals all count; a tag whose name is interpolated, or one merely mentioned in a comment, does not.
 - **Silent until the project index finishes warming** — a half-built index would flag everything.

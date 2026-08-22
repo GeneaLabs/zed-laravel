@@ -54,6 +54,8 @@ pub enum SymbolKind {
     Livewire,
     Middleware,
     Binding,
+    /// A PHP class referenced by FQCN from a Blade `@use` directive.
+    Class,
     /// Eloquent magic member / plain class member (M4). The `name` is the
     /// composite `<declaring_fqcn>#<member>` produced by the M3 resolver, so
     /// usages of an inherited or trait-shared member all share one key.
@@ -139,6 +141,7 @@ impl SymbolIndex {
         ingest!(livewire_refs, SymbolKind::Livewire, name);
         ingest!(middleware_refs, SymbolKind::Middleware, name);
         ingest!(binding_refs, SymbolKind::Binding, name);
+        ingest!(class_refs, SymbolKind::Class, name);
 
         // Chain-aware config/translation entries: a reference to a dotted key
         // is also a reference to every ancestor in the chain —
@@ -427,6 +430,7 @@ fn symbol_to_key(symbol: &SymbolRefData) -> Option<SymbolKey> {
         SymbolRefData::Livewire(n) => (SymbolKind::Livewire, n.clone()),
         SymbolRefData::Middleware(n) => (SymbolKind::Middleware, n.clone()),
         SymbolRefData::Binding(n) => (SymbolKind::Binding, n.clone()),
+        SymbolRefData::Class(n) => (SymbolKind::Class, n.clone()),
         SymbolRefData::MagicMember { fqcn, member } => {
             (SymbolKind::MagicMember, magic_member_key_name(fqcn, member))
         }

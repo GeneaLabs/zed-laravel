@@ -221,7 +221,7 @@ did_change(file) → Debounce 250ms → Update Salsa input → Queries recompute
 | Pattern | Example | Extracted From | Target |
 |---------|---------|----------------|--------|
 | Views | `view('welcome')` | SourceFile | `resources/views/*.blade.php` |
-| Blade Components | `<x-button>` | SourceFile | `resources/views/components/*.blade.php` |
+| Blade Components | `<x-button>` | SourceFile (Blade tags + PHP string literals) | `resources/views/components/*.blade.php` |
 | Blade Directives | `@include('partial')` | SourceFile | `resources/views/*.blade.php` |
 | Livewire | `<livewire:counter>` | SourceFile | `app/Livewire/*.php` |
 | Translations | `__('messages.key')` | SourceFile | `lang/*/*.php` |
@@ -230,6 +230,7 @@ did_change(file) → Debounce 250ms → Update Salsa input → Queries recompute
 | Routes | `route('home')` | SourceFile | Route name in `routes/*.php` |
 | Config | `config('app.name')` | SourceFile | `config/*.php` |
 | Env | `env('APP_NAME')` | SourceFile | `.env` |
+| Classes | `use App\Support\Foo;`, `@use('App\Support\Foo')` | SourceFile (PHP `use` clauses, Blade `@use` directives, Volt front matter) | `app/**/Foo.php` |
 | Middleware | `->middleware('auth')` | SourceFile | Alias in registry |
 | Bindings | `app('cache')` | SourceFile | Binding in registry |
 

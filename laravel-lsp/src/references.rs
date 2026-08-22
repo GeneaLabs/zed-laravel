@@ -23,6 +23,15 @@ pub enum SymbolRef {
     Livewire(String),
     Middleware(String),
     Binding(String),
+    /// A PHP class FQCN at an import site — a PHP `use` statement or a Blade
+    /// `@use` directive.
+    ///
+    /// Renaming this kind does NOT rewrite the indexed import sites the way the
+    /// other kinds do. It routes to the project-wide class rename instead,
+    /// which rewrites every reference shape (declaration, imports, `::class`,
+    /// `new`, type hints, docblocks) and moves the declaring file — a superset
+    /// of what this index holds.
+    Class(String),
 }
 
 impl SymbolRef {
@@ -37,7 +46,8 @@ impl SymbolRef {
             | SymbolRef::Component(n)
             | SymbolRef::Livewire(n)
             | SymbolRef::Middleware(n)
-            | SymbolRef::Binding(n) => n,
+            | SymbolRef::Binding(n)
+            | SymbolRef::Class(n) => n,
         }
     }
 
@@ -53,6 +63,7 @@ impl SymbolRef {
             SymbolRef::Livewire(n) => SymbolRefData::Livewire(n.clone()),
             SymbolRef::Middleware(n) => SymbolRefData::Middleware(n.clone()),
             SymbolRef::Binding(n) => SymbolRefData::Binding(n.clone()),
+            SymbolRef::Class(n) => SymbolRefData::Class(n.clone()),
         }
     }
 }
@@ -82,6 +93,10 @@ pub fn classify_pattern_at_cursor(
         PatternAtPosition::Livewire(l) => Some(SymbolRef::Livewire(l.name.clone())),
         PatternAtPosition::Middleware(m) => Some(SymbolRef::Middleware(m.name.clone())),
         PatternAtPosition::Binding(b) => Some(SymbolRef::Binding(b.name.clone())),
+        // A class import site — a PHP `use` statement or a Blade `@use`. The
+        // position index carries no `Directive` entry for `@use`, so this is the
+        // single route for both.
+        PatternAtPosition::Class(c) => Some(SymbolRef::Class(c.name.clone())),
         PatternAtPosition::Directive(d) => {
             let args = d.arguments.as_deref()?;
             // `@livewire('counter')` directive form. Carried in the

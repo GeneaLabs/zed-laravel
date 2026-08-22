@@ -154,3 +154,20 @@ Scope boundaries are respected exactly:
   This safety boundary is deliberately conservative and not yet exhaustive — more exotic dynamic shapes (`${'user'}`, `$GLOBALS['user']`, `extract($runtimeArray)`, `get_defined_vars()`) reference a local without a plain `$variable` token and aren't all detected yet. Mapping the complete set, and deciding refuse-vs-rewrite for each, is tracked in [#96](https://github.com/mike-bronner/zed-laravel/issues/96).
 
 **Not yet renameable** (out of scope for this round, planned follow-up): class properties (`$this->foo`, `self::$bar`, and dynamic property access). `prepare_rename` returns nothing for these so F2 silently does nothing.
+
+**Class imports rename the class.** F2 on a PHP `use App\Models\Flight;` or a Blade `@use('App\Models\Flight')` runs the same project-wide class rename you get from the declaration — every `use`, `::class`, `new`, type hint, `extends`/`implements`, `instanceof`, and docblock reference is rewritten, and the declaring file moves. The rename box is pre-filled with the basename, since that is the segment that changes; renaming into a different namespace (a move) isn't supported.
+
+Blade templates are covered throughout. The `@use` import string is rewritten (it's a string literal, invisible to any PHP parse); so are class usages inside `@php` blocks, `{{ }}` echoes, and bound attributes, each parsed as its own PHP region with the template's `@use` imports seeding the alias map; and so is a Volt single-file component's `<?php … ?>` front matter, which holds ordinary PHP `use` statements and class references.
+
+Every `@use` spelling participates, because the spans are computed from the source rather than anchored to the end of the import string:
+
+| Spelling | Behaviour |
+|---|---|
+| `@use('App\Models\Flight')` | rewritten |
+| `@use('App\Models\Flight', 'F')` | the class is rewritten; the alias `F` is a local binding and is left alone |
+| `@use('App\Models\{Flight, Airport}')` | only the member being renamed is rewritten; its siblings are untouched |
+| `@use('App\Models\{Flight as F}')` | the class part of the member is rewritten, not the alias |
+| `@use(' App\Models\Flight ')` | the name is located inside the padding, which survives |
+| `@use('function App\Helpers\fmt')` | skipped — binds no class |
+
+F2 works from any of them, and from a class usage inside a `@php` block or the front matter, so a rename can be started wherever it can be applied.

@@ -88,5 +88,15 @@ $schedule->command('emails:send --queue')->daily();
 //                  ^^^^^^^^^^^ → same — options/arguments after the name are ignored
 ```
 
+`@use('App\Support\Reader\VerseMarkerResolver')` in a Blade template jumps to the class file — the one Blade directive whose argument is a class rather than a view:
+
+```blade
+@use('App\Support\Reader\VerseMarkerResolver')
+```
+
+The import also binds the short name for the rest of the template, so `VerseMarkerResolver::class` in a `@php` block resolves to the same class. A group import works member by member — the cursor picks out which of `@use('App\Models\{Flight, Airport}')` you meant. `function` / `const` imports name no class, so no target is offered.
+
+A PHP `use App\Models\Flight;` statement jumps to the same place — the import sites are symmetric across the two file types.
+
 **Supported patterns:**
-`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` `Artisan::call()` `Artisan::queue()` `->command()` `->artisan()` · query-chain columns / relations / tables · magic members (relationships, scopes, accessors, columns, dynamic finders)
+`view()` `View::make()` `@extends` `@include` `@component` `@use` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` `Artisan::call()` `Artisan::queue()` `->command()` `->artisan()` · query-chain columns / relations / tables · magic members (relationships, scopes, accessors, columns, dynamic finders)

@@ -535,3 +535,11 @@ fn locate_magic_member_declaration_absent_is_none() {
         locate_magic_member_declaration(src, MagicMemberKind::Relationship, "comments").is_none()
     );
 }
+
+/// A class import site renames — it routes to the project-wide class rename
+/// rather than rewriting the indexed import sites, so F2 on a PHP `use` or a
+/// Blade `@use` rewrites every reference shape and moves the declaring file.
+#[test]
+fn can_rename_accepts_class_kind() {
+    assert!(can_rename(&SymbolRef::Class(r"App\Models\Flight".into())));
+}

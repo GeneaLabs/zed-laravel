@@ -1,5 +1,6 @@
 use super::{
-    class_at_cursor, is_dependency_path, project_php_files, reference_spans, renamed_file_path,
+    blade_use_spans, class_at_cursor, class_at_cursor_for, is_dependency_path, project_php_files,
+    reference_spans, reference_spans_for, renamed_file_path,
 };
 use std::path::Path;
 
@@ -549,4 +550,355 @@ fn cursor_on_job_static_dispatch_resolves_class() {
     let (fqcn, span) = class_at_cursor(src, byte).expect("class at cursor");
     assert_eq!(fqcn, "App\\Jobs\\SendWelcomeEmail");
     assert_eq!(&src[span.0..span.1], "SendWelcomeEmail");
+}
+
+// ---------------------------------------------------------------------------
+// Blade `@use` imports — the class name lives in a string, invisible to the
+// PHP class-name walk, so it needs its own span finder or a class rename
+// leaves the template importing a class that no longer exists.
+// ---------------------------------------------------------------------------
+
+fn blade_rename(content: &str, fqcn: &str, old: &str, new: &str) -> String {
+    apply(content, &blade_use_spans(content, fqcn, old), new)
+}
+
+#[test]
+fn blade_use_import_is_rewritten_by_a_class_rename() {
+    let src = "@use('App\\Models\\Flight')\n<div>{{ Flight::count() }}</div>\n";
+
+    assert_eq!(
+        blade_rename(src, r"App\Models\Flight", "Flight", "Booking"),
+        "@use('App\\Models\\Booking')\n<div>{{ Flight::count() }}</div>\n",
+        "only the import string is this function's job; the echo is the PHP walk's"
+    );
+}
+
+#[test]
+fn blade_use_rewrite_touches_only_the_basename() {
+    // A namespace segment that repeats the basename must not be rewritten.
+    let src = "@use('App\\Flight\\Flight')";
+
+    assert_eq!(
+        blade_rename(src, r"App\Flight\Flight", "Flight", "Booking"),
+        "@use('App\\Flight\\Booking')"
+    );
+}
+
+#[test]
+fn blade_use_for_a_different_class_is_untouched() {
+    let src = "@use('App\\Models\\Airport')";
+
+    assert_eq!(
+        blade_rename(src, r"App\Models\Flight", "Flight", "Booking"),
+        src
+    );
+}
+
+#[test]
+fn blade_use_rewrites_every_matching_import_in_the_file() {
+    let src = "@use('App\\Models\\Flight')\n@use('App\\Models\\Flight', 'F2')\n";
+
+    assert_eq!(
+        blade_rename(src, r"App\Models\Flight", "Flight", "Booking"),
+        "@use('App\\Models\\Booking')\n@use('App\\Models\\Booking', 'F2')\n"
+    );
+}
+
+/// A group import names several classes in one string. Spans are computed from
+/// the source, so the member that matches is rewritten and its siblings are not.
+#[test]
+fn blade_group_import_rewrites_only_the_matching_member() {
+    let src = "@use('App\\Models\\{Flight, Airport}')";
+
+    assert_eq!(
+        blade_rename(src, r"App\Models\Flight", "Flight", "Booking"),
+        "@use('App\\Models\\{Booking, Airport}')"
+    );
+}
+
+#[test]
+fn blade_group_import_rewrites_an_aliased_member_on_the_class_not_the_alias() {
+    let src = "@use('App\\Models\\{Flight as F, Airport}')";
+
+    assert_eq!(
+        blade_rename(src, r"App\Models\Flight", "Flight", "Booking"),
+        "@use('App\\Models\\{Booking as F, Airport}')"
+    );
+}
+
+#[test]
+fn blade_group_import_for_a_different_class_is_untouched() {
+    let src = "@use('App\\Models\\{Flight, Airport}')";
+
+    assert_eq!(
+        blade_rename(src, r"App\Models\Gate", "Gate", "Booking"),
+        src
+    );
+}
+
+#[test]
+fn blade_use_in_a_comment_is_not_rewritten() {
+    let src = "{{-- @use('App\\Models\\Flight') --}}";
+
+    assert!(blade_use_spans(src, r"App\Models\Flight", "Flight").is_empty());
+}
+
+// --- the path-aware wrapper -------------------------------------------------
+
+#[test]
+fn reference_spans_for_merges_blade_imports_with_php_positions() {
+    // A Volt-ish template: an `@use` import AND a `@php` block using the class.
+    let src = "@use('App\\Models\\Flight')\n@php\n    $n = Flight::count();\n@endphp\n";
+    let spans = reference_spans_for(
+        Path::new("/p/resources/views/x.blade.php"),
+        src,
+        r"App\Models\Flight",
+        "Flight",
+    );
+
+    assert_eq!(
+        apply(src, &spans, "Booking"),
+        "@use('App\\Models\\Booking')\n@php\n    $n = Booking::count();\n@endphp\n",
+        "both the import string and the PHP usage are rewritten"
+    );
+}
+
+#[test]
+fn reference_spans_for_a_php_file_ignores_use_directive_syntax() {
+    // `@use(...)` inside a PHP string is not a Blade directive — a `.php` file
+    // must behave exactly as `reference_spans` does.
+    let src = "<?php\nuse App\\Models\\Flight;\n$s = \"@use('App\\Models\\Flight')\";\n";
+    let path = Path::new("/p/app/Foo.php");
+
+    assert_eq!(
+        reference_spans_for(path, src, r"App\Models\Flight", "Flight"),
+        reference_spans(src, r"App\Models\Flight", "Flight"),
+        "the Blade branch must not fire for a .php file"
+    );
+}
+
+// --- cursor resolution ------------------------------------------------------
+
+#[test]
+fn cursor_inside_a_blade_use_import_resolves_the_class() {
+    let src = "@use('App\\Models\\Flight')";
+    let cursor = src.find("Models").expect("offset");
+
+    let (fqcn, span) =
+        class_at_cursor_for(Path::new("/p/resources/views/x.blade.php"), src, cursor)
+            .expect("a Blade @use import is a class reference");
+
+    assert_eq!(fqcn, r"App\Models\Flight");
+    assert_eq!(
+        &src[span.0..span.1],
+        "Flight",
+        "the rename range is the basename"
+    );
+}
+
+#[test]
+fn cursor_outside_a_blade_use_import_resolves_nothing() {
+    let src = "@use('App\\Models\\Flight')\n<div>hello</div>";
+    let cursor = src.find("hello").expect("offset");
+
+    assert!(
+        class_at_cursor_for(Path::new("/p/resources/views/x.blade.php"), src, cursor).is_none()
+    );
+}
+
+/// The cursor picks out which member of a group import it sits on.
+#[test]
+fn cursor_in_a_blade_group_import_resolves_that_member() {
+    let src = "@use('App\\Models\\{Flight, Airport}')";
+
+    let (fqcn, span) = class_at_cursor_for(
+        Path::new("/p/resources/views/x.blade.php"),
+        src,
+        src.find("Flight").expect("offset"),
+    )
+    .expect("a group member is a class reference");
+    assert_eq!(fqcn, r"App\Models\Flight");
+    assert_eq!(&src[span.0..span.1], "Flight");
+
+    let (other, _) = class_at_cursor_for(
+        Path::new("/p/resources/views/x.blade.php"),
+        src,
+        src.find("Airport").expect("offset"),
+    )
+    .expect("the sibling resolves independently");
+    assert_eq!(other, r"App\Models\Airport");
+}
+
+/// The PHP branch is unchanged — same answer as `class_at_cursor`.
+#[test]
+fn cursor_in_a_php_file_still_resolves_through_the_php_walk() {
+    let src = "<?php\nuse App\\Models\\Flight;\n";
+    let cursor = src.find("Flight").expect("offset");
+
+    assert_eq!(
+        class_at_cursor_for(Path::new("/p/app/Foo.php"), src, cursor),
+        class_at_cursor(src, cursor)
+    );
+}
+
+/// Regression: a Blade template is not PHP, so tree-sitter-php collapses the
+/// whole file to one inline-`text` node. Before regions were parsed
+/// individually, a class rename found NOTHING in any template — it rewrote the
+/// PHP side of the project and left every Blade usage pointing at a class that
+/// no longer existed.
+#[test]
+fn class_usage_in_a_blade_echo_is_rewritten() {
+    let src = "@use('App\\Models\\Flight')\n<p>{{ Flight::count() }}</p>\n";
+    let spans = reference_spans_for(
+        Path::new("/p/resources/views/x.blade.php"),
+        src,
+        r"App\Models\Flight",
+        "Flight",
+    );
+
+    assert_eq!(
+        apply(src, &spans, "Booking"),
+        "@use('App\\Models\\Booking')\n<p>{{ Booking::count() }}</p>\n"
+    );
+}
+
+#[test]
+fn class_usage_in_a_blade_template_without_the_php_walk_finds_nothing() {
+    // Proves the region parsing is what does the work: the plain PHP walk over
+    // the same template still sees a single text node.
+    let src = "@php\n    $n = App\\Models\\Flight::count();\n@endphp\n";
+
+    assert!(
+        reference_spans(src, r"App\Models\Flight", "Flight").is_empty(),
+        "the whole-file PHP walk cannot see into a template"
+    );
+    assert!(
+        !reference_spans_for(
+            Path::new("/p/resources/views/x.blade.php"),
+            src,
+            r"App\Models\Flight",
+            "Flight"
+        )
+        .is_empty(),
+        "the region walk can"
+    );
+}
+
+/// An import the template aliases still resolves usages of the alias target,
+/// and the alias itself is left alone (basename ≠ old basename).
+#[test]
+fn blade_aliased_import_rewrites_the_import_but_not_the_alias() {
+    let src = "@use('App\\Models\\Flight', 'F')\n<p>{{ F::count() }}</p>\n";
+    let spans = reference_spans_for(
+        Path::new("/p/resources/views/x.blade.php"),
+        src,
+        r"App\Models\Flight",
+        "Flight",
+    );
+
+    assert_eq!(
+        apply(src, &spans, "Booking"),
+        "@use('App\\Models\\Booking', 'F')\n<p>{{ F::count() }}</p>\n",
+        "the alias keeps pointing at the renamed class, so it must not change"
+    );
+}
+
+/// Spans from several regions must not overlap or double-apply.
+#[test]
+fn multiple_blade_regions_each_rewrite_once() {
+    let src = "@use('App\\Models\\Flight')\n@php\n    $a = Flight::first();\n@endphp\n<p>{{ Flight::count() }}</p>\n";
+    let spans = reference_spans_for(
+        Path::new("/p/resources/views/x.blade.php"),
+        src,
+        r"App\Models\Flight",
+        "Flight",
+    );
+
+    let out = apply(src, &spans, "Booking");
+    assert_eq!(out.matches("Booking").count(), 3, "got {out:?}");
+    assert!(!out.contains("Flight"), "got {out:?}");
+}
+
+/// Padding inside the quotes is located, not treated as untrustworthy: the name
+/// is found at its real offset, so only the name is rewritten and the padding
+/// survives.
+#[test]
+fn blade_use_with_padding_inside_the_quotes_is_rewritten() {
+    let src = "@use(' App\\Models\\Flight ')";
+
+    assert_eq!(
+        blade_rename(src, r"App\Models\Flight", "Flight", "Booking"),
+        "@use(' App\\Models\\Booking ')"
+    );
+    let (fqcn, span) = class_at_cursor_for(
+        Path::new("/p/resources/views/x.blade.php"),
+        src,
+        src.find("Models").expect("offset"),
+    )
+    .expect("a padded import is still an import");
+    assert_eq!(fqcn, r"App\Models\Flight");
+    assert_eq!(&src[span.0..span.1], "Flight");
+}
+
+/// A Volt single-file component keeps its class body in `<?php … ?>` front
+/// matter. Those are real PHP `use` statements and real class references — a
+/// rename that skipped them would leave the component importing a class that no
+/// longer exists.
+#[test]
+fn volt_front_matter_is_rewritten_by_a_class_rename() {
+    let src = "<?php\n\nuse App\\Models\\Flight;\nuse Livewire\\Volt\\Component;\n\nnew class extends Component {\n    public function count(): int\n    {\n        return Flight::query()->count();\n    }\n};\n\n?>\n\n<div>{{ $this->count() }}</div>\n";
+    let spans = reference_spans_for(
+        Path::new("/p/resources/views/livewire/counter.blade.php"),
+        src,
+        r"App\Models\Flight",
+        "Flight",
+    );
+
+    let out = apply(src, &spans, "Booking");
+    assert!(
+        out.contains("use App\\Models\\Booking;"),
+        "the import must be rewritten, got:\n{out}"
+    );
+    assert!(
+        out.contains("return Booking::query()->count();"),
+        "the usage must be rewritten too, got:\n{out}"
+    );
+    assert!(
+        out.contains("use Livewire\\Volt\\Component;"),
+        "an unrelated import must be untouched, got:\n{out}"
+    );
+    assert!(!out.contains("Flight"), "got:\n{out}");
+}
+
+/// And the rename can be *started* from the front matter, not only applied to
+/// it — otherwise F2 on a Volt component's own import would do nothing.
+#[test]
+fn cursor_in_volt_front_matter_resolves_the_class() {
+    let src = "<?php\nuse App\\Models\\Flight;\nnew class {};\n?>\n<div></div>\n";
+    let cursor = src.find("Flight").expect("offset");
+
+    let (fqcn, span) = class_at_cursor_for(
+        Path::new("/p/resources/views/livewire/counter.blade.php"),
+        src,
+        cursor,
+    )
+    .expect("front matter is PHP like any other");
+
+    assert_eq!(fqcn, r"App\Models\Flight");
+    assert_eq!(&src[span.0..span.1], "Flight");
+}
+
+/// A cursor on a class used inside a `@php` block resolves through the same
+/// region walk, with the template's `@use` seeding the alias map.
+#[test]
+fn cursor_on_a_class_in_a_php_block_resolves_via_the_blade_import() {
+    let src = "@use('App\\Models\\Flight')\n@php\n    $n = Flight::count();\n@endphp\n";
+    let cursor = src.rfind("Flight").expect("offset");
+
+    let (fqcn, span) =
+        class_at_cursor_for(Path::new("/p/resources/views/x.blade.php"), src, cursor)
+            .expect("a short name bound by @use is a class reference");
+
+    assert_eq!(fqcn, r"App\Models\Flight");
+    assert_eq!(&src[span.0..span.1], "Flight");
 }

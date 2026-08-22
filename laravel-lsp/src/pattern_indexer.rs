@@ -167,6 +167,10 @@ pub fn parse_owned_with_hierarchy(
         if let Ok(patterns) = extract_all_php_patterns(tree, text, &lang_php) {
             push_php_patterns(&patterns, &mut data, None);
         }
+        // Component / Livewire tags built as PHP string literals — markup a job
+        // or mailer assembles and renders later. Genuine references the Blade
+        // tag extractor never sees. Shares this same PHP parse.
+        push_string_tags(tree, text, &mut data);
         // Class-hierarchy nodes share this same PHP parse.
         nodes = classes_from_tree(path, tree, text);
     }
@@ -189,8 +193,43 @@ pub fn parse_owned_with_hierarchy(
         .map(Box::new);
     }
 
+    // Class FQCNs this file imports — Blade `@use` scanned from source, PHP
+    // `use` off the full-file tree parsed above. Same helper
+    // `handle_get_patterns` uses, so both constructors emit identical entries.
+    data.class_refs = crate::salsa_impl::class_refs_for(path, php_tree.as_ref(), text);
+
     data.build_position_index();
     (Arc::new(data), nodes)
+}
+
+/// Append the component / Livewire tags found in `tree`'s string literals into
+/// `data`'s regular reference buckets, so they index, lens, and find-reference
+/// exactly like a tag written in a `.blade.php`.
+///
+/// Kept as a named helper because `salsa_impl::parse_file_patterns` runs the
+/// identical step on its own parse — the two constructors must emit the same
+/// entries in the same order or a file's patterns would depend on which one
+/// built them.
+fn push_string_tags(tree: &tree_sitter::Tree, text: &str, data: &mut ParsedPatternsData) {
+    use crate::php_string_components::{scan_php_string_tags, StringTagKind};
+
+    for tag in scan_php_string_tags(tree, text) {
+        match tag.kind {
+            StringTagKind::Component => data.components.push(Arc::new(ComponentReferenceData {
+                name: tag.name,
+                tag_name: tag.tag_name,
+                line: tag.line,
+                column: tag.column,
+                end_column: tag.end_column,
+            })),
+            StringTagKind::Livewire => data.livewire_refs.push(Arc::new(LivewireReferenceData {
+                name: tag.name,
+                line: tag.line,
+                column: tag.column,
+                end_column: tag.end_column,
+            })),
+        }
+    }
 }
 
 /// Append every PHP-side pattern from `snippet` into `data`. When `offset`

@@ -165,3 +165,36 @@ fn php_inline_short_form_is_captured() {
         regions
     );
 }
+
+// ---------------------------------------------------------------------------
+// Volt front matter.
+// ---------------------------------------------------------------------------
+
+/// A Volt single-file component's `<?php … ?>` class body comes through as an
+/// ordinary region. Pinned because several features depend on it — class
+/// references, and the class rename that rewrites them — and it is not obvious
+/// from the extractor's code that the leading block is covered.
+#[test]
+fn front_matter_is_extracted_as_a_region() {
+    for (label, src) in [
+        (
+            "closed",
+            "<?php\nuse App\\Models\\Flight;\nnew class {};\n?>\n<div>{{ $n }}</div>\n",
+        ),
+        (
+            "unclosed",
+            "<?php\nuse App\\Models\\Flight;\nnew class {};\n",
+        ),
+    ] {
+        let regions = extract_php_regions(src);
+        let front = regions
+            .iter()
+            .find(|r| r.content.contains("use App\\Models\\Flight;"))
+            .unwrap_or_else(|| panic!("{label}: front matter must be a region, got {regions:?}"));
+        assert_eq!(
+            &src[front.byte_offset..front.byte_offset + front.content.len()],
+            front.content,
+            "{label}: byte_offset must locate the content in the outer file"
+        );
+    }
+}

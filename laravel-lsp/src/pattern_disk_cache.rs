@@ -100,7 +100,16 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        mis-decode. The bump also guarantees every restored non-vendor entry
 ///        carries context, so no "refs present but context missing" state can
 ///        exist on the resolve path.
-const SCHEMA_VERSION: u32 = 12;
+///   v13 — two output-affecting extraction changes. `.php` files now contribute
+///        `components` / `livewire_refs` entries for Blade tags written inside
+///        string literals (markup a job or mailer builds and renders later),
+///        and `ParsedPatternsData` grew a `class_refs` list holding the FQCNs
+///        the file's imports name — PHP `use` clauses and Blade `@use`
+///        directives alike. A v12 entry was written before either existed, so
+///        restoring it would under-report references — and, for the
+///        unused-symbol diagnostic, resurrect the "possibly dead" false
+///        positive on a component the string scan now sees.
+const SCHEMA_VERSION: u32 = 13;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 
