@@ -395,6 +395,12 @@ fn traversing_namespace_in_the_published_path_is_refused() {
     );
 }
 
+/// Symlink-based containment fixtures. Creating a symlink on Windows needs
+/// either Developer Mode or elevation, so `std::os::unix::fs::symlink` has no
+/// portable counterpart worth reaching for here — the guard these pin is
+/// platform-independent, only the fixture is not. Gated rather than dropped so
+/// the Unix and macOS legs keep covering it (issue #292).
+#[cfg(unix)]
 #[test]
 fn dotted_key_read_through_an_escaping_symlink_is_refused() {
     // Containment is canonical, not textual: `lang/en` is spelled inside the
@@ -419,6 +425,12 @@ fn dotted_key_read_through_an_escaping_symlink_is_refused() {
     );
 }
 
+/// Symlink-based containment fixtures. Creating a symlink on Windows needs
+/// either Developer Mode or elevation, so `std::os::unix::fs::symlink` has no
+/// portable counterpart worth reaching for here — the guard these pin is
+/// platform-independent, only the fixture is not. Gated rather than dropped so
+/// the Unix and macOS legs keep covering it (issue #292).
+#[cfg(unix)]
 #[test]
 fn text_key_read_through_an_escaping_symlink_is_refused() {
     // Same guard on the JSON catalogue read.

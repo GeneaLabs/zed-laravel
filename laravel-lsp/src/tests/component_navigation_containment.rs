@@ -17,7 +17,12 @@ use crate::LaravelLanguageServer;
 use laravel_lsp::salsa_impl::{ComponentReferenceData, LaravelConfigData};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// Used only by the `#[cfg(unix)]` symlink fixture below — without the
+// same gate the import is dead on Windows, and `-D warnings` makes that a
+// hard error (issue #292).
+#[cfg(unix)]
+use std::path::PathBuf;
 use tower_lsp::lsp_types::GotoDefinitionResponse;
 use tower_lsp::{lsp_types::Url, LspService};
 

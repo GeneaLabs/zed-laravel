@@ -8,7 +8,12 @@
 //! tests drive the private methods directly by building the server through
 //! `tower_lsp::LspService` and reaching its inner value with `inner()`.
 
-use crate::{path_within_root, LaravelLanguageServer};
+use crate::LaravelLanguageServer;
+// Used only by the `#[cfg(unix)]` symlink fixture below — without the
+// same gate the import is dead on Windows, and `-D warnings` makes that a
+// hard error (issue #292).
+#[cfg(unix)]
+use crate::path_within_root;
 use laravel_lsp::route_discovery::{RouteDefinition, RouteIndex, PRIORITY_APP};
 use std::fs;
 use std::path::Path;

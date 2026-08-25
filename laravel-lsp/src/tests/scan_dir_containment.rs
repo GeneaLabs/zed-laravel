@@ -24,7 +24,12 @@
 //! positive controls prove the gate does not over-refuse: an in-root symlink
 //! (target inside the root) and an ordinary subdirectory still yield candidates.
 
-use laravel_lsp::component_completion::{scan_anonymous_dir, scan_class_dir, ComponentCandidate};
+use laravel_lsp::component_completion::{scan_class_dir, ComponentCandidate};
+// Used only by the `#[cfg(unix)]` symlink fixture below — without the
+// same gate the import is dead on Windows, and `-D warnings` makes that a
+// hard error (issue #292).
+#[cfg(unix)]
+use laravel_lsp::component_completion::scan_anonymous_dir;
 use tempfile::TempDir;
 
 fn names(candidates: &[ComponentCandidate]) -> Vec<String> {
