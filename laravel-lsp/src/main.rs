@@ -20083,19 +20083,21 @@ return [
         let vendor_map = self.vendor_translation_namespaces_for(r).await;
         let map_ref = vendor_map.as_ref().map(|m| m.as_ref());
 
-        let mut entries: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+        // A locale either defines the key — yielding both a value and a link to
+        // the file it was read from — or it does not. The two cannot occur
+        // apart, so they travel as one.
+        let mut entries: Vec<(String, Option<(String, String)>)> = Vec::new();
         for locale in laravel_lsp::translation_lookup::available_locales(r, key, map_ref) {
-            let resolution = laravel_lsp::translation_lookup::resolve_translation_detailed(
+            let hit = match laravel_lsp::translation_lookup::resolve_translation_detailed(
                 r, key, &locale, map_ref,
-            );
-            let link = match &resolution {
-                Some(res) => Some(self.source_link(&res.source_file, None).await),
+            ) {
+                Some(res) => Some((
+                    hover::truncate_for_display(&Self::unquote_php_literal(&res.value), 200),
+                    self.source_link(&res.source_file, None).await,
+                )),
                 None => None,
             };
-            let value = resolution.as_ref().map(|res| {
-                hover::truncate_for_display(&Self::unquote_php_literal(&res.value), 200)
-            });
-            entries.push((locale, value, link));
+            entries.push((locale, hit));
         }
         hover::translation_card_locales(key, &entries)
     }

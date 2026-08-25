@@ -739,24 +739,32 @@ fn translation_card_locales_renders_one_line_per_locale_with_inline_links() {
         &[
             (
                 "de".to_string(),
-                Some("Analyse fehlgeschlagen".to_string()),
-                Some("[lang/de/contract.php](file:///x)".to_string()),
+                Some((
+                    "Analyse fehlgeschlagen".to_string(),
+                    "[lang/de/contract.php](file:///x)".to_string(),
+                )),
             ),
             (
                 "en".to_string(),
-                Some("Analysis failed".to_string()),
-                Some("[lang/en/contract.php](file:///y)".to_string()),
+                Some((
+                    "Analysis failed".to_string(),
+                    "[lang/en/contract.php](file:///y)".to_string(),
+                )),
             ),
-            // A locale that resolved but whose source file couldn't be linked —
-            // it must still occupy exactly one line, not collapse or double.
-            ("fr".to_string(), Some("Analyse échouée".to_string()), None),
+            (
+                "fr".to_string(),
+                Some((
+                    "Analyse échouée".to_string(),
+                    "[lang/fr/contract.php](file:///z)".to_string(),
+                )),
+            ),
         ],
     );
 
     assert!(card.starts_with("`failed_title`"));
     assert!(card.contains("**de** — “Analyse fehlgeschlagen” · [lang/de/contract.php](file:///x)"));
     assert!(card.contains("**en** — “Analysis failed” · [lang/en/contract.php](file:///y)"));
-    assert!(card.contains("**fr** — “Analyse échouée”"));
+    assert!(card.contains("**fr** — “Analyse échouée” · [lang/fr/contract.php](file:///z)"));
 
     // Three locales → three adjacent lines in one block, links inline. A
     // paragraph-delimited render would put a blank line between every row and
@@ -776,11 +784,13 @@ fn translation_card_locales_collapses_when_only_one_locale_resolves() {
     let card = translation_card_locales(
         "messages.welcome",
         &[
-            ("de".to_string(), None, None),
+            ("de".to_string(), None),
             (
                 "en".to_string(),
-                Some("Welcome".to_string()),
-                Some("[lang/en/messages.php](file:///y)".to_string()),
+                Some((
+                    "Welcome".to_string(),
+                    "[lang/en/messages.php](file:///y)".to_string(),
+                )),
             ),
         ],
     );
@@ -805,10 +815,7 @@ fn translation_card_locales_collapses_when_only_one_locale_resolves() {
 fn translation_card_locales_uses_the_any_locale_trailer_when_none_resolve() {
     let card = translation_card_locales(
         "messages.welcome",
-        &[
-            ("de".to_string(), None, None),
-            ("en".to_string(), None, None),
-        ],
+        &[("de".to_string(), None), ("en".to_string(), None)],
     );
     assert_eq!(
         card,

@@ -226,9 +226,16 @@ pub fn translation_card(
 /// defines the key, each carrying its own source link inline, so a `de` + `en`
 /// catalogue shows both translations at once.
 ///
-/// Three shapes, by how many locales actually *resolve* the key — which is not
-/// the same as how many locale directories exist, since a project can define a
-/// dozen locales and still have only one of them carry this key:
+/// Each entry is a locale paired with `Some((value, source_link))` when that
+/// locale defines the key, or `None` when it doesn't. Value and link travel
+/// together because they cannot occur apart: a value only exists because a
+/// file was read to produce it, and that file's path is what the link is built
+/// from. Pairing them in the type keeps "resolved but unlinkable" — a state the
+/// resolver cannot produce — out of the shape entirely.
+///
+/// Three renderings, chosen by how many locales actually *resolve* the key —
+/// not how many locale directories exist, since a project can define a dozen
+/// locales and have only one carry this key:
 ///
 /// - **None** — the not-found trailer, naming that no locale had it.
 /// - **Exactly one** — collapses to [`translation_card`]'s dense single-block
@@ -244,12 +251,12 @@ pub fn translation_card(
 /// ```
 pub fn translation_card_locales(
     key: &str,
-    entries: &[(String, Option<String>, Option<String>)],
+    entries: &[(String, Option<(String, String)>)],
 ) -> String {
     let detail = format!("`{}`", leaf_segment(key));
-    let resolved: Vec<&(String, Option<String>, Option<String>)> = entries
+    let resolved: Vec<(&String, &(String, String))> = entries
         .iter()
-        .filter(|(_, value, _)| value.is_some())
+        .filter_map(|(locale, hit)| hit.as_ref().map(|hit| (locale, hit)))
         .collect();
 
     match resolved.as_slice() {
@@ -258,21 +265,13 @@ pub fn translation_card_locales(
             trailer: Some(TRANSLATION_NOT_FOUND_ANY_LOCALE_TRAILER),
             ..Default::default()
         }),
-        [(locale, value, source_link)] => {
-            translation_card(key, locale, value.as_deref(), source_link.as_deref())
-        }
+        [(locale, (value, link))] => translation_card(key, locale, Some(value), Some(link)),
         _ => {
             let lines: Vec<String> = resolved
                 .iter()
-                .map(|(locale, value, source_link)| {
-                    // Curly quotes delimit the value so it can't be mistaken
-                    // for the key or a path — same rule as `translation_card`.
-                    let quoted = value.as_deref().unwrap_or_default();
-                    match source_link {
-                        Some(link) => format!("**{locale}** — “{quoted}” · {link}"),
-                        None => format!("**{locale}** — “{quoted}”"),
-                    }
-                })
+                // Curly quotes delimit the value so it can't be mistaken for
+                // the key or a path — same rule as `translation_card`.
+                .map(|(locale, (value, link))| format!("**{locale}** — “{value}” · {link}"))
                 .collect();
             render(&HoverContent {
                 detail: Some(&detail),
