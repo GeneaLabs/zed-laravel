@@ -56,6 +56,12 @@ jobs:
           # 8.4 matches the actual minimum required by the locked
           # vendor packages (symfony/* v8.0 requires >= 8.4).
           php-version: '8.4'
+          # `filament/support` requires ext-intl. The Ubuntu PHP image happens
+          # to ship it, the Windows one does not, so `composer update` resolved
+          # on one host and failed on the other. Requesting it explicitly makes
+          # the fixture's real requirement the same on both legs instead of an
+          # accident of the runner image.
+          extensions: intl
 
       - name: Install test-project Composer dependencies
         # `test-project/vendor/` AND `composer.lock` are gitignored — the
