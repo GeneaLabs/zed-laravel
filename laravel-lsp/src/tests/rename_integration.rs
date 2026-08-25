@@ -31,7 +31,7 @@ use laravel_lsp::rename::{build_rename_edit, build_rename_workspace_edit, EditTa
 use laravel_lsp::salsa_impl::LaravelConfigData;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tempfile::TempDir;
 use tower_lsp::lsp_types::{DocumentChangeOperation, DocumentChanges, OneOf, ResourceOp};
 
