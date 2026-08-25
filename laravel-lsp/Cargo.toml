@@ -98,8 +98,9 @@ cc = "1.2"
 [dev-dependencies]
 tempfile = "3.27"
 
-# Discovery benchmark for issue #48 — compares the byte-scan vs tree-sitter
-# route-parsing strategies. Custom timing harness (no criterion dependency);
+# Route-parsing benchmark from issue #48 — now tracks the cost of the
+# tree-sitter route index against the shallower chain walker, plus the absolute
+# `build_route_index` wall clock. Custom timing harness (no criterion dependency);
 # run with `cargo bench --bench route_cache`.
 [[bench]]
 name = "route_cache"

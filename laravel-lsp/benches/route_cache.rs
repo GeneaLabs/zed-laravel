@@ -1,15 +1,18 @@
 //! Route-cache strategy benchmark — discovery for issue #48.
 //!
-//! Today route data is materialized into three caches built by two parsing
-//! strategies. This bench measures the two strategies head-to-head so the
-//! "unify onto one canonical source" decision rests on numbers, not intuition:
+//! Route data is materialized into three caches. Since the route index moved
+//! onto tree-sitter (see `docs/route-cache-unification.md`), BOTH strategies
+//! below parse PHP — the bench now measures how much extra work the index's
+//! richer model costs over the chain walker, and tracks the absolute cost of
+//! `build_route_index` so the tree-sitter migration's price stays visible:
 //!
-//! * **byte-scan** — [`extract_named_routes`], the strategy behind
+//! * **index** — [`extract_named_routes`], the strategy behind
 //!   `build_route_index` (the whole-project name→location index, incl.
 //!   `vendor/`).
-//! * **tree-sitter** — [`extract_route_chains`], the strategy behind the
+//! * **chain-walker** — [`extract_route_chains`], the strategy behind the
 //!   per-file declaration cache (rename / find-references) and the
-//!   document-symbols outline.
+//!   document-symbols outline. Same parse, shallower model: it stops at a
+//!   `RESOURCE` leaf where the index expands the CRUD sub-routes.
 //!
 //! It generates a synthetic corpus at three vendor scales (~500 / ~2000 /
 //! ~5000 files) whose route files mimic real-world shapes — named routes,
@@ -21,7 +24,7 @@
 //! 2. **route-save path** — re-parse a single representative project file with
 //!    each strategy;
 //! 3. **realistic init** — the real `build_route_index` (discovery + disk I/O +
-//!    load-graph expansion + byte-scan) against the on-disk corpus, i.e. the
+//!    load-graph expansion + extraction) against the on-disk corpus, i.e. the
 //!    cost paid today;
 //! 4. **memory** — estimated heap footprint of caching the tree-sitter rich
 //!    per-file model (`Vec<RouteChainNode>`) for every route file.
@@ -194,7 +197,7 @@ fn read_all(paths: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-/// Recursively count every `Route::*` chain node (parity with the byte-scan
+/// Recursively count every `Route::*` chain node (parity with the index
 /// route-definition count, modulo resource granularity — see AC#4 demo).
 fn count_chain_nodes(chains: &[RouteChainNode]) -> usize {
     chains
@@ -265,7 +268,7 @@ fn bench_single_file(content: &str) -> (Duration, Duration) {
 }
 
 /// The real init cost paid today: discovery + disk read + load-graph expansion
-/// + byte-scan, via `build_route_index`.
+/// + extraction, via `build_route_index`.
 fn bench_realistic_init(root: &Path) -> (Duration, usize) {
     let start = Instant::now();
     let files = discover_route_files(root);
@@ -292,7 +295,7 @@ fn resource_granularity_demo() {
     let mut names: Vec<String> = bytescan.iter().filter_map(|(n, _)| n.clone()).collect();
     names.sort();
     println!(
-        "  byte-scan      -> {} named routes: {}",
+        "  index          -> {} named routes: {}",
         names.len(),
         names.join(", ")
     );
@@ -354,7 +357,7 @@ fn main() {
         let (ts_dur, ts_nodes, ts_bytes) = bench_treesitter(&all_contents);
         println!("[init / whole corpus, in-memory parse only]");
         println!(
-            "  byte-scan   : {:>9.2?}  ({:.2} us/file, {} route-defs)",
+            "  index       : {:>9.2?}  ({:.2} us/file, {} route-defs)",
             bs_dur,
             per_file_us(bs_dur, total_files),
             bs_defs
@@ -366,21 +369,21 @@ fn main() {
             ts_nodes
         );
         println!(
-            "  tree-sitter / byte-scan slowdown: {:.1}x",
+            "  chain-walker / index ratio: {:.1}x",
             ts_dur.as_secs_f64() / bs_dur.as_secs_f64().max(f64::EPSILON)
         );
 
         // 2. route-save path — single representative project file
         let (save_bs, save_ts) = bench_single_file(&project_contents[0]);
         println!("[route-save / single project file re-parse]");
-        println!("  byte-scan   : {save_bs:>9.2?}");
+        println!("  index       : {save_bs:>9.2?}");
         println!("  tree-sitter : {save_ts:>9.2?}");
         println!(
-            "  tree-sitter / byte-scan slowdown: {:.1}x",
+            "  chain-walker / index ratio: {:.1}x",
             save_ts.as_secs_f64() / save_bs.as_secs_f64().max(f64::EPSILON)
         );
 
-        // 3. realistic init — build_route_index (discovery + I/O + byte-scan)
+        // 3. realistic init — build_route_index (discovery + I/O + extraction)
         let (real_dur, indexed) = bench_realistic_init(&corpus.root);
         println!("[realistic init / build_route_index, disk + discovery]");
         println!(

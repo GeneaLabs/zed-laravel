@@ -5,6 +5,41 @@
 > Numbers below come from `cargo bench --bench route_cache` (a **synthetic**
 > corpus; see the caveat at the end).
 
+## Outcome (superseded — A was implemented)
+
+> **This document's recommendation was overridden.** Option **A (full unify onto
+> tree-sitter)** was implemented for `build_route_index` while fixing a
+> user-facing correctness bug: the byte scanners had no notion of PHP comments
+> or heredocs, so a commented-out `function () {` or a bare apostrophe in prose
+> shifted every group boundary that followed it. Real route files carry both,
+> and routes downstream of the corruption were indexed under the wrong prefix
+> (or none), producing false "Route not found" diagnostics on routes that
+> `artisan route:list` resolves fine.
+>
+> B (hybrid) would have fixed the first-party case at ~1× cost, but was not the
+> option chosen. The measured price of A, re-run with the same bench after the
+> migration:
+>
+> | Corpus | `build_route_index` before | after | ratio |
+> |---|---|---|---|
+> | 500 vendor files | 38.0 ms | 151.4 ms | 4.0× |
+> | 2000 vendor files | 172.8 ms | 580.0 ms | 3.4× |
+> | 5000 vendor files | 368.5 ms | 1.43 s | 3.9× |
+>
+> On a real vendor-heavy project (139 route files, 93.5% vendor) the same
+> rebuild went 55.9 ms → 173.7 ms (3.1×), and the index gained 155 correctly
+> prefixed names it had previously been getting wrong.
+>
+> The realistic-path ratio is worse than the ~2.8× parse ratio predicted below
+> because `build_route_index` parses each file twice — once to discover
+> `->group(<path>)` load edges, once to extract routes. Collapsing those two
+> passes onto one cached parse is the obvious next optimization, and the hybrid
+> split described under **B** remains available if the cold-start cost proves
+> unacceptable on large projects.
+>
+> Everything below is the original discovery, kept as the record of what was
+> measured beforehand.
+
 ## TL;DR
 
 **Recommendation: B — hybrid, but deferred.** Unify the *first-party* route

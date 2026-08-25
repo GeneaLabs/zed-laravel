@@ -1259,3 +1259,126 @@ fn folio_named_page_surfaces_in_handler_route_index() {
     assert_eq!(route.uri.as_deref(), Some("/users/{id}"));
     assert_eq!(route.method.as_deref(), Some("get"));
 }
+
+// ============================================================================
+// Comment / heredoc blindness (the byte-scan bug the AST parse retired)
+// ============================================================================
+//
+// The previous scanner matched braces, parens and quotes over raw bytes with no
+// notion of PHP comments. Real route files carry commented-out route code and
+// English prose, both of which silently corrupted every group boundary that
+// followed: a stray `{` from `// Route::get('/x', function () {` pushed a
+// group's closing brace hundreds of lines late, and a lone apostrophe in
+// "it's" opened a phantom string literal that swallowed the braces after it.
+// Routes then inherited a prefix from a group they were never inside.
+
+#[test]
+fn commented_out_route_is_not_indexed() {
+    let src = r#"<?php
+// Route::get('/ghost', [GhostController::class, 'index'])->name('ghost');
+Route::get('/real')->name('real');
+"#;
+    assert_eq!(
+        names_of(src),
+        vec!["real"],
+        "a commented-out route is not a route"
+    );
+}
+
+#[test]
+fn commented_out_resource_is_not_indexed() {
+    let src = r#"<?php
+// Route::resource('ghosts', GhostController::class);
+Route::resource('reals', RealController::class)->only(['index']);
+"#;
+    assert_eq!(names_of(src), vec!["reals.index"]);
+}
+
+#[test]
+fn commented_out_closure_brace_does_not_extend_group_body() {
+    // The decisioncloud shape: a commented-out route leaves an unmatched `{`
+    // inside the group. Byte-scanning counted it, so the group's closing brace
+    // was never found and its prefix vanished from the routes inside it.
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    // Route::get('/legacy', function () {
+    Route::get('/users')->name('users.index');
+});
+Route::name('api.')->group(function () {
+    Route::get('/posts')->name('posts.index');
+});
+"#;
+    assert_eq!(
+        names_of(src),
+        vec!["admin.users.index", "api.posts.index"],
+        "an unmatched brace in a comment must not move the group boundary"
+    );
+}
+
+#[test]
+fn apostrophe_in_comment_does_not_shift_group_boundary() {
+    // A lone `it's` opens a phantom string literal for a quote-tracking byte
+    // scanner, hiding every brace up to the next quote — here, the group's own
+    // closing `}`, which then swallowed the sibling group below it.
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    Route::get('/users')->name('users.index');
+    // the closing brace is below, it's important
+});
+Route::name('api.')->group(function () {
+    Route::get('/posts')->name('posts.index');
+});
+"#;
+    assert_eq!(
+        names_of(src),
+        vec!["admin.users.index", "api.posts.index"],
+        "a prose apostrophe must not shift the group boundary"
+    );
+}
+
+#[test]
+fn block_comment_braces_do_not_shift_group_boundary() {
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    /*
+     * Route::get('/old', function () {
+     */
+    Route::get('/users')->name('users.index');
+});
+Route::get('/login')->name('login');
+"#;
+    assert_eq!(names_of(src), vec!["admin.users.index", "login"]);
+}
+
+#[test]
+fn heredoc_braces_do_not_shift_group_boundary() {
+    // A `}` inside heredoc text closed the group early, so the route below it
+    // lost the `admin.` prefix entirely.
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    $sql = <<<'SQL'
+} this brace is data, not code
+SQL;
+    Route::get('/users')->name('users.index');
+});
+Route::get('/login')->name('login');
+"#;
+    assert_eq!(
+        names_of(src),
+        vec!["admin.users.index", "login"],
+        "heredoc content must not be parsed as code"
+    );
+}
+
+#[test]
+fn group_name_setter_is_not_itself_a_route() {
+    // `->name('admin.')` on a chain that ends in `->group(...)` configures the
+    // children's prefix; it does not register a route of its own. The byte scan
+    // indexed it as the bogus route `admin.`.
+    let src = r#"<?php
+Route::prefix('/admin')->name('admin.')->group(function () {
+    Route::get('/users')->name('users.index');
+});
+"#;
+    assert_eq!(names_of(src), vec!["admin.users.index"]);
+}

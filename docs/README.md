@@ -45,4 +45,4 @@ Internal discovery and rationale documents. Not user guides — they record why 
 
 | Document | What it covers |
 |---|---|
-| [Unifying the route caches](route-cache-unification.md) | Benchmark-backed discovery for [#48](https://github.com/mike-bronner/zed-laravel/issues/48): whether the byte-scan route index and the tree-sitter route walkers should collapse onto one model |
+| [Unifying the route caches](route-cache-unification.md) | Benchmark-backed discovery for [#48](https://github.com/mike-bronner/zed-laravel/issues/48): whether the route index and the route walkers should collapse onto one model, plus the measured cost of the tree-sitter migration that followed |
