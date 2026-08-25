@@ -42,7 +42,10 @@ pub fn is_page_file(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
-    PAGE_EXTENSIONS.contains(&ext) && path.to_string_lossy().contains(&format!("{PAGES_DIR}/"))
+    // Segment matching, not substring: the old `contains("{PAGES_DIR}/")`
+    // only matched a forward-slash spelling, so no file was ever recognised
+    // as an Inertia page on Windows (issue #292).
+    PAGE_EXTENSIONS.contains(&ext) && crate::path_segments::contains_segments(path, PAGES_DIR)
 }
 
 /// Whether a captured page name is safe to turn into a filesystem path.

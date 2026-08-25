@@ -81,10 +81,13 @@ fn watchers_register_each_configured_view_path() {
     let watchers = build_watchers(&root, &view_paths, None, &[]);
 
     for view_path in &view_paths {
+        // Compare against the same forward-slash rendering the watcher emits.
+        // LSP glob patterns are forward-slash by specification, so building the
+        // expectation from a platform-separator `Path` would only match on
+        // Unix (issue #292).
+        let expected_base = super::glob_base(view_path);
         let has_blade = watchers.iter().any(|w| match &w.glob_pattern {
-            GlobPattern::String(s) => {
-                s.contains(view_path.to_string_lossy().as_ref()) && s.ends_with("*.blade.php")
-            }
+            GlobPattern::String(s) => s.contains(&expected_base) && s.ends_with("*.blade.php"),
             _ => false,
         });
         assert!(has_blade, "missing blade watcher for {:?}", view_path);
@@ -215,7 +218,7 @@ fn watchers_include_a_recursive_glob_per_psr4_root() {
 
     let globs = globs_of(&watchers);
     for src in &psr4 {
-        let expected = format!("{}/**/*.php", src.display());
+        let expected = format!("{}/**/*.php", super::glob_base(src));
         assert!(
             globs.iter().any(|g| g == &expected),
             "missing PSR-4 glob {expected}: {globs:?}"

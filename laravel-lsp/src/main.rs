@@ -17933,7 +17933,8 @@ return [
             // Per Laravel docs: "you should ensure you are only calling the env function
             // from within your application's configuration (config) files"
             // https://laravel.com/docs/12.x/configuration#configuration-caching
-            let is_config_file = file_path.to_string_lossy().contains("/config/");
+            let is_config_file =
+                laravel_lsp::path_segments::contains_segments(&file_path, "config");
             if !is_config_file && !patterns.env_refs.is_empty() {
                 for env_ref in &patterns.env_refs {
                     let diagnostic = Diagnostic {
@@ -22670,12 +22671,18 @@ impl LanguageServer for LaravelLanguageServer {
             // `Commands/` directory (app or package). That heuristic keeps the
             // index fresh without rebuilding on every unrelated `.php` save.
             if !commands_changed {
-                let p = path.to_string_lossy();
-                if p.ends_with(".php") && p.contains("/Commands/") {
+                // `.php` stays a string suffix test — a filename extension has
+                // no separators. The directory test does not: `/Commands/`
+                // never matched a Windows path (issue #292).
+                if path.to_string_lossy().ends_with(".php")
+                    && laravel_lsp::path_segments::contains_segments(&path, "Commands")
+                {
                     commands_changed = true;
                 }
             }
-            if !migrations_changed && path.to_string_lossy().contains("database/migrations") {
+            if !migrations_changed
+                && laravel_lsp::path_segments::contains_segments(&path, "database/migrations")
+            {
                 migrations_changed = true;
             }
             // Snapshot the file's pre-change surface for the incremental magic

@@ -90,6 +90,7 @@ pub mod naming;
 pub mod parser;
 pub mod path_containment;
 pub mod path_join;
+pub mod path_segments;
 pub mod pattern_disk_cache;
 pub mod pattern_indexer;
 pub mod php_class;
