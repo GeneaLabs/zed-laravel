@@ -95,8 +95,12 @@ pub mod pattern_disk_cache;
 pub mod pattern_indexer;
 pub mod php_class;
 pub mod php_string_components;
-/// Shared fixture helpers. Test-only: never compiled into the shipped library.
-#[cfg(test)]
+/// Shared fixture helpers.
+///
+/// Not `#[cfg(test)]`: the binary crate's own test tree (`src/tests/`) links
+/// against this library as a dependency, and a `cfg(test)` module is absent
+/// from that artifact. Ten lines of always-compiled helper is the cost of one
+/// spelling of an absolute-path fixture across both crates.
 pub mod test_paths;
 // php_outline was consolidated into `laravel_introspector::walker`.
 pub mod php_variable_rename;

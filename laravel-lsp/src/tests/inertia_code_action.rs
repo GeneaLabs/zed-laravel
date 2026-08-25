@@ -56,8 +56,12 @@ fn missing_page_emits_error_diagnostic() {
     // ones, now that both families share a single `source`.
     assert!(diag.data.is_none());
     assert!(diag.message.contains("Auth/Login"), "{}", diag.message);
+    // The message embeds a display path, which carries the platform separator.
+    // Compare in one rendering rather than assuming forward slashes (#292).
     assert!(
-        diag.message.contains("resources/js/Pages/Auth/Login.vue"),
+        diag.message
+            .replace('\\', "/")
+            .contains("resources/js/Pages/Auth/Login.vue"),
         "{}",
         diag.message
     );

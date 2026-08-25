@@ -416,15 +416,15 @@ fn view_rename_assembles_workspace_edit_with_text_and_file_move() {
     // op for the .blade.php move. Verify the assembled WorkspaceEdit
     // matches that shape.
     let targets = vec![EditTarget {
-        file_path: PathBuf::from("/tmp/app/Http/Controllers/UserController.php"),
+        file_path: laravel_lsp::test_paths::abs("/tmp/app/Http/Controllers/UserController.php"),
         line: 12,
         start_column: 18,
         end_column: 31,
         new_text: "users.account".to_string(),
     }];
     let renames = vec![FileRename {
-        old_path: PathBuf::from("/tmp/resources/views/users/profile.blade.php"),
-        new_path: PathBuf::from("/tmp/resources/views/users/account.blade.php"),
+        old_path: laravel_lsp::test_paths::abs("/tmp/resources/views/users/profile.blade.php"),
+        new_path: laravel_lsp::test_paths::abs("/tmp/resources/views/users/account.blade.php"),
     }];
 
     let edit =
@@ -457,14 +457,14 @@ fn text_only_rename_emits_edits_variant() {
     // resource operations.
     let targets = vec![
         EditTarget {
-            file_path: PathBuf::from("/tmp/routes/web.php"),
+            file_path: laravel_lsp::test_paths::abs("/tmp/routes/web.php"),
             line: 3,
             start_column: 30,
             end_column: 34,
             new_text: "home".to_string(),
         },
         EditTarget {
-            file_path: PathBuf::from("/tmp/app/HomeController.php"),
+            file_path: laravel_lsp::test_paths::abs("/tmp/app/HomeController.php"),
             line: 12,
             start_column: 18,
             end_column: 22,
@@ -499,8 +499,8 @@ fn rename_file_op_carries_safe_collision_options() {
     // silently clobbering. Verify the option flags survive the
     // WorkspaceEdit construction.
     let renames = vec![FileRename {
-        old_path: PathBuf::from("/tmp/users/profile.blade.php"),
-        new_path: PathBuf::from("/tmp/users/account.blade.php"),
+        old_path: laravel_lsp::test_paths::abs("/tmp/users/profile.blade.php"),
+        new_path: laravel_lsp::test_paths::abs("/tmp/users/account.blade.php"),
     }];
     let edit = build_rename_workspace_edit(&[], &renames).expect("edit produced");
     let DocumentChanges::Operations(ops) = edit.document_changes.unwrap() else {
@@ -524,15 +524,15 @@ fn mixed_text_and_file_rename_annotates_text_edits_too() {
     // in `AnnotatedTextEdit` referencing the same change annotation —
     // so the client groups them as one reviewable change.
     let targets = vec![EditTarget {
-        file_path: PathBuf::from("/tmp/app/UserController.php"),
+        file_path: laravel_lsp::test_paths::abs("/tmp/app/UserController.php"),
         line: 0,
         start_column: 18,
         end_column: 31,
         new_text: "users.account".to_string(),
     }];
     let renames = vec![FileRename {
-        old_path: PathBuf::from("/tmp/users/profile.blade.php"),
-        new_path: PathBuf::from("/tmp/users/account.blade.php"),
+        old_path: laravel_lsp::test_paths::abs("/tmp/users/profile.blade.php"),
+        new_path: laravel_lsp::test_paths::abs("/tmp/users/account.blade.php"),
     }];
     let edit = build_rename_workspace_edit(&targets, &renames).expect("edit produced");
     let DocumentChanges::Operations(ops) = edit.document_changes.unwrap() else {

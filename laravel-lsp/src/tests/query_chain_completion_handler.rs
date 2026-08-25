@@ -155,8 +155,10 @@ const PROPERTY_RECEIVER_HOP: &str = "<?php\n\
 /// Run the real completion entry point and return the offered labels.
 async fn completion_labels(server: &LaravelLanguageServer, template: &str) -> Vec<String> {
     let (content, position) = cursor_at(template);
-    let uri = Url::from_file_path("/tmp/watson-219-fixture/Controller.php")
-        .expect("absolute path → file uri");
+    let uri = Url::from_file_path(laravel_lsp::test_paths::abs(
+        "/tmp/watson-219-fixture/Controller.php",
+    ))
+    .expect("absolute path → file uri");
     let items = server
         .try_query_chain_completion(&content, position, &uri)
         .await
