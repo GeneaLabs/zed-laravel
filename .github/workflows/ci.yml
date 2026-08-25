@@ -89,7 +89,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --all-features
+        # `--no-fail-fast` so one failing target doesn't hide the others: the
+        # Windows leg is here to inventory breakage, and stopping at the lib
+        # target would leave the bin + integration targets unreported. Applied
+        # to both legs — it widens what runs, it never narrows it.
+        run: cargo test --all-features --no-fail-fast
 
   extension:
     name: Extension — wasm check, fmt, clippy
