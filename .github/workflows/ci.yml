@@ -56,12 +56,14 @@ jobs:
           # 8.4 matches the actual minimum required by the locked
           # vendor packages (symfony/* v8.0 requires >= 8.4).
           php-version: '8.4'
-          # `filament/support` requires ext-intl. The Ubuntu PHP image happens
-          # to ship it, the Windows one does not, so `composer update` resolved
-          # on one host and failed on the other. Requesting it explicitly makes
-          # the fixture's real requirement the same on both legs instead of an
-          # accident of the runner image.
-          extensions: intl
+          # The fixture's Laravel 12 + Filament 5 tree has real platform
+          # requirements (`ext-intl` via filament/support, `ext-fileinfo` via
+          # league/flysystem-local, ...). The Ubuntu PHP image happens to ship
+          # them and the Windows one does not, so `composer update` resolved on
+          # one host and failed on the other. Request the set explicitly so both
+          # legs resolve against the same platform instead of an accident of the
+          # runner image. `extensions` is additive — the Ubuntu leg is unchanged.
+          extensions: intl, fileinfo, mbstring, openssl, tokenizer, xml, ctype, curl, dom, zip, bcmath, gd, exif, iconv, sqlite3, pdo_sqlite
 
       - name: Install test-project Composer dependencies
         # `test-project/vendor/` AND `composer.lock` are gitignored — the
