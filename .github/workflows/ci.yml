@@ -58,12 +58,20 @@ jobs:
           # 8.4 matches the actual minimum required by the locked
           # vendor packages (symfony/* v8.0 requires >= 8.4).
           php-version: '8.4'
-          # `filament/support` requires ext-intl. Ubuntu's runner PHP bundles
-          # it, so the single-OS job got it for free; the Windows runner does
-          # not, and composer refused to resolve. Naming it here makes the
-          # requirement explicit for every leg rather than leaving one
-          # platform's default doing the work (issue #292).
-          extensions: intl
+          # The PHP extensions test-project's dependency graph declares, taken
+          # from the `ext-*` requires across its installed vendor tree rather
+          # than guessed. Ubuntu's runner PHP bundles these, so the single-OS
+          # job got them for free; the Windows runner bundles fewer, and
+          # composer refused to resolve — first on ext-intl (filament/support),
+          # then ext-fileinfo (league/flysystem-local). Listing the whole set
+          # makes the requirement explicit for every leg instead of leaving one
+          # platform's defaults to carry it, and avoids discovering them one
+          # failed run at a time (issue #292).
+          #
+          # `pcntl` and `posix` appear in that scan too but are deliberately
+          # absent: they do not exist on Windows, and nothing in the resolved
+          # graph hard-requires them.
+          extensions: intl, fileinfo, mbstring, dom, tokenizer, iconv, filter, bcmath, openssl, libxml, ctype, xmlwriter, curl, zip, xml, gmp
 
       - name: Install test-project Composer dependencies
         # `test-project/vendor/` AND `composer.lock` are gitignored — the
