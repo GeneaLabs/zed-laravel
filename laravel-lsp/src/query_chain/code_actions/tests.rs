@@ -346,7 +346,10 @@ fn create_file_content(action: &tower_lsp::lsp_types::CodeAction) -> String {
 #[test]
 fn migration_action_creates_timestamped_file_with_stub() {
     let d = diag(json!({"kind": "column", "name": "phone", "table": "users"}));
-    let root = Path::new("/srv/app");
+    // A platform-absolute root: `Url::from_file_path` rejects a prefixless
+    // "/srv/app" on Windows, so the action silently produced None there.
+    let root_buf = crate::test_paths::abs("/srv/app");
+    let root = root_buf.as_path();
     let action =
         into_action(migration_action(&d, root, "2026_05_29_120000").expect("a migration action"));
     assert_eq!(

@@ -1172,7 +1172,10 @@ fn normalize_path_resolves_interior_parent_dir_and_stays_absolute() {
     // A `..` after a `Normal` segment pops that segment; the path stays absolute.
     let result = normalize_path(&PathBuf::from("/app/models/../views"));
     assert_eq!(result, PathBuf::from("/app/views"));
-    assert!(result.is_absolute(), "absolute input must stay absolute");
+    // `has_root`, not `is_absolute`: on Windows a leading separator with no
+    // drive prefix is rooted but *not* absolute, and rootedness is the
+    // invariant this test exists for (issue #292).
+    assert!(result.has_root(), "rooted input must stay rooted");
 }
 
 #[test]
@@ -1182,8 +1185,8 @@ fn normalize_path_never_pops_root_dir() {
     // and the result stays rooted (the buggy copy returned a relative `escape`).
     let result = normalize_path(&PathBuf::from("/app/../../escape"));
     assert!(
-        result.is_absolute(),
-        "absolute input must stay absolute, got {result:?}"
+        result.has_root(),
+        "rooted input must stay rooted, got {result:?}"
     );
     assert_eq!(result, PathBuf::from("/../escape"));
 }

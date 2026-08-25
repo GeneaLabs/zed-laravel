@@ -347,9 +347,14 @@ fn source_roots_drop_root_escaping_project_via_containment_guard() {
     // regression removing the containment guard would let it through and fail
     // this test.
     let outside = TempDir::new().unwrap();
+    // `\` is an escape character in JSON, so a Windows path interpolated raw
+    // makes the whole composer.json unparseable — every autoload root then
+    // comes back empty, including the legitimate one this test asserts on
+    // (issue #292).
+    let outside_json = outside.path().display().to_string().replace('\\', "\\\\");
     let composer = format!(
         r#"{{ "autoload": {{ "psr-4": {{ "Evil\\": "{}", "App\\": "app/" }} }} }}"#,
-        outside.path().display()
+        outside_json
     );
     let (_dir, root) = project_with_files(&[
         ("composer.json", &composer),

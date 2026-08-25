@@ -457,6 +457,17 @@ fn search_roots(root: &Path) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Does the path contain `name` as a whole path segment?
+    ///
+    /// `Path::components` is separator-agnostic, so this is correct on every
+    /// platform — unlike `to_string_lossy().contains("vendor/")`, which only
+    /// matches a forward-slash spelling and so never fired on Windows
+    /// (issue #292).
+    fn has_component(path: &std::path::Path, name: &str) -> bool {
+        path.components()
+            .any(|c| c.as_os_str().to_string_lossy() == name)
+    }
     use super::*;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -712,7 +723,7 @@ mod tests {
         let first =
             find_php_class_file_in_app_or_vendor("App\\Widgets\\Panel", &root).expect("resolves");
         assert!(
-            first.to_string_lossy().contains("vendor/"),
+            has_component(&first, "vendor"),
             "with no app file, resolution lands in vendor; got {first:?}"
         );
 
@@ -757,7 +768,7 @@ mod tests {
         let first = find_php_class_file_in_app_or_vendor("Modules\\Blog\\Thing", &root)
             .expect("vendor walk resolves");
         assert!(
-            first.to_string_lossy().contains("vendor/"),
+            has_component(&first, "vendor"),
             "with no app file, the walk lands in vendor; got {first:?}"
         );
 

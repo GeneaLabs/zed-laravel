@@ -84,6 +84,22 @@ pub const METHOD: &str = "workspace/didChangeWatchedFiles";
 /// fixed `app/Http/Controllers/**/*.php`) is left in place — duplicate
 /// events collapse in the idempotent watched-files handler, so the
 /// overlap is harmless.
+/// A path rendered with forward slashes, for embedding in an LSP glob pattern.
+///
+/// LSP glob patterns are forward-slash by specification, while `Path::display`
+/// emits the platform separator. Interpolating a joined path on Windows
+/// therefore produced `C:\proj\resources\views/**/*.blade.php` — both
+/// separators in one pattern. Beyond being wrong per spec, the mixed spelling
+/// defeated the string-equality dedup that collapses duplicate PSR-4 roots, so
+/// the same directory was registered twice (issue #292).
+///
+/// A literal backslash in a Unix filename would be rewritten here, but a glob
+/// base is a directory path the LSP client will match with `/` regardless, so
+/// the spec-correct spelling wins.
+fn glob_base(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
 pub fn build_watchers(
     root: &Path,
     view_paths: &[PathBuf],
@@ -116,7 +132,7 @@ pub fn build_watchers(
 
     // Routes.
     watchers.push(FileSystemWatcher {
-        glob_pattern: GlobPattern::String(format!("{}/routes/**/*.php", root.display())),
+        glob_pattern: GlobPattern::String(format!("{}/routes/**/*.php", glob_base(root))),
         kind,
     });
 
@@ -136,11 +152,11 @@ pub fn build_watchers(
     // we register one pair per configured path.
     for view_path in view_paths {
         watchers.push(FileSystemWatcher {
-            glob_pattern: GlobPattern::String(format!("{}/**/*.blade.php", view_path.display())),
+            glob_pattern: GlobPattern::String(format!("{}/**/*.blade.php", glob_base(view_path))),
             kind,
         });
         watchers.push(FileSystemWatcher {
-            glob_pattern: GlobPattern::String(format!("{}/**/*.php", view_path.display())),
+            glob_pattern: GlobPattern::String(format!("{}/**/*.php", glob_base(view_path))),
             kind,
         });
     }
@@ -149,7 +165,7 @@ pub fn build_watchers(
     // location; the config layer already resolved which one applies.
     if let Some(lw) = livewire_path {
         watchers.push(FileSystemWatcher {
-            glob_pattern: GlobPattern::String(format!("{}/**/*.php", lw.display())),
+            glob_pattern: GlobPattern::String(format!("{}/**/*.php", glob_base(lw))),
             kind,
         });
     }
@@ -161,11 +177,11 @@ pub fn build_watchers(
     // cover PHP source and Blade views; the `.json.php` data-file
     // skip lives in the warming filter, not at the watcher layer.
     watchers.push(FileSystemWatcher {
-        glob_pattern: GlobPattern::String(format!("{}/vendor/**/*.php", root.display())),
+        glob_pattern: GlobPattern::String(format!("{}/vendor/**/*.php", glob_base(root))),
         kind,
     });
     watchers.push(FileSystemWatcher {
-        glob_pattern: GlobPattern::String(format!("{}/vendor/**/*.blade.php", root.display())),
+        glob_pattern: GlobPattern::String(format!("{}/vendor/**/*.blade.php", glob_base(root))),
         kind,
     });
 
@@ -179,7 +195,7 @@ pub fn build_watchers(
     let pages_dir = crate::inertia::pages_dir(root);
     for ext in crate::inertia::PAGE_EXTENSIONS {
         watchers.push(FileSystemWatcher {
-            glob_pattern: GlobPattern::String(format!("{}/**/*.{}", pages_dir.display(), ext)),
+            glob_pattern: GlobPattern::String(format!("{}/**/*.{}", glob_base(&pages_dir), ext)),
             kind,
         });
     }
@@ -198,7 +214,7 @@ pub fn build_watchers(
         })
         .collect();
     for src_root in psr4_roots {
-        let glob = format!("{}/**/*.php", src_root.display());
+        let glob = format!("{}/**/*.php", glob_base(src_root));
         // Skip a glob already emitted — whether by a fixed watcher or an
         // earlier PSR-4 root this call (defensive: `project_source_roots`
         // already dedups, but two identical roots must never double-register).

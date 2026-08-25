@@ -1,10 +1,11 @@
 use super::*;
+use crate::test_paths::abs;
 use std::path::PathBuf;
 use tower_lsp::lsp_types::{DocumentChangeOperation, DocumentChanges, OneOf, ResourceOp};
 
 fn target(path: &str, line: u32, start: u32, end: u32, new_text: &str) -> EditTarget {
     EditTarget {
-        file_path: PathBuf::from(path),
+        file_path: abs(path),
         line,
         start_column: start,
         end_column: end,
@@ -14,8 +15,8 @@ fn target(path: &str, line: u32, start: u32, end: u32, new_text: &str) -> EditTa
 
 fn file_rename(old: &str, new: &str) -> FileRename {
     FileRename {
-        old_path: PathBuf::from(old),
-        new_path: PathBuf::from(new),
+        old_path: abs(old),
+        new_path: abs(new),
     }
 }
 
