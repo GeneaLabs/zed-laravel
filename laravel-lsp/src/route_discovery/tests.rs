@@ -1096,7 +1096,7 @@ fn no_indexed_resource_name_ever_starts_with_slash() {
     // Belt-and-suspenders: across a realistic mix, assert the slash bug is gone.
     let (_tmp, index) = index_routes(&[(
         "routes/web.php",
-        "<?php\nRoute::name('api.')->group(function () {\n    Route::resource('/leads', LeadController::class);\n    Route::apiResource('/photos/', PhotoController::class);\n});\nRoute::resource('/bare', BareController::class);\n",
+        "<?php\nRoute::name('api.')->group(function () {\n    Route::resource('/leads', LeadController::class);\n    Route::apiResource('/photos/', PhotoController::class);\n});\nRoute::resource('/bare', BareController::class);\nRoute::resource('/admin/account-manager/accounts', AccountsController::class);\n",
     )]);
 
     for name in index.routes.keys() {
@@ -1113,6 +1113,49 @@ fn no_indexed_resource_name_ever_starts_with_slash() {
     assert!(index.get("api.leads.index").is_some());
     assert!(index.get("api.photos.store").is_some());
     assert!(index.get("bare.show").is_some());
+    // A multi-segment URI is what actually exercises the invariant above —
+    // single-segment fixtures pass it even when interior slashes are kept.
+    assert!(index.get("accounts.index").is_some());
+}
+
+#[test]
+fn resource_with_multi_segment_uri_names_only_the_last_segment() {
+    // Laravel sends any slashed resource name through
+    // `ResourceRegistrar::prefixedResource`, which keeps only the final segment
+    // as the route name and treats the rest as a URI prefix. Indexing the whole
+    // path made every CRUD route of such a resource unresolvable.
+    let src = r#"<?php
+Route::resource('/admin/account-manager/accounts', AccountsController::class)->only(['index', 'show']);
+"#;
+    let mut names = names_of(src);
+    names.sort();
+    assert_eq!(names, vec!["accounts.index", "accounts.show"]);
+}
+
+#[test]
+fn resource_with_multi_segment_uri_keeps_the_full_uri_for_display() {
+    // The prefix is dropped from the NAME only — hover still shows the path
+    // the developer wrote.
+    let path = PathBuf::from("/fake/routes/web.php");
+    let results = extract_named_routes(
+        "<?php\nRoute::apiResource('admin/photos', PhotoController::class)->only(['index']);\n",
+        &path,
+        PRIORITY_APP,
+        &[],
+    );
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0.as_deref(), Some("photos.index"));
+    assert_eq!(results[0].1.uri.as_deref(), Some("admin/photos"));
+}
+
+#[test]
+fn resource_with_multi_segment_uri_composes_with_group_prefix() {
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    Route::resource('account-manager/users', UsersController::class)->only(['index']);
+});
+"#;
+    assert_eq!(names_of(src), vec!["admin.users.index"]);
 }
 
 #[test]

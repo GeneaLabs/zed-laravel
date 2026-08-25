@@ -968,8 +968,12 @@ fn emit_named_route(
 /// routes Laravel synthesizes for it — `photos.index`, `photos.show`, … — after
 /// applying any `->only([...])` / `->except([...])` filter on the same chain.
 ///
+/// A slashed URI contributes only its last segment to the names; the rest is a
+/// URI prefix. The full URI is still carried on each definition for display.
+///
 /// Punted (common case only): `->names([...])` overrides, `Route::resources([…])`
-/// plural registration, and shallow/nested resources.
+/// plural registration, `singleton(...)`/`apiSingleton(...)`, and shallow/nested
+/// resources.
 #[allow(clippy::too_many_arguments)]
 fn emit_resource_routes(
     links: &[ChainLink],
@@ -984,10 +988,16 @@ fn emit_resource_routes(
     let Some(raw) = nth_string_arg(link.args, 0, source) else {
         return;
     };
-    let resource = raw.trim_matches('/');
-    if resource.is_empty() {
+    let uri = raw.trim_matches('/');
+    if uri.is_empty() {
         return;
     }
+    // Everything before the last `/` is a URI prefix, not part of the route
+    // name: `Route::resource('admin/photos', …)` registers `photos.index`, not
+    // `admin/photos.index`. Laravel routes any slashed name through
+    // `ResourceRegistrar::prefixedResource`, whose `getResourcePrefix` keeps
+    // only the final segment as the resource name.
+    let resource = uri.rsplit('/').next().unwrap_or(uri);
 
     let defaults = if link.method == "apiResource" {
         API_RESOURCE_ACTIONS
@@ -1010,7 +1020,7 @@ fn emit_resource_routes(
                     // A resource registers several verbs; none of them applies
                     // to the group as a whole.
                     method: None,
-                    uri: Some(resource.to_string()),
+                    uri: Some(uri.to_string()),
                     action: Some(action.to_string()),
                 },
             ));
