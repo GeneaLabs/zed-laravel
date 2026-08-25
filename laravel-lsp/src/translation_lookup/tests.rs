@@ -317,6 +317,127 @@ fn namespaced_dir_outside_root_is_refused() {
     );
 }
 
+/// A sibling tree outside any project root, holding a `{locale}/{file}.php`
+/// whose value must never surface. Returns the temp dir that owns it.
+fn secret_tree_outside_any_root() -> TempDir {
+    let outside = TempDir::new().unwrap();
+    fs::create_dir_all(outside.path().join("en")).unwrap();
+    fs::write(
+        outside.path().join("en").join("invoice.php"),
+        "<?php\nreturn ['total' => 'LEAKED'];\n",
+    )
+    .unwrap();
+    outside
+}
+
+#[test]
+fn absolute_namespace_in_the_published_path_is_refused() {
+    // `namespace` is the `vendor::` prefix lifted verbatim out of parsed source
+    // — including from an indexed `vendor/**.php` file, so a compromised
+    // dependency can choose it. An *absolute* namespace wins outright, because
+    // `Path::join` discards everything to its left: the published path
+    // `lang/vendor/{namespace}/en/invoice.php` collapses to
+    // `{namespace}/en/invoice.php`, straight out of the tree.
+    let outside = secret_tree_outside_any_root();
+    let project = fake_project_with_lang();
+    let key = format!("{}::invoice.total", outside.path().display());
+
+    // The fixture is only worth anything if the unguarded path really would
+    // land on the secret file — pin that, so this can never rot into a test
+    // that passes because the join went nowhere.
+    assert!(
+        project
+            .path()
+            .join("lang")
+            .join("vendor")
+            .join(outside.path())
+            .join("en")
+            .join("invoice.php")
+            .exists(),
+        "fixture wiring: the published path must actually reach the secret file"
+    );
+
+    assert!(
+        resolve_translation_detailed(project.path(), &key, "en", None).is_none(),
+        "an absolute namespace must never escape the project root"
+    );
+}
+
+#[test]
+fn traversing_namespace_in_the_published_path_is_refused() {
+    // The relative shape of the same hole: `../../../{sibling}` walks out of
+    // `lang/vendor/` into a tree beside the project root.
+    let outside = secret_tree_outside_any_root();
+    let project = fake_project_with_lang();
+    // `read_to_string` resolves `..` through real directories only, so the
+    // published prefix has to exist for the traversal to be live at all.
+    fs::create_dir_all(project.path().join("lang").join("vendor")).unwrap();
+
+    let sibling = outside.path().file_name().unwrap().to_str().unwrap();
+    let namespace = format!("../../../{sibling}");
+    let escaped = project
+        .path()
+        .join("lang")
+        .join("vendor")
+        .join(&namespace)
+        .join("en")
+        .join("invoice.php");
+    assert!(
+        escaped.exists(),
+        "fixture wiring: the traversal must actually reach the secret file \
+         (both temp dirs must share a parent)"
+    );
+
+    let key = format!("{namespace}::invoice.total");
+    assert!(
+        resolve_translation_detailed(project.path(), &key, "en", None).is_none(),
+        "a traversing namespace must never escape the project root"
+    );
+}
+
+#[test]
+fn dotted_key_read_through_an_escaping_symlink_is_refused() {
+    // Containment is canonical, not textual: `lang/en` is spelled inside the
+    // root but resolves outside it. The dotted-key read site takes the same
+    // guard as the namespaced ones.
+    let outside = secret_tree_outside_any_root();
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("lang")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("en"),
+        project.path().join("lang").join("en"),
+    )
+    .unwrap();
+    assert!(
+        project.path().join("lang/en/invoice.php").exists(),
+        "fixture wiring: the symlink must actually reach the secret file"
+    );
+
+    assert!(
+        resolve_translation(project.path(), "invoice.total", "en").is_none(),
+        "a lang directory symlinked out of the root must never be read"
+    );
+}
+
+#[test]
+fn text_key_read_through_an_escaping_symlink_is_refused() {
+    // Same guard on the JSON catalogue read.
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("en.json"), r#"{"Welcome":"LEAKED"}"#).unwrap();
+
+    let project = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(outside.path(), project.path().join("lang")).unwrap();
+    assert!(
+        project.path().join("lang/en.json").exists(),
+        "fixture wiring: the symlink must actually reach the secret catalogue"
+    );
+
+    assert!(
+        resolve_translation(project.path(), "Welcome", "en").is_none(),
+        "a lang directory symlinked out of the root must never be read"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // available_locales — the shared locale set (issue #288)
 // ---------------------------------------------------------------------------
@@ -453,6 +574,29 @@ fn available_locales_refuses_an_out_of_root_vendor_dir() {
         available_locales(dir.path(), "shop::messages.title", Some(&map)),
         vec!["de"],
         "an out-of-root vendor dir must contribute nothing"
+    );
+}
+
+#[test]
+fn available_locales_refuses_an_escaping_published_namespace() {
+    // The enumeration twin of `absolute_namespace_in_the_published_path_is_refused`:
+    // the published dir is `lang/vendor/{namespace}`, and an absolute namespace
+    // collapses that join to the namespace itself. Unguarded, `read_dir` would
+    // list a directory outside the project and render its subdirectory names as
+    // this key's locales.
+    let outside = TempDir::new().unwrap();
+    fs::create_dir_all(outside.path().join("ja")).unwrap();
+    fs::create_dir_all(outside.path().join("ko")).unwrap();
+
+    let project = fake_project_with_lang();
+    let key = format!("{}::messages.title", outside.path().display());
+
+    let locales = available_locales(project.path(), &key, None);
+    assert_eq!(
+        locales,
+        vec!["en"],
+        "an escaping published namespace must contribute no locales, leaving \
+         only the default-locale fallback"
     );
 }
 

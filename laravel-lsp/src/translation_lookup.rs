@@ -15,8 +15,6 @@
 //!   location for package translations) first, then — when the caller supplies
 //!   the `vendor_map` built by [`crate::vendor_translations`] — the package's
 //!   own unpublished lang directory under `vendor/{vendor}/{package}/...`.
-//!   That directory comes from untrusted source, so every read against it is
-//!   fenced by [`crate::path_containment`] (issue #248).
 //!
 //! - **Text keys** (`__('Welcome to our app')`) — resolved through the single
 //!   JSON file `{lang_root}/{locale}.json`. The key IS the source string and
@@ -29,6 +27,13 @@
 //! All three shapes route to the same PHP-array walker from [`config_lookup`]
 //! since Laravel's `.php` translation files share their exact shape with
 //! config files.
+//!
+//! Every path this module builds joins segments taken verbatim from a
+//! translation key in parsed PHP/Blade source — the `vendor::` namespace, the
+//! dotted file segment — or from a `loadTranslationsFrom` argument. All of it
+//! is untrusted, so **every** read and directory enumeration here is fenced by
+//! [`crate::path_containment`]: reads through [`read_in_root`], enumeration in
+//! [`available_locales`] (issue #248).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -118,12 +123,21 @@ fn resolve_dotted(root: &Path, key: &str, locale: &str) -> Option<ResolvedTransl
         return None;
     }
     project_lang_roots(root).iter().find_map(|lang| {
-        read_php_value(&lang.join(locale).join(format!("{}.php", file)), &key_path)
+        read_php_value(
+            root,
+            &lang.join(locale).join(format!("{}.php", file)),
+            &key_path,
+        )
     })
 }
 
 /// Resolve a published namespaced key against
 /// `lang/vendor/{namespace}/{locale}/{file}.php`.
+///
+/// `namespace` is the `vendor::` prefix lifted verbatim out of parsed PHP/Blade
+/// source, so it is untrusted and can carry traversal segments. The read is
+/// fenced by [`read_in_root`], which is why `root` is threaded through
+/// (issue #248).
 fn resolve_namespaced(
     root: &Path,
     namespace: &str,
@@ -138,6 +152,7 @@ fn resolve_namespaced(
     }
     project_lang_roots(root).iter().find_map(|lang| {
         read_php_value(
+            root,
             &lang
                 .join("vendor")
                 .join(namespace)
@@ -164,24 +179,21 @@ fn resolve_namespaced_in_dir(
     if key_path.is_empty() {
         return None;
     }
-    let path = lang_dir.join(locale).join(format!("{}.php", file));
-    // Defense-in-depth: `lang_dir` is derived from a `loadTranslationsFrom`
-    // argument in project/vendor source — untrusted input. A traversal like
+    // `lang_dir` is derived from a `loadTranslationsFrom` argument in
+    // project/vendor source — untrusted input. A traversal like
     // `base_path('../../../../.ssh')` or `__DIR__.'/../../../../etc'` could seed
-    // an out-of-root directory; fail-closed before the read so a namespaced key
-    // can never turn the LSP into an arbitrary-file-read primitive. Mirrors the
-    // guard every other read site in this codebase applies (issue #248).
-    if !crate::path_containment::path_within_root(&path, root) {
-        return None;
-    }
-    read_php_value(&path, &key_path)
+    // an out-of-root directory; [`read_php_value`] fail-closes before the read
+    // so a namespaced key can never turn the LSP into an arbitrary-file-read
+    // primitive (issue #248).
+    let path = lang_dir.join(locale).join(format!("{}.php", file));
+    read_php_value(root, &path, &key_path)
 }
 
 /// Resolve a text key against `lang/{locale}.json`.
 fn resolve_text_key(root: &Path, key: &str, locale: &str) -> Option<ResolvedTranslation> {
     project_lang_roots(root).iter().find_map(|lang| {
         let path = lang.join(format!("{}.json", locale));
-        let content = std::fs::read_to_string(&path).ok()?;
+        let content = read_in_root(&path, root)?;
         let map: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&content).ok()?;
         let value = map.get(key)?.as_str()?;
@@ -203,8 +215,10 @@ const DEFAULT_LOCALE: &str = "en";
 /// namespaced key, the project lang roots otherwise — and treats both locale
 /// *subdirectories* and `{locale}.json` catalogues as evidence of a locale.
 /// The `vendor` subdirectory is excluded: it holds published package
-/// translations, not a locale. A registered namespace directory that resolves
-/// outside the project root is dropped before it is read (issue #248).
+/// translations, not a locale. Any directory that resolves outside the project
+/// root — a published path whose `vendor::` namespace carries traversal, or a
+/// registered namespace directory seeded by `loadTranslationsFrom` — is dropped
+/// before it is read (issue #248).
 ///
 /// Never returns empty. A project with no discoverable locales (no lang
 /// directory at all, or one containing nothing) falls back to
@@ -223,16 +237,8 @@ pub fn available_locales(
         for lang in project_lang_roots(root) {
             dirs.push(lang.join("vendor").join(namespace));
         }
-        // The unpublished vendor dir comes from a `loadTranslationsFrom`
-        // argument in project/vendor source — untrusted input that can point
-        // anywhere (issue #248). `resolve_namespaced_in_dir` already fences its
-        // read; this enumeration is a read site too, so it takes the same
-        // fail-closed guard rather than `read_dir`-ing an out-of-root directory
-        // and rendering whatever it finds there as this key's locales.
         if let Some(dir) = vendor_map.and_then(|m| m.get(namespace)) {
-            if crate::path_containment::path_within_root(dir, root) {
-                dirs.push(dir.clone());
-            }
+            dirs.push(dir.clone());
         }
     } else {
         dirs.extend(project_lang_roots(root));
@@ -240,6 +246,16 @@ pub fn available_locales(
 
     let mut locales: Vec<String> = Vec::new();
     for dir in &dirs {
+        // Enumeration is a read site, so it takes the same fail-closed guard
+        // the resolver reads take (issue #248). Both namespaced dirs are built
+        // from untrusted input that can point anywhere: the published path
+        // joins the `vendor::` namespace lifted verbatim out of parsed source,
+        // and the unpublished dir comes from a `loadTranslationsFrom` argument.
+        // Without the guard, `read_dir` on an escaped directory would surface
+        // whatever subdirectories it found there as this key's locales.
+        if !crate::path_containment::path_within_root(dir, root) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
@@ -284,9 +300,29 @@ pub fn available_locales(
     locales
 }
 
+/// Every *file* read in this module goes through here (directory enumeration
+/// carries its own copy of the guard, in [`available_locales`]). Every path
+/// here is built by joining segments lifted verbatim out of a translation key
+/// in parsed PHP/Blade source — the `vendor::` namespace, the dotted file
+/// segment — or, for the unpublished fallback, a `loadTranslationsFrom`
+/// directory. All of that is untrusted and can carry `../` traversal, so
+/// containment is checked here, once, for every read rather than at each
+/// caller where it can be forgotten (issue #248).
+///
+/// **Fail-closed**: a path that cannot be proven inside `root` is refused, not
+/// read. `path_within_root` canonicalizes, so an under-root symlink pointing
+/// out of the tree is refused too.
+fn read_in_root(path: &Path, root: &Path) -> Option<String> {
+    if !crate::path_containment::path_within_root(path, root) {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// Shared PHP-file read + walk. Returns the bundled value + source path on hit.
-fn read_php_value(path: &Path, key_path: &[&str]) -> Option<ResolvedTranslation> {
-    let content = std::fs::read_to_string(path).ok()?;
+/// The read is fenced inside `root` by [`read_in_root`].
+fn read_php_value(root: &Path, path: &Path, key_path: &[&str]) -> Option<ResolvedTranslation> {
+    let content = read_in_root(path, root)?;
     let value = config_lookup::resolve_in_source(&content, key_path)?;
     Some(ResolvedTranslation {
         value,
