@@ -12288,8 +12288,10 @@ impl LaravelLanguageServer {
         // 1. Anonymous: resources/views/components/button.blade.php (no class)
         // 2. Class-based: app/View/Components/Button.php with resources/views/components/button.blade.php
 
-        // Check if this is in the components directory
-        if !blade_path.contains("/components/") {
+        // Check if this is in the components directory. Normalized first:
+        // `blade_path` is a path rendered as a string, so on Windows it carries
+        // backslashes and the forward-slash marker never matched (issue #292).
+        if !Self::with_forward_slashes(blade_path).contains("/components/") {
             return None;
         }
 
@@ -22467,11 +22469,10 @@ impl LanguageServer for LaravelLanguageServer {
         // Check for lock file changes that trigger rescans
         if let Ok(path) = uri.to_file_path() {
             let file_name = path.file_name().and_then(|n| n.to_str());
-            let path_str = path.to_string_lossy();
 
             // Invalidate config cache if config-related files change
             let is_config_file = matches!(file_name, Some("composer.json"))
-                || path_str.contains("/config/")
+                || laravel_lsp::path_segments::contains_segments(&path, "config")
                 || matches!(file_name, Some("view.php" | "livewire.php"));
 
             if is_config_file {
@@ -22488,7 +22489,13 @@ impl LanguageServer for LaravelLanguageServer {
                     info!("📦 Package lock changed, queuing node_modules rescan");
                     self.queue_background_rescan(RescanType::NodeModules).await;
                 }
-                Some(name) if name.ends_with(".php") && path_str.contains("app/Providers/") => {
+                Some(name)
+                    if name.ends_with(".php")
+                        && laravel_lsp::path_segments::contains_segments(
+                            &path,
+                            "app/Providers",
+                        ) =>
+                {
                     info!("📦 App provider changed, queuing app rescan");
                     self.queue_background_rescan(RescanType::App).await;
                 }
@@ -22519,7 +22526,7 @@ impl LanguageServer for LaravelLanguageServer {
                         .as_ref()
                         .is_some_and(|idx| idx.source_files.contains(&normalized))
                 };
-                if in_index || path_str.contains("/routes/") {
+                if in_index || laravel_lsp::path_segments::contains_segments(&path, "routes") {
                     if let Some(root) = self.root_path.read().await.clone() {
                         info!("🛣️  Route file saved — rebuilding route index");
                         self.rebuild_route_index(&root).await;
