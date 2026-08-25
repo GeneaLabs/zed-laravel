@@ -5027,6 +5027,11 @@ impl LaravelLanguageServer {
                     // no size cap and chokes on these exact files.
                     // The empty patterns are ~30 bytes each in the
                     // serialized disk cache; negligible.
+                    // NOTE: this is a real OS path, so on Windows it carries `\`. The
+                    // branches below match forward-slash markers and must normalize first
+                    // — without it, editing a service provider or a config file never
+                    // re-registered with Salsa on Windows, so middleware aliases, bindings
+                    // and config values silently stopped updating (issue #292).
                     let path_str = path.to_string_lossy();
                     if path_str.ends_with(".json.php") {
                         return Some((
@@ -8756,7 +8761,9 @@ impl LaravelLanguageServer {
                     debug!("Failed to update service provider in Salsa: {}", e);
                 }
             }
-        } else if path_str.contains("app/Providers") && filename.ends_with(".php") {
+        } else if Self::with_forward_slashes(&path_str).contains("app/Providers")
+            && filename.ends_with(".php")
+        {
             // App service provider - Service provider file
             if let Some(root) = root_path {
                 debug!("📦 Updating Salsa: ServiceProviderFile ({})", filename);
@@ -8791,7 +8798,9 @@ impl LaravelLanguageServer {
             {
                 debug!("Failed to update env file in Salsa: {}", e);
             }
-        } else if path_str.contains("/config/") && filename.ends_with(".php") {
+        } else if Self::with_forward_slashes(&path_str).contains("/config/")
+            && filename.ends_with(".php")
+        {
             // Config file (config/*.php) - needs BOTH ConfigFile AND SourceFile treatment
             // ConfigFile: for config discovery (view paths, namespaces, etc.)
             // SourceFile: for pattern extraction (env() calls, etc.)

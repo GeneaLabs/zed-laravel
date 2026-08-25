@@ -379,11 +379,19 @@ impl CacheManager {
         match glob::glob(&pattern_str) {
             Ok(paths) => {
                 for entry in paths.flatten() {
+                    // Cache keys use forward slashes on every platform: every
+                    // other writer passes a literal like "bootstrap/app.php",
+                    // and the invalidation in `invalidate` matches with
+                    // `starts_with("app/Providers/")`. Deriving a key from an
+                    // OS path without normalizing produced `app\Providers\…`
+                    // on Windows, which that check never matched — so the App
+                    // rescan never cleared these entries and the provider
+                    // rescan was skipped (issue #292).
                     let relative = entry
                         .strip_prefix(&self.project_root)
                         .unwrap_or(&entry)
                         .to_string_lossy()
-                        .to_string();
+                        .replace('\\', "/");
 
                     if self.needs_rescan(&relative) {
                         return true;
