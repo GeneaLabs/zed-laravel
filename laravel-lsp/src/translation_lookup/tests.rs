@@ -395,6 +395,9 @@ fn traversing_namespace_in_the_published_path_is_refused() {
     );
 }
 
+// Symlinks need `std::os::unix`; every other symlink-escape test in the
+// tree is already `#[cfg(unix)]`-gated the same way.
+#[cfg(unix)]
 #[test]
 fn dotted_key_read_through_an_escaping_symlink_is_refused() {
     // Containment is canonical, not textual: `lang/en` is spelled inside the
@@ -419,6 +422,9 @@ fn dotted_key_read_through_an_escaping_symlink_is_refused() {
     );
 }
 
+// Symlinks need `std::os::unix`; every other symlink-escape test in the
+// tree is already `#[cfg(unix)]`-gated the same way.
+#[cfg(unix)]
 #[test]
 fn text_key_read_through_an_escaping_symlink_is_refused() {
     // Same guard on the JSON catalogue read.

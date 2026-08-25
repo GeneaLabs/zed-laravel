@@ -8,7 +8,10 @@
 //! tests drive the private methods directly by building the server through
 //! `tower_lsp::LspService` and reaching its inner value with `inner()`.
 
-use crate::{path_within_root, LaravelLanguageServer};
+use crate::LaravelLanguageServer;
+// Only the `#[cfg(unix)]` symlink tests below call the guard directly.
+#[cfg(unix)]
+use crate::path_within_root;
 use laravel_lsp::route_discovery::{RouteDefinition, RouteIndex, PRIORITY_APP};
 use std::fs;
 use std::path::Path;

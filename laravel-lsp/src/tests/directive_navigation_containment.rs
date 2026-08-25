@@ -18,7 +18,10 @@ use crate::LaravelLanguageServer;
 use laravel_lsp::salsa_impl::{DirectiveReferenceData, LaravelConfigData};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// Only the `#[cfg(unix)]` symlink tests below build a `PathBuf`.
+#[cfg(unix)]
+use std::path::PathBuf;
 use tower_lsp::lsp_types::GotoDefinitionResponse;
 use tower_lsp::{lsp_types::Url, LspService};
 

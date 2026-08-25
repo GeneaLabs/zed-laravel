@@ -24,7 +24,10 @@
 //! positive controls prove the gate does not over-refuse: an in-root symlink
 //! (target inside the root) and an ordinary subdirectory still yield candidates.
 
-use laravel_lsp::component_completion::{scan_anonymous_dir, scan_class_dir, ComponentCandidate};
+use laravel_lsp::component_completion::{scan_class_dir, ComponentCandidate};
+// Only the `#[cfg(unix)]` symlink tests below scan an anonymous dir.
+#[cfg(unix)]
+use laravel_lsp::component_completion::scan_anonymous_dir;
 use tempfile::TempDir;
 
 fn names(candidates: &[ComponentCandidate]) -> Vec<String> {
