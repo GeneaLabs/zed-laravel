@@ -10,9 +10,27 @@ env:
 jobs:
   laravel-lsp:
     name: LSP — test, fmt, clippy
-    runs-on: ubuntu-latest
+    strategy:
+      # Every leg runs to completion — one platform's failure must not cancel
+      # the others, or a Windows break would hide whether Linux and macOS are
+      # still green.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Scoped per-leg, deliberately: a bare job-level `continue-on-error: true`
+    # would make the Linux and macOS legs non-blocking too. Windows is new and
+    # expected to surface pre-existing failures (the tree carries ~455
+    # Unix-rooted path literals); it reports without blocking until those are
+    # triaged into their own issues. Dropping this is tracked in #292.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     defaults:
       run:
+        # GitHub-hosted Windows runners ship Git Bash, so one shell keeps all
+        # three legs running byte-identical commands — `cp`, path expansion and
+        # quoting included. Without it Windows would default to PowerShell and
+        # the steps would silently diverge from what Linux and macOS run.
+        shell: bash
         working-directory: laravel-lsp
     steps:
       - uses: actions/checkout@v7

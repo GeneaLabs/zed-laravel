@@ -55,3 +55,4 @@ mod view_navigation_containment;
 mod vite_completion_context;
 mod warm_parse_progress;
 mod watched_files_magic;
+mod windows_path_separators;

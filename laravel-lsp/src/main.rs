@@ -11236,9 +11236,21 @@ impl LaravelLanguageServer {
         vars
     }
 
+    /// A path with every separator normalized to `/`, so the marker matching
+    /// below reads the same on every platform.
+    ///
+    /// These paths arrive as strings rather than `Path`s, and on Windows they
+    /// carry `\\`. Matching a literal `"/components/"` against
+    /// `...\\views\\components\\button.blade.php` simply never fires, so the
+    /// component-variable inference silently produced nothing there (issue
+    /// #292).
+    fn with_forward_slashes(path: &str) -> String {
+        path.replace('\\', "/")
+    }
+
     /// Check if a blade file is a component file (in resources/views/components/)
     fn is_component_file(path: &str) -> bool {
-        path.contains("/components/") && path.ends_with(".blade.php")
+        Self::with_forward_slashes(path).contains("/components/") && path.ends_with(".blade.php")
     }
 
     /// Extract variables passed to a view from any PHP file that renders it
@@ -11828,19 +11840,22 @@ impl LaravelLanguageServer {
     ) -> Vec<(String, String)> {
         let vars = Vec::new();
 
-        // Check if this is a component view (in resources/views/components/)
-        let components_marker = format!("{}resources/views/components/", std::path::MAIN_SEPARATOR);
-        let components_marker_alt = "resources/views/components/";
+        // Check if this is a component view (in resources/views/components/).
+        // Normalize first: the previous marker was built as
+        // `format!("{}resources/views/components/", MAIN_SEPARATOR)`, which on
+        // Windows yields `\resources/views/components/` — a mix of both
+        // separators that matches no real path on any platform (issue #292).
+        let normalized = Self::with_forward_slashes(blade_path);
 
-        if !blade_path.contains(&components_marker) && !blade_path.contains(components_marker_alt) {
+        if !normalized.contains("resources/views/components/") {
             return vars;
         }
 
         // Extract component name from path
         // e.g., resources/views/components/button.blade.php -> Button
         // e.g., resources/views/components/forms/input.blade.php -> Forms/Input
-        let relative = if let Some(idx) = blade_path.find("components/") {
-            &blade_path[idx + 11..] // Skip "components/"
+        let relative = if let Some(idx) = normalized.find("components/") {
+            &normalized[idx + "components/".len()..]
         } else {
             return vars;
         };
