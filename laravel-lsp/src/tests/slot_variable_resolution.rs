@@ -81,6 +81,29 @@ fn test_is_component_file() {
     ));
 }
 
+/// `is_component_file` receives a *native* path (`Url::to_file_path`), so on
+/// Windows it is `\`-separated and the `"/components/"` marker used to match
+/// nothing at all — `$slot`/`$attributes`/`$component` silently stopped being
+/// offered in every component file on that platform (issue #292).
+#[cfg(windows)]
+#[test]
+fn test_is_component_file_windows_native_separators() {
+    assert!(LaravelLanguageServer::is_component_file(
+        r"C:\app\resources\views\components\button.blade.php"
+    ));
+    assert!(LaravelLanguageServer::is_component_file(
+        r"C:\app\resources\views\components\forms\input.blade.php"
+    ));
+    // Still discriminating on Windows: a non-component Blade file, and a
+    // component-looking path that is not a Blade file, both stay out.
+    assert!(!LaravelLanguageServer::is_component_file(
+        r"C:\app\resources\views\welcome.blade.php"
+    ));
+    assert!(!LaravelLanguageServer::is_component_file(
+        r"C:\app\resources\views\components\button.php"
+    ));
+}
+
 #[test]
 fn test_extract_slot_variable_usages_complex() {
     let content = r#"

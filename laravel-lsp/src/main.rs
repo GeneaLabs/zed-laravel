@@ -11237,8 +11237,13 @@ impl LaravelLanguageServer {
     }
 
     /// Check if a blade file is a component file (in resources/views/components/)
+    ///
+    /// `path` is native (it comes from `Url::to_file_path`), so the marker is
+    /// matched against a slash-normalized copy — on Windows the raw path is
+    /// `\`-separated and `"/components/"` never matches (issue #292).
     fn is_component_file(path: &str) -> bool {
-        path.contains("/components/") && path.ends_with(".blade.php")
+        laravel_lsp::path_slash::to_slash(path).contains("/components/")
+            && path.ends_with(".blade.php")
     }
 
     /// Extract variables passed to a view from any PHP file that renders it
@@ -11828,11 +11833,16 @@ impl LaravelLanguageServer {
     ) -> Vec<(String, String)> {
         let vars = Vec::new();
 
-        // Check if this is a component view (in resources/views/components/)
-        let components_marker = format!("{}resources/views/components/", std::path::MAIN_SEPARATOR);
-        let components_marker_alt = "resources/views/components/";
+        // Check if this is a component view (in resources/views/components/).
+        // `blade_path` is native (from `Url::to_file_path`), so normalize its
+        // separators once and keep the ordinary forward-slash marker. The old
+        // `format!("{}resources/views/components/", MAIN_SEPARATOR)` built
+        // `\resources/views/components/` on Windows and matched nothing at all
+        // — neither a native path nor a normalized one (issue #292).
+        let blade_path = laravel_lsp::path_slash::to_slash(blade_path);
+        let blade_path = blade_path.as_ref();
 
-        if !blade_path.contains(&components_marker) && !blade_path.contains(components_marker_alt) {
+        if !blade_path.contains("resources/views/components/") {
             return vars;
         }
 
@@ -12264,7 +12274,14 @@ impl LaravelLanguageServer {
         // 1. Anonymous: resources/views/components/button.blade.php (no class)
         // 2. Class-based: app/View/Components/Button.php with resources/views/components/button.blade.php
 
-        // Check if this is in the components directory
+        // Check if this is in the components directory. Both sides are native
+        // paths — `blade_path` comes from `Url::to_file_path` and `views_str`
+        // from `root.join(..)` — so both are slash-normalized before the
+        // forward-slash marker, prefix strip, and `split('/')` below, none of
+        // which match a `\`-separated Windows path (issue #292).
+        let blade_path = laravel_lsp::path_slash::to_slash(blade_path);
+        let blade_path = blade_path.as_ref();
+
         if !blade_path.contains("/components/") {
             return None;
         }
@@ -12273,6 +12290,7 @@ impl LaravelLanguageServer {
         // resources/views/components/forms/input.blade.php -> Forms/Input
         let views_components = root.join("resources").join("views").join("components");
         let views_str = views_components.to_string_lossy();
+        let views_str = laravel_lsp::path_slash::to_slash(views_str.as_ref());
 
         let relative = blade_path
             .strip_prefix(views_str.as_ref())?

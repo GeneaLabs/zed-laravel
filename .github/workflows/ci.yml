@@ -10,7 +10,19 @@ env:
 jobs:
   laravel-lsp:
     name: LSP — test, fmt, clippy
-    runs-on: ubuntu-latest
+    # Zed ships Windows builds, so a Windows-only path regression reaches users
+    # with every check green. Run the same job on both hosts (issue #292).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Scoped per-leg on purpose: a bare job-level `continue-on-error: true`
+    # would silently make the *existing* ubuntu-latest leg non-blocking too.
+    # The Windows leg reports without blocking merges until its pre-existing
+    # failures are triaged; then this comes off and its matrix-suffixed context
+    # joins branch protection's required checks.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     defaults:
       run:
         working-directory: laravel-lsp
@@ -32,6 +44,10 @@ jobs:
         # under `laravel-lsp/tests/integration_tests.rs` need one to
         # exercise env parsing + variable extraction.
         working-directory: .
+        # GitHub-hosted Windows runners default to PowerShell, where `cp` is an
+        # alias for Copy-Item rather than a real binary. Git Bash ships on every
+        # hosted Windows image, so pinning the shell keeps one command portable.
+        shell: bash
         run: cp test-project/.env.example test-project/.env
 
       - name: Setup PHP for test fixture
