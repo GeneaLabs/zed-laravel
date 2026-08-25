@@ -62,6 +62,7 @@ fn render_full_section_set_in_order() {
         "@param mixed $x".to_string(),
         "@return Response".to_string(),
     ];
+    let lines = vec!["**de** — “eins”".to_string(), "**en** — “one”".to_string()];
     let out = render(&HoverContent {
         header: Some("App\\Foo::bar"),
         detail: Some("Some detail line"),
@@ -71,6 +72,7 @@ fn render_full_section_set_in_order() {
             content: "public function bar()",
         }),
         tags: &tags,
+        lines: &lines,
         source_link: Some("[app/Foo.php:10](file:///abs/Foo.php#L10)"),
         trailer: None,
     });
@@ -84,6 +86,9 @@ fn render_full_section_set_in_order() {
                     <?php\n\
                     public function bar()\n\
                     ```\n\
+                    \n\
+                    **de** — “eins”  \n\
+                    **en** — “one”\n\
                     \n\
                     *@param mixed $x*\n\
                     \n\
@@ -728,7 +733,7 @@ fn translation_card_without_value_shows_not_found_trailer() {
 }
 
 #[test]
-fn translation_card_locales_renders_every_defined_locale() {
+fn translation_card_locales_renders_one_line_per_locale_with_inline_links() {
     let card = translation_card_locales(
         "legal::contract.prefill.failed_title",
         &[
@@ -742,16 +747,62 @@ fn translation_card_locales_renders_every_defined_locale() {
                 Some("Analysis failed".to_string()),
                 Some("[lang/en/contract.php](file:///y)".to_string()),
             ),
+            // A locale that resolved but whose source file couldn't be linked —
+            // it must still occupy exactly one line, not collapse or double.
+            ("fr".to_string(), Some("Analyse échouée".to_string()), None),
         ],
     );
+
     assert!(card.starts_with("`failed_title`"));
-    assert!(card.contains("**de** — “Analyse fehlgeschlagen”"));
-    assert!(card.contains("**en** — “Analysis failed”"));
-    assert!(card.contains("[lang/de/contract.php](file:///x)"));
+    assert!(card.contains("**de** — “Analyse fehlgeschlagen” · [lang/de/contract.php](file:///x)"));
+    assert!(card.contains("**en** — “Analysis failed” · [lang/en/contract.php](file:///y)"));
+    assert!(card.contains("**fr** — “Analyse échouée”"));
+
+    // Three locales → three adjacent lines in one block, links inline. A
+    // paragraph-delimited render would put a blank line between every row and
+    // between each row and its link.
+    let block = card.split("\n\n").nth(1).expect("a locale block");
+    assert_eq!(
+        block.lines().count(),
+        3,
+        "expected 3 locale lines, got:\n{block}"
+    );
 }
 
 #[test]
-fn translation_card_locales_skips_missing_and_falls_back_to_trailer() {
+fn translation_card_locales_collapses_when_only_one_locale_resolves() {
+    // Two locales discovered, one defines the key: the card must be the dense
+    // single-block form, not a one-row list.
+    let card = translation_card_locales(
+        "messages.welcome",
+        &[
+            ("de".to_string(), None, None),
+            (
+                "en".to_string(),
+                Some("Welcome".to_string()),
+                Some("[lang/en/messages.php](file:///y)".to_string()),
+            ),
+        ],
+    );
+
+    assert_eq!(
+        card,
+        translation_card(
+            "messages.welcome",
+            "en",
+            Some("Welcome"),
+            Some("[lang/en/messages.php](file:///y)")
+        ),
+        "a single resolving locale must render identically to translation_card"
+    );
+    assert!(
+        !card.contains("**en**"),
+        "no locale heading in the dense form"
+    );
+}
+
+#[test]
+fn translation_card_locales_uses_the_any_locale_trailer_when_none_resolve() {
     let card = translation_card_locales(
         "messages.welcome",
         &[
@@ -759,6 +810,28 @@ fn translation_card_locales_skips_missing_and_falls_back_to_trailer() {
             ("en".to_string(), None, None),
         ],
     );
-    assert!(card.contains(TRANSLATION_NOT_FOUND_TRAILER));
+    assert_eq!(
+        card,
+        format!("`welcome`\n\n{TRANSLATION_NOT_FOUND_ANY_LOCALE_TRAILER}")
+    );
     assert!(!card.contains("**de**"));
+}
+
+/// The two trailers say different things and must keep saying them: the
+/// single-locale card really did consult only one locale, the multi-locale
+/// card consulted every locale the project defines.
+#[test]
+fn the_two_not_found_trailers_have_distinct_wording() {
+    assert_eq!(
+        TRANSLATION_NOT_FOUND_TRAILER,
+        "*(translation not found for default locale)*"
+    );
+    assert_eq!(
+        TRANSLATION_NOT_FOUND_ANY_LOCALE_TRAILER,
+        "*(translation not found in any locale)*"
+    );
+    assert_ne!(
+        TRANSLATION_NOT_FOUND_TRAILER,
+        TRANSLATION_NOT_FOUND_ANY_LOCALE_TRAILER
+    );
 }

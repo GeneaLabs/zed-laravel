@@ -49,6 +49,13 @@ pub const FILE_NOT_FOUND_TRAILER: &str = "*(file not found)*";
 /// the production string.
 pub const TRANSLATION_NOT_FOUND_TRAILER: &str = "*(translation not found for default locale)*";
 
+/// Trailer for the multi-locale card: the key resolved in none of the locales
+/// the project actually defines. Distinct from
+/// [`TRANSLATION_NOT_FOUND_TRAILER`], which still says "default locale" because
+/// the single-locale [`translation_card`] path really did only consult one.
+pub const TRANSLATION_NOT_FOUND_ANY_LOCALE_TRAILER: &str =
+    "*(translation not found in any locale)*";
+
 /// Anything the cursor might be hovering. Pattern variants come straight from
 /// the Salsa position index; the Blade-variable variant is extracted by line
 /// scanning, and only matters in `.blade.php` files.
@@ -101,6 +108,11 @@ pub struct HoverContent<'a> {
     pub code: Option<CodeBlock<'a>>,
     /// Italic tag lines (`@param`, `@return`, `@throws`).
     pub tags: &'a [String],
+    /// One line per item in a repeated section — the multi-locale translation
+    /// card's `**de** — “…” · [link]` rows. Rendered as a single block with
+    /// markdown hard breaks between rows, so N entries render as N adjacent
+    /// lines rather than N paragraphs.
+    pub lines: &'a [String],
     /// Pre-built markdown link string for the source location (e.g.
     /// `[app/Models/User.php:42](file:///abs/path)`). Rendered verbatim
     /// — no `at` prefix, no surrounding backticks.
@@ -149,6 +161,11 @@ pub fn render(content: &HoverContent<'_>) -> String {
             CodeLanguage::Plain => format!("```\n{}\n```", code.content),
         };
         sections.push(block);
+    }
+    if !content.lines.is_empty() {
+        // Two trailing spaces is markdown's hard line break — a bare "\n"
+        // would let adjacent rows run together into one paragraph.
+        sections.push(content.lines.join("  \n"));
     }
     if !content.tags.is_empty() {
         let tag_lines = content
@@ -205,32 +222,65 @@ pub fn translation_card(
     })
 }
 
-/// Multi-locale variant of [`translation_card`]: one value line per locale
-/// that defines the key, each with its own source link, so a `de` + `en`
-/// catalogue shows both translations at once. Locales that don't define the
-/// key are skipped; when none does, the not-found trailer renders instead.
+/// Multi-locale variant of [`translation_card`]: one line per locale that
+/// defines the key, each carrying its own source link inline, so a `de` + `en`
+/// catalogue shows both translations at once.
+///
+/// Three shapes, by how many locales actually *resolve* the key — which is not
+/// the same as how many locale directories exist, since a project can define a
+/// dozen locales and still have only one of them carry this key:
+///
+/// - **None** — the not-found trailer, naming that no locale had it.
+/// - **Exactly one** — collapses to [`translation_card`]'s dense single-block
+///   form. Most projects ship one locale, and stacking a lone value under a
+///   locale heading would cost a line to say nothing.
+/// - **More than one** — a line per locale:
+///
+/// ```text
+/// `failed_title`
+///
+/// **de** — “Analyse fehlgeschlagen” · [lang/de/contract.php](file://…)
+/// **en** — “Analysis failed” · [lang/en/contract.php](file://…)
+/// ```
 pub fn translation_card_locales(
     key: &str,
     entries: &[(String, Option<String>, Option<String>)],
 ) -> String {
-    let mut body = format!("`{}`", leaf_segment(key));
-    let mut any = false;
-    for (locale, value, source_link) in entries {
-        let Some(value) = value else {
-            continue;
-        };
-        any = true;
-        body.push_str(&format!("\n\n**{locale}** — “{value}”"));
-        if let Some(link) = source_link {
-            body.push_str("\n\n");
-            body.push_str(link);
+    let detail = format!("`{}`", leaf_segment(key));
+    let resolved: Vec<&(String, Option<String>, Option<String>)> = entries
+        .iter()
+        .filter(|(_, value, _)| value.is_some())
+        .collect();
+
+    match resolved.as_slice() {
+        [] => render(&HoverContent {
+            detail: Some(&detail),
+            trailer: Some(TRANSLATION_NOT_FOUND_ANY_LOCALE_TRAILER),
+            ..Default::default()
+        }),
+        [(locale, value, source_link)] => {
+            translation_card(key, locale, value.as_deref(), source_link.as_deref())
+        }
+        _ => {
+            let lines: Vec<String> = resolved
+                .iter()
+                .map(|(locale, value, source_link)| {
+                    // Curly quotes delimit the value so it can't be mistaken
+                    // for the key or a path — same rule as `translation_card`.
+                    let quoted = value.as_deref().unwrap_or_default();
+                    match source_link {
+                        Some(link) => format!("**{locale}** — “{quoted}” · {link}"),
+                        None => format!("**{locale}** — “{quoted}”"),
+                    }
+                })
+                .collect();
+            render(&HoverContent {
+                detail: Some(&detail),
+                lines: &lines,
+                ..Default::default()
+            })
         }
     }
-    if !any {
-        body.push_str("\n\n");
-        body.push_str(TRANSLATION_NOT_FOUND_TRAILER);
-    }
-    body
 }
 
 /// The leaf of a translation key: the last `.`-segment, after dropping any

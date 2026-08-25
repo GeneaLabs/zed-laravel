@@ -178,6 +178,32 @@ fn find_project_root_upward(start: &Path) -> Option<PathBuf> {
     tentative
 }
 
+/// Read a single value out of a project's `.env`.
+///
+/// The one hardened `.env` reader in this codebase. The pattern is
+/// deliberately horizontal (`[ \t]*`, `[^'"\n]*`) so a blank value
+/// (`KEY=\n`) captures the empty string rather than swallowing the next
+/// line — a naive multi-line-tolerant regex here previously leaked one
+/// variable's value into another's, and any second copy of this logic risks
+/// reintroducing that. Callers that need an env value go through this.
+///
+/// Returns `None` when the file is unreadable, the key is absent, or the value
+/// is empty.
+pub fn read_env_value(project_root: &Path, key: &str) -> Option<String> {
+    let env_path = resolve_worktree_fallback(project_root, ".env");
+    let content = std::fs::read_to_string(&env_path).ok()?;
+    let pattern = format!(
+        r#"(?m)^{}[ \t]*=[ \t]*['"]?([^'"\n]*)['"]?"#,
+        regex::escape(key)
+    );
+    regex::Regex::new(&pattern)
+        .ok()?
+        .captures(&content)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Resolve a directory's real git "common dir" — the directory holding the
 /// repository's shared object database and refs.
 ///

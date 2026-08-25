@@ -47,6 +47,7 @@ mod routes_dir_gate;
 mod scan_dir_containment;
 mod slot_navigation_containment;
 mod slot_variable_resolution;
+mod translation_locale_consistency;
 mod translation_namespace_check;
 mod translation_namespace_navigation;
 mod view_diagnostic_containment;

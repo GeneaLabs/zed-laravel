@@ -14389,6 +14389,18 @@ impl LaravelLanguageServer {
         };
 
         // Laravel 9+ uses lang/, older versions use resources/lang/
+        //
+        // Deliberately NOT routed through
+        // `translation_lookup::available_locales`, which the hover /
+        // go-to-definition / diagnostics trio share (issue #288). That helper
+        // answers "which locales could define *this key*" and unions every
+        // candidate directory; completion asks a different question — "what
+        // keys exist at all" — and any single locale answers it, because a key
+        // present in one locale is offered regardless of which locale defines
+        // it. Enumerating the union here would read every catalogue in the
+        // project on each completion request to produce the same list, and
+        // would surface a key from a partially-translated locale as though it
+        // were project-wide. First-wins is the right shape for this caller.
         let lang_dirs = [root.join("lang"), root.join("resources").join("lang")];
 
         let lang_dir = lang_dirs.iter().find(|d| d.exists());
@@ -15074,43 +15086,77 @@ return [
     // Translation validation helpers
     // ========================================================================
 
-    /// Check if a translation file exists for the given key
+    /// Does the project define this translation key anywhere?
     ///
-    /// Dotted keys like "validation.required" look in lang/en/validation.php.
-    /// Text keys like "Welcome to our app" look in lang/en.json.
-    /// Namespaced keys like "filament-tables::table.label" resolve through
-    /// [`laravel_lsp::translation_lookup`] — published `lang/vendor/<ns>/`
-    /// first, then the package's own lang dir via `vendor_map` (see
-    /// [`laravel_lsp::vendor_translations`]) — the same machinery hover uses,
-    /// so the diagnostic and hover can't disagree.
+    /// The key is resolved through [`laravel_lsp::translation_lookup`] against
+    /// **every locale** the project defines, in the order
+    /// [`laravel_lsp::translation_lookup::available_locales`] returns — the
+    /// same set and order hover renders and go-to-definition navigates, so all
+    /// three agree about a key present only in, say, `de`.
+    ///
+    /// All three key shapes go through that one resolver: dotted
+    /// (`validation.required` → `{lang_root}/{locale}/validation.php`), text
+    /// (`Welcome to our app` → `{lang_root}/{locale}.json`), and namespaced
+    /// (`filament-tables::table.label` → published `lang/vendor/<ns>/` first,
+    /// then the package's own lang dir via `vendor_map`, see
+    /// [`laravel_lsp::vendor_translations`]). `{lang_root}` is `lang/` or
+    /// `resources/lang/`.
+    ///
+    /// Resolution is by *reading the key*, never by probing for the file: a
+    /// lang file that exists but does not define this key is not evidence the
+    /// key exists, and reporting it as such is how diagnostics and hover came
+    /// to disagree in the first place (issue #288).
+    ///
+    /// `expected_path` — where a missing key should be created — points at the
+    /// leading locale, which is the project's `APP_LOCALE` when it defines any
+    /// translations at all.
     fn check_translation_file(
         root: &Path,
         translation_key: &str,
         vendor_map: Option<&HashMap<String, PathBuf>>,
     ) -> TranslationCheck {
+        use laravel_lsp::translation_lookup::{
+            available_locales, project_lang_roots, resolve_translation_detailed,
+        };
+
+        // The same locale set, in the same order, that hover renders and
+        // go-to-definition navigates against — so a key defined only in `de`
+        // is not flagged missing while the hover happily displays it
+        // (issue #288). The key is *resolved* in each locale rather than the
+        // lang file merely probed for existence: a file that exists but does
+        // not define this key is not evidence the key exists.
+        let locales = available_locales(root, translation_key, vendor_map);
+        let resolution = locales.iter().find_map(|locale| {
+            resolve_translation_detailed(root, translation_key, locale, vendor_map)
+                .map(|r| (locale.clone(), r))
+        });
+        // Where a missing key should be created: the leading locale, which is
+        // the project's APP_LOCALE when it defines any translations at all.
+        let lead_locale = locales
+            .first()
+            .cloned()
+            .expect("available_locales never yields an empty set");
+
         if let Some((namespace, rest)) = translation_key.split_once("::") {
             let file_segment = rest.split('.').next().unwrap_or(rest);
             let nested_key = rest.split_once('.').map(|(_, k)| k.to_string());
-
-            let exists = laravel_lsp::translation_lookup::resolve_translation_detailed(
-                root,
-                translation_key,
-                "en",
-                vendor_map,
-            )
-            .is_some();
 
             // Expected location for the diagnostic message: the package's real
             // lang dir when the vendor scan knows it, else the published path.
             let lang_dir = vendor_map
                 .and_then(|m| m.get(namespace).cloned())
                 .unwrap_or_else(|| root.join("lang/vendor").join(namespace));
-            let expected = lang_dir.join("en").join(format!("{file_segment}.php"));
+            let expected = lang_dir
+                .join(&lead_locale)
+                .join(format!("{file_segment}.php"));
 
             return TranslationCheck {
-                exists,
+                exists: resolution.is_some(),
                 is_dotted_key: true,
-                file_exists: expected.exists(),
+                file_exists: resolution
+                    .as_ref()
+                    .map(|(_, r)| r.source_file.exists())
+                    .unwrap_or_else(|| expected.exists()),
                 expected_path: Some(expected),
                 nested_key,
             };
@@ -15119,71 +15165,43 @@ return [
         let is_dotted_key = translation_key.contains('.') && !translation_key.contains(' ');
         let is_multi_word = translation_key.contains(' ');
 
-        let mut exists = false;
-        let mut expected_path: Option<PathBuf> = None;
-        let mut file_exists = false;
-        let mut nested_key: Option<String> = None;
-
-        if is_multi_word || (!is_dotted_key && !translation_key.contains('.')) {
-            // Text key: check JSON files for the KEY, not just file existence
-            let json_paths = [
-                root.join("lang/en.json"),
-                root.join("resources/lang/en.json"),
-            ];
-
-            // Set the expected path to the first option (preferred location)
-            expected_path = Some(json_paths[0].clone());
-            nested_key = Some(translation_key.to_string());
-
-            for json_path in &json_paths {
-                if json_path.exists() {
-                    file_exists = true;
-                    expected_path = Some(json_path.clone());
-                    // Parse JSON and check if key exists
-                    if let Ok(content) = std::fs::read_to_string(json_path) {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                            if json.get(translation_key).is_some() {
-                                exists = true;
-                                break;
-                            }
-                        }
-                    }
-                    break; // Use the first existing file
-                }
-            }
-        } else if is_dotted_key {
-            // Dotted key: check PHP file based on first segment
-            let parts: Vec<&str> = translation_key.split('.').collect();
-            if !parts.is_empty() {
-                let file_name = parts[0];
-                // The nested key is everything after the first dot
-                nested_key = Some(parts[1..].join("."));
-
-                let php_paths = [
-                    root.join("lang/en").join(format!("{}.php", file_name)),
-                    root.join("resources/lang/en")
-                        .join(format!("{}.php", file_name)),
-                ];
-
-                // Set the expected path to the first option (preferred location)
-                expected_path = Some(php_paths[0].clone());
-
-                for php_path in &php_paths {
-                    if php_path.exists() {
-                        file_exists = true;
-                        exists = true; // For PHP, we only check file existence currently
-                        expected_path = Some(php_path.clone());
-                        break;
-                    }
-                }
-            }
-        }
+        // A text key lives in `{lang_root}/{locale}.json`; a dotted key in
+        // `{lang_root}/{locale}/{file}.php`. Both lang roots are candidates,
+        // matching what the resolver itself searches.
+        let (expected_path, nested_key) = if is_multi_word || !is_dotted_key {
+            let candidates: Vec<PathBuf> = project_lang_roots(root)
+                .iter()
+                .map(|lang| lang.join(format!("{lead_locale}.json")))
+                .collect();
+            let expected = candidates
+                .iter()
+                .find(|p| p.exists())
+                .cloned()
+                .unwrap_or_else(|| candidates[0].clone());
+            (Some(expected), Some(translation_key.to_string()))
+        } else {
+            let file_name = translation_key.split('.').next().unwrap_or(translation_key);
+            let nested = translation_key.split_once('.').map(|(_, k)| k.to_string());
+            let candidates: Vec<PathBuf> = project_lang_roots(root)
+                .iter()
+                .map(|lang| lang.join(&lead_locale).join(format!("{file_name}.php")))
+                .collect();
+            let expected = candidates
+                .iter()
+                .find(|p| p.exists())
+                .cloned()
+                .unwrap_or_else(|| candidates[0].clone());
+            (Some(expected), nested)
+        };
 
         TranslationCheck {
-            exists,
+            exists: resolution.is_some(),
             is_dotted_key,
+            file_exists: resolution
+                .as_ref()
+                .map(|(_, r)| r.source_file.exists())
+                .unwrap_or_else(|| expected_path.as_ref().is_some_and(|p| p.exists())),
             expected_path,
-            file_exists,
             nested_key,
         }
     }
@@ -16094,47 +16112,41 @@ return [
     ) -> Option<GotoDefinitionResponse> {
         let root_guard = self.root_path.read().await;
         let root = root_guard.as_ref()?;
+        let vendor_map = self.vendor_translation_namespaces_for(root).await;
+        let map_ref = vendor_map.as_ref().map(|m| m.as_ref());
 
-        // Resolve the target lang file. Three shapes, mirroring
-        // `check_translation_file` / `hover_for_translation` so navigation,
-        // diagnostics, and hover all agree on where a key lives:
-        //  - namespaced (`app::file.key`) → <dir>/en/<file>.php, where <dir>
-        //    comes from the merged vendor/app-provider map (falling back to
-        //    the published `lang/vendor/<namespace>` path)
-        //  - dotted (`validation.required`) → lang/en/<file>.php
-        //  - text (`Welcome to our app`) → lang/en.json
-        // For PHP files, `php_key_path` is the nested array path to the key
-        // *within* the file (the segments after the file name), used to jump to
-        // the key's exact line. `None` marks a JSON text key.
-        let (translation_path, php_key_path) =
-            if let Some((namespace, rest)) = trans.key.split_once("::") {
-                let mut segments = rest.split('.');
-                let file_segment = segments.next().unwrap_or(rest);
-                let key_path: Vec<&str> = segments.collect();
-                let vendor_map = self.vendor_translation_namespaces_for(root).await;
-                let lang_dir = vendor_map
-                    .as_ref()
-                    .and_then(|m| m.get(namespace).cloned())
-                    .unwrap_or_else(|| root.join("lang/vendor").join(namespace));
-                (
-                    lang_dir.join("en").join(format!("{file_segment}.php")),
-                    Some(key_path),
+        // Resolve the key for real, across every locale the project defines,
+        // in the same APP_LOCALE-led order hover renders and diagnostics
+        // validate against. Navigation, diagnostics and hover therefore agree
+        // on where a key lives *and* on which locale wins when several define
+        // it — a key present only in `de` navigates to the `de` file instead
+        // of silently failing against a hardcoded `en` path (issue #288).
+        //
+        // Resolving rather than probing for the file also means a locale whose
+        // lang file exists but does not define this key is correctly skipped,
+        // instead of navigating to a file that never had the key in it.
+        let locales = laravel_lsp::translation_lookup::available_locales(root, &trans.key, map_ref);
+        let translation_path = locales
+            .iter()
+            .find_map(|locale| {
+                laravel_lsp::translation_lookup::resolve_translation_detailed(
+                    root, &trans.key, locale, map_ref,
                 )
-            } else if trans.key.contains('.') && !trans.key.contains(' ') {
-                // Dotted key: "validation.required" -> lang/en/validation.php
-                let mut segments = trans.key.split('.');
-                let file = segments.next().unwrap_or(&trans.key);
-                let key_path: Vec<&str> = segments.collect();
-                (
-                    root.join("lang").join("en").join(format!("{file}.php")),
-                    Some(key_path),
-                )
-            } else {
-                // Text key: "Welcome to our app" -> lang/en.json
-                (root.join("lang").join("en.json"), None)
-            };
+            })?
+            .source_file;
 
-        if self.file_exists_cached(&translation_path).await {
+        // The nested array path to the key *within* the file (the segments
+        // after the file name), used to jump to the key's exact line. `None`
+        // marks a JSON text key, whose key is the string itself.
+        let php_key_path: Option<Vec<&str>> = if let Some((_, rest)) = trans.key.split_once("::") {
+            Some(rest.split('.').skip(1).collect())
+        } else if trans.key.contains('.') && !trans.key.contains(' ') {
+            Some(trans.key.split('.').skip(1).collect())
+        } else {
+            None
+        };
+
+        {
             if let Ok(target_uri) = Url::from_file_path(&translation_path) {
                 let origin_selection_range = Range {
                     start: Position {
@@ -20071,73 +20083,32 @@ return [
         let vendor_map = self.vendor_translation_namespaces_for(r).await;
         let map_ref = vendor_map.as_ref().map(|m| m.as_ref());
 
-        // Every locale that could define the key: the locale directories
-        // (and `{locale}.json` catalogues) of the key's lang dir(s) — the
-        // published vendor override plus the registered namespace dir for
-        // namespaced keys, the project lang dirs otherwise.
-        let mut lang_dirs: Vec<PathBuf> = Vec::new();
-        if let Some((namespace, _)) = key.split_once("::") {
-            lang_dirs.push(r.join("lang/vendor").join(namespace));
-            if let Some(dir) = map_ref.and_then(|m| m.get(namespace)) {
-                lang_dirs.push(dir.clone());
-            }
-        } else {
-            lang_dirs.push(r.join("lang"));
-            lang_dirs.push(r.join("resources/lang"));
-        }
-        let mut locales: Vec<String> = Vec::new();
-        for dir in &lang_dirs {
-            let Ok(dir_entries) = std::fs::read_dir(dir) else {
-                continue;
-            };
-            for entry in dir_entries.flatten() {
-                let path = entry.path();
-                let locale = if path.is_dir() {
-                    path.file_name()
-                        .and_then(|n| n.to_str())
-                        .map(str::to_string)
-                } else if path.extension().is_some_and(|e| e == "json") {
-                    path.file_stem()
-                        .and_then(|n| n.to_str())
-                        .map(str::to_string)
-                } else {
-                    None
-                };
-                if let Some(locale) = locale {
-                    if locale != "vendor" && !locales.contains(&locale) {
-                        locales.push(locale);
-                    }
-                }
-            }
-        }
-        locales.sort();
-        if locales.is_empty() {
-            locales.push("en".to_string());
-        }
-
         let mut entries: Vec<(String, Option<String>, Option<String>)> = Vec::new();
-        for locale in &locales {
+        for locale in laravel_lsp::translation_lookup::available_locales(r, key, map_ref) {
             let resolution = laravel_lsp::translation_lookup::resolve_translation_detailed(
-                r, key, locale, map_ref,
+                r, key, &locale, map_ref,
             );
             let link = match &resolution {
                 Some(res) => Some(self.source_link(&res.source_file, None).await),
                 None => None,
             };
-            // Translation values are PHP literals (`'foo'`) — strip the outer
-            // quotes and cap the length for in-block display.
             let value = resolution.as_ref().map(|res| {
-                let v = res.value.trim();
-                let unquoted = v
-                    .strip_prefix('\'')
-                    .and_then(|s| s.strip_suffix('\''))
-                    .or_else(|| v.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-                    .unwrap_or(v);
-                hover::truncate_for_display(unquoted, 200)
+                hover::truncate_for_display(&Self::unquote_php_literal(&res.value), 200)
             });
-            entries.push((locale.clone(), value, link));
+            entries.push((locale, value, link));
         }
         hover::translation_card_locales(key, &entries)
+    }
+
+    /// Strip the outer quotes from a PHP string literal (`'foo'` / `"foo"`).
+    /// Translation values arrive as raw literals from the PHP-array walker.
+    fn unquote_php_literal(value: &str) -> String {
+        let v = value.trim();
+        v.strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .or_else(|| v.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+            .unwrap_or(v)
+            .to_string()
     }
 
     /// Middleware — header is the alias's class FQN (the new info beyond

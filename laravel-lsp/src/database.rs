@@ -1417,36 +1417,9 @@ impl DatabaseSchemaProvider {
     /// whatever line followed), which was sent as the literal password
     /// to MySQL and rejected as bad credentials.
     fn resolve_env(&self, key: &str) -> Option<String> {
-        let env_path = crate::config::resolve_worktree_fallback(&self.project_root, ".env");
-        let content = match std::fs::read_to_string(&env_path) {
-            Ok(c) => c,
-            Err(e) => {
-                debug!("🗄️  resolve_env({}): Failed to read .env: {}", key, e);
-                return None;
-            }
-        };
-
-        // Pattern: KEY=value or KEY="value" or KEY='value', all on one
-        // line. `[ \t]*` stays horizontal so a blank value (`KEY=\n`)
-        // captures the empty string, not the next line.
-        let pattern = format!(
-            r#"(?m)^{}[ \t]*=[ \t]*['"]?([^'"\n]*)['"]?"#,
-            regex::escape(key)
-        );
-        let regex = match Regex::new(&pattern) {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("🗄️  resolve_env({}): Invalid regex: {}", key, e);
-                return None;
-            }
-        };
-
-        let result = regex
-            .captures(&content)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().trim().to_string())
-            .filter(|s| !s.is_empty());
-
+        // Delegates to the single hardened reader in `config` — see its doc
+        // comment for why this logic must not be duplicated.
+        let result = crate::config::read_env_value(&self.project_root, key);
         debug!("🗄️  resolve_env({}): {:?}", key, result);
         result
     }

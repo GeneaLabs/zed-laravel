@@ -316,3 +316,193 @@ fn namespaced_dir_outside_root_is_refused() {
         "an out-of-root namespace directory must never be read"
     );
 }
+
+// ---------------------------------------------------------------------------
+// available_locales — the shared locale set (issue #288)
+// ---------------------------------------------------------------------------
+
+/// A root with the given locale subdirectories under `lang/`.
+fn root_with_locales(locales: &[&str]) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    for locale in locales {
+        fs::create_dir_all(dir.path().join("lang").join(locale)).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn available_locales_enumerates_locale_directories() {
+    let dir = root_with_locales(&["en", "de", "fr"]);
+    assert_eq!(
+        available_locales(dir.path(), "messages.welcome", None),
+        vec!["de", "en", "fr"]
+    );
+}
+
+#[test]
+fn available_locales_extracts_json_catalogue_stems() {
+    let dir = TempDir::new().unwrap();
+    let lang = dir.path().join("lang");
+    fs::create_dir_all(&lang).unwrap();
+    fs::write(lang.join("de.json"), "{}").unwrap();
+    fs::write(lang.join("en.json"), "{}").unwrap();
+    // A non-JSON file is not a locale.
+    fs::write(lang.join("README.md"), "").unwrap();
+
+    assert_eq!(
+        available_locales(dir.path(), "Welcome to our app", None),
+        vec!["de", "en"]
+    );
+}
+
+#[test]
+fn available_locales_excludes_the_vendor_directory() {
+    let dir = root_with_locales(&["en", "de"]);
+    fs::create_dir_all(dir.path().join("lang/vendor/somepkg/en")).unwrap();
+
+    let locales = available_locales(dir.path(), "messages.welcome", None);
+    assert!(
+        !locales.contains(&"vendor".to_string()),
+        "vendor is a namespace container, not a locale: {locales:?}"
+    );
+    assert_eq!(locales, vec!["de", "en"]);
+}
+
+#[test]
+fn available_locales_falls_back_when_the_lang_directory_is_missing() {
+    let dir = TempDir::new().unwrap();
+    // No lang/ at all — read_dir errors on every candidate.
+    assert_eq!(
+        available_locales(dir.path(), "messages.welcome", None),
+        vec!["en"]
+    );
+}
+
+#[test]
+fn available_locales_falls_back_when_the_lang_directory_is_empty() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("lang")).unwrap();
+    // Exists, but holds no locale subdirectories and no .json catalogues.
+    assert_eq!(
+        available_locales(dir.path(), "messages.welcome", None),
+        vec!["en"]
+    );
+}
+
+#[test]
+fn available_locales_unions_published_and_unpublished_vendor_dirs() {
+    let dir = TempDir::new().unwrap();
+    // Published override defines only `de`.
+    fs::create_dir_all(dir.path().join("lang/vendor/shop/de")).unwrap();
+    // The package's own (unpublished) lang dir defines only `fr`.
+    let pkg_lang = dir.path().join("vendor/acme/shop/resources/lang");
+    fs::create_dir_all(pkg_lang.join("fr")).unwrap();
+
+    let mut map = HashMap::new();
+    map.insert("shop".to_string(), pkg_lang);
+
+    assert_eq!(
+        available_locales(dir.path(), "shop::messages.title", Some(&map)),
+        vec!["de", "fr"],
+        "both directories contribute; neither is consulted in isolation"
+    );
+}
+
+#[test]
+fn available_locales_deduplicates_overlapping_vendor_dirs() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("lang/vendor/shop/de")).unwrap();
+    fs::create_dir_all(dir.path().join("lang/vendor/shop/en")).unwrap();
+    let pkg_lang = dir.path().join("vendor/acme/shop/resources/lang");
+    fs::create_dir_all(pkg_lang.join("de")).unwrap();
+    fs::create_dir_all(pkg_lang.join("en")).unwrap();
+
+    let mut map = HashMap::new();
+    map.insert("shop".to_string(), pkg_lang);
+
+    assert_eq!(
+        available_locales(dir.path(), "shop::messages.title", Some(&map)),
+        vec!["de", "en"],
+        "a locale in both directories is listed once, not doubled"
+    );
+}
+
+// --- APP_LOCALE ordering ----------------------------------------------------
+
+/// `fr` is deliberately NOT alphabetically first among the discovered
+/// locales — an implementation that ignored APP_LOCALE entirely, or that only
+/// sorted, would still pass a fixture whose APP_LOCALE happened to sort first.
+#[test]
+fn available_locales_leads_with_app_locale_then_alphabetical() {
+    let dir = root_with_locales(&["en", "de", "fr", "es"]);
+    fs::write(dir.path().join(".env"), "APP_NAME=Test\nAPP_LOCALE=fr\n").unwrap();
+
+    assert_eq!(
+        available_locales(dir.path(), "messages.welcome", None),
+        vec!["fr", "de", "en", "es"],
+        "APP_LOCALE leads; the remainder stays alphabetical"
+    );
+}
+
+#[test]
+fn available_locales_is_alphabetical_when_app_locale_is_unset() {
+    let dir = root_with_locales(&["en", "de", "fr", "es"]);
+    fs::write(dir.path().join(".env"), "APP_NAME=Test\n").unwrap();
+
+    assert_eq!(
+        available_locales(dir.path(), "messages.welcome", None),
+        vec!["de", "en", "es", "fr"]
+    );
+}
+
+#[test]
+fn available_locales_ignores_an_app_locale_no_directory_defines() {
+    let dir = root_with_locales(&["en", "de", "fr", "es"]);
+    fs::write(dir.path().join(".env"), "APP_LOCALE=ja\n").unwrap();
+
+    assert_eq!(
+        available_locales(dir.path(), "messages.welcome", None),
+        vec!["de", "en", "es", "fr"],
+        "an APP_LOCALE outside the discovered set must not panic or reorder"
+    );
+}
+
+// --- resources/lang parity --------------------------------------------------
+
+/// A Laravel-8-style project keeps translations under `resources/lang/`.
+/// Discovery and resolution must agree there, or hover finds nothing while
+/// diagnostics resolves happily — the divergence issue #288 closes.
+#[test]
+fn resources_lang_only_project_discovers_and_resolves() {
+    let dir = TempDir::new().unwrap();
+    let lang = dir.path().join("resources/lang");
+    fs::create_dir_all(lang.join("de")).unwrap();
+    fs::write(
+        lang.join("de/contract.php"),
+        "<?php return ['title' => 'Vertrag'];",
+    )
+    .unwrap();
+
+    assert_eq!(
+        available_locales(dir.path(), "contract.title", None),
+        vec!["de"],
+        "discovery must see resources/lang"
+    );
+    let resolved = resolve_translation_detailed(dir.path(), "contract.title", "de", None)
+        .expect("resolution must see resources/lang too");
+    assert_eq!(resolved.value, "'Vertrag'");
+    assert_eq!(resolved.source_file, lang.join("de/contract.php"));
+}
+
+#[test]
+fn resources_lang_json_text_key_resolves() {
+    let dir = TempDir::new().unwrap();
+    let lang = dir.path().join("resources/lang");
+    fs::create_dir_all(&lang).unwrap();
+    fs::write(lang.join("de.json"), r#"{"Welcome":"Willkommen"}"#).unwrap();
+
+    assert_eq!(available_locales(dir.path(), "Welcome", None), vec!["de"]);
+    let resolved = resolve_translation_detailed(dir.path(), "Welcome", "de", None)
+        .expect("JSON catalogue under resources/lang must resolve");
+    assert_eq!(resolved.value, "'Willkommen'");
+}

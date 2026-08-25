@@ -89,7 +89,19 @@ fn is_dotted_key(key: &str) -> bool {
     key.contains('.') && !key.contains(' ')
 }
 
-/// Resolve a dotted key against `lang/{locale}/{file}.php`.
+/// The directories a project may keep translations in, in priority order:
+/// `lang/` (Laravel 9+) and `resources/lang/` (Laravel 8 and earlier).
+///
+/// Both are checked everywhere, because the diagnostics path has always
+/// checked both — resolving only `lang/` left hover unable to find any
+/// translation on a Laravel-8-style project while diagnostics happily
+/// resolved it, which is precisely the hover/diagnostics divergence issue
+/// #288 exists to close.
+pub fn project_lang_roots(root: &Path) -> [PathBuf; 2] {
+    [root.join("lang"), root.join("resources").join("lang")]
+}
+
+/// Resolve a dotted key against `{lang_root}/{locale}/{file}.php`.
 fn resolve_dotted(root: &Path, key: &str, locale: &str) -> Option<ResolvedTranslation> {
     let mut parts = key.split('.');
     let file = parts.next()?;
@@ -97,8 +109,9 @@ fn resolve_dotted(root: &Path, key: &str, locale: &str) -> Option<ResolvedTransl
     if key_path.is_empty() {
         return None;
     }
-    let path = root.join("lang").join(locale).join(format!("{}.php", file));
-    read_php_value(&path, &key_path)
+    project_lang_roots(root).iter().find_map(|lang| {
+        read_php_value(&lang.join(locale).join(format!("{}.php", file)), &key_path)
+    })
 }
 
 /// Resolve a published namespaced key against
@@ -115,13 +128,16 @@ fn resolve_namespaced(
     if key_path.is_empty() {
         return None;
     }
-    let path = root
-        .join("lang")
-        .join("vendor")
-        .join(namespace)
-        .join(locale)
-        .join(format!("{}.php", file));
-    read_php_value(&path, &key_path)
+    project_lang_roots(root).iter().find_map(|lang| {
+        read_php_value(
+            &lang
+                .join("vendor")
+                .join(namespace)
+                .join(locale)
+                .join(format!("{}.php", file)),
+            &key_path,
+        )
+    })
 }
 
 /// Resolve a namespaced key against an explicit lang directory — the
@@ -155,14 +171,100 @@ fn resolve_namespaced_in_dir(
 
 /// Resolve a text key against `lang/{locale}.json`.
 fn resolve_text_key(root: &Path, key: &str, locale: &str) -> Option<ResolvedTranslation> {
-    let path = root.join("lang").join(format!("{}.json", locale));
-    let content = std::fs::read_to_string(&path).ok()?;
-    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&content).ok()?;
-    let value = map.get(key)?.as_str()?;
-    Some(ResolvedTranslation {
-        value: format!("'{}'", value),
-        source_file: path,
+    project_lang_roots(root).iter().find_map(|lang| {
+        let path = lang.join(format!("{}.json", locale));
+        let content = std::fs::read_to_string(&path).ok()?;
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&content).ok()?;
+        let value = map.get(key)?.as_str()?;
+        Some(ResolvedTranslation {
+            value: format!("'{}'", value),
+            source_file: path,
+        })
     })
+}
+
+/// The fallback locale when a project exposes none — Laravel's own default.
+const DEFAULT_LOCALE: &str = "en";
+
+/// Every locale that could define `key`, ordered with the project's configured
+/// `APP_LOCALE` first and the rest alphabetically.
+///
+/// Discovery looks at the lang directories the key could live in — the
+/// published vendor override plus the registered namespace directory for a
+/// namespaced key, the project lang roots otherwise — and treats both locale
+/// *subdirectories* and `{locale}.json` catalogues as evidence of a locale.
+/// The `vendor` subdirectory is excluded: it holds published package
+/// translations, not a locale.
+///
+/// Never returns empty. A project with no discoverable locales (no lang
+/// directory at all, or one containing nothing) falls back to
+/// `["en"]`, so callers always have something to resolve against.
+///
+/// This is the single source of truth for "which locales matter for this key" —
+/// hover, go-to-definition and diagnostics all resolve against the same set, so
+/// a key defined only in `de` renders, navigates and validates consistently.
+pub fn available_locales(
+    root: &Path,
+    key: &str,
+    vendor_map: Option<&HashMap<String, PathBuf>>,
+) -> Vec<String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some((namespace, _)) = split_namespace(key) {
+        for lang in project_lang_roots(root) {
+            dirs.push(lang.join("vendor").join(namespace));
+        }
+        if let Some(dir) = vendor_map.and_then(|m| m.get(namespace)) {
+            dirs.push(dir.clone());
+        }
+    } else {
+        dirs.extend(project_lang_roots(root));
+    }
+
+    let mut locales: Vec<String> = Vec::new();
+    for dir in &dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let locale = if path.is_dir() {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+            } else if path.extension().is_some_and(|e| e == "json") {
+                path.file_stem()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+            } else {
+                None
+            };
+            // `vendor` is a namespace container, not a locale. Dedupe across
+            // dirs so a locale present in both the published and unpublished
+            // vendor directory is listed once.
+            if let Some(locale) = locale {
+                if locale != "vendor" && !locales.contains(&locale) {
+                    locales.push(locale);
+                }
+            }
+        }
+    }
+
+    if locales.is_empty() {
+        return vec![DEFAULT_LOCALE.to_string()];
+    }
+
+    locales.sort();
+    // The project's own locale leads; everything else stays alphabetical. An
+    // APP_LOCALE that no directory defines simply doesn't appear, leaving the
+    // alphabetical order untouched.
+    if let Some(app_locale) = crate::config::read_env_value(root, "APP_LOCALE") {
+        if let Some(idx) = locales.iter().position(|l| *l == app_locale) {
+            let leading = locales.remove(idx);
+            locales.insert(0, leading);
+        }
+    }
+    locales
 }
 
 /// Shared PHP-file read + walk. Returns the bundled value + source path on hit.
