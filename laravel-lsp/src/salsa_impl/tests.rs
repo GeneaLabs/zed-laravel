@@ -4983,27 +4983,191 @@ async fn both_constructors_agree_on_php_use_class_refs() {
     );
 }
 
-// ─── loadViewsFrom() __DIR__-relative path resolution ──────────────────────
+// ─── loadViewsFrom() path resolution (issues #285, #290) ───────────────────
 //
-// The `LOAD_VIEWS_RE` capture keeps the leading slash of the concatenated
-// fragment (`__DIR__ . '/../resources/views'` captures "/../resources/views"),
-// and `Path::join` REPLACES its receiver when handed an absolute path — so
-// every `loadViewsFrom(__DIR__.'…')` registration silently resolved to a
-// root-relative nonsense path and the namespace never worked.
+// `LOAD_VIEWS_RE` captures the concatenated fragment with its leading slash
+// (`__DIR__ . '/../resources/views'` captures "/../resources/views"), and
+// `Path::join` REPLACES its receiver when handed an absolute path — so every
+// `loadViewsFrom(__DIR__.'…')` registration silently resolved to a
+// root-relative nonsense path and the namespace never worked (#285).
+//
+// The strip-and-join rule itself is unit-tested next to the function it lives
+// on, in `path_join`. These tests pin the *behaviour* the bug broke: that a
+// registration ends up pointing at a real directory. They fail against the
+// pre-#285 parser, which yielded `Some("/../resources/views")`.
 
 #[test]
-fn load_views_relative_fragment_resolves_against_provider_dir() {
-    let provider_dir = PathBuf::from("/pkg/src/Providers");
-    assert_eq!(
-        resolve_load_views_relative(&provider_dir, "/../../resources/views"),
-        PathBuf::from("/pkg/src/Providers/../../resources/views")
+fn load_views_from_dir_relative_registers_real_directory() {
+    let ns = discovered_view_namespaces(
+        r#"<?php
+class CourierServiceProvider extends ServiceProvider
+{
+    public function boot()
+    {
+        $this->loadViewsFrom(__DIR__ . '/../resources/views', 'courier');
+    }
+}
+"#,
+        "/pkg/src/Providers/CourierServiceProvider.php",
     );
     assert_eq!(
-        resolve_load_views_relative(&provider_dir, "/views"),
-        PathBuf::from("/pkg/src/Providers/views")
+        ns,
+        vec![(
+            "courier".to_string(),
+            Some(PathBuf::from("/pkg/src/resources/views"))
+        )]
+    );
+}
+
+#[test]
+fn load_views_from_accepts_whitespace_around_the_arrow() {
+    // Space before the arrow, space after it, and the Pint-style line break
+    // that puts a fluent `->` on its own line.
+    for (label, receiver) in [
+        ("space before", "$this ->loadViewsFrom"),
+        ("space after", "$this-> loadViewsFrom"),
+        ("line break", "$this\n            ->loadViewsFrom"),
+    ] {
+        let source = format!(
+            "<?php\nclass P extends ServiceProvider\n{{\n    public function boot()\n    {{\n        {receiver}(__DIR__ . '/views', 'spaced');\n    }}\n}}\n"
+        );
+        let ns = discovered_view_namespaces(&source, "/pkg/src/P.php");
+        assert_eq!(
+            ns,
+            vec![("spaced".to_string(), Some(PathBuf::from("/pkg/src/views")))],
+            "{label} form did not register"
+        );
+    }
+}
+
+#[test]
+fn load_views_from_unwraps_realpath() {
+    let ns = discovered_view_namespaces(
+        r#"<?php
+class P extends ServiceProvider
+{
+    public function boot()
+    {
+        $this->loadViewsFrom(realpath(__DIR__ . '/../resources/views'), 'wrapped');
+    }
+}
+"#,
+        "/pkg/src/Providers/P.php",
     );
     assert_eq!(
-        resolve_load_views_relative(&provider_dir, "./views"),
-        PathBuf::from("/pkg/src/Providers/views")
+        ns,
+        vec![(
+            "wrapped".to_string(),
+            Some(PathBuf::from("/pkg/src/resources/views"))
+        )]
+    );
+}
+
+#[test]
+fn load_views_from_resolves_path_helper_arguments() {
+    let ns = discovered_view_namespaces(
+        r#"<?php
+class P extends ServiceProvider
+{
+    public function boot()
+    {
+        $this->loadViewsFrom(resource_path('views/vendor/shop'), 'shop');
+    }
+}
+"#,
+        "/pkg/src/P.php",
+    );
+    assert_eq!(
+        ns,
+        vec![(
+            "shop".to_string(),
+            Some(PathBuf::from("/proj/resources/views/vendor/shop"))
+        )]
+    );
+}
+
+#[test]
+fn load_views_from_ignores_unsupported_receivers() {
+    // Only `$this->loadViewsFrom(...)` is recognised. Static and
+    // property-chain receivers register nothing rather than registering a
+    // wrong directory — see the note above `LOAD_VIEWS_RE`.
+    let ns = discovered_view_namespaces(
+        r#"<?php
+class P extends ServiceProvider
+{
+    public function boot()
+    {
+        static::loadViewsFrom(__DIR__ . '/views', 'nope');
+        $this->app->loadViewsFrom(__DIR__ . '/views', 'alsonope');
+    }
+}
+"#,
+        "/pkg/src/P.php",
+    );
+    assert!(ns.is_empty(), "unexpected registrations: {ns:?}");
+}
+
+/// Guards the widened first-argument capture against swallowing across calls:
+/// three differently-shaped registrations in one provider must each resolve
+/// independently.
+#[test]
+fn multiple_differently_shaped_registrations_resolve_independently() {
+    let ns = discovered_view_namespaces(
+        r#"<?php
+class P extends ServiceProvider
+{
+    public function boot()
+    {
+        $this->loadViewsFrom(__DIR__ . '/../resources/views', 'plain');
+        $this->loadViewsFrom(realpath(__DIR__ . '/../resources/admin'), 'wrapped');
+        $this->loadViewsFrom(resource_path('views/vendor/shop'), 'helper');
+    }
+}
+"#,
+        "/pkg/src/Providers/P.php",
+    );
+    assert_eq!(
+        ns,
+        vec![
+            (
+                "plain".to_string(),
+                Some(PathBuf::from("/pkg/src/resources/views"))
+            ),
+            (
+                "wrapped".to_string(),
+                Some(PathBuf::from("/pkg/src/resources/admin"))
+            ),
+            (
+                "helper".to_string(),
+                Some(PathBuf::from("/proj/resources/views/vendor/shop"))
+            ),
+        ]
+    );
+}
+
+/// The first-argument capture is non-greedy. A greedy `(.+)` backtracks to the
+/// LAST `, 'ns')` on the line, swallowing an intervening registration whole —
+/// so two calls sharing a line collapse into one. Line-separated calls cannot
+/// catch this, because `.` does not match a newline.
+#[test]
+fn two_registrations_on_one_line_are_captured_separately() {
+    let ns = discovered_view_namespaces(
+        r#"<?php
+class P extends ServiceProvider
+{
+    public function boot()
+    {
+        $this->loadViewsFrom(__DIR__ . '/a', 'one'); $this->loadViewsFrom(__DIR__ . '/b', 'two');
+    }
+}
+"#,
+        "/pkg/src/P.php",
+    );
+    assert_eq!(
+        ns,
+        vec![
+            ("one".to_string(), Some(PathBuf::from("/pkg/src/a"))),
+            ("two".to_string(), Some(PathBuf::from("/pkg/src/b"))),
+        ]
     );
 }

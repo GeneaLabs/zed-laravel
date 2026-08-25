@@ -24,6 +24,10 @@ use crate::config::kebab_to_pascal_case;
 use crate::middleware_parser::middleware_base_alias;
 use crate::parser::{language_php, parse_php};
 use crate::queries::extract_all_php_patterns;
+// Single source of truth for the strip-then-join rule applied to relative
+// fragments captured from PHP source — a leading `/` would otherwise make
+// `Path::join` discard the base directory (issues #285, #290).
+use crate::path_join::join_relative;
 // Single source of truth for lexical path normalization. The local copy this
 // replaced popped unconditionally on `..`, so a `..` walking past root would
 // pop the `RootDir` component and silently relativize an absolute path (#117).
@@ -1707,16 +1711,6 @@ pub struct ParsedServiceProvider<'db> {
     pub anonymous_component_namespaces: Vec<ParsedAnonymousComponentNamespaceReg<'db>>,
 }
 
-/// Resolve the relative fragment captured from a
-/// `loadViewsFrom(__DIR__ . '<rel>', 'ns')` registration against the
-/// provider's directory. The capture keeps its leading slash
-/// ("/../resources/views"), and `Path::join` REPLACES the receiver when
-/// handed an absolute path — strip it, or every `__DIR__.'/…'` registration
-/// resolves to a nonsense root-relative path.
-fn resolve_load_views_relative(provider_dir: &Path, relative: &str) -> PathBuf {
-    provider_dir.join(relative.trim_start_matches('/').trim_start_matches("./"))
-}
-
 /// Parse a service provider file and extract middleware, bindings, views, and components
 #[salsa::tracked]
 pub fn parse_service_provider_source<'db>(
@@ -1733,9 +1727,22 @@ pub fn parse_service_provider_source<'db>(
             r#"\$this->app->alias\s*\(\s*\\?([A-Za-z0-9_\\]+)(?:::class)?\s*,\s*['"]([^'"]+)['"]\s*\)"#
         ).unwrap();
 
-        /// Matches $this->loadViewsFrom(__DIR__.'/../path', 'namespace')
+        /// Matches `$this->loadViewsFrom(<path expression>, 'namespace')` with
+        /// arbitrary whitespace around the `->` (Pint puts a fluent `->` on its
+        /// own line). The first argument is captured whole and handed to
+        /// [`resolve_php_path_expr`], so `__DIR__ . '/rel'`,
+        /// `realpath(__DIR__ . '/rel')` and `resource_path('views/vendor/ns')`
+        /// all resolve through one path rather than a pattern each.
+        ///
+        /// Receivers other than `$this` (`static::`, `$this->app->`) are
+        /// deliberately NOT matched: the framework resolves those against a
+        /// different object, and guessing a directory for them would register
+        /// a wrong path rather than none. Runtime-computed arguments
+        /// (`loadViewsFrom($dir, $name)`) stay out of reach lexically — the
+        /// builder-convention reconstruction further down covers the common
+        /// package case.
         static ref LOAD_VIEWS_RE: Regex = Regex::new(
-            r#"\$this->loadViewsFrom\s*\(\s*__DIR__\s*\.\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#
+            r#"\$this\s*->\s*loadViewsFrom\s*\(\s*(.+?)\s*,\s*['"]([^'"]+)['"]\s*\)"#
         ).unwrap();
 
         /// Matches a class-backed component registration with the tag first:
@@ -1962,38 +1969,43 @@ pub fn parse_service_provider_source<'db>(
         }
     }
 
-    // Parse loadViewsFrom() registrations
-    // Example: $this->loadViewsFrom(__DIR__.'/../resources/views', 'courier')
-    for cap in LOAD_VIEWS_RE.captures_iter(text) {
-        if let (Some(relative_path), Some(namespace)) = (cap.get(1), cap.get(2)) {
-            let relative_path_str = relative_path.as_str();
-            let namespace_str = namespace.as_str();
+    // Parse loadViewsFrom() registrations. The first argument is captured as
+    // a whole expression and resolved by `resolve_php_path_expr`, so every
+    // supported shape goes through one path:
+    //   $this->loadViewsFrom(__DIR__ . '/../resources/views', 'courier')
+    //   $this->loadViewsFrom(realpath(__DIR__ . '/../views'), 'courier')
+    //   $this->loadViewsFrom(resource_path('views/vendor/shop'), 'shop')
+    // See the notes on LOAD_VIEWS_RE for the shapes deliberately left
+    // unmatched, and why registering nothing beats registering a guess.
+    let provider_dir = path.parent().unwrap_or(path.as_path());
+    let registrations = LOAD_VIEWS_RE.captures_iter(text).filter_map(|cap| {
+        let (expr, namespace) = (cap.get(1)?, cap.get(2)?);
+        Some((
+            resolve_php_path_expr(expr.as_str(), &root, provider_dir)?,
+            namespace,
+        ))
+    });
 
-            let line = text[..namespace.start()].lines().count() as u32;
+    for (view_path, namespace) in registrations {
+        let line = text[..namespace.start()].lines().count() as u32;
+        let resolved_path = if view_path.exists() {
+            Some(view_path.canonicalize().unwrap_or(view_path))
+        } else {
+            // For non-existent paths, store the normalized form so the
+            // diagnostic can show the expected location even if it
+            // doesn't resolve on disk yet.
+            Some(normalize_path(&view_path))
+        };
 
-            // Resolve __DIR__ + relative path
-            // __DIR__ is the directory containing the service provider file
-            let provider_dir = path.parent().unwrap_or(path.as_path());
-            let view_path = resolve_load_views_relative(provider_dir, relative_path_str);
-            let resolved_path = if view_path.exists() {
-                Some(view_path.canonicalize().unwrap_or(view_path))
-            } else {
-                // For non-existent paths, store the normalized form so the
-                // diagnostic can show the expected location even if it
-                // doesn't resolve on disk yet.
-                Some(normalize_path(&view_path))
-            };
-
-            let pkg_namespace = PackageNamespace::new(db, namespace_str.to_string());
-            view_namespaces.push(ParsedViewNamespaceReg::new(
-                db,
-                pkg_namespace,
-                resolved_path,
-                line,
-                priority,
-                path.clone(),
-            ));
-        }
+        let pkg_namespace = PackageNamespace::new(db, namespace.as_str().to_string());
+        view_namespaces.push(ParsedViewNamespaceReg::new(
+            db,
+            pkg_namespace,
+            resolved_path,
+            line,
+            priority,
+            path.clone(),
+        ));
     }
 
     // Parse imperative View-factory namespace registrations:
@@ -2841,9 +2853,19 @@ fn resolve_php_path_expr(expr: &str, root: &Path, provider_dir: &Path) -> Option
         ).unwrap();
         /// A bare string literal.
         static ref LITERAL_RE: Regex = Regex::new(r#"^['"]([^'"]+)['"]$"#).unwrap();
+        /// `realpath(<expr>)` — unwrapped and resolved as its inner expression.
+        static ref REALPATH_RE: Regex = Regex::new(r#"^realpath\s*\(\s*(.+?)\s*\)$"#).unwrap();
     }
 
     let expr = expr.trim();
+
+    // `realpath(X)` is a pure syntactic pass-through here: it resolves exactly
+    // as `X` does. PHP's runtime behaviour — following symlinks, returning
+    // `false` for a missing path — is out of scope for a static pass, which
+    // never touches the filesystem to decide what a registration names.
+    if let Some(cap) = REALPATH_RE.captures(expr) {
+        return resolve_php_path_expr(cap.get(1).unwrap().as_str(), root, provider_dir);
+    }
 
     if let Some(cap) = HELPER_RE.captures(expr) {
         let helper = cap.get(1).unwrap().as_str();
@@ -2862,14 +2884,14 @@ fn resolve_php_path_expr(expr: &str, root: &Path, provider_dir: &Path) -> Option
         let joined = if sub.is_empty() {
             base
         } else {
-            base.join(sub.trim_start_matches('/'))
+            join_relative(&base, sub)
         };
         return Some(normalize_path(&joined));
     }
 
     if let Some(cap) = DIR_CONST_RE.captures(expr) {
-        let sub = cap.get(1).unwrap().as_str().trim_start_matches('/');
-        return Some(normalize_path(&provider_dir.join(sub)));
+        let sub = cap.get(1).unwrap().as_str();
+        return Some(normalize_path(&join_relative(provider_dir, sub)));
     }
 
     if let Some(cap) = LITERAL_RE.captures(expr) {

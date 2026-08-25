@@ -38,6 +38,7 @@
 //! follow-up once the scan time becomes a noticeable cost on first hover.
 
 use crate::parser::parse_php;
+use crate::path_join::join_relative;
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashMap;
@@ -314,15 +315,6 @@ fn resolve_dir_base(node: tree_sitter::Node, bytes: &[u8], provider_dir: &Path) 
         }
         _ => None,
     }
-}
-
-/// Join a captured relative fragment onto a base directory. PHP source like
-/// `__DIR__.'/../resources/lang'` yields a fragment starting with `/`; Rust's
-/// `Path::join` treats a leading `/` as absolute and discards the receiver, so
-/// strip leading `/` and `./` before joining.
-fn join_relative(base: &Path, rel: &str) -> PathBuf {
-    let rel = rel.trim_start_matches('/').trim_start_matches("./");
-    base.join(rel)
 }
 
 /// The first string-literal argument of a function call, or `None`.
