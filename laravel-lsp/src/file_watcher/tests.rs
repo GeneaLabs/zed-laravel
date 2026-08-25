@@ -237,7 +237,7 @@ fn psr4_glob_that_exactly_duplicates_an_existing_one_is_skipped() {
     let psr4 = vec![root.join("app"), root.join("app")];
     let watchers = build_watchers(&root, &[root.join("resources/views")], None, &psr4);
 
-    let expected = format!("{}/app/**/*.php", root.display());
+    let expected = format!("{}/app/**/*.php", super::glob_base(&root));
     let count = globs_of(&watchers)
         .into_iter()
         .filter(|g| g == &expected)
@@ -260,7 +260,7 @@ fn overlapping_psr4_glob_coexists_with_fixed_controllers_glob() {
     assert!(
         globs
             .iter()
-            .any(|g| g == &format!("{}/app/**/*.php", root.display())),
+            .any(|g| g == &format!("{}/app/**/*.php", super::glob_base(&root))),
         "missing widened app glob: {globs:?}"
     );
     assert!(

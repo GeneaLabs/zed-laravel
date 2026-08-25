@@ -9,7 +9,10 @@ fn test_resolve_class_to_file() {
     assert!(result.is_some());
     let path = result.unwrap();
     assert!(path.ends_with("Authenticate.php"));
-    assert!(path.to_string_lossy().contains("app/Http/Middleware"));
+    assert!(crate::path_segments::contains_segments(
+        &path,
+        "app/Http/Middleware"
+    ));
 }
 
 #[test]

@@ -1310,7 +1310,7 @@ pub fn parse_livewire_config(db: &dyn Db, file: ConfigFile, root: PathBuf) -> Op
 
     // Look for class_namespace patterns
     if text.contains("App\\Livewire") || text.contains("App\\\\Livewire") {
-        return Some(root.join("app/Livewire"));
+        return Some(root.join("app").join("Livewire"));
     }
 
     if text.contains("App\\Http\\Livewire") || text.contains("App\\\\Http\\\\Livewire") {
@@ -1351,7 +1351,7 @@ pub fn build_laravel_config<'db>(
             .and_then(|f| parse_livewire_config(db, f, root.clone()))
             .or_else(|| {
                 // Default Livewire paths
-                let v3_path = root.join("app/Livewire");
+                let v3_path = root.join("app").join("Livewire");
                 let v2_path = root.join("app/Http/Livewire");
                 if v3_path.exists() {
                     Some(v3_path)

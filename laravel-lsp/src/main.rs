@@ -14005,7 +14005,7 @@ impl LaravelLanguageServer {
             },
             None => {
                 // Default to app/Livewire if no config
-                let v3_path = root.join("app/Livewire");
+                let v3_path = root.join("app").join("Livewire");
                 let v2_path = root.join("app/Http/Livewire");
                 if v3_path.exists() {
                     v3_path

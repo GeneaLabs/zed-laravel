@@ -1071,8 +1071,11 @@ mod resolution {
         // Test that kebab-case converts to PascalCase correctly
         let root = test_project_path();
         let path = resolve_livewire_path(&root, "actions.logout");
+        // Segment matching, not a forward-slash substring: the path carries the
+        // platform separator, so `contains("Actions/Logout.php")` only ever
+        // matched on Unix (issue #292).
         assert!(
-            path.to_string_lossy().contains("Actions/Logout.php"),
+            laravel_lsp::path_segments::contains_segments(&path, "Actions/Logout.php"),
             "Livewire path should use PascalCase: {:?}",
             path
         );

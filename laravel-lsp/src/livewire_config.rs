@@ -74,7 +74,7 @@ impl LivewireConfig {
             make_command_type: ComponentFormat::Sfc,
             make_command_emoji: true,
             class_namespace: "App\\Livewire".to_string(),
-            class_path: root.join("app/Livewire"),
+            class_path: root.join("app").join("Livewire"),
             view_path: root.join("resources/views/livewire"),
         }
     }

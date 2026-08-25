@@ -191,7 +191,7 @@ fn unaliased_component_falls_back_to_directory_convention() {
     assert!(
         paths
             .iter()
-            .all(|p| !p.to_string_lossy().contains("buttons/light-button")),
+            .all(|p| !crate::path_segments::contains_segments(p, "buttons/light-button")),
         "alias must not bleed into unrelated lookups: {:?}",
         paths,
     );
@@ -208,7 +208,7 @@ fn namespaced_component_bypasses_alias_map() {
     assert!(
         paths
             .iter()
-            .all(|p| !p.to_string_lossy().contains("components/never/this")),
+            .all(|p| !crate::path_segments::contains_segments(p, "components/never/this")),
         "namespaced lookup must bypass alias map: {:?}",
         paths,
     );
@@ -619,7 +619,7 @@ fn unregistered_anonymous_prefix_does_not_borrow_registered_directory() {
     assert!(
         paths
             .iter()
-            .all(|p| !p.to_string_lossy().contains("backstage/components")),
+            .all(|p| !crate::path_segments::contains_segments(p, "backstage/components")),
         "unregistered prefix must not resolve into a registered anon directory: {:?}",
         paths,
     );
