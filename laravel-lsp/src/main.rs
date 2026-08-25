@@ -16146,40 +16146,40 @@ return [
             None
         };
 
-        {
-            if let Ok(target_uri) = Url::from_file_path(&translation_path) {
-                let origin_selection_range = Range {
-                    start: Position {
-                        line: trans.line,
-                        character: trans.column,
-                    },
-                    end: Position {
-                        line: trans.line,
-                        character: trans.end_column,
-                    },
-                };
+        if let Ok(target_uri) = Url::from_file_path(&translation_path) {
+            let origin_selection_range = Range {
+                start: Position {
+                    line: trans.line,
+                    character: trans.column,
+                },
+                end: Position {
+                    line: trans.line,
+                    character: trans.end_column,
+                },
+            };
 
-                // Jump to the key's own line where we can locate it, else the
-                // top of the file (the file resolved, only the key didn't).
-                let target_range = match php_key_path.as_deref() {
-                    // JSON text key: line of the `"key":` property.
-                    None => Self::find_json_key_location(&translation_path, &trans.key)
-                        .unwrap_or_default(),
-                    // PHP nested array key: walk the array to the leaf's line.
-                    Some(key_path) if !key_path.is_empty() => {
-                        Self::locate_php_key_range(&translation_path, key_path).unwrap_or_default()
-                    }
-                    Some(_) => Range::default(),
-                };
+            // Jump to the key's own line where we can locate it, else the
+            // top of the file (the file resolved, only the key didn't).
+            let target_range = match php_key_path.as_deref() {
+                // JSON text key: line of the `"key":` property.
+                None => {
+                    Self::find_json_key_location(&translation_path, &trans.key).unwrap_or_default()
+                }
+                // PHP nested array key: walk the array to the leaf's line.
+                Some(key_path) if !key_path.is_empty() => {
+                    Self::locate_php_key_range(&translation_path, key_path).unwrap_or_default()
+                }
+                Some(_) => Range::default(),
+            };
 
-                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                    origin_selection_range: Some(origin_selection_range),
-                    target_uri,
-                    target_range,
-                    target_selection_range: target_range,
-                }]));
-            }
+            return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                origin_selection_range: Some(origin_selection_range),
+                target_uri,
+                target_range,
+                target_selection_range: target_range,
+            }]));
         }
+
         None
     }
 

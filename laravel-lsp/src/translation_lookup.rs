@@ -1,22 +1,30 @@
 //! Resolve Laravel translation keys to their localized strings.
 //!
+//! Every shape resolves under `{lang_root}/`, where `{lang_root}` is `lang/`
+//! (Laravel 9+) or `resources/lang/` (Laravel 8 and earlier) — both are always
+//! searched, in that order. See [`project_lang_roots`].
+//!
 //! Laravel supports three translation shapes:
 //!
 //! - **Dotted keys** (`__('validation.required')`) — resolved through PHP files
-//!   under `lang/{locale}/`. `validation.required` → `lang/en/validation.php`,
-//!   key `required`.
+//!   under `{lang_root}/{locale}/`. `validation.required` →
+//!   `lang/de/validation.php` on a `de` project, key `required`.
 //!
 //! - **Namespaced dotted keys** (`__('filament-tables::table.label')`) — resolved
-//!   through `lang/vendor/{namespace}/{locale}/{file}.php` (the published
-//!   location for package translations). Vendor packages that haven't been
-//!   published still hold their source translations under
-//!   `vendor/{vendor}/{package}/...` but this resolver only checks the
-//!   published path. Scanning unpublished package translations is a separate
-//!   piece of work tracked elsewhere.
+//!   through `{lang_root}/vendor/{namespace}/{locale}/{file}.php` (the published
+//!   location for package translations) first, then — when the caller supplies
+//!   the `vendor_map` built by [`crate::vendor_translations`] — the package's
+//!   own unpublished lang directory under `vendor/{vendor}/{package}/...`.
+//!   That directory comes from untrusted source, so every read against it is
+//!   fenced by [`crate::path_containment`] (issue #248).
 //!
 //! - **Text keys** (`__('Welcome to our app')`) — resolved through the single
-//!   JSON file `lang/{locale}.json`. The key IS the source string and the
-//!   value is the translated string.
+//!   JSON file `{lang_root}/{locale}.json`. The key IS the source string and
+//!   the value is the translated string.
+//!
+//! No shape assumes a locale. [`available_locales`] answers "which locales
+//! could define this key", and hover, go-to-definition and diagnostics all
+//! resolve against that one set so they cannot disagree (issue #288).
 //!
 //! All three shapes route to the same PHP-array walker from [`config_lookup`]
 //! since Laravel's `.php` translation files share their exact shape with
@@ -195,7 +203,8 @@ const DEFAULT_LOCALE: &str = "en";
 /// namespaced key, the project lang roots otherwise — and treats both locale
 /// *subdirectories* and `{locale}.json` catalogues as evidence of a locale.
 /// The `vendor` subdirectory is excluded: it holds published package
-/// translations, not a locale.
+/// translations, not a locale. A registered namespace directory that resolves
+/// outside the project root is dropped before it is read (issue #248).
 ///
 /// Never returns empty. A project with no discoverable locales (no lang
 /// directory at all, or one containing nothing) falls back to
@@ -214,8 +223,16 @@ pub fn available_locales(
         for lang in project_lang_roots(root) {
             dirs.push(lang.join("vendor").join(namespace));
         }
+        // The unpublished vendor dir comes from a `loadTranslationsFrom`
+        // argument in project/vendor source — untrusted input that can point
+        // anywhere (issue #248). `resolve_namespaced_in_dir` already fences its
+        // read; this enumeration is a read site too, so it takes the same
+        // fail-closed guard rather than `read_dir`-ing an out-of-root directory
+        // and rendering whatever it finds there as this key's locales.
         if let Some(dir) = vendor_map.and_then(|m| m.get(namespace)) {
-            dirs.push(dir.clone());
+            if crate::path_containment::path_within_root(dir, root) {
+                dirs.push(dir.clone());
+            }
         }
     } else {
         dirs.extend(project_lang_roots(root));

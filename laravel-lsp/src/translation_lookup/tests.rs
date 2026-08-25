@@ -427,6 +427,35 @@ fn available_locales_deduplicates_overlapping_vendor_dirs() {
     );
 }
 
+/// The unpublished vendor dir is built from a `loadTranslationsFrom` argument
+/// in untrusted source and can point anywhere. Enumerating it is a read, so it
+/// takes the same fail-closed containment guard the namespaced *resolver*
+/// already applies (issue #248) — an out-of-root directory must contribute no
+/// locales, rather than having its subdirectory names rendered as this key's
+/// locale list.
+#[test]
+fn available_locales_refuses_an_out_of_root_vendor_dir() {
+    let dir = TempDir::new().unwrap();
+    // The published override contributes `de`, so a non-empty result can't be
+    // mistaken for the "no locales anywhere" fallback.
+    fs::create_dir_all(dir.path().join("lang/vendor/shop/de")).unwrap();
+
+    // A sibling tree entirely outside the project root, holding locales that
+    // must never surface.
+    let outside = TempDir::new().unwrap();
+    fs::create_dir_all(outside.path().join("ja")).unwrap();
+    fs::create_dir_all(outside.path().join("ko")).unwrap();
+
+    let mut map = HashMap::new();
+    map.insert("shop".to_string(), outside.path().to_path_buf());
+
+    assert_eq!(
+        available_locales(dir.path(), "shop::messages.title", Some(&map)),
+        vec!["de"],
+        "an out-of-root vendor dir must contribute nothing"
+    );
+}
+
 // --- APP_LOCALE ordering ----------------------------------------------------
 
 /// `fr` is deliberately NOT alphabetically first among the discovered
