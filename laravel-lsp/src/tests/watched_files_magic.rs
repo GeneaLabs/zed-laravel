@@ -814,7 +814,23 @@ async fn incremental_batch_runs_regardless_of_project_size() {
 
     // Inflate the pattern cache past the retired 15,000-file gate with cheap
     // empty entries (no parsing — direct DashMap inserts).
-    let cache = backend.salsa.pattern_cache();
+    // Register the project so the actor publishes the shared pattern cache —
+    // `seed` only drives per-file updates, which never trigger the walk.
+    backend
+        .salsa
+        .register_project_files(
+            root.to_path_buf(),
+            vec![PathBuf::from("app/Http/Controllers")],
+            vec![root.join("resources/views")],
+            None,
+            PathBuf::from("routes"),
+        )
+        .await
+        .unwrap();
+    let cache = backend
+        .salsa
+        .pattern_cache()
+        .expect("registration publishes the pattern cache");
     for i in 0..15_001 {
         cache.insert(
             root.join(format!("app/Filler/F{i}.php")),

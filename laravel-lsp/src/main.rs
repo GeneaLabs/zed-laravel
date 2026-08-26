@@ -4773,22 +4773,6 @@ impl LaravelLanguageServer {
 
         info!("Laravel: Project files registered with Salsa for reference finding");
 
-        // Size the shared pattern cache for this project's real file count
-        // now that `register_project_files`'s walk has discovered it — and
-        // BEFORE either of the two bulk-insert paths below (the disk-cache
-        // restore and warming's bulk import) run. Sizing here means neither
-        // one grows the table through a series of rehashes as it inserts.
-        // `list_project_files` just returns the actor's already-discovered
-        // list (no re-walk); a failure here is non-fatal — it only costs
-        // the resize's benefit, not correctness — so we log and continue.
-        match self.salsa.list_project_files().await {
-            Ok(paths) => self.salsa.resize_pattern_cache(paths.len()),
-            Err(e) => debug!(
-                "list_project_files failed, pattern cache stays at its bootstrap capacity: {}",
-                e
-            ),
-        }
-
         // Disk-cache restore. Loads previously-parsed patterns into the
         // shared pattern_cache, dropping any entry whose on-disk mtime
         // doesn't match what was cached. Anything restored here gets
@@ -4798,7 +4782,18 @@ impl LaravelLanguageServer {
         if let Some(p) = progress.as_mut() {
             p.report("Loading cached index…", Some(0), true).await;
         }
-        let pattern_cache = self.salsa.pattern_cache();
+        // Published by the actor at the end of the registration walk above,
+        // sized for the file count that walk discovered. Absent only if that
+        // registration didn't complete — in which case there's no indexed
+        // project to load a cache into or warm, so stop rather than build a
+        // second, unshared table nothing else would ever read.
+        let Some(pattern_cache) = self.salsa.pattern_cache() else {
+            debug!("Pattern cache not published; skipping disk-cache load and warming");
+            if let Some(p) = progress {
+                p.end("Project indexing unavailable.").await;
+            }
+            return;
+        };
         let root_for_load = root_path.to_path_buf();
         let cache_for_load = pattern_cache.clone();
         // The load is a sync, parallel (rayon) pass over ~40k cache
@@ -6647,17 +6642,23 @@ impl LaravelLanguageServer {
                 .map(|c| c.view_paths.clone())
                 .unwrap_or_default();
             let changed: HashSet<&str> = changed_views.iter().map(String::as_str).collect();
-            for entry in self.salsa.pattern_cache().iter() {
-                let p = entry.key();
-                if !p.to_string_lossy().ends_with(".blade.php")
-                    || p.components().any(|c| c.as_os_str() == "vendor")
-                {
-                    continue;
-                }
-                if let Some(name) = laravel_lsp::view_var_index::view_name_for_path(p, &view_paths)
-                {
-                    if changed.contains(name.as_str()) {
-                        work.insert(p.clone());
+            // No published cache means nothing has been indexed yet, so there
+            // are no Blade files to re-resolve — an empty work set, not a
+            // missed refresh.
+            if let Some(cache) = self.salsa.pattern_cache() {
+                for entry in cache.iter() {
+                    let p = entry.key();
+                    if !p.to_string_lossy().ends_with(".blade.php")
+                        || p.components().any(|c| c.as_os_str() == "vendor")
+                    {
+                        continue;
+                    }
+                    if let Some(name) =
+                        laravel_lsp::view_var_index::view_name_for_path(p, &view_paths)
+                    {
+                        if changed.contains(name.as_str()) {
+                            work.insert(p.clone());
+                        }
                     }
                 }
             }

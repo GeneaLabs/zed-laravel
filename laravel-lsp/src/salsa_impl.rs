@@ -5539,70 +5539,40 @@ pub enum SalsaRequest {
 #[derive(Clone)]
 pub struct SalsaHandle {
     sender: mpsc::Sender<SalsaRequest>,
-    /// Shared concurrent pattern cache — same cell the actor holds. Reads
-    /// and writes from here NEVER go through the actor's mpsc channel,
-    /// which means they're never blocked behind a slow handler. See the
-    /// comment on `SalsaActor::pattern_cache` for why this exists, and on
-    /// `resize_pattern_cache` for why it's an `RwLock<Arc<DashMap>>`
-    /// rather than a plain `Arc<DashMap>`.
+    /// Publication slot for the shared concurrent pattern cache. Reads and
+    /// writes through it NEVER go through the actor's mpsc channel, which
+    /// means they're never blocked behind a slow handler. See the comment on
+    /// `SalsaActor::pattern_cache` for why that matters.
+    ///
+    /// Empty until the actor finishes its first project walk and publishes a
+    /// table sized for the real file count (see
+    /// `SalsaActor::size_and_publish_pattern_cache`). A `OnceLock` rather
+    /// than a plain `Arc<DashMap>` handed out at `spawn()` because the
+    /// capacity isn't knowable that early — and a `OnceLock` rather than a
+    /// swappable `RwLock<Arc<DashMap>>` because a swap would silently split
+    /// a long-lived caller (warming holds this `Arc` for minutes) from the
+    /// table the actor is writing to. Published exactly once, so an `Arc`
+    /// taken from here is the live table for the rest of the session.
     pattern_cache:
-        Arc<std::sync::RwLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>>,
+        Arc<std::sync::OnceLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>>,
 }
 
 impl SalsaHandle {
     /// Borrow the shared pattern cache directly. The on-disk cache module
-    /// uses this to pre-load entries before warming starts, and to read
-    /// them back out after warming completes for persistence. Returned
-    /// `Arc` is cheap to clone — the underlying `DashMap` is the same
-    /// instance the actor reads from in `handle_get_patterns`, current as
-    /// of this call (a concurrent `resize_pattern_cache` swaps the cell to
-    /// a NEW `Arc`, which this snapshot won't see — harmless in practice,
-    /// since resize only ever runs once, early, before any caller takes
-    /// this snapshot for warming or disk-cache I/O).
-    pub fn pattern_cache(&self) -> Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>> {
-        self.pattern_cache.read().unwrap().clone()
-    }
-
-    /// Re-size the shared pattern cache for a project with `expected_files`
-    /// entries, plus [`PATTERN_CACHE_CAPACITY_PADDING`] headroom.
+    /// uses this to pre-load entries before warming starts, and to read them
+    /// back out after warming completes for persistence. The returned `Arc`
+    /// is cheap to clone and points at the same `DashMap` instance the actor
+    /// reads from in `handle_get_patterns` — for the rest of the session, not
+    /// just for the moment of this call.
     ///
-    /// dashmap 6.x has no `reserve`: the only way to grow a `DashMap`'s
-    /// table is to build a new, bigger one. Callers should invoke this
-    /// EXACTLY ONCE, right after `list_project_files` reports the
-    /// project's real file count (discovered by `register_project_files`'s
-    /// walk) — and BEFORE the disk-cache load and warming's bulk import,
-    /// both of which are the actual insert volume this sizing avoids
-    /// rehashing. `+ PATTERN_CACHE_CAPACITY_PADDING` covers files that
-    /// appear after this call without an immediate rehash — a `composer
-    /// update` pulling in new vendor packages, or new app files created
-    /// mid-session.
-    ///
-    /// A handful of entries can already be in the cache when this runs
-    /// (an editor may send `didOpen` for already-open buffers before
-    /// project registration finishes) — those are migrated into the
-    /// resized table, not dropped. No-op if the cache is already at least
-    /// as large as the target, so a second call (or a re-registration)
-    /// doesn't pay for a needless rebuild.
-    ///
-    /// Honest limit: this only avoids growth for the FIRST index of a
-    /// project. There's no signal to size from before this call runs, so
-    /// a cold start (no on-disk cache yet, nothing has called this)
-    /// still grows the table organically from
-    /// [`PATTERN_CACHE_INITIAL_CAPACITY`] as warming's own inserts land —
-    /// each such rehash is a per-shard event (dashmap defaults to 16
-    /// shards), so its cost is a fraction of a full-table rehash, not the
-    /// whole thing at once.
-    pub fn resize_pattern_cache(&self, expected_files: usize) {
-        let target_capacity = expected_files.saturating_add(PATTERN_CACHE_CAPACITY_PADDING);
-        let mut current = self.pattern_cache.write().unwrap();
-        if current.capacity() >= target_capacity {
-            return;
-        }
-        let resized = dashmap::DashMap::with_capacity(target_capacity);
-        for entry in current.iter() {
-            resized.insert(entry.key().clone(), entry.value().clone());
-        }
-        *current = Arc::new(resized);
+    /// `None` until the actor has walked a project and published the table
+    /// (see `SalsaActor::size_and_publish_pattern_cache`). Callers that run
+    /// before project registration — or in a test/tooling instance that never
+    /// registers one — must handle that rather than assume a cache exists.
+    pub fn pattern_cache(
+        &self,
+    ) -> Option<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>> {
+        self.pattern_cache.get().cloned()
     }
 
     /// Update or create a file in the database
@@ -5979,12 +5949,20 @@ impl SalsaHandle {
     /// Real-world cost: ~7ms for 40,589 entries (per earlier bench).
     /// The `async fn` and `Result` shape is preserved for source
     /// compatibility with the existing call sites.
+    ///
+    /// Errors if the actor hasn't published the cache yet. Every caller is on
+    /// the warming path, which only runs after project registration, so this
+    /// should be unreachable — but dropping the batch loudly beats inserting
+    /// it into a table nothing else can see.
     pub async fn bulk_import_patterns(
         &self,
         entries: Vec<(PathBuf, Arc<ParsedPatternsData>)>,
     ) -> Result<usize, &'static str> {
+        let cache = self
+            .pattern_cache
+            .get()
+            .ok_or("pattern cache not published — no project registered yet")?;
         let total = entries.len();
-        let cache = self.pattern_cache.read().unwrap();
         for (path, data) in entries {
             cache.insert(path, (0, data));
         }
@@ -6958,24 +6936,27 @@ pub struct SalsaActor {
     /// no reason they should serialize through the actor.
     ///
     /// DashMap is lock-free for reads and uses per-shard locks for writes
-    /// (16 shards by default), so contention between the actor's read path
-    /// and warming's bulk insert is negligible. There is no cap: it holds
-    /// exactly one entry per indexed file (app + vendor), so its size is
-    /// whatever the project's file count makes it — on a large project
+    /// (`(available_parallelism * 4).next_power_of_two()` shards by default —
+    /// 64 on a typical 10-to-16-core dev machine), so contention between the
+    /// actor's read path and warming's bulk insert is negligible. There is no
+    /// cap: it holds exactly one entry per indexed file (app + vendor), so its
+    /// size is whatever the project's file count makes it — on a large project
     /// that's tens of thousands of entries, several hundred MB total. Wins
     /// like dropping vendor `member_access_refs` at parse time (see
     /// `pattern_indexer`'s vendor gate) shrink the PER-ENTRY cost; nothing
     /// here bounds the ENTRY COUNT.
     ///
-    /// Wrapped in an `RwLock` (rather than a bare `Arc<DashMap>`) so
-    /// `SalsaHandle::resize_pattern_cache` can swap in a table pre-sized
-    /// for the project's real file count once it's known — dashmap 6.x has
-    /// no `reserve`, so growing the table means building a new one and
-    /// replacing this cell. Every read/write here pays one uncontended
-    /// `RwLock::read()` (an atomic increment/decrement), which is
-    /// negligible next to a DashMap shard lock or a tree-sitter parse.
-    pattern_cache:
-        Arc<std::sync::RwLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>>,
+    /// Replaced exactly once, by `size_and_publish_pattern_cache`, with a
+    /// table pre-sized for the project's real file count — dashmap 6.x has no
+    /// `reserve`, so growing the table means building a new one. That happens
+    /// before the table is ever published to a `SalsaHandle`, so no other
+    /// holder can be left pointing at the discarded one.
+    pattern_cache: Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
+    /// The slot every `SalsaHandle` reads `pattern_cache` out of. Filled by
+    /// `size_and_publish_pattern_cache` once the first project walk knows how
+    /// big the table should be; see `SalsaHandle::pattern_cache`.
+    pattern_cache_slot:
+        Arc<std::sync::OnceLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>>,
     /// LRU cache of parsed Blade loop blocks, keyed by file path + version.
     /// Salsa already memoizes the underlying query, but caching the Arc avoids
     /// re-walking the query graph on every diagnostic / completion request.
@@ -7101,14 +7082,14 @@ pub struct SalsaActor {
     salsa_sp_root: Option<PathBuf>,
 }
 
-/// Bootstrap capacity for the shared pattern cache, used only until
-/// `SalsaHandle::resize_pattern_cache` sizes it for real (see that method
-/// and `SalsaActor::spawn`).
+/// Bootstrap capacity for the pattern cache, used only until
+/// [`SalsaActor::size_and_publish_pattern_cache`] sizes it for real (see that
+/// method and [`SalsaActor::spawn`]).
 const PATTERN_CACHE_INITIAL_CAPACITY: usize = 1024;
 
 /// Headroom added on top of the discovered file count when
-/// `SalsaHandle::resize_pattern_cache` sizes the pattern cache — covers
-/// files that appear after that call without forcing an immediate rehash
+/// [`SalsaActor::size_and_publish_pattern_cache`] sizes the pattern cache —
+/// covers files that appear afterwards without forcing an immediate rehash
 /// (a `composer update`, new app files created mid-session).
 const PATTERN_CACHE_CAPACITY_PADDING: usize = 1000;
 
@@ -7117,27 +7098,17 @@ impl SalsaActor {
     pub fn spawn() -> SalsaHandle {
         let (tx, rx) = mpsc::channel(256);
 
-        // Shared pattern cache: created here, cloned into both the actor
-        // and the SalsaHandle. Both ends use the SAME cell so writes from
-        // either side are immediately visible on the other, and so a later
-        // `resize_pattern_cache` swap (see that method) is visible to both
-        // too.
-        //
-        // `spawn()` runs before any project is known — the LSP server is
-        // constructed here, before `initialize` carries a workspace root —
-        // so there's no file count to size against yet. This modest
-        // capacity is only the bootstrap value: `register_project_files`'s
-        // caller resizes the table for real via `resize_pattern_cache` as
-        // soon as the project's file count is known, before the disk-cache
-        // load or warming insert anything into it. A short-lived
-        // test/tooling instance that never registers a project keeps this
-        // small default and never pays for a monorepo-sized table.
-        let pattern_cache: Arc<
-            std::sync::RwLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>,
-        > = Arc::new(std::sync::RwLock::new(Arc::new(
-            dashmap::DashMap::with_capacity(PATTERN_CACHE_INITIAL_CAPACITY),
-        )));
-        let pattern_cache_for_actor = pattern_cache.clone();
+        // The pattern cache is published to handles through this slot rather
+        // than handed out here, because `spawn()` runs before any project is
+        // known — the LSP server is constructed at this point, before
+        // `initialize` carries a workspace root — so there's no file count to
+        // size a table against yet. `handle_register_project_files` fills the
+        // slot once its walk knows the count. A short-lived test/tooling
+        // instance that never registers a project simply never fills it.
+        let pattern_cache_slot: Arc<
+            std::sync::OnceLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>,
+        > = Arc::new(std::sync::OnceLock::new());
+        let pattern_cache_slot_for_actor = pattern_cache_slot.clone();
 
         std::thread::spawn(move || {
             let mut actor = SalsaActor {
@@ -7145,7 +7116,14 @@ impl SalsaActor {
                 receiver: rx,
                 // Pre-allocate with reasonable capacity to avoid early reallocations
                 files: HashMap::with_capacity(64),
-                pattern_cache: pattern_cache_for_actor,
+                // Bootstrap table, big enough for the handful of `didOpen`
+                // buffers an editor may send before registration finishes.
+                // Replaced with a correctly-sized one — carrying those
+                // entries over — by `size_and_publish_pattern_cache`.
+                pattern_cache: Arc::new(dashmap::DashMap::with_capacity(
+                    PATTERN_CACHE_INITIAL_CAPACITY,
+                )),
+                pattern_cache_slot: pattern_cache_slot_for_actor,
                 loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 document_symbols_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
@@ -7198,7 +7176,7 @@ impl SalsaActor {
 
         SalsaHandle {
             sender: tx,
-            pattern_cache,
+            pattern_cache: pattern_cache_slot,
         }
     }
 
@@ -7241,7 +7219,7 @@ impl SalsaActor {
                 }
                 SalsaRequest::RemoveFile { path, reply } => {
                     self.files.remove(&path);
-                    self.pattern_cache.read().unwrap().remove(&path);
+                    self.pattern_cache.remove(&path);
                     self.loop_blocks_cache.pop(&path);
                     self.php_assignments_cache.pop(&path);
                     self.document_symbols_cache.pop(&path);
@@ -7269,7 +7247,9 @@ impl SalsaActor {
                     // pushing into HashMaps — no parsing). Clear first
                     // so we start from a known state.
                     self.symbol_index.clear();
-                    let cache = self.pattern_cache.read().unwrap().clone();
+                    // Cloned so the iteration below borrows the Arc, not `self` —
+                    // `insert_file` needs `&mut self.symbol_index` at the same time.
+                    let cache = Arc::clone(&self.pattern_cache);
                     for entry in cache.iter() {
                         let path = entry.key();
                         let (_, ref patterns) = *entry.value();
@@ -7285,7 +7265,7 @@ impl SalsaActor {
                     // it, so a stale entry would otherwise never be re-parsed.
                     // The rest are dropped so no since-deleted file's symbols,
                     // hierarchy node, or cached parse can survive the rebuild.
-                    self.pattern_cache.read().unwrap().clear();
+                    self.pattern_cache.clear();
                     self.symbol_index.clear();
                     self.class_hierarchy_index.clear();
                     self.loop_blocks_cache.clear();
@@ -7385,9 +7365,8 @@ impl SalsaActor {
                 // See SalsaActor::pattern_cache for the architectural why.
                 SalsaRequest::BulkImportPatterns { entries, reply } => {
                     let total = entries.len();
-                    let cache = self.pattern_cache.read().unwrap();
                     for (path, data) in entries {
-                        cache.insert(path, (0, data));
+                        self.pattern_cache.insert(path, (0, data));
                     }
                     let _ = reply.send(total);
                 }
@@ -7552,7 +7531,9 @@ impl SalsaActor {
                     // freshly resolved magic members. `remove_file` clears both
                     // kinds, so re-inserting literals here keeps them alive.
                     self.symbol_index.remove_file(&path);
-                    let cache = self.pattern_cache.read().unwrap();
+                    // Cloned so the lookup borrows the Arc, not `self` — `insert_file`
+                    // needs `&mut self.symbol_index` while the Ref guard is alive.
+                    let cache = Arc::clone(&self.pattern_cache);
                     if let Some(cached) = cache.get(&path) {
                         let (_, ref patterns) = *cached;
                         self.symbol_index.insert_file(&path, patterns);
@@ -7811,7 +7792,7 @@ impl SalsaActor {
     /// Handle file update - create or update the SourceFile
     fn handle_update_file(&mut self, path: PathBuf, version: i32, text: String) {
         // Invalidate caches for this file - will be recomputed on next request
-        self.pattern_cache.read().unwrap().remove(&path);
+        self.pattern_cache.remove(&path);
         self.loop_blocks_cache.pop(&path);
         self.php_assignments_cache.pop(&path);
         self.document_symbols_cache.pop(&path);
@@ -7951,15 +7932,13 @@ impl SalsaActor {
         // we don't need a Salsa SourceFile input to serve cached
         // patterns.
         //
-        // DashMap::get returns a Ref guard; clone the Arc out and drop it
-        // (plus the RwLock read guard around it) before returning, so
-        // neither is held across the caller's continued use of `self`.
-        let cache = self.pattern_cache.read().unwrap();
-        let hit = cache.get(path).map(|entry| {
+        // DashMap::get returns a Ref guard holding a shard lock; clone the
+        // Arc out and let the guard drop at the end of this statement, so
+        // it's never held across the `&mut self` work below.
+        let hit = self.pattern_cache.get(path).map(|entry| {
             let (_, cached_data) = entry.value();
             Arc::clone(cached_data)
         });
-        drop(cache);
         if let Some(data) = hit {
             debug!("✅ Cache HIT for {} ({:?})", file_name, start.elapsed());
             return Some(data);
@@ -8546,8 +8525,6 @@ impl SalsaActor {
 
         // Cache the Arc for future requests (cheap Arc::clone on cache hit)
         self.pattern_cache
-            .read()
-            .unwrap()
             .insert(path.clone(), (version, Arc::clone(&data)));
 
         let total_time = start.elapsed();
@@ -9003,6 +8980,67 @@ impl SalsaActor {
             self.livewire_files.clone(),
             self.route_files.clone(),
         ));
+
+        // The buckets above are the only file-count signal in the process,
+        // and this is the moment they're complete — size the pattern cache
+        // from them before anything bulk-inserts into it.
+        self.size_and_publish_pattern_cache();
+    }
+
+    /// Number of distinct files the project walk discovered. Supersets the
+    /// categorized buckets (`source_files` covers all non-vendor code, and the
+    /// controller/view/livewire/route lists overlap it), so the union is
+    /// deduplicated — on borrowed paths, which costs a hash per entry and no
+    /// `PathBuf` allocations.
+    fn project_file_count(&self) -> usize {
+        let mut seen: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+        self.source_files
+            .iter()
+            .chain(self.controller_files.iter())
+            .chain(self.view_files.iter())
+            .chain(self.livewire_files.iter())
+            .chain(self.route_files.iter())
+            .chain(self.vendor_files.iter())
+            .filter(|p| seen.insert(p.as_path()))
+            .count()
+    }
+
+    /// Replace the bootstrap pattern cache with one sized for the project just
+    /// walked, then publish it to every [`SalsaHandle`].
+    ///
+    /// dashmap 6.x has no `reserve` — growing a `DashMap`'s table means
+    /// building a new one — so this runs BEFORE the table is shared, and only
+    /// ever once. Both halves of that matter:
+    ///
+    /// * **Before sharing.** The disk-cache load and warming's bulk import
+    ///   hold their `Arc` for the whole indexing pass; if the table could be
+    ///   swapped underneath them they'd read one map while the actor wrote to
+    ///   another. Sizing first and publishing second makes that unreachable
+    ///   rather than merely unlikely.
+    /// * **Only once.** A mid-session re-registration (a project-root change)
+    ///   leaves the existing table in place: [`PATTERN_CACHE_CAPACITY_PADDING`]
+    ///   absorbs ordinary growth, and organic per-shard rehashing beyond that
+    ///   is far cheaper than the alternative of a swap.
+    ///
+    /// Any entries already present — an editor may send `didOpen` for open
+    /// buffers before registration finishes — are migrated, not dropped.
+    fn size_and_publish_pattern_cache(&mut self) {
+        if self.pattern_cache_slot.get().is_some() {
+            return;
+        }
+
+        let target_capacity = self
+            .project_file_count()
+            .saturating_add(PATTERN_CACHE_CAPACITY_PADDING);
+        if self.pattern_cache.capacity() < target_capacity {
+            let sized = dashmap::DashMap::with_capacity(target_capacity);
+            for entry in self.pattern_cache.iter() {
+                sized.insert(entry.key().clone(), entry.value().clone());
+            }
+            self.pattern_cache = Arc::new(sized);
+        }
+
+        let _ = self.pattern_cache_slot.set(Arc::clone(&self.pattern_cache));
     }
 
     /// Ensure a file is registered with Salsa (read from disk if needed)
