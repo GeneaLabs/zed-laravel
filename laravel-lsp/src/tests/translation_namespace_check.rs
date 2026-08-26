@@ -8,7 +8,16 @@ use crate::LaravelLanguageServer;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::TempDir;
+use tower_lsp::LspService;
+
+/// A backend whose Salsa actor backs the translation cache. `root` is passed
+/// to `check_translation_file` explicitly, so no other state needs priming.
+fn backend() -> LaravelLanguageServer {
+    let (service, _socket) = LspService::new(LaravelLanguageServer::new);
+    service.inner().clone()
+}
 
 /// A project whose vendor package ships `lang/en/table.php` with one key,
 /// plus the vendor map the translation scan would have produced for it.
@@ -28,30 +37,34 @@ fn project_with_vendor_translations() -> (TempDir, PathBuf, HashMap<String, Path
     (dir, root, vendor_map)
 }
 
-#[test]
-fn namespaced_key_resolves_through_vendor_map() {
+#[tokio::test]
+async fn namespaced_key_resolves_through_vendor_map() {
     let (_dir, root, vendor_map) = project_with_vendor_translations();
 
-    let check = LaravelLanguageServer::check_translation_file(
-        &root,
-        "filament-tables::table.grouping.label",
-        Some(&vendor_map),
-    );
+    let check = backend()
+        .check_translation_file(
+            &root,
+            "filament-tables::table.grouping.label",
+            Some(Arc::new(vendor_map)),
+        )
+        .await;
     assert!(
         check.exists,
         "an unpublished package translation must resolve via the vendor map"
     );
 }
 
-#[test]
-fn missing_namespaced_key_still_flags_with_vendor_path() {
+#[tokio::test]
+async fn missing_namespaced_key_still_flags_with_vendor_path() {
     let (_dir, root, vendor_map) = project_with_vendor_translations();
 
-    let check = LaravelLanguageServer::check_translation_file(
-        &root,
-        "filament-tables::table.does.not.exist",
-        Some(&vendor_map),
-    );
+    let check = backend()
+        .check_translation_file(
+            &root,
+            "filament-tables::table.does.not.exist",
+            Some(Arc::new(vendor_map)),
+        )
+        .await;
     assert!(!check.exists, "a genuinely missing key must still flag");
     // The diagnostic should point at the package's real lang file, not the
     // bogus `lang/en/filament-tables::table.php` guess it used to emit.
@@ -66,8 +79,8 @@ fn missing_namespaced_key_still_flags_with_vendor_path() {
     );
 }
 
-#[test]
-fn app_provider_load_translations_from_resolves_namespaced_key() {
+#[tokio::test]
+async fn app_provider_load_translations_from_resolves_namespaced_key() {
     // Issue #248: an `AppServiceProvider` registering
     // `loadTranslationsFrom(lang_path('app'), 'app')` must make
     // `app::notification.title` resolve to `lang/app/en/notification.php` —
@@ -110,11 +123,13 @@ class AppServiceProvider {
         "app scan must register the 'app' namespace at lang/app"
     );
 
-    let check = LaravelLanguageServer::check_translation_file(
-        &root,
-        "app::notification.task_group_status_change.title",
-        Some(&map),
-    );
+    let check = backend()
+        .check_translation_file(
+            &root,
+            "app::notification.task_group_status_change.title",
+            Some(Arc::new(map)),
+        )
+        .await;
     assert!(
         check.exists,
         "the app-registered translation must resolve via the merged map"
@@ -126,12 +141,13 @@ class AppServiceProvider {
     );
 }
 
-#[test]
-fn namespaced_key_without_vendor_map_expects_published_path() {
+#[tokio::test]
+async fn namespaced_key_without_vendor_map_expects_published_path() {
     let (_dir, root, _vendor_map) = project_with_vendor_translations();
 
-    let check =
-        LaravelLanguageServer::check_translation_file(&root, "unknown-pkg::messages.hi", None);
+    let check = backend()
+        .check_translation_file(&root, "unknown-pkg::messages.hi", None)
+        .await;
     assert!(!check.exists);
     let expected = check.expected_path.expect("expected path set");
     assert!(

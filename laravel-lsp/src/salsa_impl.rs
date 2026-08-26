@@ -161,6 +161,53 @@ pub struct EnvFile {
     pub priority: u8,
 }
 
+/// One Laravel translation catalogue: a `{lang_root}/{locale}/{file}.php` array
+/// file, a `{lang_root}/vendor/{namespace}/{locale}/{file}.php` published
+/// override, or a `{lang_root}/{locale}.json` text catalogue.
+///
+/// Registered lazily, once per path, by [`SalsaActor::ensure_lang_file`] — a
+/// path that is absent, unreadable, or refused by the containment guard is
+/// registered with **empty text**, which resolves to no key just as an absent
+/// file does. That negative entry is what stops a 25-locale lookup from
+/// re-probing 24 missing files on every hover (issue #293).
+#[salsa::input]
+pub struct LangFile {
+    /// The file path
+    #[returns(ref)]
+    pub path: PathBuf,
+
+    /// Version incremented when the file changes
+    #[returns(copy)]
+    pub version: i32,
+
+    /// The file content; empty for an absent or refused file
+    #[returns(ref)]
+    pub text: String,
+}
+
+/// One directory that may contain locales — a lang root, a published
+/// `{lang_root}/vendor/{namespace}` override dir, or a package's own lang dir
+/// registered via `loadTranslationsFrom`.
+///
+/// Holds the directory's direct children rather than re-running `read_dir` per
+/// lookup. Like [`LangFile`], an absent or refused directory is registered with
+/// an **empty** listing, which contributes no locales exactly as a failed
+/// `read_dir` did (issue #293).
+#[salsa::input]
+pub struct LangDir {
+    /// The directory path
+    #[returns(ref)]
+    pub path: PathBuf,
+
+    /// Version incremented when the directory listing changes
+    #[returns(copy)]
+    pub version: i32,
+
+    /// `(file name, is_dir)` for every direct child
+    #[returns(ref)]
+    pub entries: Vec<(String, bool)>,
+}
+
 // ============================================================================
 // Interned Types - Deduplicated strings
 // ============================================================================
@@ -1487,6 +1534,683 @@ fn parse_env_value_internal(value: &str) -> String {
     }
 
     value.to_string()
+}
+
+// ============================================================================
+// Translation Resolution (Salsa-based) — issue #293
+// ============================================================================
+
+/// A resolved translation crossing the async boundary — the value as its raw
+/// PHP/JSON literal, plus the catalogue it was read from. Hover renders the
+/// source file as a link; go-to-definition navigates to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTranslationData {
+    /// The translated value, as the raw PHP/JSON literal
+    pub value: String,
+    /// The catalogue the value came from
+    pub source_file: PathBuf,
+}
+
+/// Walk a dotted key path inside one PHP array catalogue.
+///
+/// Memoized per `(file, key_path)`. An empty-text file — absent, unreadable or
+/// containment-refused — yields `None`, exactly as the direct-`fs` resolver did
+/// when the read failed.
+#[salsa::tracked]
+pub fn resolve_php_translation(
+    db: &dyn Db,
+    file: LangFile,
+    key_path: Vec<String>,
+) -> Option<String> {
+    let text = file.text(db);
+    if text.is_empty() {
+        return None;
+    }
+    let refs: Vec<&str> = key_path.iter().map(String::as_str).collect();
+    crate::config_lookup::resolve_in_source(text, &refs)
+}
+
+/// Look one text key up in a `{lang_root}/{locale}.json` catalogue.
+///
+/// Memoized per `(file, key)`. The value is returned single-quoted so it
+/// matches the PHP-literal shape the rest of the pipeline unquotes.
+#[salsa::tracked]
+pub fn resolve_json_translation(db: &dyn Db, file: LangFile, key: String) -> Option<String> {
+    let text = file.text(db);
+    if text.is_empty() {
+        return None;
+    }
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text).ok()?;
+    Some(format!("'{}'", map.get(&key)?.as_str()?))
+}
+
+/// The locale names one directory listing implies.
+///
+/// A subdirectory is a locale (`lang/de/`); a `.json` child is a locale
+/// catalogue (`lang/de.json`). `vendor` is a namespace container, never a
+/// locale. Memoized per directory listing, so a 25-locale project enumerates
+/// once instead of once per hover, goto and diagnostic (issue #293).
+#[salsa::tracked]
+pub fn locales_in_dir(db: &dyn Db, dir: LangDir) -> Vec<String> {
+    let mut locales = Vec::new();
+    for (name, is_dir) in dir.entries(db) {
+        let locale = if *is_dir {
+            Some(name.clone())
+        } else {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|e| e == "json")
+                .then(|| {
+                    std::path::Path::new(name)
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .map(str::to_string)
+                })
+                .flatten()
+        };
+        if let Some(locale) = locale {
+            if locale != "vendor" && !locales.contains(&locale) {
+                locales.push(locale);
+            }
+        }
+    }
+    locales
+}
+
+/// Lang-file reads and locale enumeration, memoized through Salsa.
+///
+/// Owned by [`SalsaActor`] in production; constructible directly so tests can
+/// exercise the real resolution path against a bare [`LaravelDatabase`] without
+/// standing up the actor.
+///
+/// # Why this exists
+///
+/// Translation resolution used to read and parse lang files with
+/// `std::fs::read_to_string` on **every** call, uncached and uninvalidated.
+/// Since #288 resolved a key against every locale a project defines, one hover
+/// on a 25-locale project meant a `read_dir` plus up to 25 file reads — repeated
+/// for go-to-definition and again for diagnostics. Routing those reads through
+/// Salsa inputs makes them incremental: read once, reuse until something
+/// actually changes (issue #293).
+///
+/// # Containment
+///
+/// [`Self::ensure_file`] and [`Self::ensure_dir`] are the **only** places this
+/// module touches disk, and both are fail-closed: a path that cannot be proven
+/// inside the project root is never read (issue #248). Candidate paths are built
+/// from `vendor::` namespaces and `loadTranslationsFrom` arguments lifted
+/// verbatim out of parsed source, so they are untrusted and may carry traversal
+/// or be absolute. Keeping the guard at these two functions is what lets
+/// `translation_lookup` be pure path arithmetic without weakening #248.
+#[derive(Default)]
+pub struct TranslationCache {
+    /// Catalogues keyed by absolute path. An entry with **empty text** is a
+    /// negative cache: the path is absent, unreadable, or containment-refused.
+    /// Without it, a key defined only in `de` would re-probe the other 24
+    /// locales' missing files on every single request.
+    files: HashMap<PathBuf, LangFile>,
+    /// Directory listings backing locale discovery, keyed by absolute path. An
+    /// empty listing likewise caches "absent, or nothing in it".
+    dirs: HashMap<PathBuf, LangDir>,
+    /// Version counter shared by files and directories; bumped on every
+    /// registration so Salsa sees a changed input.
+    version: i32,
+    /// How many times this cache has touched disk — one per
+    /// `fs::read_to_string` or `read_dir` that actually ran. Lets a test prove
+    /// a second resolution is served from Salsa rather than re-read.
+    ///
+    /// Per-cache rather than a global counter: caches are per-actor, so every
+    /// test owns its own and concurrent tests cannot perturb each other's
+    /// counts. A process-wide counter made these assertions racy — any other
+    /// test resolving a translation moved the number.
+    disk_reads: usize,
+}
+
+impl TranslationCache {
+    /// How many times this cache has touched disk. See [`Self::disk_reads`].
+    pub fn disk_reads(&self) -> usize {
+        self.disk_reads
+    }
+
+    /// Push a catalogue's authoritative text into Salsa — an editor buffer via
+    /// `did_change`, or a fresh disk read. Creates the input on first sight and
+    /// updates it in place afterwards, so dependent queries are invalidated
+    /// rather than duplicated.
+    pub fn register(&mut self, db: &mut LaravelDatabase, path: PathBuf, text: String) {
+        self.version += 1;
+        if let Some(file) = self.files.get(&path) {
+            file.set_version(db).to(self.version);
+            file.set_text(db).to(text);
+        } else {
+            let file = LangFile::new(&*db, path.clone(), self.version, text);
+            self.files.insert(path, file);
+        }
+    }
+
+    /// Drop a lang path's cached entry, and the directory listings that could
+    /// have enumerated it, so the next lookup re-reads disk. Covers external
+    /// create, change and delete alike — a create clears the negative entry, a
+    /// delete clears the positive one.
+    ///
+    /// Two directory levels are cleared because both can be invalidated by one
+    /// file event: for `lang/de/validation.php` the parent (`lang/de`) is the
+    /// locale directory and the grandparent (`lang/`) is what enumerates `de`
+    /// as a locale at all; for `lang/vendor/pkg/de/messages.php` the
+    /// grandparent (`lang/vendor/pkg`) is the namespace directory locale
+    /// discovery reads. A `lang/de.json` catalogue is covered by the first
+    /// level alone.
+    ///
+    /// Eager invalidation, lazy re-read — the same trade `file_watcher` makes,
+    /// so a `git checkout` touching many lang files does no I/O here and pays
+    /// only for the catalogues a later request actually asks for.
+    pub fn invalidate(&mut self, path: &Path) {
+        self.files.remove(path);
+        let mut dir = path.parent();
+        for _ in 0..2 {
+            let Some(d) = dir else { break };
+            self.dirs.remove(d);
+            dir = d.parent();
+        }
+    }
+
+    /// The Salsa input for `path`, registering it on first touch.
+    ///
+    /// **Fail-closed** (issue #248): a path that cannot be proven inside `root`
+    /// is registered with empty text rather than read, which resolves to no key
+    /// exactly as a failed read did. `path_within_root` canonicalizes, so an
+    /// absent path and an escaping symlink are both refused here — and both
+    /// then cost zero further disk touches, because the refusal is cached.
+    fn ensure_file(&mut self, db: &mut LaravelDatabase, path: &Path, root: &Path) -> LangFile {
+        if let Some(file) = self.files.get(path) {
+            return *file;
+        }
+        let text = if crate::path_containment::path_within_root(path, root) {
+            self.disk_reads += 1;
+            std::fs::read_to_string(path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.register(db, path.to_path_buf(), text);
+        self.files[path]
+    }
+
+    /// The Salsa input for `dir`'s listing, registering it on first touch.
+    /// Fail-closed on the same terms as [`Self::ensure_file`]: a directory that
+    /// cannot be proven inside `root` is registered with an empty listing
+    /// rather than enumerated, so an escaped directory can never surface its
+    /// subdirectories as this key's locales (issue #248).
+    fn ensure_dir(&mut self, db: &mut LaravelDatabase, dir: &Path, root: &Path) -> LangDir {
+        if let Some(handle) = self.dirs.get(dir) {
+            return *handle;
+        }
+        let entries: Vec<(String, bool)> = if crate::path_containment::path_within_root(dir, root) {
+            self.disk_reads += 1;
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|entry| {
+                            (
+                                entry.file_name().to_string_lossy().into_owned(),
+                                entry.path().is_dir(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        self.version += 1;
+        let handle = LangDir::new(&*db, dir.to_path_buf(), self.version, entries);
+        self.dirs.insert(dir.to_path_buf(), handle);
+        handle
+    }
+
+    /// Resolve `key` in `locale`, returning the value and the catalogue it came
+    /// from. Candidates are tried in
+    /// [`translation_candidates`](crate::translation_lookup::translation_candidates)
+    /// order — first hit wins, so a published vendor override beats the
+    /// package's own unpublished file.
+    ///
+    /// `vendor_map` is consulted only to *name* candidate paths; it never
+    /// enters a Salsa query key. So it can neither defeat memoization of the
+    /// common dotted path (which never looks at it) nor serve a stale
+    /// namespaced resolution (candidates are recomputed from the live map on
+    /// every call).
+    pub fn resolve(
+        &mut self,
+        db: &mut LaravelDatabase,
+        root: &Path,
+        key: &str,
+        locale: &str,
+        vendor_map: Option<&HashMap<String, PathBuf>>,
+    ) -> Option<ResolvedTranslationData> {
+        for candidate in
+            crate::translation_lookup::translation_candidates(root, key, locale, vendor_map)
+        {
+            let file = self.ensure_file(db, candidate.path(), root);
+            // Salsa hands back a borrow of the memoized value; clone it so the
+            // database borrow ends before the next candidate needs `&mut db`.
+            let value = match &candidate {
+                crate::translation_lookup::TranslationCandidate::Php { key_path, .. } => {
+                    resolve_php_translation(&*db, file, key_path.clone()).clone()
+                }
+                crate::translation_lookup::TranslationCandidate::Json { key, .. } => {
+                    resolve_json_translation(&*db, file, key.clone()).clone()
+                }
+            };
+            if let Some(value) = value {
+                return Some(ResolvedTranslationData {
+                    value,
+                    source_file: candidate.path().to_path_buf(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Every locale that could define `key`, `app_locale` first and the rest
+    /// alphabetically.
+    ///
+    /// Never returns empty: a project with no discoverable locales — no lang
+    /// directory at all, or one containing nothing — falls back to
+    /// `["en"]`, so callers always have something to resolve against.
+    ///
+    /// An `app_locale` no directory defines simply doesn't appear, leaving the
+    /// alphabetical order untouched.
+    pub fn locales(
+        &mut self,
+        db: &mut LaravelDatabase,
+        root: &Path,
+        key: &str,
+        vendor_map: Option<&HashMap<String, PathBuf>>,
+        app_locale: Option<&str>,
+    ) -> Vec<String> {
+        let mut locales: Vec<String> = Vec::new();
+        for dir in crate::translation_lookup::locale_candidate_dirs(root, key, vendor_map) {
+            let handle = self.ensure_dir(db, &dir, root);
+            let found = locales_in_dir(&*db, handle).clone();
+            // Dedupe across directories so a locale present in both the
+            // published and the unpublished vendor directory is listed once.
+            for locale in found {
+                if !locales.contains(&locale) {
+                    locales.push(locale);
+                }
+            }
+        }
+
+        if locales.is_empty() {
+            return vec![crate::translation_lookup::DEFAULT_LOCALE.to_string()];
+        }
+
+        locales.sort();
+        if let Some(app_locale) = app_locale {
+            if let Some(idx) = locales.iter().position(|l| l == app_locale) {
+                let leading = locales.remove(idx);
+                locales.insert(0, leading);
+            }
+        }
+        locales
+    }
+
+    /// Where `target` is declared inside the catalogue at `path`.
+    ///
+    /// Go-to-definition resolves a key to a file and then needs the key's own
+    /// line within it. That second step used to re-read the file — and, for a
+    /// `.php` catalogue, re-run a full tree-sitter parse — on every jump, even
+    /// though the resolution immediately before it had just read the same file
+    /// (issue #293).
+    pub fn locate_key(
+        &mut self,
+        db: &mut LaravelDatabase,
+        root: &Path,
+        path: &Path,
+        target: &TranslationKeyTarget,
+    ) -> Option<KeyLocationData> {
+        let file = self.ensure_file(db, path, root);
+        let found = match target {
+            TranslationKeyTarget::Php(key_path) => {
+                locate_php_key_in_file(&*db, file, key_path.clone())
+            }
+            TranslationKeyTarget::Json(key) => locate_json_key_in_file(&*db, file, key.clone()),
+        };
+        found.map(|(line, start_column, end_column)| KeyLocationData {
+            line,
+            start_column,
+            end_column,
+        })
+    }
+
+    /// Every translation key autocomplete should offer, sorted and deduped.
+    ///
+    /// Semantics deliberately preserved from the direct-`fs` version: the
+    /// **first** lang root that exists wins, and within it the **first** locale
+    /// subdirectory answers for the whole project — a key present in one locale
+    /// is offered regardless of which locale declares it, so enumerating the
+    /// union would read every catalogue in the project to produce the same
+    /// list. Only the reads changed: the directory listings and every
+    /// catalogue's key extraction are now memoized, where before each
+    /// completion request re-enumerated two directories and re-read *and
+    /// re-parsed* every catalogue in the locale (issue #293).
+    ///
+    /// `exists()` on the lang roots is a stat, not a read, and picking the root
+    /// this way keeps the pre-cache behaviour exactly: a first lang root that
+    /// exists but holds no locale directory yields no completions rather than
+    /// falling through to the second root.
+    pub fn completion_keys(
+        &mut self,
+        db: &mut LaravelDatabase,
+        root: &Path,
+    ) -> Vec<TranslationKeyCompletionData> {
+        let Some(lang_root) = crate::translation_lookup::project_lang_roots(root)
+            .into_iter()
+            .find(|dir| dir.exists())
+        else {
+            return Vec::new();
+        };
+        let listing = self.ensure_dir(db, &lang_root, root);
+        let Some(locale) = locales_in_dir(&*db, listing).first().cloned() else {
+            return Vec::new();
+        };
+
+        let locale_dir = lang_root.join(&locale);
+        let files = self.ensure_dir(db, &locale_dir, root).entries(&*db).clone();
+
+        let mut completions = Vec::new();
+        for (name, is_dir) in files {
+            if is_dir {
+                continue;
+            }
+            let path = locale_dir.join(&name);
+            if path.extension().is_none_or(|ext| ext != "php") {
+                continue;
+            }
+            let Some(base_key) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let source = format!("lang/{}/{}", locale, name);
+            let file = self.ensure_file(db, &path, root);
+            for (key, value) in translation_keys_in_file(&*db, file, base_key.to_string()).clone() {
+                completions.push(TranslationKeyCompletionData {
+                    key,
+                    value,
+                    source: source.clone(),
+                });
+            }
+        }
+
+        completions.sort_by(|a, b| a.key.cmp(&b.key));
+        completions.dedup_by(|a, b| a.key == b.key);
+        completions
+    }
+
+    /// Every locale file that declares `dotted_key`, with the position of the
+    /// key's own characters — the declaration sites a rename must edit.
+    ///
+    /// Walks `lang/<locale>/<file>.php` for each locale directory under
+    /// `<root>/lang`. Locales without the relevant file, or without the key in
+    /// it, are simply skipped.
+    ///
+    /// Two things changed when this moved off direct `fs` (issue #293). It is
+    /// now memoized, so renaming a key no longer re-reads and re-parses every
+    /// locale's catalogue — the same files resolution had already loaded. And
+    /// it is now **fenced**: the previous implementation joined a key-derived
+    /// file segment onto a locale directory and read the result with no
+    /// containment check at all, where routing through [`Self::ensure_file`]
+    /// brings it under the same fail-closed guard as every other read
+    /// (issue #248).
+    ///
+    /// That guard is defence in depth here rather than a closed hole: the key
+    /// is split on `.` before the stem is used, so a `../` escape leaves the
+    /// stem empty and never reaches a read. It still matters for a stem naming
+    /// an absolute path, which `Path::join` would otherwise let collapse the
+    /// base away.
+    ///
+    /// Deliberately still `lang/` only, not `resources/lang/` — that asymmetry
+    /// is pre-existing rename behaviour, and widening which files a rename
+    /// edits is a change of a different kind from caching one.
+    pub fn locate_key_across_locales(
+        &mut self,
+        db: &mut LaravelDatabase,
+        root: &Path,
+        dotted_key: &str,
+    ) -> Vec<TranslationKeyLocationData> {
+        let Some((file_stem, key_path)) =
+            crate::translation_key_locator::split_dotted_key(dotted_key)
+        else {
+            return Vec::new();
+        };
+
+        let lang_dir = root.join("lang");
+        // The raw listing rather than `locales_in_dir`: this walk has always
+        // considered exactly the subdirectories, so a `{locale}.json` stem is
+        // not a locale here.
+        let entries = self.ensure_dir(db, &lang_dir, root).entries(&*db).clone();
+
+        let mut out = Vec::new();
+        for (name, is_dir) in entries {
+            if !is_dir {
+                continue;
+            }
+            let locale_file = lang_dir.join(&name).join(format!("{file_stem}.php"));
+            let file = self.ensure_file(db, &locale_file, root);
+            if let Some(&(line, start_column, end_column)) =
+                locate_php_key_in_file(&*db, file, key_path.clone()).as_ref()
+            {
+                out.push(TranslationKeyLocationData {
+                    file_path: locale_file,
+                    location: KeyLocationData {
+                        line,
+                        start_column,
+                        end_column,
+                    },
+                });
+            }
+        }
+        out
+    }
+}
+
+/// One translation key offered by autocomplete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationKeyCompletionData {
+    /// The full dot-notation key (e.g. `messages.welcome`)
+    pub key: String,
+    /// The translated value, truncated for display
+    pub value: String,
+    /// Display source (e.g. `lang/en/messages.php`)
+    pub source: String,
+}
+
+/// One locale's declaration of a translation key, for building a rename edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationKeyLocationData {
+    /// The catalogue declaring the key.
+    pub file_path: PathBuf,
+    /// Where in it the key's own characters sit.
+    pub location: KeyLocationData,
+}
+
+/// Which key to locate inside a catalogue, and how to match it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranslationKeyTarget {
+    /// Nested array path inside a `.php` catalogue.
+    Php(Vec<String>),
+    /// The source string itself, inside a `.json` catalogue.
+    Json(String),
+}
+
+/// The line and column span of a key's declaration inside a catalogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyLocationData {
+    /// 0-based line
+    pub line: u32,
+    /// 0-based column of the key content (inside the quotes)
+    pub start_column: u32,
+    /// 0-based column one past the key content
+    pub end_column: u32,
+}
+
+/// Parse a PHP translation file to extract all keys and values
+/// Returns a list of (key, value) tuples with dot-notation keys
+fn parse_translation_keys(content: &str, base_key: &str) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+
+    // Simple regex-based parsing for Laravel translation files
+    // This handles: 'key' => 'value', or "key" => "value"
+    //
+    // Compiled once: this used to be rebuilt on every completion request, for
+    // every catalogue in the locale (issue #293).
+    static KEY_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"][\s]*=>"#).unwrap()
+    });
+    let key_pattern = &*KEY_PATTERN;
+
+    // Track nesting depth and current key path
+    let mut key_stack: Vec<String> = vec![base_key.to_string()];
+    let mut in_array_depth = 0;
+    let mut pending_key: Option<String> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Skip comments and empty lines
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with("*")
+        {
+            continue;
+        }
+
+        // Handle array opening
+        if trimmed.contains("[") && !trimmed.contains("=>") {
+            in_array_depth += 1;
+            if let Some(key) = pending_key.take() {
+                key_stack.push(key);
+            }
+            continue;
+        }
+
+        // Handle key => [ (nested array on same line)
+        if let Some(caps) = key_pattern.captures(trimmed) {
+            let key_name = caps.get(1).unwrap().as_str();
+
+            if trimmed.contains("=> [") || trimmed.ends_with("=> [") {
+                // This is a nested array
+                pending_key = Some(key_name.to_string());
+                in_array_depth += 1;
+                key_stack.push(key_name.to_string());
+            } else {
+                // This is a simple key => value
+                let full_key = format!("{}.{}", key_stack.join("."), key_name);
+
+                // Extract value
+                let value = extract_translation_value(trimmed);
+                results.push((full_key, value));
+            }
+        }
+
+        // Handle array closing
+        let close_count = trimmed.matches(']').count();
+        for _ in 0..close_count {
+            if in_array_depth > 0 {
+                in_array_depth -= 1;
+                if key_stack.len() > 1 {
+                    key_stack.pop();
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Extract the value from a translation line like "'key' => 'value',"
+pub fn extract_translation_value(line: &str) -> String {
+    if let Some(arrow_pos) = line.find("=>") {
+        let after_arrow = &line[arrow_pos + 2..];
+        let value = after_arrow.trim().trim_end_matches(',').trim();
+
+        // Remove quotes and truncate
+        let unquoted = value
+            .trim_start_matches('\'')
+            .trim_start_matches('"')
+            .trim_end_matches('\'')
+            .trim_end_matches('"');
+
+        // Truncate long values for display. Delegated rather than sliced:
+        // `&unquoted[..47]` panics when byte 47 lands mid-character, which is
+        // reachable for any non-ASCII translation value (issue #319).
+        crate::display_truncate::truncate_for_display(unquoted, 200)
+    } else {
+        String::new()
+    }
+}
+
+/// Every `key => value` pair one PHP catalogue declares, dot-prefixed with
+/// `base_key`. Memoized per `(file, base_key)` — autocomplete used to re-read
+/// and re-parse every catalogue in the locale on each request (issue #293).
+#[salsa::tracked]
+pub fn translation_keys_in_file(
+    db: &dyn Db,
+    file: LangFile,
+    base_key: String,
+) -> Vec<(String, String)> {
+    let text = file.text(db);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    parse_translation_keys(text, &base_key)
+}
+
+/// Where a nested key is declared inside a PHP catalogue, as
+/// `(line, start_column, end_column)`.
+///
+/// A tuple rather than `KeyPosition` so the return type is trivially
+/// `salsa::Update`; the handler widens it to [`KeyLocationData`].
+///
+/// Memoized per `(file, key_path)`: go-to-definition used to re-read the file
+/// **and re-run a tree-sitter parse** on every jump (issue #293).
+#[salsa::tracked]
+pub fn locate_php_key_in_file(
+    db: &dyn Db,
+    file: LangFile,
+    key_path: Vec<String>,
+) -> Option<(u32, u32, u32)> {
+    let text = file.text(db);
+    if text.is_empty() {
+        return None;
+    }
+    let refs: Vec<&str> = key_path.iter().map(String::as_str).collect();
+    let pos = crate::config_key_locator::locate_in_source(text, &refs)?;
+    Some((pos.line, pos.start_column, pos.end_column))
+}
+
+/// Where a text key is declared inside a JSON catalogue, as
+/// `(line, start_column, end_column)`.
+///
+/// The key is matched as a quoted literal and the span covers the key content
+/// inside its quotes — the same shape the PHP locator returns, so
+/// go-to-definition highlights identically across both catalogue formats.
+#[salsa::tracked]
+pub fn locate_json_key_in_file(
+    db: &dyn Db,
+    file: LangFile,
+    key: String,
+) -> Option<(u32, u32, u32)> {
+    let text = file.text(db);
+    if text.is_empty() {
+        return None;
+    }
+    let needle = format!("\"{key}\"");
+    text.lines().enumerate().find_map(|(line_num, line)| {
+        let col = line.find(&needle)?;
+        // Skip the opening quote so the span covers the key itself.
+        let start = (col + 1) as u32;
+        Some((line_num as u32, start, start + key.len() as u32))
+    })
 }
 
 // ============================================================================
@@ -5457,6 +6181,59 @@ pub enum SalsaRequest {
         reply: oneshot::Sender<Vec<ParsedEnvVarData>>,
     },
 
+    // === Salsa-based Translation Resolution (issue #293) ===
+    /// Resolve one translation key in one locale through the Salsa cache
+    ResolveTranslation {
+        root: PathBuf,
+        key: String,
+        locale: String,
+        /// Live `namespace -> lang dir` map for unpublished vendor
+        /// translations. Passed per request rather than memoized: it never
+        /// enters a query key, so it can neither defeat memoization of the
+        /// common dotted path nor serve a stale namespaced resolution.
+        vendor_map: Option<Arc<HashMap<String, PathBuf>>>,
+        reply: oneshot::Sender<Option<ResolvedTranslationData>>,
+    },
+    /// Every locale that could define this key, APP_LOCALE first
+    AvailableLocales {
+        root: PathBuf,
+        key: String,
+        vendor_map: Option<Arc<HashMap<String, PathBuf>>>,
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// Push a lang file's authoritative text (editor buffer) into Salsa
+    RegisterLangSource {
+        path: PathBuf,
+        text: String,
+        reply: oneshot::Sender<()>,
+    },
+    /// Drop a lang path's cached entry and its directory listing, so the next
+    /// lookup re-reads disk. Covers external create, change and delete.
+    InvalidateLangPath {
+        path: PathBuf,
+        reply: oneshot::Sender<()>,
+    },
+    /// Locate a key's declaration inside one catalogue
+    LocateTranslationKey {
+        root: PathBuf,
+        path: PathBuf,
+        target: TranslationKeyTarget,
+        reply: oneshot::Sender<Option<KeyLocationData>>,
+    },
+    /// Every translation key autocomplete should offer
+    TranslationKeyCompletions {
+        root: PathBuf,
+        reply: oneshot::Sender<Vec<TranslationKeyCompletionData>>,
+    },
+    /// Every locale file declaring a translation key, for rename
+    LocateKeyAcrossLocales {
+        root: PathBuf,
+        dotted_key: String,
+        reply: oneshot::Sender<Vec<TranslationKeyLocationData>>,
+    },
+    /// How many times the translation cache has touched disk
+    LangDiskReads { reply: oneshot::Sender<usize> },
+
     // === Salsa-based Service Provider Management (New) ===
     /// Register a raw service provider file for Salsa to parse
     RegisterServiceProviderSource {
@@ -6652,6 +7429,172 @@ impl SalsaHandle {
             .map_err(|_| "Salsa actor dropped reply channel")
     }
 
+    // === Salsa-based Translation Methods (issue #293) ===
+
+    /// Resolve a translation key in one locale through the Salsa cache.
+    ///
+    /// `vendor_map` is the live `namespace -> lang dir` map from
+    /// `vendor_translations`; pass `None` when the project registers no
+    /// unpublished package translations.
+    pub async fn resolve_translation(
+        &self,
+        root: PathBuf,
+        key: String,
+        locale: String,
+        vendor_map: Option<Arc<HashMap<String, PathBuf>>>,
+    ) -> Result<Option<ResolvedTranslationData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ResolveTranslation {
+                root,
+                key,
+                locale,
+                vendor_map,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Every locale that could define `key`, APP_LOCALE first. Never empty —
+    /// falls back to `["en"]` on a project that defines no translations.
+    pub async fn available_locales(
+        &self,
+        root: PathBuf,
+        key: String,
+        vendor_map: Option<Arc<HashMap<String, PathBuf>>>,
+    ) -> Result<Vec<String>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::AvailableLocales {
+                root,
+                key,
+                vendor_map,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Push a lang file's authoritative text (an editor buffer) into Salsa, so
+    /// an unsaved edit is reflected by the next resolution.
+    pub async fn register_lang_source(
+        &self,
+        path: PathBuf,
+        text: String,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::RegisterLangSource {
+                path,
+                text,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Locate a translation key's declaration inside one catalogue.
+    pub async fn locate_translation_key(
+        &self,
+        root: PathBuf,
+        path: PathBuf,
+        target: TranslationKeyTarget,
+    ) -> Result<Option<KeyLocationData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::LocateTranslationKey {
+                root,
+                path,
+                target,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Every translation key autocomplete should offer for this project.
+    pub async fn translation_key_completions(
+        &self,
+        root: PathBuf,
+    ) -> Result<Vec<TranslationKeyCompletionData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::TranslationKeyCompletions {
+                root,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Every locale file declaring `dotted_key`, for building a rename edit.
+    pub async fn locate_key_across_locales(
+        &self,
+        root: PathBuf,
+        dotted_key: String,
+    ) -> Result<Vec<TranslationKeyLocationData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::LocateKeyAcrossLocales {
+                root,
+                dotted_key,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// How many times the translation cache has touched disk this session.
+    ///
+    /// Instrumentation for the cache-warmth tests: compare the count before and
+    /// after a second resolution of the same key — an equal count is the proof
+    /// that Salsa served it.
+    pub async fn lang_disk_reads(&self) -> Result<usize, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::LangDiskReads { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Drop a lang path's cached entry after an external create, change or
+    /// delete, so the next resolution re-reads disk.
+    pub async fn invalidate_lang_path(&self, path: PathBuf) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::InvalidateLangPath {
+                path,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
     // === Salsa-based Service Provider Methods (New - Phase 1) ===
 
     /// Register a raw service provider file for Salsa to parse
@@ -7140,6 +8083,10 @@ pub struct SalsaActor {
     /// Version counter for env files
     salsa_env_version: i32,
 
+    // === Salsa-based Translation Tracking (issue #293) ===
+    /// Lang catalogues and directory listings, memoized through Salsa.
+    translations: TranslationCache,
+
     // === Salsa-based Service Provider Tracking (New) ===
     /// Service provider files registered with Salsa for incremental parsing
     salsa_sp_files: HashMap<PathBuf, ServiceProviderFile>,
@@ -7237,6 +8184,8 @@ impl SalsaActor {
                 // Salsa-based env tracking
                 salsa_env_files: HashMap::with_capacity(4),
                 salsa_env_version: 0,
+                // Salsa-based translation tracking (issue #293)
+                translations: TranslationCache::default(),
                 // Salsa-based service provider tracking
                 salsa_sp_files: HashMap::with_capacity(32),
                 salsa_sp_version: 0,
@@ -7765,6 +8714,68 @@ impl SalsaActor {
                 SalsaRequest::GetAllParsedEnvVars { reply } => {
                     let result = self.handle_get_all_parsed_env_vars();
                     let _ = reply.send(result);
+                }
+                SalsaRequest::ResolveTranslation {
+                    root,
+                    key,
+                    locale,
+                    vendor_map,
+                    reply,
+                } => {
+                    let result = self.handle_resolve_translation(
+                        &root,
+                        &key,
+                        &locale,
+                        vendor_map.as_deref(),
+                    );
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::AvailableLocales {
+                    root,
+                    key,
+                    vendor_map,
+                    reply,
+                } => {
+                    let result = self.handle_available_locales(&root, &key, vendor_map.as_deref());
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::RegisterLangSource { path, text, reply } => {
+                    self.handle_register_lang_source(path, text);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::InvalidateLangPath { path, reply } => {
+                    self.handle_invalidate_lang_path(&path);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::LocateTranslationKey {
+                    root,
+                    path,
+                    target,
+                    reply,
+                } => {
+                    let result = self
+                        .translations
+                        .locate_key(&mut self.db, &root, &path, &target);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::TranslationKeyCompletions { root, reply } => {
+                    let result = self.translations.completion_keys(&mut self.db, &root);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::LocateKeyAcrossLocales {
+                    root,
+                    dotted_key,
+                    reply,
+                } => {
+                    let result = self.translations.locate_key_across_locales(
+                        &mut self.db,
+                        &root,
+                        &dotted_key,
+                    );
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::LangDiskReads { reply } => {
+                    let _ = reply.send(self.translations.disk_reads());
                 }
 
                 // === Salsa-based Service Provider Handlers (New) ===
@@ -10288,6 +11299,57 @@ impl SalsaActor {
             );
             self.salsa_env_files.insert(path, file);
         }
+    }
+
+    // === Salsa-based Translation Handlers (issue #293) ===
+
+    /// Resolve one translation key in one locale through the Salsa cache.
+    fn handle_resolve_translation(
+        &mut self,
+        root: &Path,
+        key: &str,
+        locale: &str,
+        vendor_map: Option<&HashMap<String, PathBuf>>,
+    ) -> Option<ResolvedTranslationData> {
+        self.translations
+            .resolve(&mut self.db, root, key, locale, vendor_map)
+    }
+
+    /// Every locale that could define `key`, this project's APP_LOCALE first.
+    fn handle_available_locales(
+        &mut self,
+        root: &Path,
+        key: &str,
+        vendor_map: Option<&HashMap<String, PathBuf>>,
+    ) -> Vec<String> {
+        let app_locale = self.app_locale();
+        self.translations
+            .locales(&mut self.db, root, key, vendor_map, app_locale.as_deref())
+    }
+
+    /// The project's `APP_LOCALE`, served from the Salsa env cache.
+    ///
+    /// Reproduces `config::read_env_value(root, "APP_LOCALE")` exactly rather
+    /// than taking whatever the env layer ranks highest: that helper reads
+    /// **`.env` only**, its line-anchored regex never matches a commented line,
+    /// and it discards an empty value. Hence the three filters — priority 2 is
+    /// `.env` (1 is `.env.local`, 0 is `.env.example`). Without them, locale
+    /// *ordering* would silently change on any project whose `.env.local` or
+    /// `.env.example` sets a locale its `.env` does not.
+    fn app_locale(&self) -> Option<String> {
+        self.handle_get_parsed_env_var("APP_LOCALE")
+            .filter(|var| !var.is_commented && var.priority == 2 && !var.value.is_empty())
+            .map(|var| var.value)
+    }
+
+    /// Push a lang catalogue's authoritative text into Salsa.
+    fn handle_register_lang_source(&mut self, path: PathBuf, text: String) {
+        self.translations.register(&mut self.db, path, text);
+    }
+
+    /// Drop a lang path's cached entry so the next lookup re-reads disk.
+    fn handle_invalidate_lang_path(&mut self, path: &Path) {
+        self.translations.invalidate(path);
     }
 
     /// Handle getting a parsed env variable by name from Salsa

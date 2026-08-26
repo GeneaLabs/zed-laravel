@@ -228,6 +228,10 @@ fn detect_method_name_position_detects_instance_past_multibyte_char() {
 // catalogue case. Both now delegate to the shared, char-safe
 // `display_truncate::truncate_for_display` (also used by `hover.rs`), so the
 // limit is 200 chars, not 47/50, and the ellipsis is the single `…` char.
+//
+// `extract_translation_value` moved into `salsa_impl` when translation reads
+// were routed through Salsa (issue #293); it is the same function, and this
+// coverage follows it rather than being dropped.
 
 #[test]
 fn translation_value_truncation_is_char_boundary_safe() {
@@ -236,7 +240,7 @@ fn translation_value_truncation_is_char_boundary_safe() {
     // multibyte char at the cut point can't panic.
     let value: String = "a".repeat(199) + "č" + &"é".repeat(50);
     let line = format!("'key' => '{}',", value);
-    let display = LaravelLanguageServer::extract_translation_value(&line);
+    let display = laravel_lsp::salsa_impl::extract_translation_value(&line);
     assert!(display.ends_with('…'));
     assert_eq!(display.chars().count(), 201); // 200 + ellipsis
 }
@@ -248,7 +252,7 @@ fn translation_value_under_two_hundred_chars_is_not_truncated() {
     // 200-char, char-based limit now passes it through untouched.
     let value = "č".repeat(30);
     let line = format!("'key' => '{}',", value);
-    let display = LaravelLanguageServer::extract_translation_value(&line);
+    let display = laravel_lsp::salsa_impl::extract_translation_value(&line);
     assert_eq!(display, value);
 }
 

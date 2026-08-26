@@ -1,6 +1,68 @@
 use super::*;
+use crate::salsa_impl::{LaravelDatabase, ResolvedTranslationData, TranslationCache};
 use std::fs;
 use tempfile::TempDir;
+
+/// Drives the **real** production resolution path — [`TranslationCache`] over a
+/// bare [`LaravelDatabase`] — rather than a test-only reimplementation. This is
+/// the same code hover, go-to-definition and diagnostics run; the LSP actor
+/// adds only channel plumbing on top of it, so a guarantee proven here (a
+/// containment refusal, a precedence order) is a guarantee about production.
+///
+/// Each `Resolver::default()` is a cold cache, which is what most of these
+/// tests want. Warmth across calls is covered separately, in
+/// `translation_salsa_cache.rs`.
+#[derive(Default)]
+struct Resolver {
+    db: LaravelDatabase,
+    cache: TranslationCache,
+}
+
+impl Resolver {
+    /// Resolve a key, returning the value and the catalogue it came from.
+    fn resolve(
+        &mut self,
+        root: &Path,
+        key: &str,
+        locale: &str,
+        vendor_map: Option<&HashMap<String, PathBuf>>,
+    ) -> Option<ResolvedTranslationData> {
+        self.cache
+            .resolve(&mut self.db, root, key, locale, vendor_map)
+    }
+
+    /// Resolve a key to its value alone.
+    fn value(&mut self, root: &Path, key: &str, locale: &str) -> Option<String> {
+        self.resolve(root, key, locale, None).map(|r| r.value)
+    }
+
+    /// Every locale that could define `key`, with no APP_LOCALE — the
+    /// discovery cases below are about *which* locales are found, not their
+    /// ordering.
+    fn locales(
+        &mut self,
+        root: &Path,
+        key: &str,
+        vendor_map: Option<&HashMap<String, PathBuf>>,
+    ) -> Vec<String> {
+        self.cache
+            .locales(&mut self.db, root, key, vendor_map, None)
+    }
+
+    /// Every locale that could define `key`, ordered against an explicit
+    /// APP_LOCALE.
+    ///
+    /// Passed directly rather than written into a `.env`: the cache takes the
+    /// locale as an argument, and the actor is what reads it out of the Salsa
+    /// env cache. Writing a `.env` here would prove nothing about ordering —
+    /// these assertions would pass on a cache that ignored APP_LOCALE
+    /// entirely. The `.env` -> ordering wiring is proven end to end in
+    /// `tests/translation_salsa_cache.rs` instead.
+    fn locales_led_by(&mut self, root: &Path, key: &str, app_locale: &str) -> Vec<String> {
+        self.cache
+            .locales(&mut self.db, root, key, None, Some(app_locale))
+    }
+}
 
 /// Build a fake Laravel project root with a `lang/` directory ready for tests.
 fn fake_project_with_lang() -> TempDir {
@@ -20,7 +82,7 @@ fn resolves_dotted_key_from_php_file() {
     )
     .unwrap();
 
-    let got = resolve_translation(project.path(), "validation.required", "en");
+    let got = Resolver::default().value(project.path(), "validation.required", "en");
     assert_eq!(got.as_deref(), Some("'The :attribute field is required.'"));
 }
 
@@ -35,11 +97,15 @@ fn resolves_nested_dotted_key_from_php_file() {
     .unwrap();
 
     assert_eq!(
-        resolve_translation(project.path(), "auth.failed", "en").as_deref(),
+        Resolver::default()
+            .value(project.path(), "auth.failed", "en")
+            .as_deref(),
         Some("'These credentials do not match.'")
     );
     assert_eq!(
-        resolve_translation(project.path(), "auth.throttle.message", "en").as_deref(),
+        Resolver::default()
+            .value(project.path(), "auth.throttle.message", "en")
+            .as_deref(),
         Some("'Too many attempts.'")
     );
 }
@@ -59,7 +125,9 @@ fn resolves_text_key_from_json_file() {
     .unwrap();
 
     assert_eq!(
-        resolve_translation(project.path(), "Welcome to our app", "en").as_deref(),
+        Resolver::default()
+            .value(project.path(), "Welcome to our app", "en")
+            .as_deref(),
         Some("'Welcome to our app'")
     );
 }
@@ -71,7 +139,7 @@ fn returns_none_for_missing_dotted_key() {
     fs::write(&validation, "<?php\nreturn ['present' => 'x'];\n").unwrap();
 
     assert_eq!(
-        resolve_translation(project.path(), "validation.missing", "en"),
+        Resolver::default().value(project.path(), "validation.missing", "en"),
         None
     );
 }
@@ -83,7 +151,7 @@ fn returns_none_for_missing_json_key() {
     fs::write(&json, r#"{"Present": "Present"}"#).unwrap();
 
     assert_eq!(
-        resolve_translation(project.path(), "Missing entry", "en"),
+        Resolver::default().value(project.path(), "Missing entry", "en"),
         None
     );
 }
@@ -93,11 +161,11 @@ fn returns_none_when_file_does_not_exist() {
     let project = fake_project_with_lang();
     // No files written.
     assert_eq!(
-        resolve_translation(project.path(), "validation.required", "en"),
+        Resolver::default().value(project.path(), "validation.required", "en"),
         None
     );
     assert_eq!(
-        resolve_translation(project.path(), "Free-form text", "en"),
+        Resolver::default().value(project.path(), "Free-form text", "en"),
         None
     );
 }
@@ -134,7 +202,7 @@ fn resolves_namespaced_translation_from_published_path() {
     )
     .unwrap();
 
-    let got = resolve_translation(
+    let got = Resolver::default().value(
         project.path(),
         "filament-tables::table.actions.filter.label",
         "en",
@@ -153,9 +221,9 @@ fn resolves_namespaced_translation_with_source_path() {
     )
     .unwrap();
 
-    let resolved =
-        resolve_translation_detailed(project.path(), "livewire::validation.required", "en", None)
-            .expect("namespaced lookup should hit");
+    let resolved = Resolver::default()
+        .resolve(project.path(), "livewire::validation.required", "en", None)
+        .expect("namespaced lookup should hit");
 
     assert_eq!(resolved.value, "'This field is required.'");
     assert!(
@@ -171,7 +239,7 @@ fn resolves_namespaced_translation_with_source_path() {
 fn returns_none_for_missing_namespaced_file() {
     let project = fake_project_with_lang();
     assert_eq!(
-        resolve_translation(project.path(), "filament-tables::table.actions.label", "en"),
+        Resolver::default().value(project.path(), "filament-tables::table.actions.label", "en"),
         None
     );
 }
@@ -196,13 +264,14 @@ fn falls_back_to_unpublished_vendor_dir_when_published_path_missing() {
     let mut vendor_map: HashMap<String, PathBuf> = HashMap::new();
     vendor_map.insert("billing".to_string(), vendor_lang.clone());
 
-    let resolved = resolve_translation_detailed(
-        project.path(),
-        "billing::invoice.total",
-        "en",
-        Some(&vendor_map),
-    )
-    .expect("unpublished vendor fallback should resolve");
+    let resolved = Resolver::default()
+        .resolve(
+            project.path(),
+            "billing::invoice.total",
+            "en",
+            Some(&vendor_map),
+        )
+        .expect("unpublished vendor fallback should resolve");
     assert_eq!(resolved.value, "'Total'");
     assert!(
         resolved
@@ -240,13 +309,14 @@ fn published_path_still_wins_over_vendor_map_when_both_exist() {
     let mut vendor_map: HashMap<String, PathBuf> = HashMap::new();
     vendor_map.insert("billing".to_string(), vendor_lang);
 
-    let resolved = resolve_translation_detailed(
-        project.path(),
-        "billing::invoice.total",
-        "en",
-        Some(&vendor_map),
-    )
-    .expect("should resolve");
+    let resolved = Resolver::default()
+        .resolve(
+            project.path(),
+            "billing::invoice.total",
+            "en",
+            Some(&vendor_map),
+        )
+        .expect("should resolve");
     // Published overrides — the user's choice when they ran
     // `php artisan vendor:publish` should take precedence.
     assert_eq!(resolved.value, "'Published total'");
@@ -257,7 +327,7 @@ fn dotted_key_without_path_returns_none() {
     let project = fake_project_with_lang();
     // A bare file name like "validation" — no key segment after the dot.
     assert_eq!(
-        resolve_translation(project.path(), "validation", "en"),
+        Resolver::default().value(project.path(), "validation", "en"),
         None
     );
 }
@@ -272,11 +342,15 @@ fn respects_locale_argument() {
     fs::write(&fr, "<?php\nreturn ['required' => 'Français'];\n").unwrap();
 
     assert_eq!(
-        resolve_translation(project.path(), "validation.required", "en").as_deref(),
+        Resolver::default()
+            .value(project.path(), "validation.required", "en")
+            .as_deref(),
         Some("'English'")
     );
     assert_eq!(
-        resolve_translation(project.path(), "validation.required", "fr").as_deref(),
+        Resolver::default()
+            .value(project.path(), "validation.required", "fr")
+            .as_deref(),
         Some("'Français'")
     );
 }
@@ -305,7 +379,7 @@ fn namespaced_dir_outside_root_is_refused() {
     // Namespace points at a directory entirely outside the project root.
     vendor_map.insert("billing".to_string(), outside.path().to_path_buf());
 
-    let resolved = resolve_translation_detailed(
+    let resolved = Resolver::default().resolve(
         project.path(),
         "billing::invoice.total",
         "en",
@@ -358,7 +432,9 @@ fn absolute_namespace_in_the_published_path_is_refused() {
     );
 
     assert!(
-        resolve_translation_detailed(project.path(), &key, "en", None).is_none(),
+        Resolver::default()
+            .resolve(project.path(), &key, "en", None)
+            .is_none(),
         "an absolute namespace must never escape the project root"
     );
 }
@@ -390,7 +466,9 @@ fn traversing_namespace_in_the_published_path_is_refused() {
 
     let key = format!("{namespace}::invoice.total");
     assert!(
-        resolve_translation_detailed(project.path(), &key, "en", None).is_none(),
+        Resolver::default()
+            .resolve(project.path(), &key, "en", None)
+            .is_none(),
         "a traversing namespace must never escape the project root"
     );
 }
@@ -420,7 +498,9 @@ fn dotted_key_read_through_an_escaping_symlink_is_refused() {
     );
 
     assert!(
-        resolve_translation(project.path(), "invoice.total", "en").is_none(),
+        Resolver::default()
+            .value(project.path(), "invoice.total", "en")
+            .is_none(),
         "a lang directory symlinked out of the root must never be read"
     );
 }
@@ -445,7 +525,9 @@ fn text_key_read_through_an_escaping_symlink_is_refused() {
     );
 
     assert!(
-        resolve_translation(project.path(), "Welcome", "en").is_none(),
+        Resolver::default()
+            .value(project.path(), "Welcome", "en")
+            .is_none(),
         "a lang directory symlinked out of the root must never be read"
     );
 }
@@ -467,7 +549,7 @@ fn root_with_locales(locales: &[&str]) -> TempDir {
 fn available_locales_enumerates_locale_directories() {
     let dir = root_with_locales(&["en", "de", "fr"]);
     assert_eq!(
-        available_locales(dir.path(), "messages.welcome", None),
+        Resolver::default().locales(dir.path(), "messages.welcome", None),
         vec!["de", "en", "fr"]
     );
 }
@@ -483,7 +565,7 @@ fn available_locales_extracts_json_catalogue_stems() {
     fs::write(lang.join("README.md"), "").unwrap();
 
     assert_eq!(
-        available_locales(dir.path(), "Welcome to our app", None),
+        Resolver::default().locales(dir.path(), "Welcome to our app", None),
         vec!["de", "en"]
     );
 }
@@ -493,7 +575,7 @@ fn available_locales_excludes_the_vendor_directory() {
     let dir = root_with_locales(&["en", "de"]);
     fs::create_dir_all(dir.path().join("lang/vendor/somepkg/en")).unwrap();
 
-    let locales = available_locales(dir.path(), "messages.welcome", None);
+    let locales = Resolver::default().locales(dir.path(), "messages.welcome", None);
     assert!(
         !locales.contains(&"vendor".to_string()),
         "vendor is a namespace container, not a locale: {locales:?}"
@@ -506,7 +588,7 @@ fn available_locales_falls_back_when_the_lang_directory_is_missing() {
     let dir = TempDir::new().unwrap();
     // No lang/ at all — read_dir errors on every candidate.
     assert_eq!(
-        available_locales(dir.path(), "messages.welcome", None),
+        Resolver::default().locales(dir.path(), "messages.welcome", None),
         vec!["en"]
     );
 }
@@ -517,7 +599,7 @@ fn available_locales_falls_back_when_the_lang_directory_is_empty() {
     fs::create_dir_all(dir.path().join("lang")).unwrap();
     // Exists, but holds no locale subdirectories and no .json catalogues.
     assert_eq!(
-        available_locales(dir.path(), "messages.welcome", None),
+        Resolver::default().locales(dir.path(), "messages.welcome", None),
         vec!["en"]
     );
 }
@@ -535,7 +617,7 @@ fn available_locales_unions_published_and_unpublished_vendor_dirs() {
     map.insert("shop".to_string(), pkg_lang);
 
     assert_eq!(
-        available_locales(dir.path(), "shop::messages.title", Some(&map)),
+        Resolver::default().locales(dir.path(), "shop::messages.title", Some(&map)),
         vec!["de", "fr"],
         "both directories contribute; neither is consulted in isolation"
     );
@@ -554,7 +636,7 @@ fn available_locales_deduplicates_overlapping_vendor_dirs() {
     map.insert("shop".to_string(), pkg_lang);
 
     assert_eq!(
-        available_locales(dir.path(), "shop::messages.title", Some(&map)),
+        Resolver::default().locales(dir.path(), "shop::messages.title", Some(&map)),
         vec!["de", "en"],
         "a locale in both directories is listed once, not doubled"
     );
@@ -583,7 +665,7 @@ fn available_locales_refuses_an_out_of_root_vendor_dir() {
     map.insert("shop".to_string(), outside.path().to_path_buf());
 
     assert_eq!(
-        available_locales(dir.path(), "shop::messages.title", Some(&map)),
+        Resolver::default().locales(dir.path(), "shop::messages.title", Some(&map)),
         vec!["de"],
         "an out-of-root vendor dir must contribute nothing"
     );
@@ -603,7 +685,7 @@ fn available_locales_refuses_an_escaping_published_namespace() {
     let project = fake_project_with_lang();
     let key = format!("{}::messages.title", outside.path().display());
 
-    let locales = available_locales(project.path(), &key, None);
+    let locales = Resolver::default().locales(project.path(), &key, None);
     assert_eq!(
         locales,
         vec!["en"],
@@ -620,10 +702,9 @@ fn available_locales_refuses_an_escaping_published_namespace() {
 #[test]
 fn available_locales_leads_with_app_locale_then_alphabetical() {
     let dir = root_with_locales(&["en", "de", "fr", "es"]);
-    fs::write(dir.path().join(".env"), "APP_NAME=Test\nAPP_LOCALE=fr\n").unwrap();
 
     assert_eq!(
-        available_locales(dir.path(), "messages.welcome", None),
+        Resolver::default().locales_led_by(dir.path(), "messages.welcome", "fr"),
         vec!["fr", "de", "en", "es"],
         "APP_LOCALE leads; the remainder stays alphabetical"
     );
@@ -632,10 +713,9 @@ fn available_locales_leads_with_app_locale_then_alphabetical() {
 #[test]
 fn available_locales_is_alphabetical_when_app_locale_is_unset() {
     let dir = root_with_locales(&["en", "de", "fr", "es"]);
-    fs::write(dir.path().join(".env"), "APP_NAME=Test\n").unwrap();
 
     assert_eq!(
-        available_locales(dir.path(), "messages.welcome", None),
+        Resolver::default().locales(dir.path(), "messages.welcome", None),
         vec!["de", "en", "es", "fr"]
     );
 }
@@ -643,10 +723,9 @@ fn available_locales_is_alphabetical_when_app_locale_is_unset() {
 #[test]
 fn available_locales_ignores_an_app_locale_no_directory_defines() {
     let dir = root_with_locales(&["en", "de", "fr", "es"]);
-    fs::write(dir.path().join(".env"), "APP_LOCALE=ja\n").unwrap();
 
     assert_eq!(
-        available_locales(dir.path(), "messages.welcome", None),
+        Resolver::default().locales_led_by(dir.path(), "messages.welcome", "ja"),
         vec!["de", "en", "es", "fr"],
         "an APP_LOCALE outside the discovered set must not panic or reorder"
     );
@@ -669,11 +748,12 @@ fn resources_lang_only_project_discovers_and_resolves() {
     .unwrap();
 
     assert_eq!(
-        available_locales(dir.path(), "contract.title", None),
+        Resolver::default().locales(dir.path(), "contract.title", None),
         vec!["de"],
         "discovery must see resources/lang"
     );
-    let resolved = resolve_translation_detailed(dir.path(), "contract.title", "de", None)
+    let resolved = Resolver::default()
+        .resolve(dir.path(), "contract.title", "de", None)
         .expect("resolution must see resources/lang too");
     assert_eq!(resolved.value, "'Vertrag'");
     assert_eq!(resolved.source_file, lang.join("de/contract.php"));
@@ -686,8 +766,12 @@ fn resources_lang_json_text_key_resolves() {
     fs::create_dir_all(&lang).unwrap();
     fs::write(lang.join("de.json"), r#"{"Welcome":"Willkommen"}"#).unwrap();
 
-    assert_eq!(available_locales(dir.path(), "Welcome", None), vec!["de"]);
-    let resolved = resolve_translation_detailed(dir.path(), "Welcome", "de", None)
+    assert_eq!(
+        Resolver::default().locales(dir.path(), "Welcome", None),
+        vec!["de"]
+    );
+    let resolved = Resolver::default()
+        .resolve(dir.path(), "Welcome", "de", None)
         .expect("JSON catalogue under resources/lang must resolve");
     assert_eq!(resolved.value, "'Willkommen'");
 }

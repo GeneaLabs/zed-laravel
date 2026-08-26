@@ -52,6 +52,7 @@ mod slot_variable_resolution;
 mod translation_locale_consistency;
 mod translation_namespace_check;
 mod translation_namespace_navigation;
+mod translation_salsa_cache;
 mod view_diagnostic_containment;
 mod view_navigation_containment;
 mod vite_completion_context;

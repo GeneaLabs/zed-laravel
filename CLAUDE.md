@@ -175,6 +175,7 @@ The LSP uses a dedicated thread for Salsa incremental computation to avoid lifet
 | Project Files | `ProjectFiles` | `ViewReferenceLocationData` | Reference finding across project |
 | Service Providers | `ServiceProviderFile` | `MiddlewareRegistrationData`, `BindingRegistrationData` | Middleware/binding lookups |
 | Env Variables | `EnvFile` | `EnvVariableData` | Environment variable lookups |
+| Translations | `LangFile`, `LangDir` | `ResolvedTranslationData` | Translation key resolution + locale discovery |
 
 ### Important Conventions
 
@@ -230,6 +231,7 @@ did_change(file) → Debounce 250ms → Update Salsa input → Queries recompute
 | Routes | `route('home')` | SourceFile | Route name in `routes/*.php` |
 | Config | `config('app.name')` | SourceFile | `config/*.php` |
 | Env | `env('APP_NAME')` | SourceFile | `.env` |
+| Translations | `__('validation.required')` | LangFile / LangDir | `lang/*/*.php`, `lang/*.json` |
 | Classes | `use App\Support\Foo;`, `@use('App\Support\Foo')` | SourceFile (PHP `use` clauses, Blade `@use` directives, Volt front matter) | `app/**/Foo.php` |
 | Middleware | `->middleware('auth')` | SourceFile | Alias in registry |
 | Bindings | `app('cache')` | SourceFile | Binding in registry |
@@ -242,6 +244,7 @@ did_change(file) → Debounce 250ms → Update Salsa input → Queries recompute
 | `bootstrap/app.php`, `Providers/*.php` | `ServiceProviderFile` | Middleware aliases, container bindings |
 | `.env`, `.env.*` | `EnvFile` | Environment variable values |
 | `config/*.php`, `composer.json` | `ConfigFile` | View paths, namespaces, PSR-4 mappings |
+| `lang/**/*.php`, `lang/*.json`, `resources/lang/**` | `LangFile`, `LangDir` | Translation values, locale discovery |
 
 **Target Files (existence only):**
 - View files, component files, Livewire classes, translation files, assets

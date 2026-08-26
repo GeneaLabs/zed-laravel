@@ -12,8 +12,9 @@
 //!    notify us about files we actually index: the project's PSR-4
 //!    source roots (from `composer.json` — `app/`, `src/`, any custom
 //!    `Modules\` mapping), the configured view paths, the Livewire path
-//!    (if any), `routes/`, `database/migrations/`, `vendor/`, and the
-//!    Inertia pages dir. The PSR-4 roots (M2) are what make an external
+//!    (if any), `routes/`, `database/migrations/`, `vendor/`, the
+//!    Inertia pages dir, and both translation lang roots (`lang/` and
+//!    `resources/lang/`). The PSR-4 roots (M2) are what make an external
 //!    edit to *any* first-party source dir — not just the hardcoded
 //!    controllers path — converge the magic-member index. A
 //!    `composer install` that rewrites thousands of files in `vendor/`
@@ -113,9 +114,9 @@ pub fn build_watchers(
     let kind = Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete);
 
     // 5 fixed (controllers, routes, migrations, vendor php + blade) + 4 Inertia
-    // page-extension globs + 1 optional livewire + 2 per view path + 1 per PSR-4
-    // source root.
-    let mut watchers = Vec::with_capacity(10 + 2 * view_paths.len() + psr4_roots.len());
+    // page-extension globs + 6 lang-catalogue globs (3 per lang root) + 1
+    // optional livewire + 2 per view path + 1 per PSR-4 source root.
+    let mut watchers = Vec::with_capacity(16 + 2 * view_paths.len() + psr4_roots.len());
 
     // Controllers — current default path. If a project moves them, we
     // miss those changes until a future improvement makes this glob
@@ -198,6 +199,38 @@ pub fn build_watchers(
             glob_pattern: GlobPattern::String(format!("{}/**/*.{}", glob_base(&pages_dir), ext)),
             kind,
         });
+    }
+
+    // Translation catalogues (issue #293). Until the translation layer was
+    // routed through Salsa, every lookup re-read these files from disk, so no
+    // glob was needed — nothing was cached, so nothing could go stale. Now that
+    // they are cached, an external edit (a `git pull`, a branch switch,
+    // `php artisan lang:publish`) must reach `did_change_watched_files` or the
+    // session would keep serving the pre-change translation.
+    //
+    // Both lang roots are watched, not just `lang/`: the resolver searches
+    // `lang/` (Laravel 9+) *and* `resources/lang/` (Laravel 8 and earlier), and
+    // watching only the first would leave every Laravel-8-layout project
+    // serving stale translations — the exact hover/diagnostics divergence
+    // issue #288 exists to close.
+    //
+    // Three globs per root: `**/*.php` for locale directories (which also
+    // covers `vendor/`), `*.json` for the top-level text catalogues Laravel
+    // reads as `{lang_root}/{locale}.json`, and an explicit `vendor/**/*.php`
+    // for published package translations. The last overlaps the first; the
+    // watched-files handler is idempotent, so duplicate events collapse.
+    for lang_root in crate::translation_lookup::project_lang_roots(root) {
+        let base = glob_base(&lang_root);
+        for pattern in [
+            format!("{base}/**/*.php"),
+            format!("{base}/*.json"),
+            format!("{base}/vendor/**/*.php"),
+        ] {
+            watchers.push(FileSystemWatcher {
+                glob_pattern: GlobPattern::String(pattern),
+                kind,
+            });
+        }
     }
 
     // First-party PSR-4 source roots (M2). Each gets a recursive `**/*.php`

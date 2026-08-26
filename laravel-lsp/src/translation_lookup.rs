@@ -1,4 +1,4 @@
-//! Resolve Laravel translation keys to their localized strings.
+//! Work out *which files could define* a Laravel translation key.
 //!
 //! Every shape resolves under `{lang_root}/`, where `{lang_root}` is `lang/`
 //! (Laravel 9+) or `resources/lang/` (Laravel 8 and earlier) — both are always
@@ -20,86 +20,64 @@
 //!   JSON file `{lang_root}/{locale}.json`. The key IS the source string and
 //!   the value is the translated string.
 //!
-//! No shape assumes a locale. [`available_locales`] answers "which locales
-//! could define this key", and hover, go-to-definition and diagnostics all
-//! resolve against that one set so they cannot disagree (issue #288).
+//! No shape assumes a locale. [`locale_candidate_dirs`] answers "which
+//! directories could reveal a locale for this key", and hover, go-to-definition
+//! and diagnostics all resolve against that one set so they cannot disagree
+//! (issue #288).
 //!
-//! All three shapes route to the same PHP-array walker from [`config_lookup`]
-//! since Laravel's `.php` translation files share their exact shape with
-//! config files.
+//! # This module does no I/O
 //!
-//! Every path this module builds joins segments taken verbatim from a
-//! translation key in parsed PHP/Blade source — the `vendor::` namespace, the
-//! dotted file segment — or from a `loadTranslationsFrom` argument. All of it
-//! is untrusted, so **every** read and directory enumeration here is fenced by
-//! [`crate::path_containment`]: reads through [`read_in_root`], enumeration in
-//! [`available_locales`] (issue #248).
+//! It is **pure path arithmetic**: it names candidate files and directories and
+//! stops there. Reading them, parsing them and caching the result is
+//! [`crate::salsa_impl::TranslationCache`]'s job, so every lang-file read goes
+//! through Salsa and is invalidated rather than repeated (issue #293). Splitting
+//! it this way keeps one definition of "where could this key live" shared by the
+//! resolver, locale discovery and their tests.
+//!
+//! Every path built here joins segments taken verbatim from a translation key
+//! in parsed PHP/Blade source — the `vendor::` namespace, the dotted file
+//! segment — or from a `loadTranslationsFrom` argument. **All of it is
+//! untrusted and can carry `../` traversal or an absolute path.** Because
+//! nothing here reads, the fail-closed containment guard that used to sit at
+//! each read site now sits at the single choke point that does:
+//! `TranslationCache::ensure_file` / `ensure_dir`, which refuse any candidate
+//! they cannot prove inside the project root (issue #248). A candidate emitted
+//! here is a *proposal*, never a permission.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::config_lookup;
+/// The fallback locale when a project exposes none — Laravel's own default.
+pub const DEFAULT_LOCALE: &str = "en";
 
-/// A resolved translation along with the file the value was read from.
-/// The source file is rendered as a display-friendly path in hover output so
-/// users can tell whether a key came from an app file, a published vendor
-/// translation, or the JSON catalogue.
-#[derive(Debug, Clone)]
-pub struct ResolvedTranslation {
-    pub value: String,
-    pub source_file: PathBuf,
+/// One file that could define a translation key, and how to look it up in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranslationCandidate {
+    /// A PHP array catalogue and the nested key path to walk inside it.
+    Php {
+        /// The `.php` catalogue to read.
+        path: PathBuf,
+        /// The key segments after the file name (`['required']` for
+        /// `validation.required`). Never empty.
+        key_path: Vec<String>,
+    },
+    /// A `{lang_root}/{locale}.json` catalogue, where the key is the source
+    /// string itself.
+    Json {
+        /// The `.json` catalogue to read.
+        path: PathBuf,
+        /// The source string, used verbatim as the lookup key.
+        key: String,
+    },
 }
 
-/// Resolve a translation key against a project root and locale. Returns both
-/// the translated value and the file it was read from — see
-/// [`ResolvedTranslation`].
-///
-/// For namespaced keys (`package::file.key`), the resolver tries the
-/// published location first (`lang/vendor/<namespace>/...`) and falls back
-/// to the unpublished vendor location when `vendor_map` is provided. See
-/// [`crate::vendor_translations`] for how that map is built.
-pub fn resolve_translation_detailed(
-    root: &Path,
-    key: &str,
-    locale: &str,
-    vendor_map: Option<&HashMap<String, PathBuf>>,
-) -> Option<ResolvedTranslation> {
-    if let Some((namespace, rest)) = split_namespace(key) {
-        if let Some(r) = resolve_namespaced(root, namespace, rest, locale) {
-            return Some(r);
+impl TranslationCandidate {
+    /// The file this candidate would read.
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Php { path, .. } | Self::Json { path, .. } => path,
         }
-        // Published path missed — try the unpublished vendor directory.
-        if let Some(map) = vendor_map {
-            if let Some(dir) = map.get(namespace) {
-                return resolve_namespaced_in_dir(root, dir, rest, locale);
-            }
-        }
-        return None;
     }
-    if is_dotted_key(key) {
-        return resolve_dotted(root, key, locale);
-    }
-    resolve_text_key(root, key, locale)
-}
-
-/// Backwards-compatible wrapper that returns only the value, matching the
-/// pre-source-file API. Used by tests that don't care about the source path.
-pub fn resolve_translation(root: &Path, key: &str, locale: &str) -> Option<String> {
-    resolve_translation_detailed(root, key, locale, None).map(|r| r.value)
-}
-
-/// Split a namespaced key (`package::file.key.path`) into its namespace and
-/// the rest. Returns `None` for keys without a `::` separator.
-fn split_namespace(key: &str) -> Option<(&str, &str)> {
-    let idx = key.find("::")?;
-    Some((&key[..idx], &key[idx + 2..]))
-}
-
-/// Distinguish a dotted PHP-file key (`validation.required`) from a text key
-/// (`"Welcome to our app"`). Heuristic: dotted keys contain a `.` and no
-/// whitespace.
-fn is_dotted_key(key: &str) -> bool {
-    key.contains('.') && !key.contains(' ')
 }
 
 /// The directories a project may keep translations in, in priority order:
@@ -114,220 +92,141 @@ pub fn project_lang_roots(root: &Path) -> [PathBuf; 2] {
     [root.join("lang"), root.join("resources").join("lang")]
 }
 
-/// Resolve a dotted key against `{lang_root}/{locale}/{file}.php`.
-fn resolve_dotted(root: &Path, key: &str, locale: &str) -> Option<ResolvedTranslation> {
+/// Split a namespaced key (`package::file.key.path`) into its namespace and
+/// the rest. Returns `None` for keys without a `::` separator.
+pub fn split_namespace(key: &str) -> Option<(&str, &str)> {
+    let idx = key.find("::")?;
+    Some((&key[..idx], &key[idx + 2..]))
+}
+
+/// Distinguish a dotted PHP-file key (`validation.required`) from a text key
+/// (`"Welcome to our app"`). Heuristic: dotted keys contain a `.` and no
+/// whitespace.
+pub fn is_dotted_key(key: &str) -> bool {
+    key.contains('.') && !key.contains(' ')
+}
+
+/// Split a dotted key into its file segment and the nested key path after it.
+/// `None` when there is no key path left (`'validation'`, `'validation.'`) —
+/// a bare file name names no key, which is not a resolution.
+fn split_file_and_key_path(key: &str) -> Option<(&str, Vec<String>)> {
     let mut parts = key.split('.');
     let file = parts.next()?;
-    let key_path: Vec<&str> = parts.collect();
-    if key_path.is_empty() {
-        return None;
-    }
-    project_lang_roots(root).iter().find_map(|lang| {
-        read_php_value(
-            root,
-            &lang.join(locale).join(format!("{}.php", file)),
-            &key_path,
-        )
-    })
+    let key_path: Vec<String> = parts.map(str::to_string).collect();
+    (!key_path.is_empty()).then_some((file, key_path))
 }
 
-/// Resolve a published namespaced key against
-/// `lang/vendor/{namespace}/{locale}/{file}.php`.
+/// Every file that could define `key` in `locale`, in the order the resolver
+/// must try them — first hit wins.
 ///
-/// `namespace` is the `vendor::` prefix lifted verbatim out of parsed PHP/Blade
-/// source, so it is untrusted and can carry traversal segments. The read is
-/// fenced by [`read_in_root`], which is why `root` is threaded through
-/// (issue #248).
-fn resolve_namespaced(
+/// For namespaced keys the published override
+/// (`{lang_root}/vendor/{namespace}/{locale}/{file}.php`) is proposed before
+/// the package's own unpublished directory from `vendor_map`, matching
+/// Laravel's own precedence.
+///
+/// Returns an empty vec for a key that names no lookup at all (a bare
+/// `'validation'` with no nested path).
+pub fn translation_candidates(
     root: &Path,
-    namespace: &str,
-    rest: &str,
+    key: &str,
     locale: &str,
-) -> Option<ResolvedTranslation> {
-    let mut parts = rest.split('.');
-    let file = parts.next()?;
-    let key_path: Vec<&str> = parts.collect();
-    if key_path.is_empty() {
-        return None;
-    }
-    project_lang_roots(root).iter().find_map(|lang| {
-        read_php_value(
-            root,
-            &lang
-                .join("vendor")
-                .join(namespace)
-                .join(locale)
-                .join(format!("{}.php", file)),
-            &key_path,
-        )
-    })
-}
+    vendor_map: Option<&HashMap<String, PathBuf>>,
+) -> Vec<TranslationCandidate> {
+    let php = |path: PathBuf, key_path: &[String]| TranslationCandidate::Php {
+        path,
+        key_path: key_path.to_vec(),
+    };
 
-/// Resolve a namespaced key against an explicit lang directory — the
-/// fallback used when the published path missed and the namespace was
-/// discovered via [`crate::vendor_translations`]. `root` is the project root,
-/// used to fence the read inside the tree.
-fn resolve_namespaced_in_dir(
-    root: &Path,
-    lang_dir: &Path,
-    rest: &str,
-    locale: &str,
-) -> Option<ResolvedTranslation> {
-    let mut parts = rest.split('.');
-    let file = parts.next()?;
-    let key_path: Vec<&str> = parts.collect();
-    if key_path.is_empty() {
-        return None;
+    if let Some((namespace, rest)) = split_namespace(key) {
+        let Some((file, key_path)) = split_file_and_key_path(rest) else {
+            return Vec::new();
+        };
+        let mut out: Vec<TranslationCandidate> = project_lang_roots(root)
+            .iter()
+            .map(|lang| {
+                php(
+                    lang.join("vendor")
+                        .join(namespace)
+                        .join(locale)
+                        .join(format!("{file}.php")),
+                    &key_path,
+                )
+            })
+            .collect();
+        // Published path missed — the package's own unpublished lang dir.
+        if let Some(dir) = vendor_map.and_then(|m| m.get(namespace)) {
+            out.push(php(dir.join(locale).join(format!("{file}.php")), &key_path));
+        }
+        return out;
     }
-    // `lang_dir` is derived from a `loadTranslationsFrom` argument in
-    // project/vendor source — untrusted input. A traversal like
-    // `base_path('../../../../.ssh')` or `__DIR__.'/../../../../etc'` could seed
-    // an out-of-root directory; [`read_php_value`] fail-closes before the read
-    // so a namespaced key can never turn the LSP into an arbitrary-file-read
-    // primitive (issue #248).
-    let path = lang_dir.join(locale).join(format!("{}.php", file));
-    read_php_value(root, &path, &key_path)
-}
 
-/// Resolve a text key against `lang/{locale}.json`.
-fn resolve_text_key(root: &Path, key: &str, locale: &str) -> Option<ResolvedTranslation> {
-    project_lang_roots(root).iter().find_map(|lang| {
-        let path = lang.join(format!("{}.json", locale));
-        let content = read_in_root(&path, root)?;
-        let map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&content).ok()?;
-        let value = map.get(key)?.as_str()?;
-        Some(ResolvedTranslation {
-            value: format!("'{}'", value),
-            source_file: path,
+    if is_dotted_key(key) {
+        let Some((file, key_path)) = split_file_and_key_path(key) else {
+            return Vec::new();
+        };
+        return project_lang_roots(root)
+            .iter()
+            .map(|lang| php(lang.join(locale).join(format!("{file}.php")), &key_path))
+            .collect();
+    }
+
+    project_lang_roots(root)
+        .iter()
+        .map(|lang| TranslationCandidate::Json {
+            path: lang.join(format!("{locale}.json")),
+            key: key.to_string(),
         })
-    })
+        .collect()
 }
 
-/// The fallback locale when a project exposes none — Laravel's own default.
-const DEFAULT_LOCALE: &str = "en";
-
-/// Every locale that could define `key`, ordered with the project's configured
-/// `APP_LOCALE` first and the rest alphabetically.
+/// Every directory whose listing could reveal a locale for `key`.
 ///
-/// Discovery looks at the lang directories the key could live in — the
-/// published vendor override plus the registered namespace directory for a
-/// namespaced key, the project lang roots otherwise — and treats both locale
-/// *subdirectories* and `{locale}.json` catalogues as evidence of a locale.
-/// The `vendor` subdirectory is excluded: it holds published package
-/// translations, not a locale. Any directory that resolves outside the project
-/// root — a published path whose `vendor::` namespace carries traversal, or a
-/// registered namespace directory seeded by `loadTranslationsFrom` — is dropped
-/// before it is read (issue #248).
-///
-/// Never returns empty. A project with no discoverable locales (no lang
-/// directory at all, or one containing nothing) falls back to
-/// `["en"]`, so callers always have something to resolve against.
+/// For a namespaced key that is the published vendor override directory plus
+/// the registered namespace directory; for every other shape it is the project
+/// lang roots. Locale *subdirectories* and `{locale}.json` catalogues both
+/// count as evidence of a locale — see
+/// [`crate::salsa_impl::locales_in_dir`], which reads the listing.
 ///
 /// This is the single source of truth for "which locales matter for this key" —
 /// hover, go-to-definition and diagnostics all resolve against the same set, so
 /// a key defined only in `de` renders, navigates and validates consistently.
-pub fn available_locales(
+pub fn locale_candidate_dirs(
     root: &Path,
     key: &str,
     vendor_map: Option<&HashMap<String, PathBuf>>,
-) -> Vec<String> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some((namespace, _)) = split_namespace(key) {
-        for lang in project_lang_roots(root) {
-            dirs.push(lang.join("vendor").join(namespace));
-        }
-        if let Some(dir) = vendor_map.and_then(|m| m.get(namespace)) {
-            dirs.push(dir.clone());
-        }
-    } else {
-        dirs.extend(project_lang_roots(root));
+) -> Vec<PathBuf> {
+    let Some((namespace, _)) = split_namespace(key) else {
+        return project_lang_roots(root).to_vec();
+    };
+    let mut dirs: Vec<PathBuf> = project_lang_roots(root)
+        .iter()
+        .map(|lang| lang.join("vendor").join(namespace))
+        .collect();
+    if let Some(dir) = vendor_map.and_then(|m| m.get(namespace)) {
+        dirs.push(dir.clone());
     }
-
-    let mut locales: Vec<String> = Vec::new();
-    for dir in &dirs {
-        // Enumeration is a read site, so it takes the same fail-closed guard
-        // the resolver reads take (issue #248). Both namespaced dirs are built
-        // from untrusted input that can point anywhere: the published path
-        // joins the `vendor::` namespace lifted verbatim out of parsed source,
-        // and the unpublished dir comes from a `loadTranslationsFrom` argument.
-        // Without the guard, `read_dir` on an escaped directory would surface
-        // whatever subdirectories it found there as this key's locales.
-        if !crate::path_containment::path_within_root(dir, root) {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let locale = if path.is_dir() {
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(str::to_string)
-            } else if path.extension().is_some_and(|e| e == "json") {
-                path.file_stem()
-                    .and_then(|n| n.to_str())
-                    .map(str::to_string)
-            } else {
-                None
-            };
-            // `vendor` is a namespace container, not a locale. Dedupe across
-            // dirs so a locale present in both the published and unpublished
-            // vendor directory is listed once.
-            if let Some(locale) = locale {
-                if locale != "vendor" && !locales.contains(&locale) {
-                    locales.push(locale);
-                }
-            }
-        }
-    }
-
-    if locales.is_empty() {
-        return vec![DEFAULT_LOCALE.to_string()];
-    }
-
-    locales.sort();
-    // The project's own locale leads; everything else stays alphabetical. An
-    // APP_LOCALE that no directory defines simply doesn't appear, leaving the
-    // alphabetical order untouched.
-    if let Some(app_locale) = crate::config::read_env_value(root, "APP_LOCALE") {
-        if let Some(idx) = locales.iter().position(|l| *l == app_locale) {
-            let leading = locales.remove(idx);
-            locales.insert(0, leading);
-        }
-    }
-    locales
+    dirs
 }
 
-/// Every *file* read in this module goes through here (directory enumeration
-/// carries its own copy of the guard, in [`available_locales`]). Every path
-/// here is built by joining segments lifted verbatim out of a translation key
-/// in parsed PHP/Blade source — the `vendor::` namespace, the dotted file
-/// segment — or, for the unpublished fallback, a `loadTranslationsFrom`
-/// directory. All of that is untrusted and can carry `../` traversal, so
-/// containment is checked here, once, for every read rather than at each
-/// caller where it can be forgotten (issue #248).
+/// Is `path` a Laravel translation catalogue — a `.php` array file or a
+/// `.json` text catalogue under one of this project's lang roots?
 ///
-/// **Fail-closed**: a path that cannot be proven inside `root` is refused, not
-/// read. `path_within_root` canonicalizes, so an under-root symlink pointing
-/// out of the tree is refused too.
-fn read_in_root(path: &Path, root: &Path) -> Option<String> {
-    if !crate::path_containment::path_within_root(path, root) {
-        return None;
-    }
-    std::fs::read_to_string(path).ok()
-}
-
-/// Shared PHP-file read + walk. Returns the bundled value + source path on hit.
-/// The read is fenced inside `root` by [`read_in_root`].
-fn read_php_value(root: &Path, path: &Path, key_path: &[&str]) -> Option<ResolvedTranslation> {
-    let content = read_in_root(path, root)?;
-    let value = config_lookup::resolve_in_source(&content, key_path)?;
-    Some(ResolvedTranslation {
-        value,
-        source_file: path.to_path_buf(),
-    })
+/// Used to route editor edits and watched-file events at the correct Salsa
+/// input: a lang file must invalidate the translation cache, which no other
+/// `.php` file does (issue #293). Deliberately **lexical** — this classifies,
+/// it does not authorize, and the fail-closed containment guard still runs at
+/// the read site (issue #248).
+///
+/// `lang/vendor/**` is included: published package translations are catalogues
+/// like any other, and an edit to one must invalidate just the same.
+pub fn is_lang_file(root: &Path, path: &Path) -> bool {
+    let is_catalogue = path
+        .extension()
+        .is_some_and(|ext| ext == "php" || ext == "json");
+    is_catalogue
+        && project_lang_roots(root)
+            .iter()
+            .any(|lang| path.starts_with(lang))
 }
 
 #[cfg(test)]

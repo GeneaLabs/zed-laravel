@@ -81,7 +81,7 @@ async fn assert_all_three_agree(
         "goto must navigate to the same file hover sourced the value from"
     );
 
-    let check = LaravelLanguageServer::check_translation_file(root, key, None);
+    let check = backend.check_translation_file(root, key, None).await;
     assert!(
         check.exists,
         "diagnostics must not report a key the hover displays as missing"
@@ -145,7 +145,7 @@ async fn a_locale_file_without_the_key_is_not_treated_as_a_definition() {
     *backend.root_path.write().await = Some(root.clone());
 
     let key = "contract.prefill.failed_title";
-    let check = LaravelLanguageServer::check_translation_file(&root, key, None);
+    let check = backend.check_translation_file(&root, key, None).await;
     assert!(
         !check.exists,
         "an existing lang file without the key is not a definition"
