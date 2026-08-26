@@ -42,7 +42,6 @@ use crate::path_join::join_relative;
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 lazy_static! {
@@ -66,99 +65,83 @@ lazy_static! {
     ).unwrap();
 }
 
-/// Walk `vendor/` for service providers that register translation namespaces.
-/// Returns a map of `namespace → absolute lang directory`.
+/// Candidate provider files under `vendor/` — every `*ServiceProvider*.php`,
+/// filename-gated only.
 ///
-/// The scan applies two cheap gates before parsing any file:
-/// - **Filename**: must contain `ServiceProvider`
-/// - **Content substring**: must contain `loadTranslationsFrom` or
-///   `hasTranslations`
+/// Enumeration only: nothing is read here. The content gate
+/// (`loadTranslationsFrom` / `hasTranslations`) and the AST walk both live in
+/// [`namespaces_in_source`], which
+/// [`crate::salsa_impl::TranslationCache::vendor_namespaces`] memoizes per
+/// file — so the substring check runs once per edit rather than once per scan
+/// (issue #293).
 ///
 /// Roughly the same shape as
 /// [`crate::config::scan_vendor_for_component_aliases`] — these two scans
 /// could share a single vendor-walk pass once we add the persistent cache.
-pub fn scan_vendor_translation_namespaces(root: &Path) -> HashMap<String, PathBuf> {
-    let vendor = root.join("vendor");
-    if !vendor.is_dir() {
-        return HashMap::new();
-    }
-
-    let mut namespaces: HashMap<String, PathBuf> = HashMap::new();
-
-    for entry in walkdir::WalkDir::new(&vendor)
-        .max_depth(10)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|s| s.to_str()) != Some("php") {
-            continue;
-        }
-        let filename_matches = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.contains("ServiceProvider"))
-            .unwrap_or(false);
-        if !filename_matches {
-            continue;
-        }
-
-        let Ok(source) = fs::read_to_string(path) else {
-            continue;
-        };
-        if !source.contains("loadTranslationsFrom") && !source.contains("hasTranslations") {
-            continue;
-        }
-
-        process_provider_file(&source, path, root, &mut namespaces);
-    }
-
-    namespaces
+pub fn vendor_provider_candidates(root: &Path) -> Vec<PathBuf> {
+    php_files_named_service_provider(&root.join("vendor"), true)
 }
 
-/// Walk `app/Providers/` for app service providers that register translation
-/// namespaces. Returns a map of `namespace → absolute lang directory`.
+/// Candidate provider files under `app/Providers/`.
 ///
 /// App providers (e.g. `AppServiceProvider`) commonly register translations
 /// with `loadTranslationsFrom(lang_path('app'), 'app')` — a path the vendor
 /// scan never sees because it lives outside `vendor/` and never publishes to
 /// `lang/vendor/`. The directory itself is the gate here (everything under
-/// `app/Providers/` is a provider), so only the content substring is checked.
-pub fn scan_app_translation_namespaces(root: &Path) -> HashMap<String, PathBuf> {
-    let providers = root.join("app").join("Providers");
-    if !providers.is_dir() {
-        return HashMap::new();
+/// `app/Providers/` is a provider), so the filename is not checked.
+pub fn app_provider_candidates(root: &Path) -> Vec<PathBuf> {
+    php_files_named_service_provider(&root.join("app").join("Providers"), false)
+}
+
+/// Every `.php` file under `dir`, optionally restricted to filenames
+/// containing `ServiceProvider`. A directory walk, not a read.
+fn php_files_named_service_provider(dir: &Path, require_provider_name: bool) -> Vec<PathBuf> {
+    if !dir.is_dir() {
+        return Vec::new();
     }
-
-    let mut namespaces: HashMap<String, PathBuf> = HashMap::new();
-
-    for entry in walkdir::WalkDir::new(&providers)
+    walkdir::WalkDir::new(dir)
         .max_depth(10)
         .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|s| s.to_str()) != Some("php") {
-            continue;
-        }
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.into_path())
+        .filter(|path| path.is_file())
+        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("php"))
+        .filter(|path| {
+            !require_provider_name
+                || path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("ServiceProvider"))
+        })
+        .collect()
+}
 
-        let Ok(source) = fs::read_to_string(path) else {
-            continue;
-        };
-        if !source.contains("loadTranslationsFrom") && !source.contains("hasTranslations") {
-            continue;
-        }
-
-        process_provider_file(&source, path, root, &mut namespaces);
+/// Every `namespace -> absolute lang directory` registration one provider file
+/// declares, in declaration order.
+///
+/// Pure: the caller supplies the source. Returns a `Vec` rather than merging
+/// into a map so the caller owns precedence — first-match-wins within a scan,
+/// app-over-vendor across them — which a Salsa query must not decide for it.
+///
+/// Cheap substring gate first: a provider that mentions neither
+/// `loadTranslationsFrom` nor `hasTranslations` is never parsed.
+pub fn namespaces_in_source(
+    source: &str,
+    provider_path: &Path,
+    root: &Path,
+) -> Vec<(String, PathBuf)> {
+    if !source.contains("loadTranslationsFrom") && !source.contains("hasTranslations") {
+        return Vec::new();
     }
-
-    namespaces
+    let mut namespaces = HashMap::new();
+    process_provider_file(source, provider_path, root, &mut namespaces);
+    let mut out: Vec<(String, PathBuf)> = namespaces.into_iter().collect();
+    // `process_provider_file` merges into a HashMap, whose iteration order is
+    // random. Sort so one file's contribution is deterministic — otherwise two
+    // registrations in the same file would race for first-match-wins at the
+    // merge site and the resolved lang dir could differ between runs.
+    out.sort();
+    out
 }
 
 /// Run both extraction passes over a single provider file: the AST-based

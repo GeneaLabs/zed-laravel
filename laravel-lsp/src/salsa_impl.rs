@@ -208,6 +208,50 @@ pub struct LangDir {
     pub entries: Vec<(String, bool)>,
 }
 
+/// One service provider that may register translation namespaces — a
+/// `*ServiceProvider*.php` under `vendor/`, or any `.php` under
+/// `app/Providers/`.
+///
+/// Separate from [`LangFile`] despite the identical shape: a provider is not a
+/// catalogue, and invalidating one has different consequences (it drops the
+/// namespace map, not a directory listing).
+#[salsa::input]
+pub struct TranslationProviderFile {
+    /// The file path
+    #[returns(ref)]
+    pub path: PathBuf,
+
+    /// Version incremented when the file changes
+    #[returns(copy)]
+    pub version: i32,
+
+    /// The file content; empty for an absent or unreadable provider
+    #[returns(ref)]
+    pub text: String,
+}
+
+/// The discovered provider files, split by scan so their precedence survives:
+/// app providers override vendor ones on a namespace conflict, because the app
+/// boots last.
+///
+/// An input rather than a plain field so the walk is a tracked dependency like
+/// [`ProjectFiles`], and a provider create/delete invalidates what derives from
+/// it (issue #293).
+#[salsa::input]
+pub struct TranslationProviderFiles {
+    /// Version incremented when the discovered set changes
+    #[returns(copy)]
+    pub version: i32,
+
+    /// `*ServiceProvider*.php` under `vendor/`
+    #[returns(ref)]
+    pub vendor: Vec<PathBuf>,
+
+    /// `.php` under `app/Providers/`
+    #[returns(ref)]
+    pub app: Vec<PathBuf>,
+}
+
 // ============================================================================
 // Interned Types - Deduplicated strings
 // ============================================================================
@@ -1617,6 +1661,25 @@ pub fn locales_in_dir(db: &dyn Db, dir: LangDir) -> Vec<String> {
     locales
 }
 
+/// Every `namespace -> lang dir` registration one provider declares.
+///
+/// Memoized per `(file, root)`. The vendor scan reads and substring-gates every
+/// `*ServiceProvider*.php` in `vendor/` and AST-parses the survivors; before
+/// this it ran as one uncached sweep whose result was then held for the entire
+/// session with no way to refresh it (issue #293).
+#[salsa::tracked]
+pub fn translation_namespaces_in_provider(
+    db: &dyn Db,
+    file: TranslationProviderFile,
+    root: PathBuf,
+) -> Vec<(String, PathBuf)> {
+    let text = file.text(db);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    crate::vendor_translations::namespaces_in_source(text, file.path(db), &root)
+}
+
 /// Lang-file reads and locale enumeration, memoized through Salsa.
 ///
 /// Owned by [`SalsaActor`] in production; constructible directly so tests can
@@ -1655,6 +1718,11 @@ pub struct TranslationCache {
     /// Version counter shared by files and directories; bumped on every
     /// registration so Salsa sees a changed input.
     version: i32,
+    /// Service providers registering translation namespaces, keyed by path.
+    providers: HashMap<PathBuf, TranslationProviderFile>,
+    /// The discovered provider set. `None` until the first scan, and reset by
+    /// [`Self::invalidate_providers`] so a create or delete is picked up.
+    provider_files: Option<TranslationProviderFiles>,
     /// How many times this cache has touched disk — one per
     /// `fs::read_to_string` or `read_dir` that actually ran. Lets a test prove
     /// a second resolution is served from Salsa rather than re-read.
@@ -2009,6 +2077,105 @@ impl TranslationCache {
             }
         }
         out
+    }
+
+    /// Drop everything derived from service providers, so the next namespace
+    /// lookup rediscovers and re-reads them.
+    ///
+    /// Both halves are cleared: the discovered set (a provider may have been
+    /// created or deleted) and every provider's cached text (one may have been
+    /// edited). Lang catalogues are untouched — a provider edit changes *where*
+    /// a namespaced key resolves, not what any catalogue contains.
+    pub fn invalidate_providers(&mut self) {
+        self.provider_files = None;
+        self.providers.clear();
+    }
+
+    /// The Salsa input for one provider's text, registering it on first touch.
+    ///
+    /// No containment guard here, unlike [`Self::ensure_file`], and the
+    /// difference is deliberate: these paths come from walking the project's
+    /// own `vendor/` and `app/Providers/` directories, not from joining an
+    /// untrusted key segment onto a directory. There is nothing for #248 to
+    /// fence — and canonicalizing every `*ServiceProvider*.php` in `vendor/`
+    /// would add thousands of syscalls to buy nothing.
+    fn ensure_provider(
+        &mut self,
+        db: &mut LaravelDatabase,
+        path: &Path,
+    ) -> TranslationProviderFile {
+        if let Some(file) = self.providers.get(path) {
+            return *file;
+        }
+        self.disk_reads += 1;
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        self.version += 1;
+        let file = TranslationProviderFile::new(&*db, path.to_path_buf(), self.version, text);
+        self.providers.insert(path.to_path_buf(), file);
+        file
+    }
+
+    /// The discovered provider set, walking `vendor/` and `app/Providers/` on
+    /// first touch.
+    fn ensure_provider_files(
+        &mut self,
+        db: &mut LaravelDatabase,
+        root: &Path,
+    ) -> TranslationProviderFiles {
+        if let Some(files) = self.provider_files {
+            return files;
+        }
+        self.disk_reads += 1;
+        let vendor = crate::vendor_translations::vendor_provider_candidates(root);
+        let app = crate::vendor_translations::app_provider_candidates(root);
+        self.version += 1;
+        let files = TranslationProviderFiles::new(&*db, self.version, vendor, app);
+        self.provider_files = Some(files);
+        files
+    }
+
+    /// The project's `namespace -> lang directory` map, as registered by its
+    /// service providers.
+    ///
+    /// Precedence is preserved from the direct-`fs` scans: **first-match-wins**
+    /// within a scan (provider boot order is non-deterministic and we cannot
+    /// rank packages without a full composer graph), and the **app scan
+    /// overrides vendor** on conflict, because the app boots last.
+    ///
+    /// Every read behind this — the directory walk, each provider's text, the
+    /// substring gate and the AST parse — is memoized. Previously the whole
+    /// sweep ran once and its result was cached for the life of the session
+    /// with no invalidation path at all, so a `composer update` or an edited
+    /// `loadTranslationsFrom` was invisible until the LSP restarted. Since this
+    /// map decides where a namespaced key resolves, that made a stale map a
+    /// wrong answer rather than merely an old one (issue #293).
+    pub fn vendor_namespaces(
+        &mut self,
+        db: &mut LaravelDatabase,
+        root: &Path,
+    ) -> HashMap<String, PathBuf> {
+        let files = self.ensure_provider_files(db, root);
+        let vendor = files.vendor(&*db).clone();
+        let app = files.app(&*db).clone();
+
+        let mut map: HashMap<String, PathBuf> = HashMap::new();
+        for path in vendor {
+            let file = self.ensure_provider(db, &path);
+            for (namespace, dir) in
+                translation_namespaces_in_provider(&*db, file, root.to_path_buf()).clone()
+            {
+                map.entry(namespace).or_insert(dir);
+            }
+        }
+        for path in app {
+            let file = self.ensure_provider(db, &path);
+            for (namespace, dir) in
+                translation_namespaces_in_provider(&*db, file, root.to_path_buf()).clone()
+            {
+                map.insert(namespace, dir);
+            }
+        }
+        map
     }
 }
 
@@ -6231,6 +6398,13 @@ pub enum SalsaRequest {
         dotted_key: String,
         reply: oneshot::Sender<Vec<TranslationKeyLocationData>>,
     },
+    /// The project's provider-registered translation namespace map
+    VendorTranslationNamespaces {
+        root: PathBuf,
+        reply: oneshot::Sender<HashMap<String, PathBuf>>,
+    },
+    /// Drop everything derived from service providers
+    InvalidateTranslationProviders { reply: oneshot::Sender<()> },
     /// How many times the translation cache has touched disk
     LangDiskReads { reply: oneshot::Sender<usize> },
 
@@ -7563,6 +7737,36 @@ impl SalsaHandle {
             .map_err(|_| "Salsa actor dropped reply channel")
     }
 
+    /// The project's provider-registered `namespace -> lang dir` map.
+    pub async fn vendor_translation_namespaces(
+        &self,
+        root: PathBuf,
+    ) -> Result<HashMap<String, PathBuf>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::VendorTranslationNamespaces {
+                root,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Drop everything derived from service providers after one changed.
+    pub async fn invalidate_translation_providers(&self) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::InvalidateTranslationProviders { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
     /// How many times the translation cache has touched disk this session.
     ///
     /// Instrumentation for the cache-warmth tests: compare the count before and
@@ -8773,6 +8977,14 @@ impl SalsaActor {
                         &dotted_key,
                     );
                     let _ = reply.send(result);
+                }
+                SalsaRequest::VendorTranslationNamespaces { root, reply } => {
+                    let result = self.translations.vendor_namespaces(&mut self.db, &root);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::InvalidateTranslationProviders { reply } => {
+                    self.translations.invalidate_providers();
+                    let _ = reply.send(());
                 }
                 SalsaRequest::LangDiskReads { reply } => {
                     let _ = reply.send(self.translations.disk_reads());

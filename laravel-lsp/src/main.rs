@@ -2053,7 +2053,6 @@ struct LaravelLanguageServer {
     /// `None` means "not yet scanned"; `Some(map)` means "scanned, here's
     /// what we found" (the map can be empty if no packages register).
     /// Wrapped in `Arc` so clones share memory across hover calls.
-    vendor_translation_namespaces: Arc<RwLock<Option<Arc<HashMap<String, PathBuf>>>>>,
 
     /// Cache of parsed Laravel framework Builder + Query/Builder method
     /// surfaces, keyed by project root. Populated lazily on the first
@@ -4427,7 +4426,6 @@ impl LaravelLanguageServer {
             indexing_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_index: Arc::new(RwLock::new(None)),
             command_index: Arc::new(RwLock::new(None)),
-            vendor_translation_namespaces: Arc::new(RwLock::new(None)),
             builder_method_index_cache: Arc::new(RwLock::new(HashMap::new())),
             route_decl_cache: Arc::new(RwLock::new(HashMap::new())),
             magic_deps: Arc::new(std::sync::RwLock::new(
@@ -17365,7 +17363,6 @@ return [
             indexing_in_flight: self.indexing_in_flight.clone(),
             migration_index: self.migration_index.clone(),
             command_index: self.command_index.clone(),
-            vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
             builder_method_index_cache: self.builder_method_index_cache.clone(),
             route_decl_cache: self.route_decl_cache.clone(),
             magic_deps: self.magic_deps.clone(),
@@ -20565,49 +20562,34 @@ return [
         }
     }
 
-    /// Return the cached vendor translation-namespace map, building it on
-    /// first call. The scan walks `vendor/` for service providers calling
-    /// `loadTranslationsFrom(...)` — see [`laravel_lsp::vendor_translations`].
-    /// Subsequent hover calls reuse the cached Arc without re-scanning.
-    /// Drop the cached vendor translation-namespace map so the next lookup
-    /// rescans providers. See [`Self::vendor_translation_namespaces_for`].
+    /// Drop everything derived from service providers, so the next namespace
+    /// lookup rediscovers and re-reads them.
     async fn invalidate_vendor_translation_namespaces(&self) {
-        *self.vendor_translation_namespaces.write().await = None;
+        let _ = self.salsa.invalidate_translation_providers().await;
     }
 
+    /// The project's provider-registered `namespace -> lang dir` map — the
+    /// registrations `loadTranslationsFrom(...)` makes, from both `vendor/`
+    /// and `app/Providers/`.
+    ///
+    /// Served from the Salsa translation cache (issue #293). This used to run
+    /// one uncached `walkdir` sweep under `spawn_blocking` and hold the result
+    /// in an `RwLock` for the whole session, with nothing that could ever clear
+    /// it — so a `composer update`, a newly-installed package, or an edited
+    /// registration was invisible until the LSP restarted. Salsa is the cache
+    /// now, which is both warm and invalidatable.
+    ///
+    /// `None` only when the actor is unreachable; an empty map is `Some`, since
+    /// "this project registers no namespaces" is an answer, not a failure.
     async fn vendor_translation_namespaces_for(
         &self,
         root: &Path,
     ) -> Option<Arc<HashMap<String, PathBuf>>> {
-        {
-            let guard = self.vendor_translation_namespaces.read().await;
-            if let Some(ref existing) = *guard {
-                return Some(existing.clone());
-            }
-        }
-        // Cache miss — scan and store. Done under spawn_blocking so the
-        // walkdir traversal doesn't block the LSP event loop.
-        //
-        // Two passes merge into one map: the vendor scan first, then the
-        // app-provider scan, which overrides vendor on namespace conflict —
-        // the app boots last, so an app `loadTranslationsFrom` for a namespace
-        // a package also registers is the one that wins at runtime.
-        let root_clone = root.to_path_buf();
-        let scanned = tokio::task::spawn_blocking(move || {
-            let mut map =
-                laravel_lsp::vendor_translations::scan_vendor_translation_namespaces(&root_clone);
-            for (namespace, dir) in
-                laravel_lsp::vendor_translations::scan_app_translation_namespaces(&root_clone)
-            {
-                map.insert(namespace, dir);
-            }
-            map
-        })
-        .await
-        .ok()?;
-        let arc = Arc::new(scanned);
-        *self.vendor_translation_namespaces.write().await = Some(arc.clone());
-        Some(arc)
+        self.salsa
+            .vendor_translation_namespaces(root.to_path_buf())
+            .await
+            .ok()
+            .map(Arc::new)
     }
 }
 

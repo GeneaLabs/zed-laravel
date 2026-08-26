@@ -1,6 +1,24 @@
 use super::*;
+use crate::salsa_impl::{LaravelDatabase, TranslationCache};
+use std::collections::HashMap;
 use std::fs;
 use tempfile::TempDir;
+
+/// Drives the **real** production path — `TranslationCache::vendor_namespaces`
+/// over a bare `LaravelDatabase`. That method merges both scans (vendor first,
+/// then app overriding it), which is what production consumes; no fixture here
+/// mixes the two, so each test still exercises exactly the scan it names.
+#[derive(Default)]
+struct Scanner {
+    db: LaravelDatabase,
+    cache: TranslationCache,
+}
+
+impl Scanner {
+    fn scan(&mut self, root: &Path) -> HashMap<String, PathBuf> {
+        self.cache.vendor_namespaces(&mut self.db, root)
+    }
+}
 
 /// Build a fake vendor tree at `vendor/<vendor>/<package>/` with a service
 /// provider file at the standard location.
@@ -31,7 +49,7 @@ class BillingServiceProvider {
     )
     .unwrap();
 
-    let map = scan_vendor_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     let resolved = map.get("billing").expect("should find billing namespace");
     assert!(
         resolved.ends_with("resources/lang"),
@@ -57,7 +75,7 @@ class Helpers {}
     )
     .unwrap();
 
-    let map = scan_vendor_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     assert!(map.is_empty(), "non-provider files must be ignored");
 }
 
@@ -77,7 +95,7 @@ class BillingServiceProvider {
     )
     .unwrap();
 
-    let map = scan_vendor_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     assert!(
         map.is_empty(),
         "providers without loadTranslationsFrom must contribute nothing"
@@ -100,7 +118,7 @@ fn captures_multiple_namespaces_across_packages() {
     )
     .unwrap();
 
-    let map = scan_vendor_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     assert!(map.contains_key("billing"));
     assert!(map.contains_key("auth"));
 }
@@ -109,7 +127,7 @@ fn captures_multiple_namespaces_across_packages() {
 fn returns_empty_when_vendor_dir_missing() {
     let project = TempDir::new().unwrap();
     // No vendor/ directory.
-    let map = scan_vendor_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     assert!(map.is_empty());
 }
 
@@ -130,7 +148,7 @@ fn first_registration_wins_on_namespace_conflict() {
     )
     .unwrap();
 
-    let map = scan_vendor_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     let resolved = map.get("shared").expect("conflict must still resolve");
     // The path will contain either "first" or "second" depending on walk order —
     // accept either, but it must be a single deterministic entry.
@@ -158,7 +176,7 @@ class BillingServiceProvider {
     )
     .unwrap();
 
-    let map = scan_vendor_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     let resolved = map
         .get("app")
         .expect("lang_path('app') must register 'app'");
@@ -185,7 +203,7 @@ class BillingServiceProvider {
     )
     .unwrap();
 
-    let map = scan_vendor_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     let resolved = map
         .get("custom")
         .expect("base_path('lang/custom') must register 'custom'");
@@ -216,7 +234,7 @@ class BillingServiceProvider {
     )
     .unwrap();
 
-    let map = scan_vendor_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     let resolved = map
         .get("billing")
         .expect("dirname(__DIR__).'/lang' must register 'billing'");
@@ -255,7 +273,7 @@ class AppServiceProvider {
 "#,
     );
 
-    let map = scan_app_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     let resolved = map
         .get("app")
         .expect("app provider registration must yield the 'app' namespace");
@@ -265,7 +283,7 @@ class AppServiceProvider {
 #[test]
 fn app_scan_returns_empty_when_providers_dir_missing() {
     let project = TempDir::new().unwrap();
-    let map = scan_app_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     assert!(map.is_empty());
 }
 
@@ -277,7 +295,7 @@ fn app_scan_ignores_providers_without_load_translations() {
         "AppServiceProvider",
         "<?php\nclass AppServiceProvider { public function boot(): void {} }\n",
     );
-    let map = scan_app_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     assert!(map.is_empty());
 }
 
@@ -320,7 +338,7 @@ class TablesServiceProvider extends PackageServiceProvider
     )
     .unwrap();
 
-    let map = scan_vendor_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     let resolved = map
         .get("filament-tables")
         .expect("builder registration must yield the filament-tables namespace");
@@ -349,7 +367,7 @@ class ToolsServiceProvider extends PackageServiceProvider
     )
     .unwrap();
 
-    let map = scan_vendor_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     assert!(
         map.contains_key("tools"),
         "->name('laravel-tools') must register namespace 'tools', got {map:?}"
@@ -376,9 +394,62 @@ class UiServiceProvider extends PackageServiceProvider
     )
     .unwrap();
 
-    let map = scan_vendor_translation_namespaces(project.path());
+    let map = Scanner::default().scan(project.path());
     assert!(
         map.is_empty(),
         "no ->hasTranslations() means no translation namespace, got {map:?}"
+    );
+}
+
+// ─── Precedence across the two scans ─────────────────────────────────────
+
+#[test]
+fn app_provider_overrides_a_vendor_provider_on_namespace_conflict() {
+    // The app boots last, so an app `loadTranslationsFrom` for a namespace a
+    // package also registers is the one that wins at runtime. Nothing else
+    // covers this: every other fixture here has providers from one scan only,
+    // so a merge that dropped the override would pass the whole rest of the
+    // suite.
+    let project = TempDir::new().unwrap();
+    let root = project.path();
+
+    // A package registering `shop` at its own bundled lang dir.
+    let provider = fake_vendor_package(root, "acme", "shop", "ShopServiceProvider");
+    let vendor_lang = provider.parent().unwrap().join("../resources/lang");
+    fs::create_dir_all(&vendor_lang).unwrap();
+    fs::write(
+        &provider,
+        r#"<?php
+namespace Acme\Shop;
+class ShopServiceProvider {
+    public function boot() {
+        $this->loadTranslationsFrom(__DIR__.'/../resources/lang', 'shop');
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // The app registering the same namespace somewhere else.
+    let app_lang = root.join("lang/shop");
+    fs::create_dir_all(&app_lang).unwrap();
+    fake_app_provider(
+        root,
+        "AppServiceProvider",
+        r#"<?php
+namespace App\Providers;
+class AppServiceProvider {
+    public function boot(): void {
+        $this->loadTranslationsFrom(lang_path('shop'), 'shop');
+    }
+}
+"#,
+    );
+
+    let map = Scanner::default().scan(root);
+    assert_eq!(
+        map.get("shop"),
+        Some(&app_lang.canonicalize().unwrap()),
+        "the app registration must win over the package's own"
     );
 }

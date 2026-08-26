@@ -854,3 +854,73 @@ async fn a_namespaced_key_resolves_against_the_refreshed_provider_map() {
          is now, not as it was when the session started"
     );
 }
+
+#[tokio::test]
+async fn the_provider_scan_is_warm_across_requests() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("lang/app")).unwrap();
+    write(
+        &root,
+        "app/Providers/AppServiceProvider.php",
+        &provider_registering("app", "app"),
+    );
+    // A vendor provider too, so the walk has both halves to do.
+    write(
+        &root,
+        "vendor/acme/billing/src/BillingServiceProvider.php",
+        "<?php\nclass BillingServiceProvider {\n    public function boot() {}\n}\n",
+    );
+    let backend = backend_for(&root).await;
+
+    let before = disk_reads(&backend).await;
+    let first = backend.vendor_translation_namespaces_for(&root).await;
+    let after_first = disk_reads(&backend).await;
+    let second = backend.vendor_translation_namespaces_for(&root).await;
+    let after_second = disk_reads(&backend).await;
+
+    assert!(first.as_ref().is_some_and(|m| m.contains_key("app")));
+    assert_eq!(second, first);
+    assert!(
+        after_first > before,
+        "the first scan must actually walk and read the providers"
+    );
+    assert_eq!(
+        after_second, after_first,
+        "the provider scan must be served from Salsa, not re-walked per request"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_created_externally_is_discovered() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("lang/shop")).unwrap();
+    fs::create_dir_all(root.join("app/Providers")).unwrap();
+    let backend = backend_for(&root).await;
+
+    assert!(
+        backend
+            .vendor_translation_namespaces_for(&root)
+            .await
+            .is_some_and(|m| m.is_empty()),
+        "precondition: no providers, and that empty result is now cached"
+    );
+
+    // A package is installed, or a provider is written, outside the editor.
+    let provider = write(
+        &root,
+        "app/Providers/ShopServiceProvider.php",
+        &provider_registering("shop", "shop"),
+    );
+    watched_event(&backend, &provider, FileChangeType::CREATED).await;
+
+    assert!(
+        backend
+            .vendor_translation_namespaces_for(&root)
+            .await
+            .is_some_and(|m| m.contains_key("shop")),
+        "a provider that did not exist at scan time must still be discovered — \
+         invalidation has to drop the discovered set, not just the file texts"
+    );
+}

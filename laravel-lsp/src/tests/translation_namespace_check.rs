@@ -114,7 +114,12 @@ class AppServiceProvider {
     .unwrap();
 
     // The merged map the LSP builds — here just the app-provider scan.
-    let map = laravel_lsp::vendor_translations::scan_app_translation_namespaces(&root);
+    let map = backend()
+        .vendor_translation_namespaces_for(&root)
+        .await
+        .expect("the actor must answer")
+        .as_ref()
+        .clone();
     // The dir exists, so the scan canonicalizes it (resolving macOS's
     // /var → /private/var symlink) — compare against the canonical form.
     assert_eq!(
