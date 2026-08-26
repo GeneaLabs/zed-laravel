@@ -1938,7 +1938,7 @@ struct LaravelLanguageServer {
     /// `vendor_open_magic_lru`) rather than a plain `HashMap`: the TTL only
     /// expires an entry's VALUE on next lookup, it never removes the key, so
     /// an unbounded map grew for every distinct path ever probed over a
-    /// session (goto/hover/diagnostics checking candidate paths that don't
+    /// session (goto/hover/completion checking candidate paths that don't
     /// exist) with nothing ever shrinking it. `std::sync::Mutex`, not
     /// `RwLock`: `lru` mutates on every read to reorder recency, so a "read"
     /// is never actually read-only.
@@ -2151,9 +2151,28 @@ const DEFAULT_SALSA_DEBOUNCE_MS: u64 = 200;
 const VENDOR_OPEN_MAGIC_LRU_CAP: usize = 128;
 
 /// Cap on `file_exists_cache`: how many distinct (path, exists, cached_at)
-/// probes stay resident at once. Generous — goto/hover/diagnostics probe many
-/// candidate paths per request, most of which don't exist — but bounded, so
-/// a long session doesn't grow the map for every path ever checked.
+/// probes stay resident at once.
+///
+/// This is a MEMORY CEILING, not a fit to a measured working set, and the
+/// distinction is worth keeping straight before anyone re-tunes it.
+///
+/// `file_exists_cached` is reached from exactly three places —
+/// `goto_definition`, `hover`, and `completion` — via the `resolve_*_file` and
+/// `create_*_location_from_salsa` helpers. All three are cursor-driven: they
+/// resolve ONE symbol, probing that symbol's handful of candidate paths.
+/// Nothing sweeps the project through here; diagnostics in particular resolve
+/// through their own path and never touch this cache. So the live set is
+/// bounded by how many distinct symbols a person navigates to, throttled
+/// further by the 5-second TTL — orders of magnitude below this cap in any
+/// plausible session.
+///
+/// The cap exists because the TTL alone never freed anything: it was only
+/// consulted on read, so a path probed once and never probed again stayed
+/// resident for the life of the process. 8192 entries is on the order of a
+/// megabyte — small enough to not care about, large enough that eviction
+/// pressure isn't a realistic concern. If it ever needs deriving from real
+/// data, measure the distinct-key count from a live session; do NOT scale it
+/// off the project's file count, which is not what keys this cache.
 const FILE_EXISTS_CACHE_CAP: usize = 8192;
 
 // NOTE: Blade directives are now dynamically discovered via get_all_blade_directives()
