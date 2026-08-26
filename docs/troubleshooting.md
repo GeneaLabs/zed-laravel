@@ -14,7 +14,7 @@ The extension is built against `zed_extension_api 0.7.0`, which requires **Zed 0
 
 ## 2. Does Zed recognize the file as PHP / Blade?
 
-The language server only attaches to files Zed has classified as **PHP**, **Blade**, **XML**, or `.env` (**Shell Script** by Zed's default, or **env** if you've remapped `.env` files to the [env extension](https://github.com/zarifpour/zed-env) via `file_types`). Open a `.php` file and check the **bottom-right status bar**:
+The language server only attaches to files Zed has classified as **PHP**, **Blade**, **XML**, or **Shell Script** — the last being Zed's default classification for `.env` and every `.env.*` variant. If you've remapped `.env` to another language via `file_types`, the server no longer attaches there; see [Environment files](environment.md). Open a `.php` file and check the **bottom-right status bar**:
 
 - Says **"PHP"** → good, the language is registered.
 - Says **"Plain Text"** → install the official [**PHP**](https://github.com/zed-extensions/php) extension (and [**Laravel Blade**](https://github.com/bajrangCoder/zed-laravel-blade) for `.blade.php`). Without a language registered, no language server — ours included — can attach.

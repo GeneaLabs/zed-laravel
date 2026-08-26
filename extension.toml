@@ -14,6 +14,16 @@ version = "0.7.2"
 # Short form: this is Zed's compact status-bar / language-server-list slot.
 name = "Laravel CE"
 # XML: for phpunit.xml env var autocomplete
-# Shell Script: Zed treats .env files as Shell Script (see bash/config.toml path_suffixes)
-# env: .env files remapped to the "env" extension's language via a user file_types setting
+# Shell Script: Zed classifies every env file as Shell Script — bare `.env` via
+# bash/config.toml `path_suffixes`, and `.env.*` variants via the
+# `"Shell Script": [".env.*"]` entry in Zed's own default settings. One entry
+# therefore attaches the server to `.env` and every variant alike, with no
+# user configuration.
+# env: the language name registered by dotenv extensions such as
+# zarifpour/zed-env. Inert on a default install — it only matters once a user
+# has installed such an extension AND remapped `.env` via `file_types`.
+# docs/environment.md argues against doing that, but arguing against a path is
+# not the same as breaking it: a user who wants a purpose-built dotenv grammar
+# should not thereby lose this extension's `.env` features. The LSP dispatches
+# env features on filename, not language, so attaching is all that is required.
 languages = ["PHP", "Blade", "XML", "Shell Script", "env"]

@@ -100,9 +100,16 @@ Map `.env` files to a non-shell language in `settings.json`. A `.env` is `KEY=va
 }
 ```
 
-Install the Ini extension (`zed: extensions`, search "INI") if you don't already have it. To avoid any extra install, map to the built-in **Plain Text** instead — the warnings disappear, but `.env` renders without highlighting. There's also a dedicated [env extension](https://github.com/zarifpour/zed-env) with a purpose-built dotenv grammar (keys, values, booleans, URLs, `${interpolations}`) — map to `"env"` after installing it.
+Install the Ini extension (`zed: extensions`, search "INI") if you don't already have it. To avoid any extra install, map to the built-in **Plain Text** instead — the warnings disappear, but `.env` renders without highlighting.
 
-> Heads-up: this extension's `.env` features (reference-count lens, hover, go-to) attach to the **Shell Script** and **env** languages. Remapping to Ini or Plain Text detaches them.
+> ⚠️ **This detaches our `.env` features.** The reference-count lens, hover, and go-to attach to the **Shell Script** language — Zed's default classification for `.env` and every `.env.*` variant. Remap to Ini or Plain Text and you trade shellcheck noise for losing them. Since v0.7.2 silences that noise automatically, approach 4 is now rarely the right trade.
+
+### A note on dedicated dotenv extensions
+
+[`zarifpour/zed-env`](https://github.com/zarifpour/zed-env) ships a purpose-built dotenv grammar and looks like the obvious answer. It isn't — for two reasons worth knowing before you install it:
+
+- **It does not claim your `.env` files.** Its `path_suffixes` list a bare `"env"`, which loses the length tie to Shell Script's `".env"`; the `.env.*` variants are claimed by Zed's own default settings at a tier the extension can't reach. Installing it changes nothing about `.env` unless you *also* write a `file_types` line — and that line works with or without the extension. This is the extension's own [issue #5](https://github.com/zarifpour/zed-env/issues/5), still open.
+- **It reclassifies files you didn't ask it to.** Those same `path_suffixes` include bare `"conf"`, `"example"`, `"local"`, and `"test"`, which match *any* otherwise-unclaimed file ending in them. In a stock Laravel app that captures `laravel/sail`'s `supervisord.conf` files, and it will keep reaching across every project you open.
 
 ## Per-project
 
@@ -111,4 +118,4 @@ Any of the `settings.json` blocks above also work in `.zed/settings.json` at the
 ## What the extension can — and can't — do for you
 
 - **Can (and does):** configure the bash language server. Zed lets one extension contribute *additional workspace configuration* to another server, merged into that server's own config — that's how the automatic fix above is delivered, and why it works even on Zed versions that drop your own `bash-language-server` settings.
-- **Can't:** change how Zed classifies files. The extension manifest has no `file_types` field, and Zed's default settings claim `.env*` for Shell Script at a tier only *your* `file_types` setting can override. That's why approach 4 is one line in your config, not something the extension ships.
+- **Can't:** change how Zed classifies files. The extension manifest has no `file_types` field, so the only lever an extension has is a language of its own with matching `path_suffixes` — and that lever reaches exactly half the problem. Bare `.env` is claimed by the bash grammar's `path_suffixes`, which an extension language could tie and win; the `.env.*` variants are claimed by Zed's *default settings*, a tier no extension can reach and only *your* `file_types` can override. Shipping a language would therefore fix `.env` and leave `.env.local` shell-linted — a split we'd rather not hand you. That's why approach 4 is one line in your config, and why this extension attaches to Shell Script instead of trying to replace it.
