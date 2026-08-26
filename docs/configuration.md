@@ -97,6 +97,30 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
           ]
         }
       }
+    },
+
+    // Tailwind completions inside Blade. The Tailwind server only offers
+    // completions in languages it knows, and only inside attributes it's told
+    // to treat as class lists — neither covers Blade out of the box. This block
+    // fixes both. It only takes effect once the server actually attaches, so
+    // also add "tailwindcss-language-server" to the Blade `language_servers`
+    // list further down (it is NOT in the list shown there — that list is the
+    // minimum this extension needs). Nothing here is required by this
+    // extension; skip the whole block if you don't use Tailwind.
+    "tailwindcss-language-server": {
+      "settings": {
+        // Parse Blade (and PHP) as HTML so the server offers completions there.
+        "includeLanguages": { "Blade": "html", "PHP": "html" },
+        // Attributes treated as class lists. Beyond plain `class`: Blade's
+        // @class([...]) directive, Alpine's :class / x-bind:class, and
+        // Livewire's wire:class.
+        "classAttributes": ["class", "@class", ":class", "wire:class", "x-bind:class"],
+        "experimental": {
+          // Completions inside any *:class="…" attribute the list above misses
+          // (e.g. x-transition:class, or a custom wire:*:class).
+          "classRegex": ["\\w?:class=\"([^\"]*)"]
+        }
+      }
     }
   },
 
