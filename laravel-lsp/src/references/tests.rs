@@ -230,6 +230,65 @@ fn classifies_each_directive_first_arg_as_view() {
     assert_eq!(got, Some(SymbolRef::View("view.row".into())));
 }
 
+/// Classify the directive at the cursor from its raw argument text. The span
+/// is deliberately wide so column 3 always lands inside it.
+fn classify_directive(name: &str, args: &str) -> Option<SymbolRef> {
+    let mut p = empty_patterns();
+    p.directives.push(Arc::new(DirectiveReferenceData {
+        name: name.to_string(),
+        arguments: Some(args.to_string()),
+        line: 0,
+        column: 0,
+        end_column: 200,
+        string_column: 0,
+        string_end_column: 0,
+    }));
+    p.build_position_index();
+    classify_pattern_at_cursor(&p, 0, 3)
+}
+
+/// `@includeWhen` / `@includeUnless` are condition-first, so the view name is
+/// argument one. Reading argument zero surfaced the condition expression
+/// itself as a "view" — and `@includeUnless` was absent from the directive
+/// list outright, so find-references skipped it entirely.
+#[test]
+fn classifies_condition_first_directives_at_their_second_argument() {
+    assert_eq!(
+        classify_directive("includeWhen", "($type === 'admin', 'pages.admin')"),
+        Some(SymbolRef::View("pages.admin".into()))
+    );
+    assert_eq!(
+        classify_directive("includeUnless", "($guest, 'partials.user-nav')"),
+        Some(SymbolRef::View("partials.user-nav".into()))
+    );
+    assert_eq!(
+        classify_directive("includeUnless", "(in_array($k, ['a', 'b']), 'pages.list')"),
+        Some(SymbolRef::View("pages.list".into()))
+    );
+}
+
+/// A view argument that isn't a string literal names no view this parser can
+/// resolve. The loose quote-trimming this replaced classified `$view` and
+/// `partials.` as View symbols — names no other reference can ever match.
+#[test]
+fn a_non_literal_directive_argument_classifies_nothing() {
+    assert_eq!(classify_directive("include", "($view)"), None);
+    assert_eq!(classify_directive("include", "('partials.' . $name)"), None);
+    assert_eq!(classify_directive("extends", "($layout)"), None);
+    assert_eq!(classify_directive("livewire", "($component)"), None);
+    assert_eq!(classify_directive("includeWhen", "($cond, $view)"), None);
+}
+
+/// The `@livewire('counter')` directive form still classifies as Livewire —
+/// it reads argument zero, which the strictness change must not disturb.
+#[test]
+fn classifies_livewire_directive_form() {
+    assert_eq!(
+        classify_directive("livewire", "('counter')"),
+        Some(SymbolRef::Livewire("counter".into()))
+    );
+}
+
 #[test]
 fn returns_none_when_cursor_misses_all_patterns() {
     // Empty pattern set + any cursor position → nothing classified.

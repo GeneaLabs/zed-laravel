@@ -222,6 +222,29 @@ fn extracts_blade_includes() {
     );
 }
 
+/// The outline label for a condition-first directive is argument one. A
+/// condition that compares a string used to donate its own literal to the
+/// label (`@includeWhen($type === 'admin', ...)` rendered `@includeWhen
+/// admin`), and a condition carrying an array literal donated the array's
+/// first element.
+#[test]
+fn condition_first_includes_label_from_their_second_argument() {
+    let content = r#"@includeWhen($type === 'admin', 'pages.admin')
+@includeUnless(in_array($k, ['a', 'b']), 'pages.list')
+@includeWhen($cond, 'pages.plain', ['status' => 'complete'])
+"#;
+    let symbols = extract_blade_symbols(content);
+    let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "@includeWhen pages.admin",
+            "@includeUnless pages.list",
+            "@includeWhen pages.plain",
+        ]
+    );
+}
+
 #[test]
 fn blade_outline_for_component_file() {
     // A typical Blade component file: props + slot + child components.

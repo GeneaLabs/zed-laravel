@@ -15922,34 +15922,16 @@ return [
         }]))
     }
 
-    /// Extract the second string argument from directive args
-    /// For @includeWhen($condition, 'view.name', $data)
+    /// Extract the view name from a condition-first directive's arguments.
+    /// For `@includeWhen($condition, 'view.name', $data)`.
     fn extract_second_string_arg(arguments: &str) -> Option<String> {
-        // Condition-first directives (`@includeWhen($cond, 'view', [...])`,
-        // `@includeUnless(...)`) put a boolean EXPRESSION first — it is not
-        // a quoted string. The name is therefore the FIRST quoted string in
-        // the args. The previous version skipped one quoted string on the
-        // assumption argument one was quoted: the two-argument form then
-        // resolved nothing, and the three-argument form returned the data
-        // array's first key — a wrong goto target and a false missing-view
-        // diagnostic.
-        let mut in_string = false;
-        let mut quote_char = ' ';
-        let mut result = String::new();
-
-        for ch in arguments.chars() {
-            if !in_string {
-                if ch == '\'' || ch == '"' {
-                    in_string = true;
-                    quote_char = ch;
-                }
-            } else if ch == quote_char {
-                return (!result.is_empty()).then_some(result);
-            } else {
-                result.push(ch);
-            }
-        }
-        None
+        // Condition-first directives (`@includeWhen`, `@includeUnless`) put a
+        // boolean EXPRESSION first, so the name is argument *one* — reached by
+        // splitting at the first top-level comma, not by taking the first
+        // quoted string in the list. A condition that compares a string
+        // (`$type === 'admin'`) donates its own literal to a first-string-wins
+        // scan, which then resolves the wrong view. See `directive_args`.
+        laravel_lsp::directive_args::nth_literal(arguments, 1)
     }
 
     /// Extract array of string arguments from directive args

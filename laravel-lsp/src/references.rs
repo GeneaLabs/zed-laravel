@@ -7,6 +7,7 @@
 //! "follow the instance chain" rule that distinguishes this from a global
 //! grep-and-rename.
 
+use crate::directive_args;
 use crate::salsa_impl::{ParsedPatternsData, PatternAtPosition, SymbolRefData};
 
 /// Classified symbol under the cursor. Mirrors [`SymbolRefData`] but stays on
@@ -105,7 +106,7 @@ pub fn classify_pattern_at_cursor(
             // a Livewire symbol so rename / find-references / goto match
             // the `<livewire:...>` tag form.
             if d.name == "livewire" {
-                let name = directive_first_string_arg(args)?;
+                let name = directive_args::nth_literal(args, 0)?;
                 return Some(SymbolRef::Livewire(name));
             }
             // @include('users.profile') and friends carry the view name in the
@@ -135,31 +136,27 @@ pub fn classify_pattern_at_cursor(
 /// Extract the view name carried by a Blade directive that takes a view
 /// argument (`@include`, `@extends`, `@component`, `@each`, plus the
 /// conditional variants). Returns `None` for directives that don't reference
-/// views or whose argument couldn't be parsed as a single string literal.
+/// views, and for a view argument that isn't a string literal — `@include($v)`
+/// and `@include('partials.' . $n)` name no view this parser can resolve.
 fn directive_view_name(name: &str, args: &str) -> Option<String> {
     if !matches!(
         name,
-        "include" | "extends" | "component" | "each" | "includeIf" | "includeWhen"
+        "include"
+            | "extends"
+            | "component"
+            | "each"
+            | "includeIf"
+            | "includeWhen"
+            | "includeUnless"
     ) {
         return None;
     }
-    directive_first_string_arg(args)
-}
-
-/// Extract the first string argument from a directive's parenthesized
-/// argument list. Handles `@livewire('counter')`, `@include('view')`, etc.
-/// Returns `None` when the args can't be parsed as a single quoted
-/// string at the head position.
-fn directive_first_string_arg(args: &str) -> Option<String> {
-    let trimmed = args.trim().trim_matches('(').trim_matches(')').trim();
-    // First comma-separated argument; trim quotes.
-    let first = trimmed.split(',').next()?.trim();
-    let unquoted = first.trim_matches('\'').trim_matches('"');
-    if unquoted.is_empty() {
-        None
-    } else {
-        Some(unquoted.to_string())
-    }
+    // `@includeWhen` / `@includeUnless` are condition-first, so their view
+    // name is argument one. Reading argument zero surfaced the condition
+    // expression itself as a "view" — a symbol that can never match another
+    // reference. `@includeUnless` was missing from the list outright, so
+    // find-references skipped it entirely.
+    directive_args::nth_literal(args, usize::from(directive_args::is_condition_first(name)))
 }
 
 #[cfg(test)]

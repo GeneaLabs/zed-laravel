@@ -245,13 +245,15 @@ fn directive_first_string_extraction_survives_data_arguments() {
 }
 
 /// Regression for the condition-first extractor: `@includeWhen` /
-/// `@includeUnless` put a boolean EXPRESSION first, so the view name is the
-/// FIRST quoted string in the args. The previous version skipped one quoted
-/// string — the two-argument form resolved nothing, and the three-argument
-/// form returned the data array's first key as the "view name" (wrong goto
-/// target, false missing-view diagnostic).
+/// `@includeUnless` put a boolean EXPRESSION first, so the view name is
+/// argument ONE — found by splitting the list at its first *top-level* comma,
+/// one that is not inside a quoted string, a nested `(...)`, or a `[...]`
+/// array literal. A first-quoted-string-wins scan resolved the condition's
+/// own literal (`$type === 'admin'` → `admin`) as the view name, and the
+/// version before that skipped one literal and returned the data array's
+/// first key. Both produced a wrong goto-definition target.
 #[test]
-fn second_arg_extraction_takes_the_first_quoted_string() {
+fn second_arg_extraction_splits_at_top_level_comma() {
     let cases = [
         ("($cond, 'view')", Some("view")),
         (
@@ -264,6 +266,22 @@ fn second_arg_extraction_takes_the_first_quoted_string() {
         ),
         ("($cond)", None),
         ("($cond, '')", None),
+        // A condition that compares a string — the bug this fixes.
+        ("($type === 'admin', 'pages.admin')", Some("pages.admin")),
+        (
+            "($user->role == 'editor', 'panels.editor', ['x' => 1])",
+            Some("panels.editor"),
+        ),
+        // Two commas inside the condition's own array literal, both before
+        // the real split point: bracket tracking is load-bearing here.
+        (
+            "(in_array($k, ['a', 'b']), 'pages.list')",
+            Some("pages.list"),
+        ),
+        // A comma inside the condition's own string is not structure.
+        ("($status === 'a,b', 'view.name')", Some("view.name")),
+        // A top-level comma exists, but neither argument is a literal.
+        ("($cond1, $cond2)", None),
     ];
     for (args, expected) in cases {
         assert_eq!(

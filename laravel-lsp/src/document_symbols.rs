@@ -34,6 +34,7 @@
 //! All positions are 0-based to match the LSP and the rest of this codebase
 //! (see `CLAUDE.md` § Position Indexing Convention).
 
+use crate::directive_args;
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::path::Path;
@@ -344,7 +345,8 @@ fn extract_blade_symbols(content: &str) -> Vec<SymbolEntry> {
             .get(1)
             .map(|m| m.as_str().to_string())
             .unwrap_or_default();
-        let (arg, end_pos) = parse_directive_args(content, full.end());
+        let (raw_args, end_pos) = parse_directive_args(content, full.end());
+        let arg = raw_args.and_then(|a| directive_label(&directive, a));
         matches.push(BladeMatch::Directive {
             directive,
             arg,
@@ -573,18 +575,37 @@ fn blade_directive_label(directive: &str, arg: Option<&str>) -> String {
     }
 }
 
-/// Scan a Blade directive's `(...)` argument list with brace-aware balanced
-/// paren tracking. Returns `(first_string, end_of_directive)`:
-///   - `first_string` is the first quoted string literal anywhere in the
-///     args (`'title'` from `@props(['title', ...])`, or
-///     `'partial'` from `@includeWhen($x->y(), 'partial')`).
+/// The label fragment shown after the directive name in the outline.
+///
+/// Condition-first directives put a boolean expression in argument zero, and
+/// that expression routinely contains a string literal of its own — so the
+/// name has to be read at argument one rather than wherever the first quote
+/// happens to fall. Every other directive carries its name inside an array
+/// literal (`@props(['title', 'count' => 0])`, `@includeFirst(['a', 'b'])`)
+/// or as its sole argument, both of which the first-literal scan reaches.
+fn directive_label(directive: &str, args: &str) -> Option<String> {
+    if directive_args::is_condition_first(directive) {
+        directive_args::nth_literal(args, 1)
+    } else {
+        directive_args::first_literal(args)
+    }
+}
+
+/// Scan a Blade directive's `(...)` argument list with balanced paren
+/// tracking. Returns `(arguments, end_of_directive)`:
+///   - `arguments` is the raw text between the directive's own parens, with
+///     those parens removed — `['title', 'count' => 0]` from
+///     `@props(['title', 'count' => 0])`. `None` when the directive has no
+///     parenthesised argument list. Interpreting it is
+///     [`directive_label`]'s job, because the position of the name inside it
+///     depends on the directive.
 ///   - `end_of_directive` is the byte offset just past the matching close
 ///     paren, or `after_directive` if there are no parens. Used as the
 ///     symbol's end position.
 ///
 /// Handles nested parens (so `$user->method()` inside args doesn't truncate
 /// the search early) and quoted-string escape sequences.
-fn parse_directive_args(content: &str, after_directive: usize) -> (Option<String>, usize) {
+fn parse_directive_args(content: &str, after_directive: usize) -> (Option<&str>, usize) {
     let bytes = content.as_bytes();
     let mut i = after_directive;
 
@@ -597,12 +618,11 @@ fn parse_directive_args(content: &str, after_directive: usize) -> (Option<String
         return (None, after_directive);
     }
     i += 1; // step past the `(`
+    let start = i;
 
     let mut depth: u32 = 0;
-    let mut first_string: Option<String> = None;
     let mut in_string = false;
     let mut string_quote = b' ';
-    let mut string_start = 0usize;
 
     while i < bytes.len() {
         let c = bytes[i];
@@ -615,11 +635,6 @@ fn parse_directive_args(content: &str, after_directive: usize) -> (Option<String
                 continue;
             }
             if c == string_quote {
-                if first_string.is_none() {
-                    if let Ok(s) = std::str::from_utf8(&bytes[string_start..i]) {
-                        first_string = Some(s.to_string());
-                    }
-                }
                 in_string = false;
             }
         } else {
@@ -627,14 +642,13 @@ fn parse_directive_args(content: &str, after_directive: usize) -> (Option<String
                 b'(' => depth += 1,
                 b')' => {
                     if depth == 0 {
-                        return (first_string, i + 1);
+                        return (content.get(start..i), i + 1);
                     }
                     depth -= 1;
                 }
                 b'\'' | b'"' => {
                     in_string = true;
                     string_quote = c;
-                    string_start = i + 1;
                 }
                 _ => {}
             }
@@ -642,8 +656,8 @@ fn parse_directive_args(content: &str, after_directive: usize) -> (Option<String
         i += 1;
     }
 
-    // Unclosed args — return whatever we found, ending at EOF.
-    (first_string, bytes.len())
+    // Unclosed args — return what was typed, ending at EOF.
+    (content.get(start..), bytes.len())
 }
 
 /// One frame on the Blade open-block stack — the directive that opened it
