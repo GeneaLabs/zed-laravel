@@ -1985,6 +1985,11 @@ struct LaravelLanguageServer {
     /// Add space between directive name and parentheses in completions
     /// false: @if($condition)  |  true: @if ($condition)
     directive_spacing: Arc<RwLock<bool>>,
+    /// Extra directive names the user declared as view-rendering (issue #325),
+    /// set via the `blade.viewDirectives` LSP setting. Read by
+    /// [`Self::create_directive_location_from_salsa`]'s goto fallback; the
+    /// diagnostic path never consults it.
+    view_directives: Arc<RwLock<ViewDirectivesSettings>>,
     /// Severity for query-chain diagnostics (unknown column/relation/table).
     /// `None` disables them; defaults to `WARNING`. Set via the
     /// `diagnostics.severity` LSP setting.
@@ -2193,6 +2198,43 @@ const FILE_EXISTS_CACHE_CAP: usize = 8192;
 // NOTE: Blade directives are now dynamically discovered via get_all_blade_directives()
 // which scans the Laravel framework, app service providers, and packages.
 
+/// User-declared view-rendering directive names (issue #325). Configured via:
+/// `{ "lsp": { "laravel-lsp": { "settings": { "blade": { "viewDirectives": {
+/// "firstArg": ["myDirective"], "secondArg": ["myOtherDirective"] } } } } } }`
+///
+/// The escape hatch for a directive the goto fallback can't or shouldn't infer:
+/// a name listed here resolves exactly like a hardcoded `view_directives_first_arg`
+/// / `view_directives_second_arg` entry. Entries outrank [`NON_VIEW_DIRECTIVES`]
+/// (a user may deliberately re-enable a denylisted name) but never outrank a
+/// directive with dedicated handling — see
+/// [`LaravelLanguageServer::create_directive_location_from_salsa`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewDirectivesSettings {
+    /// Directive names whose FIRST quoted argument is a view name, like
+    /// `@extends`/`@include`.
+    #[serde(default)]
+    first_arg: Vec<String>,
+    /// Directive names whose SECOND quoted argument is a view name (after a
+    /// condition), like `@includeWhen`/`@includeUnless`.
+    #[serde(default)]
+    second_arg: Vec<String>,
+}
+
+/// Whether a missing view behind this directive raises a "View file not found"
+/// diagnostic.
+///
+/// Deliberately far narrower than the set goto-definition resolves (issue
+/// #325): goto and diagnostics have opposite risk profiles. A wrong goto costs
+/// one keystroke; a wrong squiggle marks working code. So the goto path gained a
+/// permissive fallback for third-party `Blade::directive()` registrations while
+/// this gate stayed exactly as it was — a directive reachable only through that
+/// fallback, or through the `blade.viewDirectives` setting, can never produce a
+/// false missing-view diagnostic.
+fn directive_takes_missing_view_diagnostic(name: &str) -> bool {
+    name == "extends" || name == "include"
+}
+
 /// Blade-specific settings
 /// Configured via: { "lsp": { "laravel-lsp": { "settings": { "blade": { ... } } } } }
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -2203,7 +2245,106 @@ struct BladeSettings {
     /// true:  @if ($condition)
     #[serde(default)]
     directive_spacing: bool,
+    /// Extra directive names to treat as view-rendering in goto-definition.
+    /// Both lists default to empty.
+    #[serde(default)]
+    view_directives: ViewDirectivesSettings,
 }
+
+/// Built-in Blade directives whose argument is NOT a view name, so the
+/// goto-definition fallback in
+/// [`LaravelLanguageServer::create_directive_location_from_salsa`] must never
+/// fire for them (issue #325).
+///
+/// Without this, `@section('content')` would jump to
+/// `resources/views/content.blade.php` whenever a view happens to share the
+/// section's name — a plausible-looking but wrong target. The list is the
+/// container/label directives the outline builder already enumerates (see
+/// `document_symbols.rs`), the section-name pair `@hasSection`/`@sectionMissing`
+/// (identical false-positive shape to `@section`), and the standard
+/// control-flow/utility directives.
+///
+/// A name here is still resolvable if the user explicitly declares it under
+/// `blade.viewDirectives` — see [`ViewDirectivesSettings`].
+const NON_VIEW_DIRECTIVES: &[&str] = &[
+    // Container / label directives (mirrors document_symbols.rs).
+    "section",
+    "endsection",
+    "push",
+    "endpush",
+    "prepend",
+    "endprepend",
+    "slot",
+    "endslot",
+    "endcomponent",
+    "stack",
+    "yield",
+    "props",
+    // Section-name directives — same false-positive shape as @section.
+    "hasSection",
+    "sectionMissing",
+    // Control flow.
+    "if",
+    "elseif",
+    "else",
+    "endif",
+    "unless",
+    "endunless",
+    "switch",
+    "case",
+    "default",
+    "break",
+    "continue",
+    "endswitch",
+    "foreach",
+    "endforeach",
+    "forelse",
+    "endforelse",
+    "empty",
+    "endempty",
+    "for",
+    "endfor",
+    "while",
+    "endwhile",
+    // Authorization / environment / state guards.
+    "can",
+    "cannot",
+    "elsecan",
+    "elsecannot",
+    "endcan",
+    "endcannot",
+    "error",
+    "enderror",
+    "env",
+    "production",
+    "endenv",
+    "auth",
+    "endauth",
+    "guest",
+    "endguest",
+    "isset",
+    "endisset",
+    // Utility / output.
+    "php",
+    "endphp",
+    "inject",
+    "method",
+    "csrf",
+    "json",
+    "dump",
+    "dd",
+    "class",
+    "style",
+    "checked",
+    "selected",
+    "disabled",
+    "readonly",
+    "required",
+    "use",
+    "lang",
+    "vite",
+    "aware",
+];
 
 /// Query-chain diagnostics settings (unknown column / relation / table).
 /// Configured via:
@@ -4420,6 +4561,7 @@ impl LaravelLanguageServer {
             pending_salsa_updates: Arc::new(RwLock::new(HashMap::new())),
             auto_complete_debounce_ms: Arc::new(RwLock::new(DEFAULT_SALSA_DEBOUNCE_MS)),
             directive_spacing: Arc::new(RwLock::new(false)),
+            view_directives: Arc::new(RwLock::new(ViewDirectivesSettings::default())),
             chain_diagnostic_severity: Arc::new(RwLock::new(Some(DiagnosticSeverity::WARNING))),
             code_lens_enabled: Arc::new(RwLock::new(false)),
             vendor_diagnostic_shown: Arc::new(RwLock::new(false)),
@@ -4472,6 +4614,19 @@ impl LaravelLanguageServer {
                 old_spacing, new_spacing
             );
             *self.directive_spacing.write().await = new_spacing;
+        }
+
+        // Extra view-rendering directive names (issue #325). The old value is
+        // cloned into a local first: a read guard held in the `if` condition
+        // would outlive the condition and deadlock against the `write()` below.
+        let new_view_directives = &settings.blade.view_directives;
+        let old_view_directives = self.view_directives.read().await.clone();
+        if *new_view_directives != old_view_directives {
+            info!(
+                "⚙️  Updating blade.viewDirectives: firstArg={:?}, secondArg={:?}",
+                new_view_directives.first_arg, new_view_directives.second_arg
+            );
+            *self.view_directives.write().await = new_view_directives.clone();
         }
 
         // Query-chain diagnostics severity
@@ -15846,6 +16001,59 @@ return [
             }
         }
 
+        // ── Fallback for directives with no dedicated handling (issue #325) ──
+        //
+        // A package that registers its own view-rendering directive through
+        // `Blade::directive()` is invisible to every hardcoded list above, so it
+        // gets no goto at all. Goto and diagnostics have opposite risk profiles:
+        // a wrong goto costs the user one keystroke, while a wrong "view does
+        // not exist" squiggle marks working code. Only the *goto* path gains
+        // this permissive fallback — `validate_and_publish_diagnostics` keeps
+        // its strict `extends`/`include` allowlist, so a false missing-view
+        // diagnostic stays impossible by construction.
+        //
+        // The gate is keyed on `dir.name`, never on "nothing has resolved yet":
+        // a dedicated branch above that fails to find its own target must keep
+        // returning `None` rather than leaking into this heuristic and offering
+        // a naively-guessed view file instead.
+        let name = dir.name.as_str();
+        let dedicated = matches!(name, "component" | "livewire" | "feature" | "includeFirst")
+            || view_directives_first_arg.contains(&name)
+            || view_directives_second_arg.contains(&name);
+        if dedicated {
+            return None;
+        }
+
+        // `blade.viewDirectives` is the escape hatch for a directive the
+        // heuristic can't or shouldn't infer, so a declared name outranks
+        // `NON_VIEW_DIRECTIVES` — a user may deliberately re-enable a
+        // denylisted name. It never outranks dedicated handling, refused above.
+        let configured = self.view_directives.read().await.clone();
+        let view_name = if configured.first_arg.iter().any(|d| d == name) {
+            Self::extract_view_from_directive_args(arguments)
+        } else if configured.second_arg.iter().any(|d| d == name) {
+            Self::extract_second_string_arg(arguments)
+        } else if NON_VIEW_DIRECTIVES.contains(&name) {
+            None
+        } else {
+            Self::extract_view_from_directive_args(arguments)
+        };
+
+        if let Some(view_name) = view_name {
+            // Same loop-and-two-gate shape as every branch above: try every
+            // candidate `resolve_view_path` offers, not just the first, and
+            // re-check containment after the existence probe.
+            for path in config.resolve_view_path(&view_name) {
+                if !self.file_exists_cached(&path).await {
+                    continue;
+                }
+                if !path_within_root(&path, &config.root) {
+                    continue;
+                }
+                return self.create_location_link(dir, &path);
+            }
+        }
+
         None
     }
 
@@ -17342,6 +17550,7 @@ return [
             pending_salsa_updates: self.pending_salsa_updates.clone(),
             auto_complete_debounce_ms: self.auto_complete_debounce_ms.clone(),
             directive_spacing: self.directive_spacing.clone(),
+            view_directives: self.view_directives.clone(),
             chain_diagnostic_severity: self.chain_diagnostic_severity.clone(),
             code_lens_enabled: self.code_lens_enabled.clone(),
             vendor_diagnostic_shown: self.vendor_diagnostic_shown.clone(),
@@ -18491,7 +18700,7 @@ return [
         // Check @extends and @include directives using Salsa patterns
         for dir_ref in &patterns.directives {
             // Only validate @extends and @include
-            if dir_ref.name == "extends" || dir_ref.name == "include" {
+            if directive_takes_missing_view_diagnostic(&dir_ref.name) {
                 if let Some(ref args) = dir_ref.arguments {
                     if let Some(view_name) = Self::extract_view_from_directive_args(args) {
                         let possible_paths = config.resolve_view_path(&view_name);

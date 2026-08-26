@@ -18,6 +18,7 @@ mod controllers_dir_containment;
 mod db_provider_init_idempotency;
 mod diagnostic_severity;
 mod directive_navigation_containment;
+mod directive_view_fallback;
 mod dynamic_where_sparseness;
 mod expected_path_diagnostic_containment;
 mod factory_goto_def_handler;

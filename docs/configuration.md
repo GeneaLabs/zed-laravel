@@ -23,7 +23,23 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
         "blade": {
           // Space between a directive and its parentheses.
           // false → @if($x)    true → @if ($x)                  Default: false
-          "directiveSpacing": false
+          "directiveSpacing": false,
+
+          // Extra directive names to treat as view-rendering in
+          // go-to-definition. A custom Blade::directive() is already resolved
+          // automatically — this is the escape hatch for the two cases that
+          // can't be inferred: a directive on the excluded label list
+          // (@section, @yield, @stack, control flow…), and one whose view name
+          // is the SECOND argument, after a condition (the @includeWhen shape).
+          // Directives with dedicated handling (@component, @livewire,
+          // @feature, @includeFirst, @extends, @include, @includeIf, @each,
+          // @includeWhen, @includeUnless) ignore both lists.
+          // Goto only — never affects diagnostics. Guide:
+          // docs/go-to-definition.md.               Default: both lists empty
+          "viewDirectives": {
+            "firstArg": [],   // view name is the 1st argument (@include shape)
+            "secondArg": []   // view name is the 2nd argument (@includeWhen shape)
+          }
         },
 
         "codeLens": {

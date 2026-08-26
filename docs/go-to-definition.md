@@ -98,5 +98,29 @@ The import also binds the short name for the rest of the template, so `VerseMark
 
 A PHP `use App\Models\Flight;` statement jumps to the same place — the import sites are symmetric across the two file types.
 
+**Third-party Blade directives** resolve too. A package that registers its own view-rendering directive through `Blade::directive()` is on no built-in list, so its first quoted argument is treated as a view name and offered as a target when — and only when — that view file actually exists inside the project root:
+
+```blade
+@renderPartial('dashboard.summary')
+{{--             ^^^^^^^^^^^^^^^^^ → resources/views/dashboard/summary.blade.php --}}
+```
+
+Directives whose argument is a *label* rather than a view — `@section`, `@hasSection`, `@yield`, `@stack`, `@push`, and the standard control-flow set — are excluded, so `@section('content')` never jumps to `resources/views/content.blade.php` just because that file happens to exist.
+
+This applies to go-to-definition only. The "View file not found" diagnostic still validates just `@extends` and `@include`, so a directive resolved this way can never produce a false squiggle.
+
+Two escape hatches cover what the heuristic can't infer — a directive that takes a view but is on the excluded list, or one whose view name is the *second* argument (after a condition, like `@includeWhen`):
+
+```jsonc
+"blade": {
+  "viewDirectives": {
+    "firstArg": ["renderPartial"],
+    "secondArg": ["renderWhen"]
+  }
+}
+```
+
+Names with dedicated handling (`@component`, `@livewire`, `@feature`, `@includeFirst`, `@extends`, `@include`, `@includeIf`, `@each`, `@includeWhen`, `@includeUnless`) ignore both lists — their own resolution always wins. See [Configuration](configuration.md).
+
 **Supported patterns:**
-`view()` `View::make()` `@extends` `@include` `@component` `@use` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` `Artisan::call()` `Artisan::queue()` `->command()` `->artisan()` · query-chain columns / relations / tables · magic members (relationships, scopes, accessors, columns, dynamic finders)
+`view()` `View::make()` `@extends` `@include` `@includeIf` `@includeWhen` `@includeUnless` `@includeFirst` `@each` `@component` custom `Blade::directive()` view directives `@use` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` `Artisan::call()` `Artisan::queue()` `->command()` `->artisan()` · query-chain columns / relations / tables · magic members (relationships, scopes, accessors, columns, dynamic finders)
