@@ -2107,7 +2107,11 @@ struct LaravelLanguageServer {
     /// on-open path — never eager app files or saved files.
     /// `std::sync::Mutex`, not `RwLock`: `lru` mutates on read to reorder
     /// recency, and every critical section is a short map op (same rationale
-    /// as the `class_locator` cache).
+    /// as the `class_locator` cache). The lock recovers from poisoning with
+    /// `unwrap_or_else(|e| e.into_inner())` rather than panicking: the cache is
+    /// pure memoization, so a half-written entry is at worst a stale recency
+    /// ordering, and losing the cache for the rest of the session would be
+    /// strictly worse.
     vendor_open_magic_lru: Arc<std::sync::Mutex<lru::LruCache<PathBuf, ()>>>,
     /// Dominant Inertia page extension (`vue` / `tsx` / `jsx` / `svelte`),
     /// detected once at startup by counting files under `resources/js/Pages/`.
@@ -6987,7 +6991,10 @@ impl LaravelLanguageServer {
     /// simply go missing again until the next re-open or save re-indexes it.
     async fn record_vendor_open_magic(&self, path: &Path) {
         let evicted = {
-            let mut lru = self.vendor_open_magic_lru.lock().unwrap();
+            let mut lru = self
+                .vendor_open_magic_lru
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             // `push` returns the displaced pair: the SAME key on a re-open
             // (a recency touch — must not evict the entries we just wrote),
             // or the LRU-oldest entry on overflow.
