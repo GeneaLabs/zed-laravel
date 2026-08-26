@@ -56,6 +56,7 @@ pub mod command_call_locator;
 pub mod command_disk_cache;
 pub mod command_index;
 pub mod command_signature;
+pub mod completion_display;
 pub mod completion_format;
 pub mod component_completion;
 pub mod component_declaration_locator;

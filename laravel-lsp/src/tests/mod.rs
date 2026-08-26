@@ -10,6 +10,7 @@ mod cast_type_context;
 mod class_locator_and_properties;
 mod code_action_create_containment;
 mod code_lens_opt_in;
+mod completion_value_pipeline;
 mod component_file_navigation_containment;
 mod component_navigation_containment;
 mod composer_autoload_containment;

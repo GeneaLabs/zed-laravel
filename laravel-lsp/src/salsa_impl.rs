@@ -2192,7 +2192,10 @@ impl TranslationCache {
 pub struct TranslationKeyCompletionData {
     /// The full dot-notation key (e.g. `messages.welcome`)
     pub key: String,
-    /// The translated value, truncated for display
+    /// The translated value at **full length**, untruncated. Each render
+    /// site clips it to its own budget via
+    /// `completion_display::{COMPLETION_DETAIL_LIMIT, COMPLETION_DOC_LIMIT}`
+    /// (issue #326).
     pub value: String,
     /// Display source (e.g. `lang/en/messages.php`)
     pub source: String,
@@ -2302,23 +2305,25 @@ fn parse_translation_keys(content: &str, base_key: &str) -> Vec<(String, String)
     results
 }
 
-/// Extract the value from a translation line like "'key' => 'value',"
+/// Extract the value from a translation line like "'key' => 'value',".
+///
+/// Returns the value at full length — see `completion_display` for why the
+/// truncation lives at the render sites rather than here.
 pub fn extract_translation_value(line: &str) -> String {
     if let Some(arrow_pos) = line.find("=>") {
         let after_arrow = &line[arrow_pos + 2..];
         let value = after_arrow.trim().trim_end_matches(',').trim();
 
-        // Remove quotes and truncate
-        let unquoted = value
+        // Remove the surrounding quotes; the value is returned at full
+        // length. Truncation happens at each render site instead, because
+        // the completion list line and the documentation panel want
+        // different budgets and one shared cut served neither (issue #326).
+        value
             .trim_start_matches('\'')
             .trim_start_matches('"')
             .trim_end_matches('\'')
-            .trim_end_matches('"');
-
-        // Truncate long values for display. Delegated rather than sliced:
-        // `&unquoted[..47]` panics when byte 47 lands mid-character, which is
-        // reachable for any non-ASCII translation value (issue #319).
-        crate::display_truncate::truncate_for_display(unquoted, 200)
+            .trim_end_matches('"')
+            .to_string()
     } else {
         String::new()
     }

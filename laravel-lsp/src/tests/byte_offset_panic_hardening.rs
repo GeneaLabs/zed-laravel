@@ -218,16 +218,29 @@ fn detect_method_name_position_detects_instance_past_multibyte_char() {
     assert_eq!(ctx, MethodNameContext::Instance);
 }
 
-// ---- display-value truncation: char-boundary safety ----------------------
+// ---- display-value extraction: no truncation, at any length --------------
 //
 // `extract_translation_value` and `extract_config_value` both used to
 // truncate their hover/completion display value with a byte slice
 // (`&s[..47]`), which panicked whenever a multibyte character straddled
 // index 47 — reachable via any root `lang/` translation value over 50 bytes
 // with a multibyte char at the boundary, not just an exotic namespaced-
-// catalogue case. Both now delegate to the shared, char-safe
-// `display_truncate::truncate_for_display` (also used by `hover.rs`), so the
-// limit is 200 chars, not 47/50, and the ellipsis is the single `…` char.
+// catalogue case. #319 replaced that with the shared, char-safe
+// `display_truncate::truncate_for_display` at a 200-char limit.
+//
+// #326 moved the cut out of these two functions entirely: the completion
+// list line and the documentation panel want different budgets, so each
+// render site now truncates the full value itself (see
+// `completion_display`). The char-boundary property is still pinned — at
+// the render sites, in `completion_display::tests` — while these four
+// assert the property that replaced it here: **whatever the length, and
+// whatever the encoding, the value comes back exactly as written**. An
+// inequality would pass with truncation quietly reinstated, so these are
+// exact-equality against multibyte inputs well past the old 200 limit.
+//
+// The four names below are kept verbatim from #319 so this coverage stays
+// traceable to the panic it guards, even though what they now assert is the
+// *absence* of a cut rather than a safe one.
 //
 // `extract_translation_value` moved into `salsa_impl` when translation reads
 // were routed through Salsa (issue #293); it is the same function, and this
@@ -235,21 +248,18 @@ fn detect_method_name_position_detects_instance_past_multibyte_char() {
 
 #[test]
 fn translation_value_truncation_is_char_boundary_safe() {
-    // 199 ASCII chars, then a two-byte 'č', then padding well past the
-    // shared 200-char limit. Truncation operates on chars, not bytes, so the
-    // multibyte char at the cut point can't panic.
+    // 199 ASCII chars, then a two-byte 'č', then padding well past the old
+    // 200-char limit — the cut point the byte slice used to panic on.
     let value: String = "a".repeat(199) + "č" + &"é".repeat(50);
     let line = format!("'key' => '{}',", value);
     let display = laravel_lsp::salsa_impl::extract_translation_value(&line);
-    assert!(display.ends_with('…'));
-    assert_eq!(display.chars().count(), 201); // 200 + ellipsis
+    assert_eq!(display, value, "the extractor must not truncate at all");
 }
 
 #[test]
 fn translation_value_under_two_hundred_chars_is_not_truncated() {
     // A 30-char/60-byte Czech string used to get truncated (and could
-    // panic) under the old byte-slice/50-char threshold; the shared
-    // 200-char, char-based limit now passes it through untouched.
+    // panic) under the old byte-slice/50-char threshold.
     let value = "č".repeat(30);
     let line = format!("'key' => '{}',", value);
     let display = laravel_lsp::salsa_impl::extract_translation_value(&line);
@@ -262,8 +272,7 @@ fn config_value_truncation_is_char_boundary_safe() {
     let line = format!("'key' => '{}',", value);
     let env_vars = std::collections::HashMap::new();
     let display = LaravelLanguageServer::extract_config_value(&line, &env_vars);
-    assert!(display.ends_with('…'));
-    assert_eq!(display.chars().count(), 201); // 200 + ellipsis
+    assert_eq!(display, value, "the extractor must not truncate at all");
 }
 
 #[test]
@@ -273,4 +282,25 @@ fn config_value_under_two_hundred_chars_is_not_truncated() {
     let env_vars = std::collections::HashMap::new();
     let display = LaravelLanguageServer::extract_config_value(&line, &env_vars);
     assert_eq!(display, value);
+}
+
+#[test]
+fn a_five_thousand_char_translation_value_survives_extraction_whole() {
+    let value = "ž".repeat(5_000);
+    let line = format!("'key' => '{}',", value);
+    assert_eq!(
+        laravel_lsp::salsa_impl::extract_translation_value(&line),
+        value
+    );
+}
+
+#[test]
+fn a_five_thousand_char_config_value_survives_extraction_whole() {
+    let value = "ö".repeat(5_000);
+    let line = format!("'key' => '{}',", value);
+    let env_vars = std::collections::HashMap::new();
+    assert_eq!(
+        LaravelLanguageServer::extract_config_value(&line, &env_vars),
+        value
+    );
 }

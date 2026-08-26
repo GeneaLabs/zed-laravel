@@ -188,7 +188,10 @@ struct ConfigCheck {
 struct ConfigKeyCompletion {
     /// The full dot-notation key (e.g., "app.name")
     key: String,
-    /// The value (truncated for display)
+    /// The resolved value at **full length**, untruncated. Each render site
+    /// clips it to its own budget via
+    /// `completion_display::{COMPLETION_DETAIL_LIMIT, COMPLETION_DOC_LIMIT}`
+    /// (issue #326).
     value: String,
     /// Source file (e.g., "config/app.php")
     source: String,
@@ -258,7 +261,10 @@ struct ModelPropertyCompletion {
 struct TranslationKeyCompletion {
     /// The full dot-notation key (e.g., "messages.welcome")
     key: String,
-    /// The translated value (for display)
+    /// The translated value at **full length**, untruncated. Each render site
+    /// clips it to its own budget via
+    /// `completion_display::{COMPLETION_DETAIL_LIMIT, COMPLETION_DOC_LIMIT}`
+    /// (issue #326).
     value: String,
     /// Source file (e.g., "lang/en/messages.php")
     source: String,
@@ -14712,6 +14718,11 @@ impl LaravelLanguageServer {
 
     /// Extract the value from a config line like "'key' => value,"
     /// Resolves env() references using the provided env_vars map
+    ///
+    /// Returns the value at full length. Truncation happens at each render
+    /// site instead, because the completion list line and the documentation
+    /// panel want different budgets and one shared cut served neither
+    /// (issue #326) — see `laravel_lsp::completion_display`.
     fn extract_config_value(
         line: &str,
         env_vars: &std::collections::HashMap<String, String>,
@@ -14721,9 +14732,7 @@ impl LaravelLanguageServer {
             let value = after_arrow.trim().trim_end_matches(',').trim();
 
             // Check for env() call pattern: env('VAR_NAME') or env('VAR_NAME', 'default')
-            let resolved = Self::resolve_env_value(value, env_vars);
-
-            laravel_lsp::display_truncate::truncate_for_display(&resolved, 200)
+            Self::resolve_env_value(value, env_vars)
         } else {
             String::new()
         }
@@ -25268,23 +25277,12 @@ impl LanguageServer for LaravelLanguageServer {
                     .into_iter()
                     .filter(|c| c.key.starts_with(&config_ctx.prefix))
                     .map(|c| {
-                        let detail = if c.value.is_empty() {
-                            format!("({})", c.source)
-                        } else {
-                            format!("{} ({})", c.value, c.source)
-                        };
-
-                        let doc = {
-                            let mut d = CompletionDoc::new().header(&c.key);
-                            if !c.value.is_empty() {
-                                d = d.code(laravel_lsp::completion_format::CodeBlock::new(
-                                    "php",
-                                    format!("return {};", c.value),
-                                ));
-                            }
-                            d.section(format!("Source: {}", c.source))
-                                .into_documentation()
-                        };
+                        let detail =
+                            laravel_lsp::completion_display::completion_detail(&c.value, &c.source);
+                        let doc = laravel_lsp::completion_display::config_documentation(
+                            &c.key, &c.value, &c.source,
+                        )
+                        .into_documentation();
                         CompletionItem {
                             label: c.key.clone(),
                             kind: Some(CompletionItemKind::CONSTANT),
@@ -26202,22 +26200,12 @@ impl LanguageServer for LaravelLanguageServer {
                     .into_iter()
                     .filter(|t| t.key.starts_with(&trans_ctx.prefix))
                     .map(|t| {
-                        let detail = if t.value.is_empty() {
-                            format!("({})", t.source)
-                        } else {
-                            format!("{} ({})", t.value, t.source)
-                        };
-
-                        let doc = {
-                            let mut d = CompletionDoc::new().header(&t.key);
-                            if !t.value.is_empty() {
-                                d = d.summary(&t.value);
-                            } else {
-                                d = d.summary("Translation key.");
-                            }
-                            d.section(format!("Source: {}", t.source))
-                                .into_documentation()
-                        };
+                        let detail =
+                            laravel_lsp::completion_display::completion_detail(&t.value, &t.source);
+                        let doc = laravel_lsp::completion_display::translation_documentation(
+                            &t.key, &t.value, &t.source,
+                        )
+                        .into_documentation();
                         CompletionItem {
                             label: t.key.clone(),
                             kind: Some(CompletionItemKind::TEXT),
