@@ -1978,7 +1978,15 @@ impl TranslationCache {
             return Vec::new();
         };
         let listing = self.ensure_dir(db, &lang_root, root);
-        let Some(locale) = locales_in_dir(&*db, listing).first().cloned() else {
+        // Sorted before taking the first: `locales_in_dir` preserves the
+        // directory listing order, which is filesystem-dependent — APFS hands
+        // entries back sorted, ext4 does not. Taking `first()` off the raw
+        // listing therefore made *which locale answers autocomplete* vary by
+        // platform (caught by CI on ubuntu, green on macOS). Alphabetical is
+        // arbitrary but stable, and matches how `locales` orders.
+        let mut candidates = locales_in_dir(&*db, listing).clone();
+        candidates.sort();
+        let Some(locale) = candidates.first().cloned() else {
             return Vec::new();
         };
 

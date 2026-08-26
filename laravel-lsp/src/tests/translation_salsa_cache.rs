@@ -718,16 +718,30 @@ async fn autocomplete_keys_reflect_an_external_edit() {
 async fn autocomplete_answers_from_a_single_locale_directory() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().to_path_buf();
-    // Two locales; each declares the same key plus one of its own.
+    // Three locales, created in reverse-alphabetical order so creation order,
+    // listing order and alphabetical order cannot all coincide. Each declares
+    // the same key plus one of its own.
+    //
+    // The guarantee under test is "the alphabetically-first locale answers",
+    // not "whatever the filesystem lists first" — which is exactly the bug CI
+    // caught: `locales_in_dir` preserves listing order, so this picked `en` on
+    // ext4 and `de` on APFS. Note that on a filesystem which already returns
+    // entries sorted, this test passes with or without the fix; ext4 (CI) is
+    // where it discriminates.
     write(
         &root,
-        "lang/de/messages.php",
-        "<?php\nreturn [\n    'shared' => 'Geteilt',\n    'only_de' => 'Nur DE',\n];\n",
+        "lang/zz/messages.php",
+        "<?php\nreturn [\n    'shared' => 'ZZ',\n    'only_zz' => 'Only ZZ',\n];\n",
     );
     write(
         &root,
         "lang/en/messages.php",
         "<?php\nreturn [\n    'shared' => 'Shared',\n    'only_en' => 'Only EN',\n];\n",
+    );
+    write(
+        &root,
+        "lang/de/messages.php",
+        "<?php\nreturn [\n    'shared' => 'Geteilt',\n    'only_de' => 'Nur DE',\n];\n",
     );
     let backend = backend_for(&root).await;
 
@@ -738,7 +752,7 @@ async fn autocomplete_answers_from_a_single_locale_directory() {
         .map(|c| c.key)
         .collect();
 
-    // `de` sorts first, so it is the locale that answers.
+    // `de` sorts first, so it is the locale that answers — on every platform.
     assert_eq!(
         keys,
         vec!["messages.only_de", "messages.shared"],

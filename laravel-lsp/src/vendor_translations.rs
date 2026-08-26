@@ -99,7 +99,7 @@ fn php_files_named_service_provider(dir: &Path, require_provider_name: bool) -> 
     if !dir.is_dir() {
         return Vec::new();
     }
-    walkdir::WalkDir::new(dir)
+    let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(dir)
         .max_depth(10)
         .into_iter()
         .filter_map(|entry| entry.ok())
@@ -113,7 +113,13 @@ fn php_files_named_service_provider(dir: &Path, require_provider_name: bool) -> 
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.contains("ServiceProvider"))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    // Sorted so first-match-wins on a namespace conflict resolves the same way
+    // on every machine. `WalkDir` yields directory order, which is
+    // filesystem-dependent, so without this the winning registration could
+    // differ between a developer's APFS checkout and CI's ext4 one.
+    paths.sort();
+    paths
 }
 
 /// Every `namespace -> absolute lang directory` registration one provider file
