@@ -283,6 +283,32 @@ fn vendor_member_access_refs_are_dropped_but_app_ones_kept() {
 }
 
 #[test]
+fn dropped_vendor_member_access_refs_release_their_buffer() {
+    // `is_empty()` above can't tell `.clear()` from a fresh `Vec`: clearing
+    // drops the `Arc`s but keeps the backing buffer alive for the lifetime of
+    // the cache entry (~560k pointer slots on a large project). The parse must
+    // hand back a Vec that owns no allocation at all.
+    let src = "<?php\nnamespace App\\Models;\nclass User { public function f() { return $this->email; } }\n";
+
+    // Same source on an app path proves the parse really did populate the list
+    // — so a zero capacity on the vendor path is a release, not an empty parse.
+    let app_path = PathBuf::from("/proj/app/Models/User.php");
+    let (app_data, _) = parse_owned_with_hierarchy(&app_path, src);
+    assert!(
+        app_data.member_access_refs.capacity() > 0,
+        "fixture must produce at least one member access ref"
+    );
+
+    let vendor_path = PathBuf::from("/proj/vendor/acme/pkg/src/User.php");
+    let (vendor_data, _) = parse_owned_with_hierarchy(&vendor_path, src);
+    assert_eq!(
+        vendor_data.member_access_refs.capacity(),
+        0,
+        "a dropped vendor ref list must release its buffer, not just its length"
+    );
+}
+
+#[test]
 fn parse_owned_no_context_for_pattern_free_file() {
     let path = PathBuf::from("/proj/app/Widget.php");
     let src = "<?php\nnamespace App;\nclass Widget { public function noop() {} }\n";

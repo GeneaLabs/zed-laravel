@@ -203,7 +203,12 @@ pub fn parse_owned_with_hierarchy(
         // `handle_update_file`, which removes this path's `pattern_cache`
         // entry, so the next `handle_get_patterns` re-parses the file through
         // the full (non-warming) path instead of serving this slimmed entry.
-        data.member_access_refs.clear();
+        //
+        // Assigned a fresh `Vec` rather than `.clear()`ed: clearing drops the
+        // `Arc`s (the ~110MB of `MemberAccessReferenceData`) but KEEPS the
+        // backing buffer, so the pointer array — ~560k slots on a large
+        // project — stays resident for the lifetime of the cache entry.
+        data.member_access_refs = Vec::new();
     }
 
     // Class FQCNs this file imports — Blade `@use` scanned from source, PHP
