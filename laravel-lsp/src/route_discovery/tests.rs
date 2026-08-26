@@ -1428,3 +1428,480 @@ Route::prefix('/admin')->name('admin.')->group(function () {
 "#;
     assert_eq!(names_of(src), vec!["admin.users.index"]);
 }
+
+// ============================================================================
+// Singleton route derivation (Route::singleton / Route::apiSingleton)
+// ============================================================================
+
+/// Route names from a direct extraction, sorted so asserts don't depend on
+/// emission order. Sorting also makes a duplicated name visible as an extra
+/// element rather than silently collapsing.
+fn sorted_names_of(src: &str) -> Vec<String> {
+    let mut names = names_of(src);
+    names.sort();
+    names
+}
+
+#[test]
+fn singleton_yields_show_edit_update() {
+    let src = r#"<?php
+Route::singleton('profile', ProfileController::class);
+"#;
+    assert_eq!(
+        sorted_names_of(src),
+        vec!["profile.edit", "profile.show", "profile.update"],
+        "a bare singleton registers exactly show/edit/update"
+    );
+}
+
+#[test]
+fn singleton_creatable_adds_create_store_destroy() {
+    let src = r#"<?php
+Route::singleton('profile', ProfileController::class)->creatable();
+"#;
+    assert_eq!(
+        sorted_names_of(src),
+        vec![
+            "profile.create",
+            "profile.destroy",
+            "profile.edit",
+            "profile.show",
+            "profile.store",
+            "profile.update",
+        ],
+        "creatable() adds create/store/destroy to the singleton defaults"
+    );
+}
+
+#[test]
+fn singleton_destroyable_adds_only_destroy() {
+    let src = r#"<?php
+Route::singleton('profile', ProfileController::class)->destroyable();
+"#;
+    let names = sorted_names_of(src);
+    assert_eq!(
+        names,
+        vec![
+            "profile.destroy",
+            "profile.edit",
+            "profile.show",
+            "profile.update",
+        ],
+        "destroyable() adds destroy and nothing else"
+    );
+    // The create/store pair belongs to creatable() alone.
+    assert!(!names.iter().any(|n| n == "profile.create"));
+    assert!(!names.iter().any(|n| n == "profile.store"));
+}
+
+#[test]
+fn singleton_creatable_and_destroyable_union_without_duplicates() {
+    // creatable() already implies destroy; stacking destroyable() on top must
+    // not emit it twice, and neither chain order may drop an action.
+    let expected = vec![
+        "profile.create",
+        "profile.destroy",
+        "profile.edit",
+        "profile.show",
+        "profile.store",
+        "profile.update",
+    ];
+    let creatable_first = r#"<?php
+Route::singleton('profile', ProfileController::class)->creatable()->destroyable();
+"#;
+    let destroyable_first = r#"<?php
+Route::singleton('profile', ProfileController::class)->destroyable()->creatable();
+"#;
+    assert_eq!(sorted_names_of(creatable_first), expected);
+    assert_eq!(sorted_names_of(destroyable_first), expected);
+}
+
+#[test]
+fn api_singleton_yields_show_and_update_only() {
+    let src = r#"<?php
+Route::apiSingleton('profile', ProfileController::class);
+"#;
+    let names = sorted_names_of(src);
+    assert_eq!(
+        names,
+        vec!["profile.show", "profile.update"],
+        "a bare apiSingleton registers exactly show/update"
+    );
+    // `edit` renders a form — an API singleton never registers it.
+    assert!(!names.iter().any(|n| n == "profile.edit"));
+}
+
+#[test]
+fn api_singleton_creatable_adds_store_and_destroy_but_never_create() {
+    let src = r#"<?php
+Route::apiSingleton('profile', ProfileController::class)->creatable();
+"#;
+    let names = sorted_names_of(src);
+    assert_eq!(
+        names,
+        vec![
+            "profile.destroy",
+            "profile.show",
+            "profile.store",
+            "profile.update",
+        ],
+        "apiSingleton()->creatable() adds store/destroy only"
+    );
+    // Both form-rendering actions stay out of the API set.
+    assert!(!names.iter().any(|n| n == "profile.create"));
+    assert!(!names.iter().any(|n| n == "profile.edit"));
+}
+
+#[test]
+fn api_singleton_destroyable_adds_destroy() {
+    let src = r#"<?php
+Route::apiSingleton('profile', ProfileController::class)->destroyable();
+"#;
+    assert_eq!(
+        sorted_names_of(src),
+        vec!["profile.destroy", "profile.show", "profile.update"],
+    );
+}
+
+#[test]
+fn singleton_only_and_except_filter_the_bare_action_set() {
+    let only = r#"<?php
+Route::singleton('profile', ProfileController::class)->only(['show', 'update']);
+"#;
+    assert_eq!(
+        sorted_names_of(only),
+        vec!["profile.show", "profile.update"]
+    );
+
+    let except = r#"<?php
+Route::singleton('profile', ProfileController::class)->except(['edit']);
+"#;
+    assert_eq!(
+        sorted_names_of(except),
+        vec!["profile.show", "profile.update"]
+    );
+}
+
+#[test]
+fn api_singleton_only_and_except_filter_the_bare_action_set() {
+    let only = r#"<?php
+Route::apiSingleton('profile', ProfileController::class)->only(['show']);
+"#;
+    assert_eq!(sorted_names_of(only), vec!["profile.show"]);
+
+    let except = r#"<?php
+Route::apiSingleton('profile', ProfileController::class)->except(['update']);
+"#;
+    assert_eq!(sorted_names_of(except), vec!["profile.show"]);
+}
+
+#[test]
+fn singleton_only_filters_against_the_expanded_not_the_bare_action_set() {
+    // `create` exists only once creatable() has widened the set. Filtering for
+    // it without creatable() must yield nothing — proof that only() runs
+    // against the expanded set rather than a base set with extras appended
+    // after the filter.
+    let bare = r#"<?php
+Route::singleton('profile', ProfileController::class)->only(['create']);
+"#;
+    assert!(
+        sorted_names_of(bare).is_empty(),
+        "create is not in the bare singleton set, so only(['create']) yields nothing"
+    );
+
+    let creatable = r#"<?php
+Route::singleton('profile', ProfileController::class)->creatable()->only(['create', 'destroy']);
+"#;
+    assert_eq!(
+        sorted_names_of(creatable),
+        vec!["profile.create", "profile.destroy"],
+    );
+
+    let destroyable = r#"<?php
+Route::singleton('profile', ProfileController::class)->destroyable()->only(['destroy']);
+"#;
+    assert_eq!(sorted_names_of(destroyable), vec!["profile.destroy"]);
+}
+
+#[test]
+fn singleton_except_filters_against_the_expanded_not_the_bare_action_set() {
+    let creatable = r#"<?php
+Route::singleton('profile', ProfileController::class)->creatable()->except(['create', 'store', 'edit']);
+"#;
+    assert_eq!(
+        sorted_names_of(creatable),
+        vec!["profile.destroy", "profile.show", "profile.update"],
+    );
+
+    let destroyable = r#"<?php
+Route::singleton('profile', ProfileController::class)->destroyable()->except(['destroy']);
+"#;
+    assert_eq!(
+        sorted_names_of(destroyable),
+        vec!["profile.edit", "profile.show", "profile.update"],
+        "excepting destroy must undo destroyable(), not be ignored"
+    );
+}
+
+#[test]
+fn api_singleton_only_filters_against_the_expanded_not_the_bare_action_set() {
+    let bare = r#"<?php
+Route::apiSingleton('profile', ProfileController::class)->only(['store']);
+"#;
+    assert!(
+        sorted_names_of(bare).is_empty(),
+        "store is not in the bare apiSingleton set"
+    );
+
+    let creatable = r#"<?php
+Route::apiSingleton('profile', ProfileController::class)->creatable()->only(['store', 'destroy']);
+"#;
+    assert_eq!(
+        sorted_names_of(creatable),
+        vec!["profile.destroy", "profile.store"],
+    );
+
+    let destroyable = r#"<?php
+Route::apiSingleton('profile', ProfileController::class)->destroyable()->only(['destroy']);
+"#;
+    assert_eq!(sorted_names_of(destroyable), vec!["profile.destroy"]);
+}
+
+#[test]
+fn api_singleton_except_filters_against_the_expanded_not_the_bare_action_set() {
+    let creatable = r#"<?php
+Route::apiSingleton('profile', ProfileController::class)->creatable()->except(['store']);
+"#;
+    assert_eq!(
+        sorted_names_of(creatable),
+        vec!["profile.destroy", "profile.show", "profile.update"],
+    );
+
+    let destroyable = r#"<?php
+Route::apiSingleton('profile', ProfileController::class)->destroyable()->except(['destroy']);
+"#;
+    assert_eq!(
+        sorted_names_of(destroyable),
+        vec!["profile.show", "profile.update"],
+    );
+}
+
+#[test]
+fn singleton_with_multi_segment_uri_names_only_the_last_segment() {
+    // Laravel detours a slashed singleton name through `prefixedSingleton`,
+    // whose `getResourcePrefix` keeps only the final segment as the name.
+    let src = r#"<?php
+Route::singleton('admin/profile', ProfileController::class);
+Route::apiSingleton('admin/settings/theme', ThemeController::class);
+"#;
+    let names = sorted_names_of(src);
+    assert!(
+        names.contains(&"profile.show".to_string()),
+        "expected profile.show, got {names:?}"
+    );
+    assert!(
+        names.contains(&"theme.show".to_string()),
+        "expected theme.show, got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains('/')),
+        "no singleton name may carry a slash, got {names:?}"
+    );
+}
+
+#[test]
+fn singleton_with_multi_segment_uri_keeps_the_full_uri_for_display() {
+    let src = r#"<?php
+Route::singleton('admin/profile', ProfileController::class)->only(['show']);
+"#;
+    let path = PathBuf::from("/fake/routes/web.php");
+    let routes = extract_named_routes(src, &path, PRIORITY_APP, &[]);
+    let (name, definition) = routes
+        .into_iter()
+        .find(|(n, _)| n.as_deref() == Some("profile.show"))
+        .expect("profile.show must be indexed");
+    assert_eq!(name.as_deref(), Some("profile.show"));
+    assert_eq!(definition.uri.as_deref(), Some("admin/profile"));
+}
+
+#[test]
+fn singleton_inside_name_group_composes_the_prefix() {
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    Route::singleton('profile', ProfileController::class);
+});
+"#;
+    assert_eq!(
+        sorted_names_of(src),
+        vec![
+            "admin.profile.edit",
+            "admin.profile.show",
+            "admin.profile.update",
+        ],
+    );
+}
+
+#[test]
+fn singleton_skips_non_string_and_empty_names() {
+    for src in [
+        "<?php\nRoute::singleton($name, ProfileController::class);\n",
+        "<?php\nRoute::singleton('', ProfileController::class);\n",
+        "<?php\nRoute::singleton('/', ProfileController::class);\n",
+        "<?php\nRoute::apiSingleton($name, ProfileController::class);\n",
+        "<?php\nRoute::apiSingleton('', ProfileController::class);\n",
+        "<?php\nRoute::apiSingleton('/', ProfileController::class);\n",
+    ] {
+        assert!(
+            names_of(src).is_empty(),
+            "unresolvable singleton name must be skipped: {src:?}"
+        );
+    }
+}
+
+#[test]
+fn resource_forms_are_unaffected_by_the_singleton_code_path() {
+    // Regression guard: adding singleton/apiSingleton to the dispatch must not
+    // shift what resource/apiResource emit.
+    let resource = r#"<?php
+Route::resource('photos', PhotoController::class);
+"#;
+    assert_eq!(
+        sorted_names_of(resource),
+        vec![
+            "photos.create",
+            "photos.destroy",
+            "photos.edit",
+            "photos.index",
+            "photos.show",
+            "photos.store",
+            "photos.update",
+        ],
+    );
+
+    let api_resource = r#"<?php
+Route::apiResource('photos', PhotoController::class);
+"#;
+    assert_eq!(
+        sorted_names_of(api_resource),
+        vec![
+            "photos.destroy",
+            "photos.index",
+            "photos.show",
+            "photos.store",
+            "photos.update",
+        ],
+    );
+
+    // `creatable()`/`destroyable()` are not valid on a resource chain, but the
+    // shared dispatch makes them a plausible copy-paste. They must be inert.
+    let stray = r#"<?php
+Route::resource('photos', PhotoController::class)->creatable()->destroyable();
+Route::apiResource('videos', VideoController::class)->creatable();
+"#;
+    let names = sorted_names_of(stray);
+    assert_eq!(
+        names,
+        vec![
+            "photos.create",
+            "photos.destroy",
+            "photos.edit",
+            "photos.index",
+            "photos.show",
+            "photos.store",
+            "photos.update",
+            "videos.destroy",
+            "videos.index",
+            "videos.show",
+            "videos.store",
+            "videos.update",
+        ],
+        "stray singleton modifiers must not alter a resource action set"
+    );
+}
+
+#[test]
+fn container_singleton_is_not_indexed_as_a_route() {
+    // `singleton(...)` is the service container's binding method too. A package
+    // provider that binds into the container *and* registers a named route
+    // passes the file-discovery gate, so without a receiver check every binding
+    // key was indexed as a phantom `<key>.show`/`.edit`/`.update` route.
+    let src = r#"<?php
+class TelescopeServiceProvider extends ServiceProvider {
+    public function register(): void
+    {
+        $this->app->singleton('telescope.limiter', fn ($app) => new Limiter($app));
+        $app->singleton('flare.logger', fn ($app) => new Logger($app));
+        App::singleton('metrics.recorder', fn ($app) => new Recorder($app));
+        Container::singleton('audit.trail', fn ($app) => new Trail($app));
+    }
+    public function boot(): void
+    {
+        Route::get('/health', HealthController::class)->name('health');
+    }
+}
+"#;
+    assert!(
+        content_registers_named_routes(src),
+        "this file must reach extraction — the gate is not what protects us here"
+    );
+    assert_eq!(
+        names_of(src),
+        vec!["health"],
+        "container bindings must contribute no route names"
+    );
+}
+
+#[test]
+fn router_receivers_other_than_the_route_facade_index_singletons() {
+    // The allow-list is not "static calls on `Route`" — Laravel registers
+    // routes through a router instance in provider `map()` methods, and through
+    // the fully-qualified facade in files without a `use` import.
+    let cases = [
+        (
+            "<?php\n$router->singleton('profile', ProfileController::class);\n",
+            "$router",
+        ),
+        (
+            "<?php\n$this->router->singleton('profile', ProfileController::class);\n",
+            "$this->router",
+        ),
+        (
+            "<?php\n\\Illuminate\\Support\\Facades\\Route::singleton('profile', ProfileController::class);\n",
+            "fully-qualified facade",
+        ),
+        (
+            "<?php\nRoute::middleware('auth')->singleton('profile', ProfileController::class);\n",
+            "receiver behind a chained router call",
+        ),
+    ];
+    for (src, label) in cases {
+        assert_eq!(
+            sorted_names_of(src),
+            vec!["profile.edit", "profile.show", "profile.update"],
+            "{label} must still index singleton routes"
+        );
+    }
+}
+
+#[test]
+fn resource_forms_do_not_require_a_router_receiver() {
+    // The receiver gate is scoped to the singleton forms, where a real name
+    // collision exists. `resource(...)` collides with nothing, so gating it
+    // would risk dropping registrations that index correctly today.
+    let src = r#"<?php
+$this->app->resource('photos', PhotoController::class);
+"#;
+    assert_eq!(
+        sorted_names_of(src),
+        vec![
+            "photos.create",
+            "photos.destroy",
+            "photos.edit",
+            "photos.index",
+            "photos.show",
+            "photos.store",
+            "photos.update",
+        ],
+        "resource() must keep its current receiver-agnostic behavior",
+    );
+}

@@ -516,6 +516,10 @@ struct ChainLink<'a> {
     name_node: Node<'a>,
     /// The `->` / `?->` / `::` operator node — anchors named-route definitions.
     operator: Option<Node<'a>>,
+    /// The call's receiver — the `Route` of `Route::singleton(…)`, the
+    /// `$this->app` of `$this->app->singleton(…)`. Read lazily; only the
+    /// chain-opening link's receiver is ever consulted.
+    receiver: Option<Node<'a>>,
     /// True for `$obj->method(...)`, false for `Class::method(...)`.
     instance: bool,
 }
@@ -562,6 +566,9 @@ fn collect_links<'a>(chain: Node<'a>, source: &[u8]) -> Vec<ChainLink<'a>> {
                     args,
                     name_node,
                     operator: operator_node(node),
+                    receiver: node
+                        .child_by_field_name("scope")
+                        .or_else(|| node.child_by_field_name("object")),
                     instance: node.kind() != "scoped_call_expression",
                 });
             }
@@ -573,6 +580,16 @@ fn collect_links<'a>(chain: Node<'a>, source: &[u8]) -> Vec<ChainLink<'a>> {
 
     links.reverse();
     links
+}
+
+/// True when a chain's receiver is Laravel's router, and not some other object
+/// that happens to expose a same-named method. Deliberately an allow-list: an
+/// unrecognised receiver fails closed (no routes indexed) rather than emitting
+/// names that were never registered.
+fn is_router_receiver(receiver: &str) -> bool {
+    matches!(receiver, "Route" | "Router" | "$router" | "$this->router")
+        || receiver.ends_with("\\Route")
+        || receiver.ends_with("\\Router")
 }
 
 /// The `->` / `?->` / `::` token of a call, used to position the definition at
@@ -917,7 +934,22 @@ fn emit_chain_routes(
                 link, prefix, source, file, priority, effective, &metadata, results,
             );
         }
-        if link.method == "resource" || link.method == "apiResource" {
+        // `singleton(...)` is also the service container's binding method, so
+        // — unlike `resource(...)`, which collides with nothing — the singleton
+        // forms register routes only when the chain opens on the router itself.
+        // Without this, `$this->app->singleton('cache.limiter', …)` in a
+        // provider that also declares a named route indexes the phantom names
+        // `cache.limiter.show`/`.edit`/`.update`.
+        let registers_resource = match link.method.as_str() {
+            "resource" | "apiResource" => true,
+            "singleton" | "apiSingleton" => links
+                .first()
+                .and_then(|first| first.receiver)
+                .and_then(|node| node.utf8_text(source).ok())
+                .is_some_and(is_router_receiver),
+            _ => false,
+        };
+        if registers_resource {
             emit_resource_routes(
                 links, link, prefix, source, file, priority, effective, results,
             );
@@ -964,16 +996,20 @@ fn emit_named_route(
     }
 }
 
-/// Expand a `resource(...)` / `apiResource(...)` registration into the named
-/// routes Laravel synthesizes for it — `photos.index`, `photos.show`, … — after
-/// applying any `->only([...])` / `->except([...])` filter on the same chain.
+/// Expand a resource registration into the named routes Laravel synthesizes for
+/// it — `photos.index`, `photos.show`, … — after applying any `->only([...])` /
+/// `->except([...])` filter on the same chain.
+///
+/// Covers all four forms Laravel's `ResourceRegistrar` handles: `resource(...)`,
+/// `apiResource(...)`, `singleton(...)` and `apiSingleton(...)`. They differ only
+/// in their default action set; everything downstream of that is shared.
 ///
 /// A slashed URI contributes only its last segment to the names; the rest is a
 /// URI prefix. The full URI is still carried on each definition for display.
 ///
-/// Punted (common case only): `->names([...])` overrides, `Route::resources([…])`
-/// plural registration, `singleton(...)`/`apiSingleton(...)`, and shallow/nested
-/// resources.
+/// Punted (common case only): `->names([...])` overrides, the plural
+/// `Route::resources([…])` / `Route::singletons([…])` registrations, and
+/// shallow/nested resources.
 #[allow(clippy::too_many_arguments)]
 fn emit_resource_routes(
     links: &[ChainLink],
@@ -999,14 +1035,15 @@ fn emit_resource_routes(
     // only the final segment as the resource name.
     let resource = uri.rsplit('/').next().unwrap_or(uri);
 
-    let defaults = if link.method == "apiResource" {
-        API_RESOURCE_ACTIONS
-    } else {
-        RESOURCE_ACTIONS
+    let defaults = match link.method.as_str() {
+        "apiResource" => API_RESOURCE_ACTIONS.to_vec(),
+        "singleton" => singleton_actions(links, false),
+        "apiSingleton" => singleton_actions(links, true),
+        _ => RESOURCE_ACTIONS.to_vec(),
     };
     let (line, column, end_column) = definition_span(link.name_node, link.args);
 
-    for action in resource_actions(links, defaults, source) {
+    for action in resource_actions(links, &defaults, source) {
         let leaf = format!("{prefix}{resource}.{action}");
         for inherited in effective {
             results.push((
@@ -1033,7 +1070,7 @@ fn emit_resource_routes(
 /// argument is ignored, leaving the defaults in place.
 fn resource_actions(
     links: &[ChainLink],
-    defaults: &'static [&'static str],
+    defaults: &[&'static str],
     source: &[u8],
 ) -> Vec<&'static str> {
     let array_arg = |method: &str| -> Option<Vec<String>> {
@@ -1061,6 +1098,43 @@ fn resource_actions(
     }
     defaults.to_vec()
 }
+
+/// The default action set a `singleton(...)` / `apiSingleton(...)` registration
+/// starts from, before the chain's own `->only([...])` / `->except([...])` filter.
+///
+/// `->creatable()` widens the defaults with `create`/`store`/`destroy`;
+/// `->destroyable()` adds `destroy` alone. `creatable` wins when both are on the
+/// chain — it already implies `destroy`, so the two can't duplicate it, and
+/// neither ordering drops an action.
+///
+/// `apiSingleton` is not a separate default set: `Router::apiSingleton` registers
+/// an ordinary singleton with an implicit `only => [...]`, which
+/// `getResourceMethods` intersects with the (possibly widened) defaults above.
+/// That single mechanism is why a bare `apiSingleton` yields just `show`+`update`
+/// while `store`/`destroy` surface only alongside `creatable`/`destroyable` — and
+/// why `create`/`edit`, which render forms, can never appear on the API form.
+fn singleton_actions(links: &[ChainLink], api: bool) -> Vec<&'static str> {
+    let has = |method: &str| links.iter().any(|link| link.method == method);
+
+    let mut actions: Vec<&'static str> = match (has("creatable"), has("destroyable")) {
+        (true, _) => [&["create", "store"][..], SINGLETON_ACTIONS, &["destroy"]].concat(),
+        (false, true) => [SINGLETON_ACTIONS, &["destroy"][..]].concat(),
+        (false, false) => SINGLETON_ACTIONS.to_vec(),
+    };
+    if api {
+        actions.retain(|action| API_SINGLETON_ONLY.contains(action));
+    }
+    actions
+}
+
+/// Default action set for `Route::singleton(...)` — a single resource with no
+/// index and no identifier, so no `index`/`create`/`store`/`destroy`.
+/// Mirrors `ResourceRegistrar::$singletonResourceDefaults`.
+const SINGLETON_ACTIONS: &[&str] = &["show", "edit", "update"];
+
+/// The implicit `only => [...]` filter `Router::apiSingleton(...)` applies on top
+/// of the singleton defaults.
+const API_SINGLETON_ONLY: &[&str] = &["store", "show", "update", "destroy"];
 
 /// Default action set for `Route::resource(...)` — full CRUD.
 const RESOURCE_ACTIONS: &[&str] = &[
