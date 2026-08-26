@@ -376,99 +376,43 @@ When working on this project:
 - Laravel VSCode extension (for feature reference): https://github.com/amiralizadeh9480/laravel-extra-intellisense
 
 ---
+## Session State (2026-08-26)
 
-## Session State (2026-02-08)
+### `.env` handling — settled
 
-### Last Session Summary
+Zed classifies **every** env file as Shell Script: bare `.env` via the bash
+grammar's `path_suffixes`, and `.env.*` variants via `"Shell Script": [".env.*"]`
+in Zed's own `assets/settings/default.json`. The extension therefore attaches to
+`.env` through the single `"Shell Script"` entry in `extension.toml`, and the LSP
+dispatches env features on **filename** (`main.rs` `is_env` / `is_env_file`), not
+on Zed's language classification.
 
-**Focus**: Investigating whether to remove the bundled Blade language definition and rely on the separate Blade Zed extension, per Zed reviewer feedback. Explored Option C (LSP semantic tokens) in depth and found it's not viable yet.
+Consequences, all verified against primary sources:
 
-### Context: Zed Reviewer Feedback
+- **No language definition is shipped for `.env`, and none should be.** An
+  extension language could tie-and-win bare `.env` (bash offers `".env"`), but
+  the `.env.*` variants sit at the `UserConfigured` tier that only a user's own
+  `file_types` can override. Shipping one would fix `.env` and leave
+  `.env.local` shell-linted — a split worse than the uniform status quo.
+- **`zarifpour/zed-env` is not recommended, but the `"env"` attach entry stays.**
+  Its `path_suffixes` are a bare `"env"` (loses the length tie to `".env"`), so
+  it never claims the files it appears to; and its bare `"conf"` / `"example"` /
+  `"local"` / `"test"` entries reclassify unrelated files project-wide (e.g.
+  `laravel/sail`'s `supervisord.conf`). The docs argue against remapping — but
+  arguing against a path is not the same as breaking it. `extension.toml` keeps
+  `"env"` in its `languages` list so a user who wants a purpose-built dotenv
+  grammar does not thereby lose this extension's `.env` features. Docs express
+  a recommendation; the manifest expresses a capability. Don't conflate them.
+- **SC2034 noise is silenced automatically** in Laravel worktrees via the
+  extension's additional-workspace-configuration hook (`src/lib.rs`). A user's
+  own `bashIde.shellcheckArguments` containing `SC2034` short-circuits the
+  injection and passes through untouched.
 
-The Zed extension reviewer asked why this extension bundles its own Blade language definition when the existing Blade extension (`bajrangCoder/zed-laravel-blade`) already provides one. The reviewer suggested users could disable the Blade extension's language servers and use `laravel-lsp` instead.
+### Blade language definition — still open
 
-### Branch: `experiment/remove-blade-language`
-
-**What was done:**
-- Deleted `languages/blade/` (config.toml, highlights.scm, brackets.scm, indents.scm, injections.scm)
-- Deleted `languages/php_only/` (config.toml, highlights.scm)
-- Removed `[grammars.blade]` and `[grammars.php_only]` from `extension.toml`
-- Removed empty `languages/` directory
-- Updated README: replaced "Blade Language Support" section, updated project structure, added note about separate Blade extension
-- Changed LSP semantic token type from `KEYWORD` to `FUNCTION` in `main.rs` (so directive highlighting matches our `@function` tree-sitter capture)
-- Build passes, all 190 tests pass
-
-**What was NOT changed:**
-- `extension.toml` still lists `languages = ["PHP", "Blade", "XML", "Shell Script"]` for the LSP (correct — this just activates the LSP for those file types, doesn't own the language)
-- All LSP code (build.rs, parser.rs, queries.rs, etc.) still uses tree-sitter-blade internally for parsing
-
-### Key Findings
-
-1. **Zed does NOT support augmenting a language from another extension** — you either own the full language definition or you don't. No partial overrides. Community has requested this but it's not implemented.
-
-2. **Providing `languages/blade/` with .scm files but no `config.toml` errors** — Zed requires `config.toml` when it finds the directory.
-
-3. **Providing `config.toml` without grammar declarations works** — Zed resolves the `blade` grammar from the other Blade extension. BUT this takes full ownership of the language definition, replacing (not augmenting) the other extension's .scm files.
-
-4. **A file can only belong to ONE language in Zed** — creating a separate language name (e.g., "laravel-blade") doesn't work because the Blade extension's language servers are registered for "Blade", not the custom name.
-
-5. **The Blade extension (`bajrangCoder/zed-laravel-blade`) provides:**
-   - Language definition: config.toml, highlights.scm, brackets.scm, indents.scm, injections.scm, outline.scm, overrides.scm
-   - Grammars: tree-sitter-blade, tree-sitter-php (php_only)
-   - Language servers: emmet, intelephense, phptools, phpactor (all PHP LSPs wired to Blade files)
-   - No custom Blade LSP of its own
-   - Cloned to `/Users/mike/Developer/zed-laravel-blade` and installed as dev extension for testing
-
-6. **Semantic tokens (Option C) NOT viable yet:**
-   - Zed PR #46356 "editor: Implement semantic highlighting" merged to `main` on Feb 4, 2026
-   - But it has NOT been released in any build — not in stable (0.222.4) nor preview (0.223.2)
-   - The `semantic_tokens` setting, `lsp: restart language servers` command, and `dev: open highlights tree view` command do not exist in current Zed builds
-   - The documentation at https://zed.dev/docs/semantic-tokens is published ahead of the actual release
-   - Once released, users would need `"semantic_tokens": "combined"` in their Blade language settings
-   - The LSP already sends `FUNCTION` tokens for directives (changed from `KEYWORD` this session)
-
-### Detailed Feature Comparison (Our Extension vs Blade Extension)
-
-**Losses from removing our language files:**
-
-| Category | Impact | Details |
-|---|---|---|
-| **Directive highlighting** | **Significant** | Our `@function` (blue) vs their `@tag` (cyan) — directives become visually indistinguishable from HTML tags |
-| **Blade bracket pairs** | **Moderate** | `{{ }}`, `{!! !!}`, `{{-- --}}` bracket matching/pairing lost — they don't define these in config.toml |
-| **`{` auto-close** | **Minor** | We set `close = false` (LSP handles snippets), they set `close = true` |
-| **Hyphenated word selection** | **Minor** | We define `word_characters = ["-"]` on root + `element` + `string` overrides; they only define it on `string` |
-
-**No loss:**
-- Indentation (`indents.scm`) — identical files
-- Injections (`injections.scm`) — identical files
-- Bracket queries (`brackets.scm`) — identical files
-- `php_only` language — identical highlights and config (whitespace-only diff)
-
-**Features gained from Blade extension:**
-- `outline.scm` — comments in symbol outline panel
-- `overrides.scm` — TailwindCSS completions in attribute values
-- `wrap_characters` — HTML tag wrapping support
-
-### Network Issue (Resolved)
-
-- **Proxyman Guard** network extension was still active on macOS despite the app being uninstalled, causing connection timeouts to `api.zed.dev` and `zed-extensions.nyc3.digitaloceanspaces.com`
-- Disabled via System Settings > General > Login Items & Extensions > Network Extensions
-- `api.zed.dev` works after disabling Proxyman; DigitalOcean Spaces still has ISP-level routing issues (Lumen NYC edge router drops packets to DO's NYC3 region)
-- Workaround: `/etc/hosts` entry for `api.zed.dev` pointing to working Cloudflare IP `172.66.165.132` (can be removed when ISP routing resolves)
-- Blade extension installed as dev extension from `/Users/mike/Developer/zed-laravel-blade` to bypass download
-
-### Remaining Options
-
-1. **Option A: Contribute upstream** — PR our highlighting improvements (`@function` for directives, bracket pair definitions, `word_characters` config) to `bajrangCoder/zed-laravel-blade`. Cleanest long-term solution.
-2. **Option B: Keep owning the language definition without grammars** — Provide `languages/blade/` with our `.scm` files + `config.toml` but no `[grammars.*]` in `extension.toml`. Grammar resolves from Blade extension. Addresses reviewer's duplicate grammar concern but still duplicates language definition.
-3. **Option C: Wait for semantic tokens** — Once Zed ships the feature (PR #46356), the LSP's `FUNCTION` tokens will overlay directive highlighting. Doesn't solve bracket pairs or config differences. Can be combined with A or B later.
-
-### Current Status
-
-- Branch: `experiment/remove-blade-language`
-- Build: **Passing**
-- Tests: **190 tests passing**
-- Uncommitted changes: language files deleted, README updated, extension.toml grammar refs removed, LSP semantic token type changed to FUNCTION
-- Blade extension cloned to `/Users/mike/Developer/zed-laravel-blade` and installed as dev extension
-- Zed settings reverted (removed `semantic_tokens: "combined"` that was added for testing)
-- Decision pending on which option (A, B, or C) to pursue
+The `experiment/remove-blade-language` investigation (options A/B/C: contribute
+upstream to `bajrangCoder/zed-laravel-blade`, own the language definition without
+bundling grammars, or wait for semantic tokens) has **not** been decided. Note
+that Zed has since shipped semantic highlighting, so the `semantic_tokens`
+setting referenced by option C now exists and is documented in
+`docs/configuration.md` for Blade.
