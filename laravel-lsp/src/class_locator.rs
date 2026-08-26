@@ -79,6 +79,15 @@ struct CacheEntry {
 ///
 /// Bounded `LruCache` behind a `Mutex` (lru mutates on read to reorder;
 /// `spawn_blocking` workers share it, so the lock guards the O(1) get/put only).
+///
+/// Poisoning: every `.lock()` on this cache recovers a poisoned mutex with
+/// `unwrap_or_else(|e| e.into_inner())` instead of panicking, so a panic in one
+/// worker can't permanently disable class resolution for the rest of the
+/// session. That is safe because the worst case of a half-updated entry here is
+/// a stale hit or a briefly-wrong recency ordering, never an incorrect result:
+/// a positive is revalidated on every hit with `exists()` + [`path_within_root`]
+/// and a negative expires after [`NEGATIVE_TTL`], so a stale entry costs at most
+/// one extra walk.
 type LocatorKey = (PathBuf, String, bool);
 type LocatorCache = Mutex<LruCache<LocatorKey, CacheEntry>>;
 fn locator_cache() -> &'static LocatorCache {
@@ -102,16 +111,30 @@ fn locator_cache() -> &'static LocatorCache {
 /// watched `.php` create/delete calls [`invalidate_project`]), so this full
 /// reset is only needed when the caller wants a guaranteed-clean slate.
 pub fn reset_locator_cache() {
-    locator_cache().lock().unwrap().clear();
+    locator_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Canonicalize the project root once per process (canonicalize is a syscall;
 /// the root never changes during a session). Mirrors `ComposerAutoload`'s key
 /// normalization so both caches agree on what "this project" means.
+///
+/// `std::sync::Mutex` guards the `ROOTS` map: the critical section is one short
+/// `entry`/`or_insert_with` and is never held across an `.await`.
+///
+/// Poisoning: the `.lock()` recovers a poisoned mutex with
+/// `unwrap_or_else(|e| e.into_inner())` instead of panicking, so a panic
+/// elsewhere can't permanently break root canonicalization. That is safe
+/// because the worst case of a half-updated entry here is a stale hit — an
+/// entry the panicking thread never finished inserting, so the next call simply
+/// re-canonicalizes — never an incorrect result, since the cached value is a
+/// pure function of its key.
 fn canonical_root(root: &Path) -> PathBuf {
     static ROOTS: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
     let roots = ROOTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = roots.lock().expect("class_locator root cache poisoned");
+    let mut map = roots.lock().unwrap_or_else(|e| e.into_inner());
     map.entry(root.to_path_buf())
         .or_insert_with(|| root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))
         .clone()
@@ -126,7 +149,12 @@ fn canonical_root(root: &Path) -> PathBuf {
 /// Composer/PSR-4 tiers live before reaching here.
 fn cached_walk(class_name: &str, root: &Path, include_vendor: bool) -> Option<PathBuf> {
     let key = (canonical_root(root), class_name.to_string(), include_vendor);
-    if let Some(hit) = locator_cache().lock().unwrap().get(&key).cloned() {
+    if let Some(hit) = locator_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
         match &hit.path {
             // Positive hit — trust it only while the file still exists AND still
             // resolves inside the project root (a swapped-in symlink could now
@@ -156,13 +184,16 @@ fn walk_and_cache(
     include_vendor: bool,
 ) -> Option<PathBuf> {
     let resolved = find_php_class_file_impl(class_name, root, include_vendor);
-    locator_cache().lock().unwrap().put(
-        key.clone(),
-        CacheEntry {
-            path: resolved.clone(),
-            cached_at: std::time::Instant::now(),
-        },
-    );
+    locator_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(
+            key.clone(),
+            CacheEntry {
+                path: resolved.clone(),
+                cached_at: std::time::Instant::now(),
+            },
+        );
     resolved
 }
 
@@ -193,7 +224,12 @@ fn walk_and_cache(
 fn live_app_walk(class_name: &str, root: &Path) -> Option<PathBuf> {
     let key = (canonical_root(root), class_name.to_string(), false);
     // Trust a still-valid cached app-positive without re-walking.
-    if let Some(hit) = locator_cache().lock().unwrap().get(&key).cloned() {
+    if let Some(hit) = locator_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
         if let Some(path) = &hit.path {
             if path.exists() && path_within_root(path, root) {
                 return Some(path.clone());
@@ -213,7 +249,7 @@ pub fn invalidate_project(project_root: &Path) {
     // `LruCache` has no `retain`; rebuild without this root's entries. The cache
     // is small (bounded) and invalidation is rare (a watched create/delete), so
     // the O(n) rebuild is fine.
-    let mut cache = locator_cache().lock().unwrap();
+    let mut cache = locator_cache().lock().unwrap_or_else(|e| e.into_inner());
     let keep: Vec<(LocatorKey, CacheEntry)> = cache
         .iter()
         .filter(|((root, _, _), _)| root != &key_root)

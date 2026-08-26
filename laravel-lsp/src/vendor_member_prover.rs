@@ -237,6 +237,18 @@ fn vendor_package_root(root: &Path, file: &Path) -> Option<PathBuf> {
 /// `(package root, member)`. Vendor packages don't change mid-session, and the
 /// diagnostics pass re-proves the same handful of members on every debounced
 /// edit — without this, each keystroke batch would re-walk `laravel/framework`.
+///
+/// `std::sync::Mutex`, not `RwLock` or `tokio::sync::Mutex`: the critical
+/// section is one short `HashMap` get/insert and is never held across an
+/// `.await` (the package walk runs outside the lock).
+///
+/// Poisoning: every `.lock()` on this cache recovers a poisoned mutex with
+/// `unwrap_or_else(|e| e.into_inner())` instead of panicking, so a panic
+/// elsewhere in the process can't turn every later diagnostics pass into a
+/// panic. That is safe because the worst case of a half-updated entry here is a
+/// stale hit — a verdict the panicking thread never finished inserting, so the
+/// next call re-walks the package — never an incorrect result, since a verdict
+/// is a pure re-derivation from a vendor tree that does not change mid-session.
 static PACKAGE_MEMBER_READS: LazyLock<Mutex<HashMap<(PathBuf, String), bool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -246,7 +258,11 @@ static PACKAGE_MEMBER_READS: LazyLock<Mutex<HashMap<(PathBuf, String), bool>>> =
 /// the walk is bounded by [`MAX_PACKAGE_FILES`].
 fn package_touches_member(package_root: &Path, member: &str) -> bool {
     let key = (package_root.to_path_buf(), member.to_string());
-    if let Some(&hit) = PACKAGE_MEMBER_READS.lock().unwrap().get(&key) {
+    if let Some(&hit) = PACKAGE_MEMBER_READS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
         return hit;
     }
 
@@ -279,7 +295,10 @@ fn package_touches_member(package_root: &Path, member: &str) -> bool {
         }
     }
 
-    PACKAGE_MEMBER_READS.lock().unwrap().insert(key, found);
+    PACKAGE_MEMBER_READS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, found);
     found
 }
 

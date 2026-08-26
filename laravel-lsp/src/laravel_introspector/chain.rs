@@ -120,6 +120,14 @@ struct ParsedClassFile {
 /// read (it promotes the touched entry to most-recently-used), and `analyze`
 /// runs on the parallel `spawn_blocking` index workers — the lock is held only
 /// for the O(1) get/put, never across the parse.
+///
+/// Poisoning: every `.lock()` on this cache recovers a poisoned mutex with
+/// `unwrap_or_else(|e| e.into_inner())` instead of panicking, so a panic in one
+/// index worker can't permanently disable the memo for the rest of the session.
+/// That is safe because the worst case of a half-updated entry here is a stale
+/// hit or a briefly-wrong recency ordering, never an incorrect result: every
+/// lookup re-stats the file and rebuilds on a changed [`FileStamp`], so a stale
+/// entry costs at most one extra read + parse.
 type ParsedCache = Mutex<LruCache<PathBuf, (FileStamp, Arc<ParsedClassFile>)>>;
 fn parsed_file_cache() -> &'static ParsedCache {
     static CACHE: OnceLock<ParsedCache> = OnceLock::new();
@@ -141,7 +149,10 @@ fn parsed_file_cache() -> &'static ParsedCache {
 /// rebuilds on a changed [`FileStamp`] — so this full reset is only needed
 /// when the caller wants a guaranteed-clean slate.
 pub fn reset_parsed_file_cache() {
-    parsed_file_cache().lock().unwrap().clear();
+    parsed_file_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Read + parse `path` once (structure + use-aliases), memoized and revalidated
@@ -154,7 +165,11 @@ fn parsed_class_file(path: &Path) -> Option<Arc<ParsedClassFile>> {
     let stamp = FileStamp::of(path);
     if let Some(stamp) = stamp {
         // Scope the lock to the O(1) lookup — never held across the parse below.
-        if let Some((cached_stamp, parsed)) = parsed_file_cache().lock().unwrap().get(path) {
+        if let Some((cached_stamp, parsed)) = parsed_file_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+        {
             if *cached_stamp == stamp {
                 return Some(parsed.clone());
             }
@@ -181,7 +196,7 @@ fn parsed_class_file(path: &Path) -> Option<Arc<ParsedClassFile>> {
     if let Some(stamp) = stamp {
         parsed_file_cache()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .put(path.to_path_buf(), (stamp, parsed.clone()));
     }
     Some(parsed)

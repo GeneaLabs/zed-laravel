@@ -363,6 +363,19 @@ impl ComposerAutoload {
     /// instance because Composer rarely changes during an editing session
     /// — when it does (e.g. `composer require ...`), the user typically
     /// restarts the editor or reloads the extension anyway.
+    ///
+    /// `std::sync::Mutex` guards the map: both critical sections are one short
+    /// `HashMap` get/insert and neither is held across the load or an `.await`.
+    ///
+    /// Poisoning: both `.lock()` calls recover a poisoned mutex with
+    /// `unwrap_or_else(|e| e.into_inner())` instead of panicking, so a panic
+    /// elsewhere can't permanently break every PSR-4 lookup. That is safe
+    /// because the worst case of a half-updated entry here is a stale hit — an
+    /// entry the panicking thread never finished inserting, so the next call
+    /// rebuilds and interns a second `&'static ComposerAutoload` for that root,
+    /// exactly the harmless duplicate the race note below already accepts —
+    /// never an incorrect result, since each interned value is immutable and
+    /// derived from the same `vendor/composer` files.
     pub fn for_project(project_root: &Path) -> &'static ComposerAutoload {
         static CACHE: OnceLock<Mutex<HashMap<PathBuf, &'static ComposerAutoload>>> =
             OnceLock::new();
@@ -374,7 +387,7 @@ impl ComposerAutoload {
 
         // Fast path: already cached.
         {
-            let map = cache.lock().expect("composer_autoload cache poisoned");
+            let map = cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(found) = map.get(&key) {
                 return found;
             }
@@ -384,7 +397,7 @@ impl ComposerAutoload {
         // cache lives for the entire process lifetime — leaks bounded by
         // the number of distinct projects ever opened.
         let loaded = Box::leak(Box::new(ComposerAutoload::load(project_root)));
-        let mut map = cache.lock().expect("composer_autoload cache poisoned");
+        let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
         // Race-safe: if another thread already inserted while we built,
         // drop ours and use theirs. (We can't free the leak, but a
         // duplicate static autoload is harmless.)

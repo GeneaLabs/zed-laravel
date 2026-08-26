@@ -37,6 +37,7 @@ mod livewire_component_resolution;
 mod livewire_tag_navigation_containment;
 mod loop_variable_resolution;
 mod macro_goto_def_handler;
+mod mutex_poison_recovery;
 mod nested_module_root_correction;
 mod query_chain_completion_handler;
 mod rename_integration;
