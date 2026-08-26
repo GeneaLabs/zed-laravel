@@ -111,6 +111,34 @@ Install the Ini extension (`zed: extensions`, search "INI") if you don't already
 - **It does not claim your `.env` files.** Its `path_suffixes` list a bare `"env"`, which loses the length tie to Shell Script's `".env"`; the `.env.*` variants are claimed by Zed's own default settings at a tier the extension can't reach. Installing it changes nothing about `.env` unless you *also* write a `file_types` line — and that line works with or without the extension. This is the extension's own [issue #5](https://github.com/zarifpour/zed-env/issues/5), still open.
 - **It reclassifies files you didn't ask it to.** Those same `path_suffixes` include bare `"conf"`, `"example"`, `"local"`, and `"test"`, which match *any* otherwise-unclaimed file ending in them. In a stock Laravel app that captures `laravel/sail`'s `supervisord.conf` files, and it will keep reaching across every project you open.
 
+## 💬 Inline comments
+
+Inline comments are standard dotenv syntax — `vlucas/phpdotenv` (what Laravel runs), `motdotla/dotenv`, `bkeepers/dotenv`, and `python-dotenv` all support them, and all agree that inside an **unquoted** value a `#` starts a comment with no preceding space required:
+
+```dotenv
+APP_NAME=Laravel        # this is a comment
+SECRET="has#a#hash"     # quoted, so the hashes are part of the value
+DB_PASSWORD=p@ss#word   # the value here is p@ss — NOT p@ss#word
+```
+
+**To keep a literal `#` in a value, quote it.** That is the documented remedy in every implementation, not a workaround.
+
+Because Zed highlights `.env` with the bash grammar, and bash treats a mid-word `#` as ordinary text, the third line above renders as though `#word` were part of the value. The value colouring is misleading; Laravel still reads `p@ss`. Comments written the idiomatic way — with a space before the `#` — highlight correctly.
+
+The extension corrects this via LSP semantic tokens, which Zed leaves **off** by default. To turn it on:
+
+```json
+{
+  "languages": {
+    "Shell Script": {
+      "semantic_tokens": "combined"
+    }
+  }
+}
+```
+
+`"combined"` overlays our tokens on the bash grammar's colours rather than replacing them. Without it the highlighting is cosmetic-only and everything above still parses the same way at runtime.
+
 ## Per-project
 
 Any of the `settings.json` blocks above also work in `.zed/settings.json` at the project root, scoping the change to one project instead of all of Zed. (The `.shellcheckrc` approach is already project-scoped by nature.)

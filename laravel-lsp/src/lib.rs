@@ -68,6 +68,7 @@ pub mod database;
 pub mod directive_args;
 pub mod display_truncate;
 pub mod document_symbols;
+pub mod env_comment_tokens;
 pub mod env_key_locator;
 pub mod facade_resolver;
 pub mod factory_resolver;

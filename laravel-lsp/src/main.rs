@@ -22187,6 +22187,7 @@ impl LanguageServer for LaravelLanguageServer {
                             legend: SemanticTokensLegend {
                                 token_types: vec![
                                     SemanticTokenType::FUNCTION, // index 0 - @directive
+                                    SemanticTokenType::COMMENT,  // index 1 - .env inline comment
                                 ],
                                 token_modifiers: vec![],
                             },
@@ -26724,8 +26725,17 @@ impl LanguageServer for LaravelLanguageServer {
         let uri = &params.text_document.uri;
         let path = uri.path();
 
-        // Only process Blade files
-        if !path.ends_with(".blade.php") {
+        // Two buffer kinds carry semantic tokens: Blade files (custom inline
+        // directives the grammar can't colour) and env files (inline comments,
+        // where the bash grammar Zed highlights `.env` with disagrees with
+        // dotenv about where a comment starts — see `env_comment_tokens`).
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let is_blade = path.ends_with(".blade.php");
+        let is_env = file_name == ".env" || file_name.starts_with(".env.");
+        if !is_blade && !is_env {
             return Ok(None);
         }
 
@@ -26743,13 +26753,16 @@ impl LanguageServer for LaravelLanguageServer {
             }
         };
 
-        // Extract directive tokens, keeping only names we recognise as real
-        // directives (standard + registered custom) and skipping commented-out ones.
-        let known = self.get_directive_name_set().await;
-        let tokens =
-            laravel_lsp::blade_directive_tokens::extract_blade_directive_tokens(&content, &known);
+        let tokens = if is_env {
+            laravel_lsp::env_comment_tokens::extract_env_comment_tokens(&content)
+        } else {
+            // Extract directive tokens, keeping only names we recognise as real
+            // directives (standard + registered custom) and skipping commented-out ones.
+            let known = self.get_directive_name_set().await;
+            laravel_lsp::blade_directive_tokens::extract_blade_directive_tokens(&content, &known)
+        };
 
-        info!("   Found {} directive tokens", tokens.len());
+        info!("   Found {} semantic tokens", tokens.len());
 
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,

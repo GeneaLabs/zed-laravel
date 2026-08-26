@@ -155,6 +155,15 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
       // (e.g. a @money($x) Blade::directive). Requires Zed semantic-token
       // support; "combined" overlays them on the Blade extension's colors.
       "semantic_tokens": "combined"
+    },
+    "Shell Script": {
+      // Zed classifies .env (and .env.*) as Shell Script, so the bash grammar
+      // highlights it — and bash treats a mid-word "#" as literal text, while
+      // dotenv treats it as the start of an inline comment. Turning semantic
+      // tokens on lets us paint those comments correctly. Zed defaults this to
+      // "off", so the fix is invisible without this line. Guide:
+      // docs/environment.md.                                  Default: "off"
+      "semantic_tokens": "combined"
     }
   }
 }
