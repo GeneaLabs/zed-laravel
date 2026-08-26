@@ -15841,7 +15841,20 @@ return [
         None
     }
 
-    /// Create LocationLink for a directive reference from Salsa data
+    /// Create LocationLink for a directive reference from Salsa data.
+    ///
+    /// Dispatch is a single `match` on the directive name, deliberately: a
+    /// directive's handling and its exclusion from the catch-all fallback are
+    /// then the *same arm*, so the two cannot drift apart. Adding a dedicated
+    /// arm automatically excludes that name from the fallback, and an arm that
+    /// resolves nothing yields `None` rather than leaking into the fallback's
+    /// heuristic and offering a naively-guessed view file (issue #325).
+    ///
+    /// Containment guard (issue #148, extending #130): every arm resolves its
+    /// argument through [`Self::first_contained_view`], which honours
+    /// `loadViewsFrom`-style namespaces that can point outside the project root
+    /// and so re-checks containment after the existence probe. The `@feature`
+    /// arm builds its path from `root.join(..)` and is contained by construction.
     async fn create_directive_location_from_salsa(
         &self,
         dir: &DirectiveReferenceData,
@@ -15849,211 +15862,141 @@ return [
         let arguments = dir.arguments.as_ref()?;
         let config = self.get_cached_config().await?;
 
-        // Containment guard (issue #148, extending #130): every candidate loop
-        // below resolves a directive argument to a view/component path through
-        // `resolve_view_path`, which honours `loadViewsFrom`-style namespaces that
-        // can point an absolute path outside the project root. Each loop re-checks
-        // `path_within_root(&path, &config.root)` after the existence check and
-        // `continue`s past any out-of-root candidate, so no directive flow hands
-        // the client a navigation target that escapes the root. The `@feature`
-        // branch builds its path from `root.join(..)` and so is already contained.
-
-        // Directives where first argument is a view name
-        let view_directives_first_arg = ["extends", "include", "includeIf", "each"];
-
-        // Directives where second argument is a view name (after a condition)
-        // `@includeUnless($boolean, 'view.name', [...])` is condition-first,
-        // exactly like `@includeWhen` — it never resolved from the
-        // first-argument list.
-        let view_directives_second_arg = ["includeWhen", "includeUnless"];
-
-        // @component directive - resolves to component file
-        if dir.name == "component" {
-            if let Some(component_name) = Self::extract_view_from_directive_args(arguments) {
-                // Try as component path (resources/views/components/...)
-                let component_path = format!("components.{}", component_name);
-                let possible_paths = config.resolve_view_path(&component_path);
-
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
+        // Note: @lang is handled as a Translation pattern and @vite as an Asset
+        // pattern, not as Directive patterns — see parse_file_patterns in
+        // salsa_impl.rs. Neither reaches this method.
+        match dir.name.as_str() {
+            // `@component('foo')` accepts either a components/ path or a plain
+            // view path; the components/ location wins when both exist.
+            "component" => {
+                let name = Self::extract_view_from_directive_args(arguments)?;
+                let mut resolved = self
+                    .first_contained_view(&config, &format!("components.{name}"))
+                    .await;
+                if resolved.is_none() {
+                    resolved = self.first_contained_view(&config, &name).await;
                 }
+                self.create_location_link(dir, &resolved?)
+            }
 
-                // Also try direct view path
-                let possible_paths = config.resolve_view_path(&component_name);
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
+            // First argument is a view name.
+            "extends" | "include" | "includeIf" | "each" => {
+                let view_name = Self::extract_view_from_directive_args(arguments)?;
+                let path = self.first_contained_view(&config, &view_name).await?;
+                self.create_location_link(dir, &path)
+            }
+
+            // Second argument is a view name, after a condition.
+            // `@includeUnless($boolean, 'view.name', [...])` is condition-first,
+            // exactly like `@includeWhen` — it never resolved from the
+            // first-argument list (issue #327).
+            "includeWhen" | "includeUnless" => {
+                let view_name = Self::extract_second_string_arg(arguments)?;
+                let path = self.first_contained_view(&config, &view_name).await?;
+                self.create_location_link(dir, &path)
+            }
+
+            // `@includeFirst(['view1', 'view2'])` — first view that exists wins.
+            "includeFirst" => {
+                for view_name in Self::extract_array_string_args(arguments) {
+                    if let Some(path) = self.first_contained_view(&config, &view_name).await {
+                        return self.create_location_link(dir, &path);
                     }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
                 }
+                None
+            }
+
+            // `@livewire('component-name')` navigates to the component's Blade
+            // view. The clickable range covers just the quoted name.
+            "livewire" => {
+                let component_name = Self::extract_view_from_directive_args(arguments)?;
+                let path = self.first_contained_view(&config, &component_name).await?;
+                self.create_location_link_with_string_range(dir, &path)
+            }
+
+            // `@feature('feature-name')` — Laravel Pennant. Resolves against
+            // app/Features/, NOT the view tree, which is why a miss here must
+            // never fall through to the fallback's view-name guess.
+            "feature" => {
+                let feature_name = Self::extract_view_from_directive_args(arguments)?;
+                let root = self.root_path.read().await.clone()?;
+
+                // A feature class may override its key via a $name property;
+                // otherwise derive the class name from the key.
+                let feature_path = match scan_feature_classes(&root)
+                    .iter()
+                    .find(|f| f.feature_key == feature_name)
+                {
+                    Some(info) => root
+                        .join("app/Features")
+                        .join(format!("{}.php", info.class_name)),
+                    None => root.join(format!(
+                        "app/Features/{}.php",
+                        feature_key_to_class_name(&feature_name)
+                    )),
+                };
+
+                if !self.file_exists_cached(&feature_path).await {
+                    return None;
+                }
+                self.create_location_link_with_string_range(dir, &feature_path)
+            }
+
+            // ── Fallback: no dedicated arm above (issue #325) ──
+            //
+            // A package that registers its own view-rendering directive through
+            // `Blade::directive()` matches no arm above, so before this it got
+            // no goto at all. Reaching this arm is itself the proof that no
+            // dedicated handling exists — the `match` makes that structural
+            // rather than a hand-maintained exclusion list that can drift.
+            //
+            // Goto and diagnostics have opposite risk profiles: a wrong goto
+            // costs one keystroke, a wrong "view does not exist" squiggle marks
+            // working code. Only goto gains this permissive fallback —
+            // `validate_and_publish_diagnostics` keeps its strict
+            // `extends`/`include` gate, so a false missing-view diagnostic stays
+            // impossible by construction.
+            name => {
+                // `blade.viewDirectives` is the escape hatch for a directive the
+                // heuristic can't or shouldn't infer, so a declared name
+                // outranks `NON_VIEW_DIRECTIVES` — a user may deliberately
+                // re-enable a denylisted name. It can never outrank a dedicated
+                // arm, which the `match` already consumed.
+                let configured = self.view_directives.read().await.clone();
+                let view_name = if configured.first_arg.iter().any(|d| d == name) {
+                    Self::extract_view_from_directive_args(arguments)
+                } else if configured.second_arg.iter().any(|d| d == name) {
+                    Self::extract_second_string_arg(arguments)
+                } else if NON_VIEW_DIRECTIVES.contains(&name) {
+                    None
+                } else {
+                    Self::extract_view_from_directive_args(arguments)
+                }?;
+
+                let path = self.first_contained_view(&config, &view_name).await?;
+                self.create_location_link(dir, &path)
             }
         }
+    }
 
-        // Handle view directives (first argument is view name)
-        if view_directives_first_arg.contains(&dir.name.as_str()) {
-            if let Some(view_name) = Self::extract_view_from_directive_args(arguments) {
-                let possible_paths = config.resolve_view_path(&view_name);
-
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
-                }
+    /// First candidate for `view_name` that exists on disk **and** resolves
+    /// inside the project root.
+    ///
+    /// `resolve_view_path` returns one candidate per configured view root (or
+    /// per namespace), in priority order, and honours `loadViewsFrom`-style
+    /// registrations that can map a namespace to an absolute directory outside
+    /// the root (issues #130/#148). Containment is therefore re-checked after
+    /// the existence probe, and every candidate is tried — not just the first.
+    async fn first_contained_view(
+        &self,
+        config: &LaravelConfigData,
+        view_name: &str,
+    ) -> Option<PathBuf> {
+        for path in config.resolve_view_path(view_name) {
+            if self.file_exists_cached(&path).await && path_within_root(&path, &config.root) {
+                return Some(path);
             }
         }
-
-        // Handle @includeWhen($condition, 'view') - second arg is view
-        if view_directives_second_arg.contains(&dir.name.as_str()) {
-            if let Some(view_name) = Self::extract_second_string_arg(arguments) {
-                let possible_paths = config.resolve_view_path(&view_name);
-
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
-                }
-            }
-        }
-
-        // Handle @includeFirst(['view1', 'view2']) - array of views
-        if dir.name == "includeFirst" {
-            let view_names = Self::extract_array_string_args(arguments);
-            for view_name in view_names {
-                let possible_paths = config.resolve_view_path(&view_name);
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    return self.create_location_link(dir, &path);
-                }
-            }
-        }
-
-        // Note: @lang is now handled as Translation patterns (see parse_file_patterns in salsa_impl.rs)
-        // Note: @vite is handled as Asset patterns, not Directive patterns
-        // See parse_file_patterns in salsa_impl.rs
-
-        // Handle @livewire('component-name') - Livewire component directive
-        // Navigates to the Blade view using view_path resolution
-        if dir.name == "livewire" {
-            if let Some(component_name) = Self::extract_view_from_directive_args(arguments) {
-                // Resolve using view path (e.g., 'navigation-menu' -> resources/views/navigation-menu.blade.php)
-                let possible_paths = config.resolve_view_path(&component_name);
-
-                for path in possible_paths {
-                    if !self.file_exists_cached(&path).await {
-                        continue;
-                    }
-                    if !path_within_root(&path, &config.root) {
-                        continue;
-                    }
-                    // Use string_column/string_end_column for the clickable range (just the component name)
-                    return self.create_location_link_with_string_range(dir, &path);
-                }
-            }
-        }
-
-        // Handle @feature('feature-name') - Laravel Pennant feature directive
-        if dir.name == "feature" {
-            if let Some(feature_name) = Self::extract_view_from_directive_args(arguments) {
-                let root = self.root_path.read().await;
-                if let Some(root) = root.as_ref() {
-                    // First check scanned features for custom $name property matches
-                    let scanned_features = scan_feature_classes(root);
-                    let feature_path = if let Some(feature_info) = scanned_features
-                        .iter()
-                        .find(|f| f.feature_key == feature_name)
-                    {
-                        // Found a feature class with matching $name property or derived key
-                        root.join("app/Features")
-                            .join(format!("{}.php", feature_info.class_name))
-                    } else {
-                        // Fallback: Convert feature key to class name and build path
-                        let class_name = feature_key_to_class_name(&feature_name);
-                        root.join(format!("app/Features/{}.php", class_name))
-                    };
-
-                    if self.file_exists_cached(&feature_path).await {
-                        // Use string_column/string_end_column for the clickable range (just the feature name)
-                        return self.create_location_link_with_string_range(dir, &feature_path);
-                    }
-                }
-            }
-        }
-
-        // ── Fallback for directives with no dedicated handling (issue #325) ──
-        //
-        // A package that registers its own view-rendering directive through
-        // `Blade::directive()` is invisible to every hardcoded list above, so it
-        // gets no goto at all. Goto and diagnostics have opposite risk profiles:
-        // a wrong goto costs the user one keystroke, while a wrong "view does
-        // not exist" squiggle marks working code. Only the *goto* path gains
-        // this permissive fallback — `validate_and_publish_diagnostics` keeps
-        // its strict `extends`/`include` allowlist, so a false missing-view
-        // diagnostic stays impossible by construction.
-        //
-        // The gate is keyed on `dir.name`, never on "nothing has resolved yet":
-        // a dedicated branch above that fails to find its own target must keep
-        // returning `None` rather than leaking into this heuristic and offering
-        // a naively-guessed view file instead.
-        let name = dir.name.as_str();
-        let dedicated = matches!(name, "component" | "livewire" | "feature" | "includeFirst")
-            || view_directives_first_arg.contains(&name)
-            || view_directives_second_arg.contains(&name);
-        if dedicated {
-            return None;
-        }
-
-        // `blade.viewDirectives` is the escape hatch for a directive the
-        // heuristic can't or shouldn't infer, so a declared name outranks
-        // `NON_VIEW_DIRECTIVES` — a user may deliberately re-enable a
-        // denylisted name. It never outranks dedicated handling, refused above.
-        let configured = self.view_directives.read().await.clone();
-        let view_name = if configured.first_arg.iter().any(|d| d == name) {
-            Self::extract_view_from_directive_args(arguments)
-        } else if configured.second_arg.iter().any(|d| d == name) {
-            Self::extract_second_string_arg(arguments)
-        } else if NON_VIEW_DIRECTIVES.contains(&name) {
-            None
-        } else {
-            Self::extract_view_from_directive_args(arguments)
-        };
-
-        if let Some(view_name) = view_name {
-            // Same loop-and-two-gate shape as every branch above: try every
-            // candidate `resolve_view_path` offers, not just the first, and
-            // re-check containment after the existence probe.
-            for path in config.resolve_view_path(&view_name) {
-                if !self.file_exists_cached(&path).await {
-                    continue;
-                }
-                if !path_within_root(&path, &config.root) {
-                    continue;
-                }
-                return self.create_location_link(dir, &path);
-            }
-        }
-
         None
     }
 
