@@ -53,25 +53,18 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
           // table in Eloquent & DB::table() chains). Silent without a live DB
           // connection. One of: "error" | "warning" | "info" | "off".
           "severity": "warning"   // Default: "warning"
-        },
-
-        "shellcheck": {
-          // Auto-mute shellcheck SC2034 ("appears unused") in Laravel
-          // worktrees — .env lines otherwise all warn, because Zed lints
-          // .env as Shell Script. Guide: docs/environment.md. Default: true
-          "suppressUnusedVarWarnings": true
         }
       }
     },
 
     // ── Optional third-party language-server tweaks ────────────────────
-    // shellcheck SC2034 "APP_NAME appears unused" on .env lines is silenced
-    // AUTOMATICALLY in Laravel worktrees (composer.json requiring laravel/*
-    // or illuminate/*) — no block needed. Opt out via
-    // laravel-lsp.settings.shellcheck.suppressUnusedVarWarnings: false.
-    // The manual block below is only for non-Laravel projects; note Zed
-    // ≤1.8.2 never delivers it to the server (fixed by zed#57487). The
-    // bashIde wrapper is required. Details & alternatives: docs/environment.md.
+    // shellcheck SC2034 "APP_NAME appears unused" warns on every .env line,
+    // because Zed lints .env as Shell Script. This extension does NOT silence
+    // that for you — configuring another extension's language server is
+    // outside what a Zed extension may do — so the block below is yours to
+    // add. Note Zed ≤1.8.2 never delivers it to the server (fixed by
+    // zed#57487); on those versions use a .shellcheckrc instead. The bashIde
+    // wrapper is required. Details & alternatives: docs/environment.md.
     "bash-language-server": {
       "settings": {
         "bashIde": { "shellcheckArguments": ["--exclude=SC2034"] }
