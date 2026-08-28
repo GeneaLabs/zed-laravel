@@ -1661,6 +1661,73 @@ pub fn locales_in_dir(db: &dyn Db, dir: LangDir) -> Vec<String> {
     locales
 }
 
+/// The locale whose catalogues supply autocomplete's preview values.
+///
+/// Completion offers keys from exactly one locale (see
+/// [`TranslationCache::completion_keys`]), so *which* one decides every value
+/// previewed next to a key. That used to be the alphabetically-first
+/// directory, which is deterministic but arbitrary: a project with `lang/de/`,
+/// `lang/en/` and `'locale' => 'en'` previewed German for every key
+/// (issue #340).
+///
+/// The chain, first match wins:
+///
+/// 1. `app.locale` from `config/app.php`, normalized by
+///    [`config_string_literal`], when it names one of `candidates`;
+/// 2. `app.fallback_locale`, under the same normalization and the same
+///    membership check — Laravel ships it `env()`-wrapped, so it needs the
+///    normalization just as much as `app.locale` does;
+/// 3. the alphabetically-first candidate, preserving the pre-#340 behaviour
+///    for any project whose config cannot be read statically.
+///
+/// `candidates` is read, never mutated: step 3 sees the whole list
+/// [`locales_in_dir`] returned, not what the earlier steps failed to match, so
+/// the fallback answers with the same locale it always did.
+///
+/// `None` only when `candidates` is empty — a project with no locale
+/// directories has nothing to preview, whatever its config says.
+fn completion_locale(root: &Path, candidates: &[String]) -> Option<String> {
+    ["app.locale", "app.fallback_locale"]
+        .into_iter()
+        .find_map(|key| {
+            let locale = config_string_literal(&crate::config_lookup::resolve_value(root, key)?)?;
+            candidates.contains(&locale).then_some(locale)
+        })
+        .or_else(|| candidates.iter().min().cloned())
+}
+
+/// The string a PHP config value denotes, or `None` when it denotes none
+/// statically.
+///
+/// Mirrors the two forms
+/// [`crate::config::php_top_level_string_value`] accepts, because
+/// [`crate::config_lookup::resolve_value`] hands back raw source text either
+/// way: a quoted literal (`'en'` → `en`) and `env('NAME', 'default')`, whose
+/// default argument is taken since a static reader cannot see the running
+/// process's environment.
+///
+/// Everything else is unresolved — a constant, a concatenation, a function
+/// call, or an `env('NAME')` with no default. Those return `None` rather than
+/// the raw text, so a caller matching against real directory names can never
+/// match on an expression.
+fn config_string_literal(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if let Some(literal) = unquote_php_string(raw) {
+        return Some(literal.to_string());
+    }
+    let args = raw.strip_prefix("env(")?.rsplit_once(')')?.0;
+    unquote_php_string(args.split_once(',')?.1.trim()).map(str::to_string)
+}
+
+/// The body of a single- or double-quoted PHP string literal.
+///
+/// `None` when `raw` does not open and close with the same quote — an
+/// unquoted constant, or a truncated `'en`.
+fn unquote_php_string(raw: &str) -> Option<&str> {
+    let quote = raw.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    raw.strip_prefix(quote)?.strip_suffix(quote)
+}
+
 /// Every `namespace -> lang dir` registration one provider declares.
 ///
 /// Memoized per `(file, root)`. The vendor scan reads and substring-gates every
@@ -1953,14 +2020,18 @@ impl TranslationCache {
     /// Every translation key autocomplete should offer, sorted and deduped.
     ///
     /// Semantics deliberately preserved from the direct-`fs` version: the
-    /// **first** lang root that exists wins, and within it the **first** locale
-    /// subdirectory answers for the whole project — a key present in one locale
-    /// is offered regardless of which locale declares it, so enumerating the
-    /// union would read every catalogue in the project to produce the same
-    /// list. Only the reads changed: the directory listings and every
-    /// catalogue's key extraction are now memoized, where before each
-    /// completion request re-enumerated two directories and re-read *and
-    /// re-parsed* every catalogue in the locale (issue #293).
+    /// **first** lang root that exists wins, and within it **one** locale
+    /// answers for the whole project — a key present in one locale is offered
+    /// regardless of which locale declares it, so enumerating the union would
+    /// read every catalogue in the project to produce the same list. Only the
+    /// reads changed: the directory listings and every catalogue's key
+    /// extraction are now memoized, where before each completion request
+    /// re-enumerated two directories and re-read *and re-parsed* every
+    /// catalogue in the locale (issue #293).
+    ///
+    /// Which locale that is comes from [`completion_locale`]: the app's
+    /// configured locale where `config/app.php` names one this project
+    /// defines, else the alphabetically-first (issue #340).
     ///
     /// `exists()` on the lang roots is a stat, not a read, and picking the root
     /// this way keeps the pre-cache behaviour exactly: a first lang root that
@@ -1978,15 +2049,15 @@ impl TranslationCache {
             return Vec::new();
         };
         let listing = self.ensure_dir(db, &lang_root, root);
-        // Sorted before taking the first: `locales_in_dir` preserves the
-        // directory listing order, which is filesystem-dependent — APFS hands
-        // entries back sorted, ext4 does not. Taking `first()` off the raw
-        // listing therefore made *which locale answers autocomplete* vary by
-        // platform (caught by CI on ubuntu, green on macOS). Alphabetical is
-        // arbitrary but stable, and matches how `locales` orders.
-        let mut candidates = locales_in_dir(&*db, listing).clone();
-        candidates.sort();
-        let Some(locale) = candidates.first().cloned() else {
+        // `locales_in_dir` preserves the directory listing order, which is
+        // filesystem-dependent — APFS hands entries back sorted, ext4 does
+        // not. So the choice must never depend on position in that list:
+        // `completion_locale` selects by name, and its own last resort is the
+        // alphabetical minimum rather than whatever the filesystem listed
+        // first (the platform split CI caught on ubuntu while macOS stayed
+        // green).
+        let candidates = locales_in_dir(&*db, listing).clone();
+        let Some(locale) = completion_locale(root, &candidates) else {
             return Vec::new();
         };
 

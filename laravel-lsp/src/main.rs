@@ -14725,9 +14725,11 @@ impl LaravelLanguageServer {
     /// Served from the Salsa translation cache (issue #293). This used to
     /// re-enumerate the lang root *and* the locale directory, then re-read and
     /// re-parse every catalogue in that locale — recompiling the key regex each
-    /// time — on **every completion request**. The semantics are unchanged:
-    /// first existing lang root, first locale directory within it, first-wins
-    /// on duplicate keys. See
+    /// time — on **every completion request**. The semantics are unchanged
+    /// except for which locale answers: first existing lang root, one locale
+    /// directory within it — the app's configured locale since #340, the
+    /// alphabetically-first before that and still when the config names none
+    /// this project defines — and first-wins on duplicate keys. See
     /// [`laravel_lsp::salsa_impl::TranslationCache::completion_keys`] for why
     /// a single locale is the right answer here where the hover / goto /
     /// diagnostics trio unions every locale.

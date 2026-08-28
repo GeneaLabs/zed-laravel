@@ -728,6 +728,11 @@ async fn autocomplete_answers_from_a_single_locale_directory() {
     // ext4 and `de` on APFS. Note that on a filesystem which already returns
     // entries sorted, this test passes with or without the fix; ext4 (CI) is
     // where it discriminates.
+    //
+    // Since #340 that is the *last resort* rather than the rule: this project
+    // ships no `config/app.php`, so nothing names a locale and the chain falls
+    // through to it. Which is the point — the fix must not cost projects whose
+    // config cannot be read statically their determinism.
     write(
         &root,
         "lang/zz/messages.php",
@@ -771,6 +776,124 @@ async fn autocomplete_is_empty_for_a_project_with_no_lang_directory() {
     assert!(
         backend.get_all_translation_keys().await.is_empty(),
         "no lang directory means nothing to offer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Autocomplete previews the app's configured locale (issue #340)
+//
+// One locale answers autocomplete, so which one decides every value previewed
+// next to a key. That used to be the alphabetically-first directory: a project
+// with `lang/de/`, `lang/en/` and `'locale' => 'en'` previewed German for
+// every key, silently, since the keys themselves looked right.
+//
+// The chain lives in `salsa_impl::completion_locale` and is unit-tested there.
+// These drive the real `Backend` end to end, because a unit test of the
+// resolver says nothing about whether `completion_keys` consults it.
+// ---------------------------------------------------------------------------
+
+/// A `config/app.php` returning exactly the given entry lines.
+fn app_config(entries: &str) -> String {
+    format!("<?php\n\nreturn [\n{entries}\n];\n")
+}
+
+#[tokio::test]
+async fn autocomplete_previews_the_configured_locale_not_the_first_alphabetically() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    write(
+        &root,
+        "config/app.php",
+        &app_config("    'locale' => 'en',"),
+    );
+    write(
+        &root,
+        "lang/de/messages.php",
+        "<?php\nreturn [\n    'welcome' => 'Willkommen',\n];\n",
+    );
+    write(
+        &root,
+        "lang/en/messages.php",
+        "<?php\nreturn [\n    'welcome' => 'Welcome',\n];\n",
+    );
+    let backend = backend_for(&root).await;
+
+    let previews: Vec<(String, String)> = backend
+        .get_all_translation_keys()
+        .await
+        .into_iter()
+        .map(|c| (c.key, c.value))
+        .collect();
+
+    assert_eq!(
+        previews,
+        vec![("messages.welcome".to_string(), "Welcome".to_string())],
+        "`de` sorts first, but the app renders `en` — previewing the German string \
+         next to a key is issue #340"
+    );
+}
+
+#[tokio::test]
+async fn autocomplete_previews_the_fallback_locale_when_the_configured_one_is_untranslated() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    write(
+        &root,
+        "config/app.php",
+        &app_config(
+            "    'locale' => env('APP_LOCALE', 'es'),\n    'fallback_locale' => env('APP_FALLBACK_LOCALE', 'en'),",
+        ),
+    );
+    write(
+        &root,
+        "lang/de/messages.php",
+        "<?php\nreturn [\n    'welcome' => 'Willkommen',\n];\n",
+    );
+    write(
+        &root,
+        "lang/en/messages.php",
+        "<?php\nreturn [\n    'welcome' => 'Welcome',\n];\n",
+    );
+    let backend = backend_for(&root).await;
+
+    let previews: Vec<(String, String)> = backend
+        .get_all_translation_keys()
+        .await
+        .into_iter()
+        .map(|c| (c.key, c.value))
+        .collect();
+
+    assert_eq!(
+        previews,
+        vec![("messages.welcome".to_string(), "Welcome".to_string())],
+        "`es` has no catalogue, so the env-wrapped `fallback_locale` answers — not \
+         `de`, which merely sorts first"
+    );
+}
+
+#[tokio::test]
+async fn autocomplete_is_empty_when_a_configured_locale_has_no_directories_to_read() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    write(
+        &root,
+        "config/app.php",
+        &app_config("    'locale' => 'en',"),
+    );
+    fs::create_dir_all(root.join("lang")).unwrap();
+    let backend = backend_for(&root).await;
+
+    // A contract guard, not a discriminating test, and deliberately so: with no
+    // candidates there is no directory to read, so `completion_keys` returns
+    // empty however `completion_locale` answers — verified by mutating the
+    // resolver to hand back `en` here and watching this stay green. What it
+    // does pin is that the configured-locale chain never turns "nothing to
+    // offer" into a panic or a read of a directory that was never there. The
+    // empty-candidate decision itself is pinned by
+    // `salsa_impl::tests::no_candidates_resolves_to_no_locale`.
+    assert!(
+        backend.get_all_translation_keys().await.is_empty(),
+        "a lang root with no locale in it offers nothing, whatever the config names"
     );
 }
 

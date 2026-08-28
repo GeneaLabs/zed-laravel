@@ -5316,3 +5316,209 @@ async fn re_registration_leaves_the_published_table_live() {
         "re-registration must not swap the published table"
     );
 }
+
+// ─── Which locale answers translation autocomplete (issue #340) ─────────
+//
+// Completion previews values from exactly one locale, so `completion_locale`
+// decides what every key's preview says. It used to be the alphabetically
+// first directory, which previews German on a `de`/`en`/`fr` project that
+// renders `en`. These drive the chain directly; the end-to-end proof that
+// `completion_keys` actually consults it lives in
+// `tests/translation_salsa_cache.rs`.
+
+/// A project root whose `config/app.php` returns exactly `entries`.
+fn root_with_app_config(entries: &str) -> (TempDir, PathBuf) {
+    project_with_files(&[(
+        "config/app.php",
+        &format!("<?php\n\nreturn [\n{entries}\n];\n"),
+    )])
+}
+
+fn locales(names: &[&str]) -> Vec<String> {
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn configured_locale_beats_the_alphabetically_first() {
+    let (_tmp, root) = root_with_app_config("    'locale' => 'en',");
+
+    assert_eq!(
+        completion_locale(&root, &locales(&["de", "en", "fr"])).as_deref(),
+        Some("en"),
+        "the app renders `en`; previewing `de` because it sorts first is issue #340"
+    );
+}
+
+#[test]
+fn a_missing_app_locale_falls_through_to_fallback_locale() {
+    let (_tmp, root) = root_with_app_config("    'fallback_locale' => 'fr',");
+
+    assert_eq!(
+        completion_locale(&root, &locales(&["de", "en", "fr"])).as_deref(),
+        Some("fr"),
+        "no `locale` key at all must consult `fallback_locale`, not give up on the config"
+    );
+}
+
+#[test]
+fn a_configured_locale_with_no_directory_falls_through_to_fallback_locale() {
+    let (_tmp, root) =
+        root_with_app_config("    'locale' => 'es',\n    'fallback_locale' => 'fr',");
+
+    assert_eq!(
+        completion_locale(&root, &locales(&["de", "en", "fr"])).as_deref(),
+        Some("fr"),
+        "a locale the project does not translate has nothing to preview — but that \
+         is a reason to try `fallback_locale`, not to jump straight to alphabetical"
+    );
+}
+
+#[test]
+fn a_non_literal_app_locale_is_unresolved() {
+    let (_tmp, root) =
+        root_with_app_config("    'locale' => APP_DEFAULT_LOCALE,\n    'fallback_locale' => 'fr',");
+
+    assert_eq!(
+        completion_locale(&root, &locales(&["de", "en", "fr"])).as_deref(),
+        Some("fr"),
+        "a constant reference is not statically readable; it must never be matched \
+         as raw text, and must not panic"
+    );
+}
+
+#[test]
+fn a_concatenated_app_locale_is_unresolved() {
+    let (_tmp, root) = root_with_app_config("    'locale' => 'e' . 'n',");
+
+    assert_eq!(
+        completion_locale(&root, &locales(&["fr", "de", "en"])).as_deref(),
+        Some("de"),
+        "a concatenation is not a literal — fall all the way through to alphabetical \
+         rather than evaluating PHP"
+    );
+}
+
+#[test]
+fn neither_key_resolving_falls_back_to_alphabetically_first() {
+    let (_tmp, root) = root_with_app_config("    'name' => 'Laravel',");
+
+    // Deliberately not in sorted order: a fallback that took the list's first
+    // entry rather than its minimum would answer `fr` here, which is precisely
+    // the filesystem-order bug the sort was introduced to kill.
+    assert_eq!(
+        completion_locale(&root, &locales(&["fr", "de", "en"])).as_deref(),
+        Some("de"),
+        "the pre-#340 guarantee: deterministic on every filesystem"
+    );
+}
+
+#[test]
+fn a_project_with_no_config_directory_falls_back_to_alphabetically_first() {
+    let (dir, root) = project_with_files(&[]);
+    let _ = dir;
+
+    assert_eq!(
+        completion_locale(&root, &locales(&["en", "de"])).as_deref(),
+        Some("de"),
+        "an unreadable config must degrade to the old behaviour, not to no completions"
+    );
+}
+
+#[test]
+fn the_alphabetical_fallback_sees_every_candidate_the_chain_tried() {
+    let (_tmp, root) =
+        root_with_app_config("    'locale' => 'de',\n    'fallback_locale' => 'en',");
+
+    // Both configured locales exist as directories, so the chain matches at
+    // step 1 — but if a failing step ever removed what it tried from the list,
+    // this project's fallback would answer `fr` instead of `de`.
+    assert_eq!(
+        completion_locale(&root, &locales(&["de", "en", "fr"])).as_deref(),
+        Some("de"),
+    );
+    assert_eq!(
+        completion_locale(&root, &locales(&["gr", "fr"])).as_deref(),
+        Some("fr"),
+        "neither configured locale exists here, so the fallback must still see the \
+         whole candidate list"
+    );
+}
+
+#[test]
+fn an_env_wrapped_app_locale_uses_its_default_argument() {
+    let (_tmp, root) = root_with_app_config("    'locale' => env('APP_LOCALE', 'en'),");
+
+    assert_eq!(
+        completion_locale(&root, &locales(&["de", "en"])).as_deref(),
+        Some("en"),
+        "Laravel ships `app.locale` env-wrapped; matching the raw `env(...)` text \
+         against directory names would silently reproduce issue #340"
+    );
+}
+
+#[test]
+fn an_env_wrapped_fallback_locale_uses_its_default_argument() {
+    let (_tmp, root) = root_with_app_config(
+        "    'locale' => env('APP_LOCALE'),\n    'fallback_locale' => env('APP_FALLBACK_LOCALE', 'fr'),",
+    );
+
+    assert_eq!(
+        completion_locale(&root, &locales(&["de", "en", "fr"])).as_deref(),
+        Some("fr"),
+        "the env unwrap applies to both lookups — `fallback_locale` is env-wrapped \
+         in a stock Laravel skeleton too"
+    );
+}
+
+#[test]
+fn no_candidates_resolves_to_no_locale() {
+    let (_tmp, root) = root_with_app_config("    'locale' => 'en',");
+
+    assert_eq!(
+        completion_locale(&root, &[]),
+        None,
+        "a project with no locale directories has nothing to preview, whatever its \
+         config says"
+    );
+}
+
+#[test]
+fn config_string_literal_reads_both_quote_styles() {
+    assert_eq!(config_string_literal("'en'").as_deref(), Some("en"));
+    assert_eq!(config_string_literal("\"en\"").as_deref(), Some("en"));
+    assert_eq!(
+        config_string_literal("  'en'  ").as_deref(),
+        Some("en"),
+        "surrounding whitespace is not part of the literal"
+    );
+}
+
+#[test]
+fn config_string_literal_rejects_unresolvable_forms() {
+    for raw in [
+        "env('APP_LOCALE')",
+        "env('APP_LOCALE', APP_DEFAULT)",
+        "APP_LOCALE",
+        "'en",
+        "en'",
+        "'",
+        "",
+        "config('app.locale')",
+    ] {
+        assert_eq!(
+            config_string_literal(raw),
+            None,
+            "`{raw}` denotes no static string and must not be matched as raw text"
+        );
+    }
+}
+
+#[test]
+fn config_string_literal_reads_an_empty_literal() {
+    assert_eq!(
+        config_string_literal("''").as_deref(),
+        Some(""),
+        "an empty literal resolves to the empty string — it simply matches no \
+         directory name"
+    );
+}
