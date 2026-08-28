@@ -26,12 +26,18 @@
 use crate::completion_format::{CodeBlock, CompletionDoc};
 use crate::display_truncate::truncate_for_display;
 
-/// What every surface prints in place of a sensitive `.env` value.
+/// What every *client-rendered* surface prints in place of a sensitive `.env`
+/// value.
 ///
 /// One constant rather than a per-site literal: the four surfaces that used to
 /// echo dotenv values (env completion, `.env` hover, `config('…')` completion,
 /// and the warm-start disk cache) are meant to be indistinguishable to a
 /// reader, and a second spelling is how they drift apart (issue #344).
+///
+/// The server log is the one masked surface that does *not* use this string.
+/// It renders `(set)` — see `database::mask_env_value_for_log` — because a log
+/// line is read as a diagnostic, not as a popup, and that file already masked
+/// the resolved DB password in exactly that spelling.
 pub const REDACTED_ENV_VALUE: &str = "(redacted — matches sensitive-name pattern)";
 
 /// Name segments that mark a `.env` variable as secret-bearing.
@@ -57,7 +63,8 @@ const SENSITIVE_ENV_SEGMENTS: [&str; 8] = [
 /// popup most likely to be on screen during a screen-share or a recording
 /// (issue #344). The heuristic is deliberately name-based and shared: a custom
 /// name outside these segments still shows its value, but no surface may decide
-/// that question for itself.
+/// that question for itself — including the server log, which is as visible in
+/// a screen-share as any popup (`database::mask_env_value_for_log`).
 ///
 /// Case-insensitive, because `.env` keys are conventionally upper-case but
 /// nothing enforces it.

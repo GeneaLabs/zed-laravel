@@ -1803,3 +1803,187 @@ async fn decision_cloud_end_to_end_variable_config_plus_sail_override() {
         "Sail override 127.0.0.2 detected once the host is correct: {labels:?}"
     );
 }
+
+// ---- logs are a display surface (issue #344) ----
+//
+// The four surfaces #344 enumerated all render into the client. Logs are the
+// fifth: with `RUST_LOG` unset the server logs at `info` to stderr, which Zed
+// shows in a visible panel, and `docs/troubleshooting.md` asks users to paste
+// that panel into bug reports. A `.env` value read under a secret-bearing name
+// must therefore be masked there too, by the same predicate the other four use.
+
+/// A plaintext distinctive enough that finding it in a log cannot be a
+/// coincidence.
+const LOG_SECRET: &str = "hunter2-log-issue-344";
+/// A second matched keyword category. One category alone cannot tell the shared
+/// predicate from a hard-coded `contains("PASSWORD")`.
+const LOG_TOKEN: &str = "tok-log-issue-344";
+/// The unmatched control: an ordinary setting whose value must still be logged
+/// in full, or the masking has bought security by deleting the diagnostic.
+const LOG_PLAIN_HOST: &str = "db.internal.example";
+
+fn log_fixture_env() -> String {
+    format!(
+        "DB_CONNECTION=mysql\nDB_HOST={LOG_PLAIN_HOST}\nDB_DATABASE=laravel\n\
+         DB_USERNAME=sail\nDB_PASSWORD={LOG_SECRET}\nMAIL_API_TOKEN={LOG_TOKEN}\n"
+    )
+}
+
+/// Run `f` and return its result plus everything it logged.
+///
+/// `with_default` scopes the subscriber to this thread for the duration of the
+/// call, so a capture neither depends on nor disturbs whatever subscriber the
+/// test binary installed globally, and two tests capturing at once cannot read
+/// each other's lines. DEBUG because one of the two masked sites is a `debug!`.
+fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+        type Writer = Buffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let buffer = Buffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buffer.clone())
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .finish();
+
+    let result = tracing::subscriber::with_default(subscriber, f);
+    let captured =
+        String::from_utf8(buffer.0.lock().unwrap().clone()).expect("log output is utf-8");
+    (result, captured)
+}
+
+#[test]
+fn parsing_the_database_config_never_logs_the_dotenv_password() {
+    let dir = TempDir::new().unwrap();
+    write_config_php(dir.path(), CONFIG_VAR_FORM);
+    write(dir.path(), ".env", &log_fixture_env());
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+
+    let (config, logs) = capture_logs(|| provider.parse_database_config().expect("config parsed"));
+
+    assert_eq!(
+        config.password, LOG_SECRET,
+        "the parse still resolves the real password — masking is a log concern only"
+    );
+    assert!(
+        !logs.contains(LOG_SECRET),
+        "the .env password reached the log in plaintext:\n{logs}"
+    );
+    // Pinned to the line that owns the value. A bare `(set)` search would pass
+    // on the neighbouring `password: (set)` summary, which was already masked
+    // before this change and proves nothing about these sites.
+    assert!(
+        logs.contains("resolved from .env: (set)"),
+        "the resolver's info line carries the masked rendering:\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"resolve_env(DB_PASSWORD): Some("(set)")"#),
+        "the reader's debug line carries the masked rendering:\n{logs}"
+    );
+    assert!(
+        logs.contains(LOG_PLAIN_HOST),
+        "an ordinary DB_HOST value is still logged in full:\n{logs}"
+    );
+}
+
+#[test]
+fn resolve_env_masks_every_matched_keyword_category_in_its_debug_log() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", &log_fixture_env());
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+
+    let ((password, token, host), logs) = capture_logs(|| {
+        (
+            provider.resolve_env("DB_PASSWORD"),
+            provider.resolve_env("MAIL_API_TOKEN"),
+            provider.resolve_env("DB_HOST"),
+        )
+    });
+
+    assert_eq!(
+        password.as_deref(),
+        Some(LOG_SECRET),
+        "caller still gets it"
+    );
+    assert_eq!(token.as_deref(), Some(LOG_TOKEN), "caller still gets it");
+    assert_eq!(
+        host.as_deref(),
+        Some(LOG_PLAIN_HOST),
+        "caller still gets it"
+    );
+
+    assert!(
+        !logs.contains(LOG_SECRET) && !logs.contains(LOG_TOKEN),
+        "a secret-named value reached the debug log in plaintext:\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"resolve_env(DB_PASSWORD): Some("(set)")"#),
+        "PASSWORD is masked:\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"resolve_env(MAIL_API_TOKEN): Some("(set)")"#),
+        "TOKEN is masked by the same gate, not by a PASSWORD-only check:\n{logs}"
+    );
+    assert!(
+        logs.contains(&format!(
+            r#"resolve_env(DB_HOST): Some("{LOG_PLAIN_HOST}")"#
+        )),
+        "an unmatched name still logs its value in full:\n{logs}"
+    );
+}
+
+#[test]
+fn parse_env_setting_masks_by_the_env_var_name_not_the_config_key() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", &log_fixture_env());
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    // `host` is an innocuous config key fed by a secret-named variable, and
+    // `password` a secret-sounding key fed by an ordinary one: the gate reads
+    // the env var's name, which is the only name the policy is defined over.
+    let block = "'host' => env('MAIL_API_TOKEN', '127.0.0.1'),\n\
+                 'password' => env('DB_HOST', ''),";
+
+    let ((host, password), logs) = capture_logs(|| {
+        (
+            provider.parse_env_setting(block, "host", "127.0.0.1"),
+            provider.parse_env_setting(block, "password", ""),
+        )
+    });
+
+    assert_eq!(host, LOG_TOKEN, "the resolved value is unchanged");
+    assert_eq!(password, LOG_PLAIN_HOST, "the resolved value is unchanged");
+    assert!(
+        !logs.contains(LOG_TOKEN),
+        "the secret-named value leaked through an innocuous config key:\n{logs}"
+    );
+    assert!(
+        logs.contains("resolved from .env: (set)"),
+        "the secret-named value is masked:\n{logs}"
+    );
+    assert!(
+        logs.contains(&format!("resolved from .env: {LOG_PLAIN_HOST}")),
+        "the ordinary value is logged in full even under a `password` key:\n{logs}"
+    );
+}

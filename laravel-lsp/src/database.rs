@@ -3,6 +3,7 @@
 //! Provides database schema information (tables and columns) for
 //! `exists:` and `unique:` validation rule autocomplete.
 
+use crate::completion_display::is_sensitive_env_name;
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -499,6 +500,31 @@ fn mask_url_password(url: &str) -> String {
     masked.push_str("***");
     masked.push_str(&url[creds_end..]); // from `@` onwards
     masked
+}
+
+/// Render a `.env`-sourced value for a log line.
+///
+/// Logs are a display surface. With `RUST_LOG` unset the server installs
+/// `EnvFilter::new("info,salsa=warn")` over stderr, which Zed shows in a visible
+/// log panel — the same screen-share exposure the completion, hover, `config()`
+/// and warm-start-cache redaction closes (issue #344). A value read under a
+/// variable name that [`is_sensitive_env_name`] matches therefore never reaches a
+/// log in the clear.
+///
+/// Masked values render `(set)`, the spelling
+/// [`DatabaseSchemaProvider::parse_database_config`] already prints for the
+/// resolved DB password. There is no `(empty)` arm: every call site logs a value
+/// that came back from [`crate::config::read_env_value`], which filters an empty
+/// value to `None` before it can get here.
+///
+/// A non-matching name logs unchanged — `DB_HOST` and `DB_DATABASE` are why these
+/// lines exist, and redacting them would spend the whole diagnostic for nothing.
+fn mask_env_value_for_log<'a>(name: &str, value: &'a str) -> &'a str {
+    if is_sensitive_env_name(name) {
+        "(set)"
+    } else {
+        value
+    }
 }
 
 /// One thing the connector should attempt: a URL to connect with, a short
@@ -1255,7 +1281,10 @@ impl DatabaseSchemaProvider {
 
                     // Try to resolve from .env first
                     if let Some(env_value) = self.resolve_env(&env_var) {
-                        info!("🗄️      → resolved from .env: {}", env_value);
+                        info!(
+                            "🗄️      → resolved from .env: {}",
+                            mask_env_value_for_log(&env_var, &env_value)
+                        );
                         return env_value;
                     }
 
@@ -1420,7 +1449,13 @@ impl DatabaseSchemaProvider {
         // Delegates to the single hardened reader in `config` — see its doc
         // comment for why this logic must not be duplicated.
         let result = crate::config::read_env_value(&self.project_root, key);
-        debug!("🗄️  resolve_env({}): {:?}", key, result);
+        debug!(
+            "🗄️  resolve_env({}): {:?}",
+            key,
+            result
+                .as_deref()
+                .map(|value| mask_env_value_for_log(key, value))
+        );
         result
     }
 

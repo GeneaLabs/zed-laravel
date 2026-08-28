@@ -6,6 +6,10 @@
 //! echoed them — env completion, `.env` hover, `config('…')` completion, and
 //! the warm-start disk cache.
 //!
+//! A fifth was found in review: the server log. It consults the same predicate
+//! and is covered next to the code that logs, in `database::tests` — these four
+//! are the client-rendered ones.
+//!
 //! All four now consult one predicate,
 //! `completion_display::is_sensitive_env_name`. These tests drive the real
 //! entry points — `completion()`, `hover_for_env`, `get_all_config_keys`, and
