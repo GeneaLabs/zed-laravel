@@ -2,12 +2,13 @@
 //!
 //! `completion` picks the context helper for the cursor from the file's
 //! classification: an env file gets `${...}` interpolation, a PHPUnit XML file
-//! gets its `<env name="…">` attributes, and everything else — PHP and Blade
-//! included — gets `env('...')` call completion. That choice used to gate on
-//! `path.contains(".env")`, a substring test over the whole path, so every
-//! file under a directory such as `.envs/` classified as an env file. A `.php`
-//! file there was handed the interpolation helper, so its `env('…')` calls
-//! never reached the call-context helper that completes them.
+//! gets its `<env name="…">` and `<server name="…">` attributes, and everything
+//! else — PHP and Blade included — gets `env('...')` call completion. That
+//! choice used to gate on `path.contains(".env")`, a substring test over the
+//! whole path, so every file under a directory such as `.envs/` classified as
+//! an env file. A `.php` file there was handed the interpolation helper, so
+//! its `env('…')` calls never reached the call-context helper that completes
+//! them.
 //!
 //! `env_key_locator::path_is_env_file` now owns the decision, and its own unit
 //! tests pin the predicate. They say nothing about whether this dispatch
@@ -36,9 +37,16 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{LanguageServer, LspService};
 
 /// The variable the project's own `.env` declares. Deliberately unlike any
-/// real environment variable: the handler appends `std::env::vars()` matching
-/// the same prefix, so a name that could collide with the machine's
-/// environment would make "no items" mean "no match" rather than "no context".
+/// real environment variable.
+///
+/// The handler offers only what the project declares. It *used to* merge the
+/// server's own `std::env::vars()` into that list and no longer does — the
+/// leak was issue #342, `main.rs` states its removal outright where the items
+/// are built, and `env_completion_system_leak` pins it. So this sentinel
+/// guards against a regression rather than describing current behaviour: were
+/// the merge ever to return, a name colliding with the machine's environment
+/// would make a rejection test's empty result mean "no match" instead of
+/// "no context", and it would pass for the wrong reason.
 const SENTINEL: &str = "ZL345_SENTINEL";
 
 /// The prefix typed at the cursor. Must remain a prefix of [`SENTINEL`], so
@@ -47,7 +55,36 @@ const SENTINEL: &str = "ZL345_SENTINEL";
 /// offered, and a prefix that had drifted out of sync with the sentinel would
 /// satisfy that assertion by matching nothing at all. The positive tests share
 /// the constant and so keep it honest — they fail if it stops matching.
+///
+/// That downstream protection is real, but it lands in the wrong place: drift
+/// reddens the two positive controls, whose names point at env-variant
+/// classification and PHP call completion and say nothing about constant
+/// drift. The assertion below fails at the constants instead.
 const PREFIX: &str = "ZL345_";
+
+const _: () = assert!(
+    is_proper_prefix(PREFIX.as_bytes(), SENTINEL.as_bytes()),
+    "PREFIX must remain a proper prefix of SENTINEL: every fixture here types \
+     PREFIX at the cursor and expects SENTINEL back, so drift would leave the \
+     rejection tests asserting emptiness against a prefix that matches nothing"
+);
+
+/// Whether `prefix` is a proper prefix of `full`. A `const fn` because the
+/// invariant it serves is a property of the constants themselves, so it is
+/// checked when the crate compiles rather than when some test happens to run.
+const fn is_proper_prefix(prefix: &[u8], full: &[u8]) -> bool {
+    if prefix.len() >= full.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < prefix.len() {
+        if prefix[i] != full[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
 /// A backend with `root_path` primed and the Salsa debounce removed, so a
 /// `did_change` can be awaited deterministically instead of slept on.
@@ -62,8 +99,10 @@ async fn backend_for(root: &Path) -> LaravelLanguageServer {
 
 /// Register the project's `.env` as a real Salsa env source by driving the
 /// `did_change` handler, so the completion under test has something to offer.
-/// Without this every assertion below would read "no items" and pass for the
-/// wrong reason.
+/// Without it every *rejection* assertion below would read "no items" and pass
+/// for the wrong reason. The two positive controls are what stop that going
+/// unnoticed: they require the sentinel back, so an unseeded harness fails
+/// them loudly instead of quietly satisfying their negative siblings.
 async fn seed_env_source(backend: &LaravelLanguageServer, root: &Path) {
     let text = format!("{SENTINEL}=from_dot_env\n");
     let path = root.join(".env");
