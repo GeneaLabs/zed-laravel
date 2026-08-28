@@ -459,6 +459,18 @@ async fn config_completion_redacts_only_the_dotenv_sourced_sensitive_values() {
     );
 }
 
+/// `config/app.php` rendered the way the completion detail renders it — with
+/// the platform's own separator. Windows displays `config\app.php`, which is
+/// correct for Windows, so the expectation has to be built rather than typed:
+/// a literal `config/app.php` reddens the whole matrix job on a path-display
+/// difference that has nothing to do with redaction.
+fn config_app_display() -> String {
+    std::path::Path::new("config")
+        .join("app.php")
+        .display()
+        .to_string()
+}
+
 /// End-to-end through the real handler, so the render sites are covered too:
 /// `completion_detail` and `config_documentation` both receive the redacted
 /// value, and nothing else in the response carries the secret.
@@ -474,7 +486,7 @@ async fn the_config_completion_response_carries_no_dotenv_secret() {
     let password = item(&items, "app.password", "config completion");
     assert_eq!(
         password.detail.as_deref(),
-        Some(format!("{REDACTED_ENV_VALUE} (config/app.php)").as_str())
+        Some(format!("{REDACTED_ENV_VALUE} ({})", config_app_display()).as_str())
     );
     assert!(
         documentation_markdown(password, "config completion").contains(REDACTED_ENV_VALUE),
@@ -485,7 +497,7 @@ async fn the_config_completion_response_carries_no_dotenv_secret() {
     let name = item(&items, "app.name", "config completion");
     assert_eq!(
         name.detail.as_deref(),
-        Some(format!("{PLAIN_VALUE} (config/app.php)").as_str())
+        Some(format!("{PLAIN_VALUE} ({})", config_app_display()).as_str())
     );
 }
 

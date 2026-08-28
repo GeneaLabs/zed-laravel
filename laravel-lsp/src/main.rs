@@ -21214,12 +21214,28 @@ return [
                 trailer: Some(&label),
                 ..Default::default()
             })
+        } else if laravel_lsp::completion_display::is_sensitive_env_name(&var.name) {
+            // Same two redaction guards `hover_for_env` applies to the reverse
+            // direction (issues #344, #348). The value being on screen already
+            // is not a reason to skip them: this card is LSP output like any
+            // other, and the name-matched value is dropped rather than masked
+            // because a partial credential is still a credential.
+            hover::render(&hover::HoverContent {
+                header: Some(key),
+                detail: Some(laravel_lsp::completion_display::REDACTED_ENV_VALUE),
+                source_link: Some(&link),
+                trailer: Some(&label),
+                ..Default::default()
+            })
         } else {
+            // Unmatched by name, but the value may still carry a credential of
+            // its own — `DATABASE_URL` is the stock Laravel case.
+            let shown = laravel_lsp::completion_display::mask_url_credentials(&var.value);
             hover::render(&hover::HoverContent {
                 header: Some(key),
                 code: Some(hover::CodeBlock {
                     language: hover::CodeLanguage::Plain,
-                    content: &var.value,
+                    content: &shown,
                 }),
                 source_link: Some(&link),
                 trailer: Some(&label),

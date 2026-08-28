@@ -538,3 +538,47 @@ async fn find_all_references_stays_php_only_on_env_buffers() {
         "textDocument/references must stay `.php`-only on env buffers"
     );
 }
+
+// ── secrets stay redacted here too ────────────────────────────────────────
+
+#[tokio::test]
+async fn sensitive_values_are_redacted_in_the_env_buffer_card() {
+    // The value is already on screen in the buffer, which is exactly the
+    // argument that would leave this card as the one un-redacted env surface.
+    // It is LSP output like any other (issues #344, #348), so it applies both
+    // of `hover_for_env`'s guards: the name match drops the value outright,
+    // and an unmatched name still gets its URL credentials masked.
+    let (server, dir) = server_with(
+        &[(
+            ".env",
+            "DB_PASSWORD=hunter2\nDATABASE_URL=mysql://root:hunter2@localhost/app\n",
+        )],
+        &[],
+    )
+    .await;
+    let env = dir.path().join(".env");
+
+    let by_name = hover_at(&server, &env, position(0, 2))
+        .await
+        .expect("a secret-named key must still render a card");
+    assert!(
+        !by_name.contains("hunter2"),
+        "the name-matched secret must not reach the card: {by_name:?}"
+    );
+    assert!(
+        by_name.contains(laravel_lsp::completion_display::REDACTED_ENV_VALUE),
+        "the card must say why the value is missing: {by_name:?}"
+    );
+
+    let by_shape = hover_at(&server, &env, position(1, 2))
+        .await
+        .expect("DATABASE_URL must still render a card");
+    assert!(
+        !by_shape.contains("hunter2"),
+        "an unmatched name must still have its URL password masked: {by_shape:?}"
+    );
+    assert!(
+        by_shape.contains("mysql://"),
+        "masking must keep the rest of the URL readable: {by_shape:?}"
+    );
+}
