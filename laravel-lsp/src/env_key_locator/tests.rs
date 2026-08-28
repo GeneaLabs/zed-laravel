@@ -237,7 +237,7 @@ fn enumerate_handles_empty_value_and_leading_whitespace() {
     assert_eq!((keys[1].1.start_column, keys[1].1.end_column), (2, 8));
 }
 
-// ── `is_env_file_name` — the single gate every env feature dispatches on ──
+// ── `is_env_file_name` — the gate every env feature classifies with ──
 
 #[test]
 fn env_file_name_matches_bare_env_and_every_variant() {

@@ -9063,8 +9063,14 @@ impl LaravelLanguageServer {
                     debug!("Failed to update service provider in Salsa: {}", e);
                 }
             }
-        } else if filename.starts_with(".env") {
-            // Env file (.env, .env.local, .env.example)
+        } else if laravel_lsp::env_key_locator::is_env_file_name(filename) {
+            // Env file (.env, .env.local, .env.example).
+            //
+            // Gated on the shared predicate, not `starts_with(".env")`: that
+            // prefix also swallows `.envrc` (direnv's file, common in Laravel
+            // repositories), `.environment`, and `.env-backup`, registering
+            // each as a Laravel env source that Salsa then merges into
+            // completion and hover results.
             let priority = match filename {
                 ".env" => 2,
                 ".env.local" => 1,

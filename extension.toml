@@ -24,8 +24,9 @@ name = "Laravel CE"
 #     classification. Every one of them routes through a single gate,
 #     `env_key_locator::is_env_file_name`, which matches `.env` exactly or a
 #     `.env.` variant prefix: the code lens (`collect_lens_items`), the
-#     inline-comment semantic tokens (`semantic_tokens_full`), and env-key
-#     completion. Every position request — hover, go-to-definition,
+#     inline-comment semantic tokens (`semantic_tokens_full`), env-key
+#     completion, and the ingestion step that admits an edited buffer as an
+#     env source at all. Every position request — hover, go-to-definition,
 #     find-references, rename — returns early unless the path ends in `.php`
 #     or `.blade.php`, so none of them reach a Shell Script buffer at all.
 #

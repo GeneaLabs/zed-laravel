@@ -387,7 +387,12 @@ in Zed's own `assets/settings/default.json`. The extension therefore attaches to
 dispatches env features on **filename**, not on Zed's language classification:
 every env feature routes through one shared gate,
 `env_key_locator::is_env_file_name` (and its path form `path_is_env_file`),
-which matches `.env` exactly or a `.env.` variant prefix.
+which matches `.env` exactly or a `.env.` variant prefix. The Salsa ingestion
+in `execute_salsa_update` joined that gate last — it read `starts_with(".env")`
+until #337, and so admitted `.envrc`, `.environment`, and `.env-backup` as
+Laravel env sources. Startup registration is the one env path that does not
+consult the gate, because it names its three files outright and classifies
+nothing.
 
 Consequences, all verified against primary sources:
 

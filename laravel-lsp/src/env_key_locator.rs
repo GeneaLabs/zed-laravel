@@ -30,14 +30,22 @@ pub struct EnvKeyLocation {
 /// exactly `.env`, or a `.env.<suffix>` variant (`.env.local`,
 /// `.env.example`, `.env.testing`, …).
 ///
-/// This is the single gate every env feature dispatches on, and it takes a
-/// **file name** — never a path. A substring test against a whole path
-/// (`path.contains(".env")`) also matches every file under a directory such
-/// as `.envs/`, which attaches env behaviour to shell scripts and `.php`
+/// Every env feature that has to *classify* a file asks this function —
+/// directly, or through [`path_is_env_file`] when it holds a path. Startup
+/// registration is the one env path that never asks, because it names `.env`,
+/// `.env.local`, and `.env.example` outright and so classifies nothing.
+///
+/// It takes a **file name** — never a path. A substring test against a whole
+/// path (`path.contains(".env")`) also matches every file under a directory
+/// such as `.envs/`, which attaches env behaviour to shell scripts and `.php`
 /// files that are not env files at all.
 ///
-/// Note `.env` alone is matched exactly: `.envrc` starts with `.env` but is
-/// direnv's file, not Laravel's, so the variant arm requires the dot.
+/// Note `.env` alone is matched exactly, and the variant arm requires the
+/// dot. A bare `starts_with(".env")` admits `.envrc` — direnv's file, not
+/// Laravel's, and common in Laravel repositories — along with `.environment`
+/// and `.env-backup`. Salsa merges env sources by variable name, so admitting
+/// one of those does not just add a file: it lets a foreign `DATABASE_URL`
+/// answer for the project's own.
 pub fn is_env_file_name(name: &str) -> bool {
     name == ".env" || name.starts_with(".env.")
 }

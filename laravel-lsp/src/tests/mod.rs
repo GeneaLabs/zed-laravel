@@ -20,6 +20,7 @@ mod diagnostic_severity;
 mod directive_navigation_containment;
 mod directive_view_fallback;
 mod dynamic_where_sparseness;
+mod env_source_registration_gate;
 mod expected_path_diagnostic_containment;
 mod factory_goto_def_handler;
 mod flux_component_context;
