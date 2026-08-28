@@ -50,6 +50,12 @@ pub enum ComponentFormat {
 pub struct LivewireConfig {
     pub component_locations: Vec<PathBuf>,
     pub component_namespaces: HashMap<String, PathBuf>,
+    /// Class-component namespaces registered imperatively via
+    /// `Livewire::addNamespace(...)` (or a wrapper method) in service
+    /// providers — prefix → (class namespace, class directory). Populated
+    /// by the caller from the provider scan, not by `parse()`; see
+    /// [`crate::livewire_namespaces`].
+    pub class_namespaces: HashMap<String, crate::livewire_namespaces::LivewireClassNamespace>,
     pub make_command_type: ComponentFormat,
     pub make_command_emoji: bool,
     pub class_namespace: String,
@@ -71,6 +77,7 @@ impl LivewireConfig {
                 root.join("resources/views/livewire"),
             ],
             component_namespaces,
+            class_namespaces: HashMap::new(),
             make_command_type: ComponentFormat::Sfc,
             make_command_emoji: true,
             class_namespace: "App\\Livewire".to_string(),

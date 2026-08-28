@@ -23,7 +23,7 @@
 //! syntax, numeric keys) is skipped silently. The rename operation simply
 //! produces fewer `TextEdit`s — never an incorrect edit.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
 /// Position of a config-key string literal's *content* (no quotes).
@@ -38,16 +38,40 @@ pub struct KeyPosition {
 /// `"database.connections.mysql.host"`) under a Laravel project root.
 /// Returns `None` if the file or any path segment is missing.
 pub fn locate_key(root: &Path, dotted_key: &str) -> Option<KeyPosition> {
+    locate_key_all(root, &[], dotted_key)
+        .into_iter()
+        .next()
+        .map(|(_, position)| position)
+}
+
+/// Locate `dotted_key` in **every** file contributing to its config group —
+/// the project `config/{group}.php` plus each module's config file (see
+/// [`crate::config::config_group_files`], which already orders by
+/// descending merge precedence — the file whose value wins first), so `.first()`
+/// is the primary declaration and the full list feeds find-references and
+/// rename across merged declarations.
+pub fn locate_key_all(
+    root: &Path,
+    module_dirs: &[PathBuf],
+    dotted_key: &str,
+) -> Vec<(PathBuf, KeyPosition)> {
     let mut parts = dotted_key.split('.');
-    let file = parts.next()?;
+    let Some(file) = parts.next() else {
+        return Vec::new();
+    };
     let path_segments: Vec<&str> = parts.collect();
     if path_segments.is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    let config_path = root.join("config").join(format!("{file}.php"));
-    let content = std::fs::read_to_string(&config_path).ok()?;
-    locate_in_source(&content, &path_segments)
+    crate::config::config_group_files(root, module_dirs, file)
+        .into_iter()
+        .filter_map(|config_path| {
+            let content = std::fs::read_to_string(&config_path).ok()?;
+            let position = locate_in_source(&content, &path_segments)?;
+            Some((config_path, position))
+        })
+        .collect()
 }
 
 /// Source-only variant for unit tests — operates on a string rather than

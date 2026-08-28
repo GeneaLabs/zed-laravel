@@ -920,7 +920,10 @@ fn generate_directive_description(_directive: &str, source_file: &str) -> String
 }
 
 /// Scan for custom Blade directives registered via Blade::directive()
-fn scan_custom_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> {
+fn scan_custom_blade_directives(
+    project_root: &Path,
+    module_dirs: &[PathBuf],
+) -> Vec<BladeDirectiveInfo> {
     use regex::Regex;
 
     let mut directives = Vec::new();
@@ -933,6 +936,24 @@ fn scan_custom_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> 
     let app_providers = project_root.join("app/Providers");
     if app_providers.exists() {
         scan_directory_for_directives(&app_providers, &directive_re, "app", &mut directives);
+    }
+
+    // Module providers (`modules.paths`) register directives the same way
+    // the app's own providers do.
+    for path in laravel_lsp::config::module_provider_files(module_dirs) {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for cap in directive_re.captures_iter(&content) {
+                if let Some(name) = cap.get(1) {
+                    directives.push(BladeDirectiveInfo {
+                        name: name.as_str().to_string(),
+                        description: "Custom directive from app module".to_string(),
+                        has_params: true,
+                        closing: None,
+                        source: "app".to_string(),
+                    });
+                }
+            }
+        }
     }
 
     // Scan vendor packages for service providers
@@ -1009,9 +1030,12 @@ fn scan_directory_for_directives(
 }
 
 /// Get all Blade directives (Laravel built-in + custom)
-fn get_all_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> {
+fn get_all_blade_directives(
+    project_root: &Path,
+    module_dirs: &[PathBuf],
+) -> Vec<BladeDirectiveInfo> {
     let mut all_directives = scan_laravel_blade_directives(project_root);
-    let custom_directives = scan_custom_blade_directives(project_root);
+    let custom_directives = scan_custom_blade_directives(project_root, module_dirs);
 
     // Add custom directives, avoiding duplicates
     for custom in custom_directives {
@@ -2065,6 +2089,19 @@ struct LaravelLanguageServer {
     /// what we found" (the map can be empty if no packages register).
     /// Wrapped in `Arc` so clones share memory across hover calls.
 
+    /// Module directory patterns from the `modules.paths` setting. Empty =
+    /// modular-monolith support off (the default). See [`ModulesSettings`].
+    module_path_patterns: Arc<RwLock<Vec<String>>>,
+
+    /// Cached expansion of `module_path_patterns` against the current root,
+    /// in ascending config-merge precedence. `None` = not yet expanded;
+    /// cleared when the setting changes and by `invalidate_config_cache`.
+    cached_module_dirs: Arc<RwLock<Option<Arc<Vec<PathBuf>>>>>,
+
+    /// Wrapper method names treated as Livewire namespace registrars
+    /// (`modules.livewireRegistrars` setting).
+    module_livewire_registrars: Arc<RwLock<Vec<String>>>,
+
     /// Cache of parsed Laravel framework Builder + Query/Builder method
     /// surfaces, keyed by project root. Populated lazily on the first
     /// `Model::|` completion that asks for it; reused for every subsequent
@@ -2401,6 +2438,36 @@ struct CodeLensSettings {
     enabled: bool,
 }
 
+/// Modular-monolith support settings. Configured via:
+/// `{ "lsp": { "laravel-lsp": { "settings": { "modules": { "paths": ["app/*/*"] } } } } }`
+///
+/// Off by default: with an empty `paths` list the server behaves exactly as
+/// before. When set, each matched directory is treated as an application
+/// module whose `config/*.php` files are merged into the Laravel config
+/// under the file name as top-level key (the composer-merge-plugin /
+/// ModuleServiceProvider pattern). Patterns are listed in ascending merge
+/// precedence and a directory keeps its first (lowest-precedence) position
+/// when several patterns match it, so `["app/Common/*", "app/*/*"]` merges
+/// Common modules before the rest.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ModulesSettings {
+    /// Directory patterns relative to the project root, `*` matching one
+    /// path segment (e.g. "app/*/*", "modules/*"). Non-directories and
+    /// duplicates are dropped.
+    #[serde(default)]
+    paths: Vec<String>,
+    /// Provider method names that wrap `Livewire::addNamespace(path, prefix)`
+    /// — see [`laravel_lsp::livewire_namespaces`]. The direct
+    /// `Livewire::addNamespace(...)` form is always parsed.
+    #[serde(default = "default_livewire_registrars")]
+    livewire_registrars: Vec<String>,
+}
+
+fn default_livewire_registrars() -> Vec<String> {
+    vec!["loadLivewireComponentsFrom".to_string()]
+}
+
 /// LSP settings object from Zed
 /// Configured via: { "lsp": { "laravel-lsp": { "settings": { ... } } } }
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -2417,6 +2484,8 @@ struct LspSettings {
     diagnostics: DiagnosticsSettings,
     #[serde(default)]
     code_lens: CodeLensSettings,
+    #[serde(default)]
+    modules: ModulesSettings,
 }
 
 // ============================================================================
@@ -4601,6 +4670,9 @@ impl LaravelLanguageServer {
             indexing_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_index: Arc::new(RwLock::new(None)),
             command_index: Arc::new(RwLock::new(None)),
+            module_path_patterns: Arc::new(RwLock::new(Vec::new())),
+            cached_module_dirs: Arc::new(RwLock::new(None)),
+            module_livewire_registrars: Arc::new(RwLock::new(default_livewire_registrars())),
             builder_method_index_cache: Arc::new(RwLock::new(HashMap::new())),
             route_decl_cache: Arc::new(RwLock::new(HashMap::new())),
             magic_deps: Arc::new(std::sync::RwLock::new(
@@ -4677,6 +4749,63 @@ impl LaravelLanguageServer {
             );
             *self.code_lens_enabled.write().await = new_code_lens;
         }
+
+        // Modular-monolith module paths
+        let new_module_paths = settings.modules.paths.clone();
+        let old_module_paths = self.module_path_patterns.read().await.clone();
+        if new_module_paths != old_module_paths {
+            info!(
+                "⚙️  Updating module paths: {:?} → {:?}",
+                old_module_paths, new_module_paths
+            );
+            *self.module_path_patterns.write().await = new_module_paths;
+            *self.cached_module_dirs.write().await = None;
+            // Translation namespaces include module-provider registrations,
+            // so the provider-derived map must rebuild with the new module
+            // set (`module_dirs_for` re-registers the extras on its next
+            // resolve).
+            let _ = self.salsa.invalidate_translation_providers().await;
+            // Livewire class namespaces come from module providers too.
+            *self.cached_livewire.write().await = None;
+        }
+
+        // Livewire namespace registrar method names
+        let new_registrars = settings.modules.livewire_registrars.clone();
+        let old_registrars = self.module_livewire_registrars.read().await.clone();
+        if new_registrars != old_registrars {
+            info!(
+                "⚙️  Updating Livewire namespace registrars: {:?} → {:?}",
+                old_registrars, new_registrars
+            );
+            *self.module_livewire_registrars.write().await = new_registrars;
+            *self.cached_livewire.write().await = None;
+        }
+    }
+
+    /// Return the module directories configured via `modules.paths`,
+    /// expanded against `root` in ascending config-merge precedence.
+    /// Cached after the first expansion; an empty result means modular
+    /// support is off or nothing matched.
+    async fn module_dirs_for(&self, root: &Path) -> Arc<Vec<PathBuf>> {
+        {
+            let guard = self.cached_module_dirs.read().await;
+            if let Some(ref existing) = *guard {
+                return existing.clone();
+            }
+        }
+        let patterns = self.module_path_patterns.read().await.clone();
+        let expanded = Arc::new(laravel_lsp::config::expand_module_dirs(root, &patterns));
+        *self.cached_module_dirs.write().await = Some(expanded.clone());
+        // Module service providers register translation namespaces via
+        // `loadTranslationsFrom` too — hand them to the Salsa translation
+        // layer as first-party providers (a no-op when the set is
+        // unchanged), so `ns::` hover/goto/completion covers modules.
+        let module_providers = laravel_lsp::config::module_provider_files(&expanded);
+        let _ = self
+            .salsa
+            .set_translation_provider_extras(module_providers)
+            .await;
+        expanded
     }
 
     /// Pull `lsp.laravel-lsp.settings` from the client via
@@ -4752,7 +4881,10 @@ impl LaravelLanguageServer {
         let directives = {
             let root_guard = self.root_path.read().await;
             match root_guard.as_ref() {
-                Some(root) => get_all_blade_directives(root),
+                Some(root) => {
+                    let module_dirs = self.module_dirs_for(root).await;
+                    get_all_blade_directives(root, &module_dirs)
+                }
                 None => get_fallback_blade_directives(),
             }
         };
@@ -6131,7 +6263,7 @@ impl LaravelLanguageServer {
                             .register_service_provider_source(
                                 path.to_path_buf(),
                                 content,
-                                2, // app priority
+                                3, // app priority
                                 root.to_path_buf(),
                             )
                             .await
@@ -6140,6 +6272,39 @@ impl LaravelLanguageServer {
                         registered_count += 1;
                     }
                 }
+            }
+        }
+
+        // Priority 2: Module providers (`modules.paths`). Modules register
+        // their providers via composer `extra.laravel.providers` in merged
+        // sub-manifests, so the app/Providers walk above never sees them —
+        // yet their loadViewsFrom/loadTranslationsFrom/Blade registrations
+        // are as first-party as the app's own.
+        let module_dirs = self.module_dirs_for(root).await;
+        for path in laravel_lsp::config::module_provider_files(&module_dirs) {
+            let content = if let Ok(uri) = Url::from_file_path(&path) {
+                if let Some((buffer_content, _)) = documents.get(&uri) {
+                    buffer_content.clone()
+                } else {
+                    std::fs::read_to_string(&path).unwrap_or_default()
+                }
+            } else {
+                std::fs::read_to_string(&path).unwrap_or_default()
+            };
+
+            if !content.is_empty()
+                && self
+                    .salsa
+                    .register_service_provider_source(
+                        path,
+                        content,
+                        2, // module priority — above packages, below the app
+                        root.to_path_buf(),
+                    )
+                    .await
+                    .is_ok()
+            {
+                registered_count += 1;
             }
         }
 
@@ -6206,7 +6371,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         bootstrap_app,
                         content,
-                        2, // app priority
+                        3, // app priority
                         root.to_path_buf(),
                     )
                     .await
@@ -6236,7 +6401,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         kernel_path,
                         content,
-                        2, // app priority
+                        3, // app priority
                         root.to_path_buf(),
                     )
                     .await
@@ -6575,7 +6740,7 @@ impl LaravelLanguageServer {
                             .register_service_provider_source(
                                 path.to_path_buf(),
                                 content,
-                                2, // app priority
+                                3, // app priority
                                 root.to_path_buf(),
                             )
                             .await
@@ -6584,6 +6749,37 @@ impl LaravelLanguageServer {
                         registered_count += 1;
                     }
                 }
+            }
+        }
+
+        // Priority 2: Module providers (`modules.paths`) — kept in sync with
+        // register_service_provider_files_with_salsa so a rescan doesn't
+        // drop module view/translation/Blade registrations.
+        let module_dirs = self.module_dirs_for(root).await;
+        for path in laravel_lsp::config::module_provider_files(&module_dirs) {
+            let content = if let Ok(uri) = Url::from_file_path(&path) {
+                if let Some((buffer_content, _)) = documents.get(&uri) {
+                    buffer_content.clone()
+                } else {
+                    std::fs::read_to_string(&path).unwrap_or_default()
+                }
+            } else {
+                std::fs::read_to_string(&path).unwrap_or_default()
+            };
+
+            if !content.is_empty()
+                && self
+                    .salsa
+                    .register_service_provider_source(
+                        path,
+                        content,
+                        2, // module priority — above packages, below the app
+                        root.to_path_buf(),
+                    )
+                    .await
+                    .is_ok()
+            {
+                registered_count += 1;
             }
         }
 
@@ -6648,7 +6844,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         bootstrap_app,
                         content,
-                        2, // app priority
+                        3, // app priority
                         root.to_path_buf(),
                     )
                     .await
@@ -6678,7 +6874,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         kernel_path,
                         content,
-                        2, // app priority
+                        3, // app priority
                         root.to_path_buf(),
                     )
                     .await
@@ -7789,7 +7985,28 @@ impl LaravelLanguageServer {
         if let Ok(env_vars) = self.salsa.get_all_parsed_env_vars().await {
             let mut variables = std::collections::HashMap::new();
             for var in &env_vars {
-                variables.insert(var.name.clone(), var.value.clone());
+                // A secret-bearing name is cached by name with an empty value
+                // (issue #344): the plaintext never reaches the cache file,
+                // which is world-readable-ish, long-lived, and outside the
+                // project the developer thinks they are protecting. The key is
+                // kept rather than dropped so a warm start still knows the
+                // variable exists and can offer it — the surfaces redact by
+                // name, so it renders identically to a live parse.
+                //
+                // No `is_commented` filter, matching the loop's existing
+                // behaviour: a commented-out `# DB_PASSWORD=hunter2` is cached
+                // too, so it must be redacted here as well.
+                //
+                // An unmatched name is still not written raw: `DATABASE_URL`
+                // matches no segment and carries the password inside its value,
+                // so it goes to disk with the credential masked. The plaintext
+                // must not reach this file under either gate.
+                let value = if laravel_lsp::completion_display::is_sensitive_env_name(&var.name) {
+                    String::new()
+                } else {
+                    laravel_lsp::completion_display::mask_url_credentials(&var.value).into_owned()
+                };
+                variables.insert(var.name.clone(), value);
             }
             debug!("Caching {} env variables", variables.len());
             cache.set_env_vars(CachedEnvVars { variables });
@@ -8857,7 +9074,50 @@ impl LaravelLanguageServer {
     ) -> laravel_lsp::livewire_config::LivewireConfig {
         let path = root.join("config/livewire.php");
         let source = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-        laravel_lsp::livewire_config::parse(&source, root)
+        let mut config = laravel_lsp::livewire_config::parse(&source, root);
+
+        // Imperative `Livewire::addNamespace(...)` registrations (direct or
+        // via a `modules.livewireRegistrars` wrapper method) from app and
+        // module service providers. On a prefix
+        // conflict the LAST registration wins — the same rule the
+        // translation-namespace merge follows — so modules are scanned first
+        // (in ascending `modules.paths` precedence) and app providers LAST:
+        // an app registration overrides any module's, because the app boots
+        // last, and between two modules the higher-precedence (later) one
+        // wins.
+        let registrars = self.module_livewire_registrars.read().await.clone();
+        let module_dirs = self.module_dirs_for(root).await;
+        let mut provider_files: Vec<PathBuf> =
+            laravel_lsp::config::module_provider_files(&module_dirs);
+        let app_providers = root.join("app/Providers");
+        if app_providers.is_dir() {
+            for entry in WalkDir::new(&app_providers)
+                .max_depth(3)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let p = entry.path();
+                if p.is_file() && p.extension().is_some_and(|ext| ext == "php") {
+                    provider_files.push(p.to_path_buf());
+                }
+            }
+        }
+
+        for provider_path in provider_files {
+            let Ok(provider_source) = std::fs::read_to_string(&provider_path) else {
+                continue;
+            };
+            for (prefix, reg) in laravel_lsp::livewire_namespaces::extract_livewire_namespaces(
+                &provider_source,
+                &provider_path,
+                root,
+                &registrars,
+            ) {
+                config.class_namespaces.insert(prefix, reg);
+            }
+        }
+
+        config
     }
 
     /// Read `composer.lock` and return the detected Livewire major version.
@@ -8937,6 +9197,9 @@ impl LaravelLanguageServer {
         // `composer.lock`, both of which change in tandem with the
         // general Laravel config layer.
         *self.cached_livewire.write().await = None;
+        // Module directories are derived from the filesystem too (a module
+        // may appear or disappear alongside its composer.json/config).
+        *self.cached_module_dirs.write().await = None;
     }
 
     /// Get middleware from cache first, then Salsa
@@ -9093,7 +9356,7 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         path.clone(),
                         content.to_string(),
-                        2, // priority: app = 2
+                        3, // priority: app = 3
                         root,
                     )
                     .await
@@ -9101,8 +9364,19 @@ impl LaravelLanguageServer {
                     debug!("Failed to update service provider in Salsa: {}", e);
                 }
             }
-        } else if Self::with_forward_slashes(&path_str).contains("app/Providers")
-            && filename.ends_with(".php")
+        } else if filename.ends_with(".php")
+            && (Self::with_forward_slashes(&path_str).contains("app/Providers") || {
+                // Module provider (`modules.paths`) outside app/Providers —
+                // e.g. app/{Parent}/{Module}/src/Providers/FooServiceProvider.php.
+                filename.ends_with("ServiceProvider.php")
+                    && match root_path.as_ref() {
+                        Some(root) => {
+                            let module_dirs = self.module_dirs_for(root).await;
+                            module_dirs.iter().any(|m| path.starts_with(m))
+                        }
+                        None => false,
+                    }
+            })
         {
             // App service provider - Service provider file
             //
@@ -9117,12 +9391,17 @@ impl LaravelLanguageServer {
                     .register_service_provider_source(
                         path.clone(),
                         content.to_string(),
-                        2, // priority: app = 2
+                        3, // priority: app = 3
                         root,
                     )
                     .await
                 {
                     debug!("Failed to update service provider in Salsa: {}", e);
+                } else {
+                    // The cached LaravelConfigData bakes in this provider's
+                    // view/component namespaces — without dropping it the
+                    // edit is registered but never observable.
+                    self.invalidate_config_cache().await;
                 }
             }
         } else if laravel_lsp::env_key_locator::is_env_file_name(filename) {
@@ -14349,10 +14628,38 @@ impl LaravelLanguageServer {
             None => return Vec::new(),
         };
 
-        let config_dir = root.join("config");
-        if !config_dir.exists() {
+        // Enumeration discovers WHICH groups exist (the union of file stems
+        // across the root and module config dirs); the per-group file order
+        // — and with it the precedence of a key declared in several files —
+        // comes from `config_group_files`, the single owner of that rule.
+        // The helper returns descending precedence, so the FIRST file
+        // declaring a key wins here, exactly as it does for hover/goto.
+        let module_dirs = self.module_dirs_for(&root).await;
+        let config_dirs: Vec<PathBuf> = std::iter::once(root.join("config"))
+            .chain(module_dirs.iter().map(|m| m.join("config")))
+            .filter(|d| d.is_dir())
+            .collect();
+        if config_dirs.is_empty() {
             return Vec::new();
         }
+        let mut groups: Vec<String> = config_dirs
+            .iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "php") {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        groups.sort();
+        groups.dedup();
 
         // Get env vars for resolving env() references
         let env_vars: std::collections::HashMap<String, String> =
@@ -14365,36 +14672,33 @@ impl LaravelLanguageServer {
                 Err(_) => std::collections::HashMap::new(),
             };
 
-        let mut completions = Vec::new();
+        // BTreeMap dedups keys declared in several merged files (first
+        // insertion wins — the files arrive highest-precedence first) and
+        // keeps the sorted order the old Vec sort provided.
+        let mut merged: std::collections::BTreeMap<String, ConfigKeyCompletion> =
+            std::collections::BTreeMap::new();
 
-        // Read all PHP files in config directory
-        if let Ok(entries) = std::fs::read_dir(&config_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "php") {
-                    if let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) {
-                        let base_key = file_name.to_string();
-                        let source = format!("config/{}.php", file_name);
-
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            // Parse the config file and extract keys
-                            let keys = Self::parse_config_keys(&content, &base_key, &env_vars);
-                            for (key, value) in keys {
-                                completions.push(ConfigKeyCompletion {
-                                    key,
-                                    value,
-                                    source: source.clone(),
-                                });
-                            }
-                        }
-                    }
+        for group in &groups {
+            for path in laravel_lsp::config::config_group_files(&root, &module_dirs, group) {
+                let source = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (key, value) in Self::parse_config_keys(&content, group, &env_vars) {
+                    merged.entry(key.clone()).or_insert(ConfigKeyCompletion {
+                        key,
+                        value,
+                        source: source.clone(),
+                    });
                 }
             }
         }
 
-        // Sort by key for consistent ordering
-        completions.sort_by(|a, b| a.key.cmp(&b.key));
-        completions
+        merged.into_values().collect()
     }
 
     /// Get all view names from resources/views for autocomplete
@@ -14660,78 +14964,120 @@ impl LaravelLanguageServer {
             None => return Vec::new(),
         };
 
-        // Get Livewire path from cached config
+        // Get Livewire path from cached config — the conventional-path scan
+        // below is skipped (not the whole function) when there isn't one, so
+        // a project whose components live ONLY under a registered namespace
+        // (no root `app/Livewire`) still gets that namespace's completions.
         let livewire_path = match self.cached_config.read().await.as_ref() {
-            Some(config) => match &config.livewire_path {
-                Some(path) => root.join(path),
-                None => return Vec::new(), // Livewire not configured
-            },
+            Some(config) => config.livewire_path.as_ref().map(|path| root.join(path)),
             None => {
                 // Default to app/Livewire if no config
                 let v3_path = root.join("app").join("Livewire");
                 let v2_path = root.join("app/Http/Livewire");
                 if v3_path.exists() {
-                    v3_path
+                    Some(v3_path)
                 } else if v2_path.exists() {
-                    v2_path
+                    Some(v2_path)
                 } else {
-                    return Vec::new();
+                    None
                 }
             }
         };
 
-        if !livewire_path.exists() {
-            return Vec::new();
-        }
-
         let mut completions = Vec::new();
 
-        // Containment audit (issue #228): no walk-entry gate is needed here. A
-        // discovered path becomes only the `path` *display* string of a
-        // `LivewireComponentCompletion` — never read, opened, or resolved to an FS
-        // primitive at this site. Selecting a completion inserts its `name`;
-        // navigation resolves that name through the independently
-        // containment-gated Livewire resolver. So a `follow_links(true)` escape
-        // could at most surface an out-of-root display string, never a read.
-        for entry in walkdir::WalkDir::new(&livewire_path)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "php")
-            })
-        {
-            let path = entry.into_path();
+        if let Some(livewire_path) = livewire_path.filter(|p| p.exists()) {
+            // Containment audit (issue #228): no walk-entry gate is needed here. A
+            // discovered path becomes only the `path` *display* string of a
+            // `LivewireComponentCompletion` — never read, opened, or resolved to an FS
+            // primitive at this site. Selecting a completion inserts its `name`;
+            // navigation resolves that name through the independently
+            // containment-gated Livewire resolver. So a `follow_links(true)` escape
+            // could at most surface an out-of-root display string, never a read.
+            for entry in walkdir::WalkDir::new(&livewire_path)
+                .follow_links(true)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "php")
+                })
+            {
+                let path = entry.into_path();
 
-            // Convert file path to component name
-            if let Ok(relative) = path.strip_prefix(&livewire_path) {
-                let relative_str = relative.to_string_lossy();
+                // Convert file path to component name
+                if let Ok(relative) = path.strip_prefix(&livewire_path) {
+                    let relative_str = relative.to_string_lossy();
 
-                // Remove .php extension
-                let component_name = if relative_str.ends_with(".php") {
-                    relative_str.trim_end_matches(".php")
-                } else {
+                    // Remove .php extension
+                    let component_name = if relative_str.ends_with(".php") {
+                        relative_str.trim_end_matches(".php")
+                    } else {
+                        continue;
+                    };
+
+                    // Convert path separators to dots for nested components
+                    // e.g., "Admin/Dashboard.php" -> "admin.dashboard"
+                    let component_name = component_name.replace(['/', '\\'], ".");
+
+                    // Convert PascalCase to kebab-case
+                    // e.g., "UserProfile" -> "user-profile", "Admin.Dashboard" -> "admin.dashboard"
+                    let component_name = Self::to_kebab_case(&component_name);
+
+                    // Get relative path from project root for display
+                    let display_path = path
+                        .strip_prefix(&root)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+                    completions.push(LivewireComponentCompletion {
+                        name: component_name,
+                        path: display_path,
+                    });
+                }
+            }
+        }
+
+        // Registered class namespaces (`Livewire::addNamespace` /
+        // `modules.livewireRegistrars`) — same walk per namespace dir,
+        // names prefixed `ns::`.
+        if let Some((livewire_config, _version)) = self.get_cached_livewire().await {
+            for (ns, reg) in &livewire_config.class_namespaces {
+                if !reg.class_path.is_dir() {
                     continue;
-                };
-
-                // Convert path separators to dots for nested components
-                // e.g., "Admin/Dashboard.php" -> "admin.dashboard"
-                let component_name = component_name.replace(['/', '\\'], ".");
-
-                // Convert PascalCase to kebab-case
-                // e.g., "UserProfile" -> "user-profile", "Admin.Dashboard" -> "admin.dashboard"
-                let component_name = Self::to_kebab_case(&component_name);
-
-                // Get relative path from project root for display
-                let display_path = path
-                    .strip_prefix(&root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| path.to_string_lossy().to_string());
-
-                completions.push(LivewireComponentCompletion {
-                    name: component_name,
-                    path: display_path,
-                });
+                }
+                // Depth-bounded: registrations are containment-gated at
+                // extraction, but this walk runs on every completion
+                // request, so a deep in-root tree must not turn one
+                // keystroke into a full-subtree traversal. Livewire
+                // component nesting is shallow in practice.
+                for entry in walkdir::WalkDir::new(&reg.class_path)
+                    .follow_links(true)
+                    .max_depth(8)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_type().is_file()
+                            && e.path().extension().is_some_and(|ext| ext == "php")
+                    })
+                {
+                    let path = entry.into_path();
+                    if let Ok(relative) = path.strip_prefix(&reg.class_path) {
+                        let relative_str = relative.to_string_lossy();
+                        let Some(component_name) = relative_str.strip_suffix(".php") else {
+                            continue;
+                        };
+                        let component_name =
+                            Self::to_kebab_case(&component_name.replace(['/', '\\'], "."));
+                        let display_path = path
+                            .strip_prefix(&root)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+                        completions.push(LivewireComponentCompletion {
+                            name: format!("{ns}::{component_name}"),
+                            path: display_path,
+                        });
+                    }
+                }
             }
         }
 
@@ -15250,12 +15596,33 @@ impl LaravelLanguageServer {
     }
 
     /// Resolve an env() call to its actual value
-    /// Handles: env('VAR'), env('VAR', 'default'), env('VAR', default_value)
+    /// Handles: env('VAR'), env('VAR', 'default'), env('VAR', default_value),
+    /// and the `(bool) env('VAR')` cast spelling.
+    ///
+    /// A value read out of the project's `.env` for a secret-bearing variable
+    /// name is replaced here, before it reaches `ConfigKeyCompletion` and the
+    /// two render sites, so the config popup cannot echo a credential
+    /// (issue #344). Only the dotenv-sourced path is redacted — a literal
+    /// default written in the PHP source is already on screen in the file being
+    /// edited, and the `${VAR}` placeholder carries no value to leak.
+    ///
+    /// **One branch, on purpose.** A `(bool) env('APP_DEBUG', false)` cast used
+    /// to have a second `bool_env_pattern` arm below this one. That arm was
+    /// unreachable: `env_pattern` is unanchored, so it matches the
+    /// `env('APP_DEBUG', false)` *substring* of the cast and returns before the
+    /// second pattern is ever consulted. Two arms that cannot both run are not
+    /// redundancy — they are a place for redaction to be fixed in one and
+    /// forgotten in the other, and a test naming "both branches" that only ever
+    /// drove one. The cast spelling still resolves and still redacts; it does so
+    /// through the single arm below, which
+    /// `config_completion_redacts_only_the_dotenv_sourced_sensitive_values`
+    /// pins with a `(bool) env(…)` fixture.
     fn resolve_env_value(
         value: &str,
         env_vars: &std::collections::HashMap<String, String>,
     ) -> String {
-        // Match env('VAR_NAME') or env('VAR_NAME', default) or env("VAR_NAME", default)
+        // Match env('VAR_NAME') or env('VAR_NAME', default) or env("VAR_NAME", default).
+        // Unanchored, so a `(bool) env('VAR')` cast matches here too.
         let env_pattern =
             regex::Regex::new(r#"env\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"](?:\s*,\s*(.+))?\s*\)"#)
                 .unwrap();
@@ -15265,7 +15632,7 @@ impl LaravelLanguageServer {
 
             // Try to get value from env vars
             if let Some(env_value) = env_vars.get(var_name) {
-                return env_value.clone();
+                return Self::env_display_value(var_name, env_value);
             }
 
             // Fall back to default if provided
@@ -15279,29 +15646,26 @@ impl LaravelLanguageServer {
             return format!("${{{}}}", var_name);
         }
 
-        // Check for (bool) env(...) pattern
-        let bool_env_pattern = regex::Regex::new(
-            r#"\(bool\)\s*env\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"](?:\s*,\s*(.+))?\s*\)"#,
-        )
-        .unwrap();
-
-        if let Some(caps) = bool_env_pattern.captures(value) {
-            let var_name = caps.get(1).unwrap().as_str();
-
-            if let Some(env_value) = env_vars.get(var_name) {
-                return env_value.clone();
-            }
-
-            if let Some(default_match) = caps.get(2) {
-                let default = default_match.as_str().trim();
-                return default.to_string();
-            }
-
-            return format!("${{{}}}", var_name);
-        }
-
         // Not an env() call, clean up and return as-is
         value.trim_matches('\'').trim_matches('"').to_string()
+    }
+
+    /// A dotenv-sourced value as it may be displayed: the shared redaction
+    /// string when the variable's name is secret-bearing, otherwise the value
+    /// with any credential embedded in it masked.
+    ///
+    /// Both gates, because either alone leaks: `DB_PASSWORD` is caught by its
+    /// name and `DATABASE_URL=mysql://user:hunter2@host/db` only by its shape.
+    /// The `env()` resolver above is this function's only caller, and it is the
+    /// only route from the dotenv map into `ConfigKeyCompletion`, so the two
+    /// render sites (`completion_detail` and `config_documentation`) receive a
+    /// value that is already safe to print.
+    fn env_display_value(var_name: &str, env_value: &str) -> String {
+        if laravel_lsp::completion_display::is_sensitive_env_name(var_name) {
+            laravel_lsp::completion_display::REDACTED_ENV_VALUE.to_string()
+        } else {
+            laravel_lsp::completion_display::mask_url_credentials(env_value).into_owned()
+        }
     }
 
     // ========================================================================
@@ -15852,8 +16216,11 @@ return [
 
     /// Check if a config file/key exists for the given key
     ///
-    /// Config keys like "app.name" look in config/app.php
-    fn check_config_file(root: &Path, config_key: &str) -> ConfigCheck {
+    /// Config keys like "app.name" look in config/app.php, plus every
+    /// module config file contributing to the group when `modules.paths`
+    /// is configured. `expected_path` stays the root config file so the
+    /// create-file quick fix keeps offering the canonical location.
+    fn check_config_file(root: &Path, module_dirs: &[PathBuf], config_key: &str) -> ConfigCheck {
         // Config keys are always dotted (e.g., "app.name", "database.connections.mysql")
         let parts: Vec<&str> = config_key.split('.').collect();
 
@@ -15874,7 +16241,8 @@ return [
         };
 
         let config_path = root.join("config").join(format!("{}.php", file_name));
-        let file_exists = config_path.exists();
+        let file_exists = config_path.exists()
+            || !laravel_lsp::config::config_group_files(root, module_dirs, file_name).is_empty();
 
         // For now, we only check file existence, not key existence within the file
         // (Parsing PHP arrays to check for keys would be complex)
@@ -16524,46 +16892,84 @@ return [
         }]))
     }
 
-    /// Create LocationLink for a config reference from Salsa data
+    /// Create LocationLink(s) for a config reference from Salsa data.
+    ///
+    /// Emits one link per file declaring the key — the project config file
+    /// plus any module config files merged into the same group
+    /// (`modules.paths`) — highest merge precedence first, targeting the
+    /// key itself. Falls back to the top of the existing group file(s) when
+    /// the dotted key can't be located (dynamic keys, whole-group
+    /// references like `config('app')`).
     async fn create_config_location_from_salsa(
         &self,
         config_ref: &ConfigReferenceData,
     ) -> Option<GotoDefinitionResponse> {
         let project_config = self.get_cached_config().await?;
+        let root = project_config.root.clone();
 
         // Parse config key like "app.name" -> file: config/app.php
         let parts: Vec<&str> = config_ref.key.split('.').collect();
         if parts.is_empty() {
             return None;
         }
-
         let config_file = parts[0];
-        let config_path = project_config
-            .root
-            .join("config")
-            .join(format!("{}.php", config_file));
+        let module_dirs = self.module_dirs_for(&root).await;
 
-        if self.file_exists_cached(&config_path).await {
-            if let Ok(target_uri) = Url::from_file_path(&config_path) {
-                let origin_selection_range = Range {
-                    start: Position {
-                        line: config_ref.line,
-                        character: config_ref.column,
-                    },
-                    end: Position {
-                        line: config_ref.line,
-                        character: config_ref.end_column,
-                    },
+        let origin_selection_range = Range {
+            start: Position {
+                line: config_ref.line,
+                character: config_ref.column,
+            },
+            end: Position {
+                line: config_ref.line,
+                character: config_ref.end_column,
+            },
+        };
+
+        let mut links = Vec::new();
+        for (path, position) in
+            laravel_lsp::config_key_locator::locate_key_all(&root, &module_dirs, &config_ref.key)
+        {
+            let Ok(target_uri) = Url::from_file_path(&path) else {
+                continue;
+            };
+            let key_range = Range {
+                start: Position {
+                    line: position.line,
+                    character: position.start_column,
+                },
+                end: Position {
+                    line: position.line,
+                    character: position.end_column,
+                },
+            };
+            links.push(LocationLink {
+                origin_selection_range: Some(origin_selection_range),
+                target_uri,
+                target_range: key_range,
+                target_selection_range: key_range,
+            });
+        }
+
+        if links.is_empty() {
+            for path in laravel_lsp::config::config_group_files(&root, &module_dirs, config_file) {
+                let Ok(target_uri) = Url::from_file_path(&path) else {
+                    continue;
                 };
-                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                links.push(LocationLink {
                     origin_selection_range: Some(origin_selection_range),
                     target_uri,
                     target_range: Range::default(),
                     target_selection_range: Range::default(),
-                }]));
+                });
             }
         }
-        None
+
+        if links.is_empty() {
+            None
+        } else {
+            Some(GotoDefinitionResponse::Link(links))
+        }
     }
 
     /// Create LocationLink for a middleware reference
@@ -17862,6 +18268,9 @@ return [
             indexing_in_flight: self.indexing_in_flight.clone(),
             migration_index: self.migration_index.clone(),
             command_index: self.command_index.clone(),
+            module_path_patterns: self.module_path_patterns.clone(),
+            cached_module_dirs: self.cached_module_dirs.clone(),
+            module_livewire_registrars: self.module_livewire_registrars.clone(),
             builder_method_index_cache: self.builder_method_index_cache.clone(),
             route_decl_cache: self.route_decl_cache.clone(),
             magic_deps: self.magic_deps.clone(),
@@ -18669,8 +19078,9 @@ return [
             // Check config calls using Salsa patterns - warn about missing config files
             let root_guard = self.root_path.read().await;
             if let Some(root) = root_guard.as_ref() {
+                let module_dirs = self.module_dirs_for(root).await;
                 for config_ref in &patterns.config_refs {
-                    let check = Self::check_config_file(root, &config_ref.key);
+                    let check = Self::check_config_file(root, &module_dirs, &config_ref.key);
                     if !check.exists {
                         diagnostics.push(Self::create_config_diagnostic(
                             &config_ref.key,
@@ -20605,13 +21015,24 @@ return [
     /// `config/<group>.php` file.
     async fn hover_for_config(&self, key: &str, root: Option<&Path>) -> String {
         use laravel_lsp::hover;
-        let value = root.and_then(|r| laravel_lsp::config_lookup::resolve_value(r, key));
-        let link = match (root, key.split('.').next()) {
-            (Some(r), Some(group)) => {
-                let path = r.join("config").join(format!("{}.php", group));
-                Some(self.source_link(&path, None).await)
+        let resolved = match root {
+            Some(r) => {
+                let module_dirs = self.module_dirs_for(r).await;
+                laravel_lsp::config_lookup::resolve_value_with_source(r, &module_dirs, key)
             }
+            None => None,
+        };
+        // Link to the file whose value wins the merge; fall back to the
+        // canonical project config file when the key can't be resolved.
+        let link_path = match (&resolved, root, key.split('.').next()) {
+            (Some((_, source_path)), _, _) => Some(source_path.clone()),
+            (None, Some(r), Some(group)) => Some(r.join("config").join(format!("{}.php", group))),
             _ => None,
+        };
+        let value = resolved.map(|(value, _)| value);
+        let link = match link_path {
+            Some(path) => Some(self.source_link(&path, None).await),
+            None => None,
         };
         let truncated = value
             .as_deref()
@@ -20633,7 +21054,9 @@ return [
     }
 
     /// Env — value as a plain code block, link to the `.env` file it was
-    /// read from. Commented-out entries render as a detail note.
+    /// read from. Commented-out entries render as a detail note, and a
+    /// secret-bearing name renders the redaction note instead of its value
+    /// (issue #344).
     async fn hover_for_env(&self, name: &str) -> String {
         use laravel_lsp::hover;
         let var = self
@@ -20655,11 +21078,23 @@ return [
                 source_link: Some(&link),
                 ..Default::default()
             })
+        } else if laravel_lsp::completion_display::is_sensitive_env_name(&var.name) {
+            // The value is dropped, not truncated or masked character-by-character:
+            // a partial credential is still a credential, and the hover has no
+            // second field to hide it in.
+            hover::render(&hover::HoverContent {
+                detail: Some(laravel_lsp::completion_display::REDACTED_ENV_VALUE),
+                source_link: Some(&link),
+                ..Default::default()
+            })
         } else {
+            // Unmatched by name, but the value may still carry a credential of
+            // its own — `DATABASE_URL` is the stock Laravel case (issue #344).
+            let shown = laravel_lsp::completion_display::mask_url_credentials(&var.value);
             hover::render(&hover::HoverContent {
                 code: Some(hover::CodeBlock {
                     language: hover::CodeLanguage::Plain,
-                    content: &var.value,
+                    content: &shown,
                 }),
                 source_link: Some(&link),
                 ..Default::default()
@@ -21669,22 +22104,26 @@ fn pattern_range_at(
 /// stays terse.
 fn collect_config_declaration_target(
     root: &Path,
+    module_dirs: &[PathBuf],
     old_key: &str,
     new_key: &str,
-) -> Option<laravel_lsp::rename::EditTarget> {
-    let pos = laravel_lsp::config_key_locator::locate_key(root, old_key)?;
-    let file_stem = old_key.split('.').next()?;
-    let file_path = root.join("config").join(format!("{file_stem}.php"));
+) -> Vec<laravel_lsp::rename::EditTarget> {
     // Decl text = leaf segment of the new dotted form. The file portion
-    // stays — it IS the config filename, which renames don't move.
+    // stays — it IS the config filename, which renames don't move. A key
+    // merged from several files (project config + module configs) is
+    // rewritten in every declaring file, or the survivors would resurrect
+    // the old key at runtime.
     let new_leaf = new_key.rsplit('.').next().unwrap_or(new_key).to_string();
-    Some(laravel_lsp::rename::EditTarget {
-        file_path,
-        line: pos.line,
-        start_column: pos.start_column,
-        end_column: pos.end_column,
-        new_text: new_leaf,
-    })
+    laravel_lsp::config_key_locator::locate_key_all(root, module_dirs, old_key)
+        .into_iter()
+        .map(|(file_path, pos)| laravel_lsp::rename::EditTarget {
+            file_path,
+            line: pos.line,
+            start_column: pos.start_column,
+            end_column: pos.end_column,
+            new_text: new_leaf.clone(),
+        })
+        .collect()
 }
 
 /// Find every declaration-site `Location` for a classified symbol — the
@@ -21785,24 +22224,24 @@ async fn collect_declaration_locations(
             }
         }
         SymbolRef::Config(key) => {
-            if let Some(pos) = laravel_lsp::config_key_locator::locate_key(root, key) {
-                if let Some(file_stem) = key.split('.').next() {
-                    let path = root.join("config").join(format!("{file_stem}.php"));
-                    if let Ok(uri) = Url::from_file_path(&path) {
-                        out.push(Location {
-                            uri,
-                            range: Range {
-                                start: Position {
-                                    line: pos.line,
-                                    character: pos.start_column,
-                                },
-                                end: Position {
-                                    line: pos.line,
-                                    character: pos.end_column,
-                                },
+            let module_dirs = server.module_dirs_for(root).await;
+            for (path, pos) in
+                laravel_lsp::config_key_locator::locate_key_all(root, &module_dirs, key)
+            {
+                if let Ok(uri) = Url::from_file_path(&path) {
+                    out.push(Location {
+                        uri,
+                        range: Range {
+                            start: Position {
+                                line: pos.line,
+                                character: pos.start_column,
                             },
-                        });
-                    }
+                            end: Position {
+                                line: pos.line,
+                                character: pos.end_column,
+                            },
+                        },
+                    });
                 }
             }
         }
@@ -22159,11 +22598,22 @@ impl LaravelLanguageServer {
         let file_stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
         let is_env = laravel_lsp::env_key_locator::is_env_file_name(file_name);
         let root = self.root_path.read().await.clone();
-        // A `config/<file>.php` (direct child of the project's config dir).
-        let is_config = file_name.ends_with(".php")
-            && root
-                .as_ref()
-                .is_some_and(|r| path.parent() == Some(r.join("config").as_path()));
+        // A `config/<file>.php` — direct child of the project's config dir,
+        // or of a configured module's config dir (`modules.paths`).
+        let is_config = if file_name.ends_with(".php") {
+            match root.as_ref() {
+                Some(r) if path.parent() == Some(r.join("config").as_path()) => true,
+                Some(r) => {
+                    let module_dirs = self.module_dirs_for(r).await;
+                    module_dirs
+                        .iter()
+                        .any(|m| path.parent() == Some(m.join("config").as_path()))
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
         // A `lang/<locale>/<file>.php` (or legacy `resources/lang/<locale>/…`).
         let is_translation = file_name.ends_with(".php")
             && root.as_ref().is_some_and(|r| {
@@ -22941,11 +23391,18 @@ impl LanguageServer for LaravelLanguageServer {
                 let psr4_roots =
                     laravel_lsp::composer_autoload::ComposerAutoload::for_project(&root)
                         .project_source_roots();
+                // Module dirs get their own watcher pair — settings were
+                // pulled earlier in this same `initialized` flow, so the
+                // expanded set is available here. Changing `modules.paths`
+                // MID-SESSION does not re-register watchers: that needs a
+                // server restart (documented in docs/configuration.md).
+                let module_dirs = server.module_dirs_for(&root).await;
                 let registration = laravel_lsp::file_watcher::build_registration(
                     &root,
                     &config.view_paths,
                     config.livewire_path.as_deref(),
                     &psr4_roots,
+                    &module_dirs,
                 );
                 match server.client.register_capability(vec![registration]).await {
                     Ok(_) => info!(
@@ -23298,6 +23755,21 @@ impl LanguageServer for LaravelLanguageServer {
                 _ => {}
             }
 
+            // Module providers (`modules.paths`) saved outside an
+            // `app/Providers/` path segment still need the app rescan (the
+            // arm above only substring-matches that segment).
+            if file_name.is_some_and(|n| n.ends_with("ServiceProvider.php"))
+                && !laravel_lsp::path_segments::contains_segments(&path, "app/Providers")
+            {
+                if let Some(root) = self.root_path.read().await.clone() {
+                    let module_dirs = self.module_dirs_for(&root).await;
+                    if module_dirs.iter().any(|m| path.starts_with(m)) {
+                        info!("📦 Module provider changed, queuing app rescan");
+                        self.queue_background_rescan(RescanType::App).await;
+                    }
+                }
+            }
+
             // Route files: rebuild the route-name index on save so completion,
             // hover and goto reflect the change. The index reads from disk, and
             // did_save fires after the editor has flushed the buffer, so the
@@ -23495,6 +23967,19 @@ impl LanguageServer for LaravelLanguageServer {
                     _ => created_or_changed += 1,
                 }
                 continue;
+            }
+            // Config files changed outside the editor (git pull, a publish
+            // command) invalidate the cached config layer plus this file's
+            // existence-cache entry, so `config()` goto/diagnostics see the
+            // new state immediately instead of after the 5-second TTL.
+            // Substring match covers module config dirs (`modules.paths`)
+            // as well as the root `config/`.
+            {
+                let p = path.to_string_lossy();
+                if p.ends_with(".php") && p.contains("/config/") {
+                    self.file_exists_cache.lock().unwrap().pop(&path);
+                    self.invalidate_config_cache().await;
+                }
             }
             // A Command class can live anywhere, but conventionally sits under a
             // `Commands/` directory (app or package). That heuristic keeps the
@@ -24698,9 +25183,13 @@ impl LanguageServer for LaravelLanguageServer {
                 // key position in config/app.php). The file portion can't
                 // change without moving the config file.
                 if let Some(root) = root_path.as_ref() {
-                    if let Some(t) = collect_config_declaration_target(root, key, &new_name) {
-                        targets.push(t);
-                    }
+                    let module_dirs = self.module_dirs_for(root).await;
+                    targets.extend(collect_config_declaration_target(
+                        root,
+                        &module_dirs,
+                        key,
+                        &new_name,
+                    ));
                 }
             }
             laravel_lsp::references::SymbolRef::Translation(key) => {
@@ -25860,7 +26349,10 @@ impl LanguageServer for LaravelLanguageServer {
                     let directives = {
                         let root_guard = self.root_path.read().await;
                         match root_guard.as_ref() {
-                            Some(root) => get_all_blade_directives(root),
+                            Some(root) => {
+                                let module_dirs = self.module_dirs_for(root).await;
+                                get_all_blade_directives(root, &module_dirs)
+                            }
                             None => get_fallback_blade_directives(),
                         }
                     };
@@ -27417,17 +27909,36 @@ impl LanguageServer for LaravelLanguageServer {
                     .and_then(|n| n.to_str())
                     .unwrap_or(".env");
 
+                // A secret-bearing name never shows its value here, whatever
+                // the value is (issue #344). The check precedes the empty-value
+                // display below on purpose: `DB_PASSWORD=` renders as redacted,
+                // not as `(empty)`, so the popup never distinguishes "unset"
+                // from "set" for a credential.
+                let sensitive = laravel_lsp::completion_display::is_sensitive_env_name(&v.name);
+                // The second gate, for a value whose *name* clears the first
+                // one: `DATABASE_URL` matches no segment, and stock Laravel
+                // fills it with `mysql://user:hunter2@host/db`. Identity for
+                // every value that is not a credential-bearing URL, so an
+                // ordinary variable renders exactly as it did.
+                let shown = laravel_lsp::completion_display::mask_url_credentials(&v.value);
+
                 CompletionItem {
                     label: v.name.clone(),
                     kind: Some(CompletionItemKind::VARIABLE),
-                    detail: Some(format!("{} (from {})", v.value, source_file)),
+                    detail: Some(if sensitive {
+                        format!("(from {})", source_file)
+                    } else {
+                        format!("{} (from {})", shown, source_file)
+                    }),
                     documentation: Some(
                         CompletionDoc::new()
                             .header(&v.name)
-                            .summary(if v.value.is_empty() {
+                            .summary(if sensitive {
+                                laravel_lsp::completion_display::REDACTED_ENV_VALUE.to_string()
+                            } else if v.value.is_empty() {
                                 "(empty)".to_string()
                             } else {
-                                v.value.clone()
+                                shown.to_string()
                             })
                             .section(format!("Source: {}", source_file))
                             .into_documentation(),

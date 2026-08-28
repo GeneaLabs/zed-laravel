@@ -824,3 +824,45 @@ fn cursor_past_end_of_line_does_not_panic() {
     assert!(wire_attribute_completion_context(line, past).is_none());
     assert!(wire_attribute_target_at(line, past).is_none());
 }
+
+#[test]
+fn namespaced_component_resolution_with_negative_controls() {
+    // The AC trio for `<livewire:ns::component>`: a component reachable
+    // ONLY through a registered namespace resolves; the same lookup with
+    // the namespace registration removed fails (negative control); a
+    // genuinely missing component under the valid namespace still fails
+    // (true negative).
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    // Outside every default component-discovery root:
+    let ns_dir = root.join("app/Common/Ui/app/Livewire");
+    std::fs::create_dir_all(&ns_dir).unwrap();
+    write(
+        &ns_dir.join("Badge.php"),
+        "<?php namespace App\\Common\\Ui\\Livewire; use Livewire\\Component; class Badge extends Component {}",
+    );
+
+    let mut with_ns = config_for(&root);
+    with_ns.class_namespaces.insert(
+        "common-ui".to_string(),
+        crate::livewire_namespaces::LivewireClassNamespace {
+            class_path: ns_dir.clone(),
+            class_namespace: "App\\Common\\Ui\\Livewire".to_string(),
+        },
+    );
+
+    let resolved = resolve_component("common-ui::badge", &with_ns, LivewireVersion::V4)
+        .expect("namespace-only component resolves");
+    assert!(resolved.paths.contains(&ns_dir.join("Badge.php")));
+
+    let without_ns = config_for(&root);
+    assert!(
+        resolve_component("common-ui::badge", &without_ns, LivewireVersion::V4).is_none(),
+        "negative control: registration removed, resolution fails again"
+    );
+
+    assert!(
+        resolve_component("common-ui::missing", &with_ns, LivewireVersion::V4).is_none(),
+        "true negative: a missing component under the valid namespace stays missing"
+    );
+}

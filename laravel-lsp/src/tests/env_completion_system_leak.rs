@@ -34,9 +34,9 @@
 //! stays green under that mutation by design: its fixture `.env` declares the
 //! process variable's own name, so the deleted loop's own
 //! `!seen_names.contains(&name)` guard skipped that variable even before this
-//! fix. A second mutation discriminates it — change the `.env` echo format
-//! (`format!("{} (from {})", …)` in `completion()`) and its `detail` assertion
-//! fails.
+//! fix. A second mutation discriminates it — that name is secret-bearing, so
+//! dropping the redaction branch added for issue #344 changes its `detail` and
+//! its documentation panel, and both assertions fail.
 
 use crate::LaravelLanguageServer;
 use std::path::PathBuf;
@@ -65,7 +65,13 @@ const SECRET_VALUE: &str = "s3cr3t-value-set-only-by-issue-342-tests";
 const TYPED_PREFIX: &str = "AWS_SECRET";
 
 /// A variable the *project* declares, sharing `TYPED_PREFIX` with the secret.
-const DECLARED_NAME: &str = "AWS_SECRET_DECLARED";
+///
+/// `SECRETARIAT` deliberately is not the segment `SECRET`: this control asserts
+/// the untouched `.env` echo format, so its name must fall outside
+/// `completion_display::is_sensitive_env_name` (issue #344) — which redacts by
+/// whole `_`-delimited segment, and would otherwise blank the very value this
+/// control is here to see.
+const DECLARED_NAME: &str = "AWS_SECRETARIAT_REGION";
 const DECLARED_VALUE: &str = "declared-in-dotenv";
 
 /// `.env` fixture: one variable under the typed prefix, one outside it. Built
@@ -457,14 +463,22 @@ async fn dotenv_declaration_shadowing_a_process_var_still_completes_from_the_fil
         "the declared variable must be offered exactly once, got {:?}",
         items.iter().map(|i| &i.label).collect::<Vec<_>>()
     );
+    // `AWS_SECRET_ACCESS_KEY_TEST` is secret-bearing, so issue #344 redacts its
+    // value on this surface. That is orthogonal to what this test is about —
+    // the declaration is still the one that wins, and it is still offered
+    // exactly once — but the rendering it asserts is now the redacted one.
     assert_eq!(
         shadowing[0].detail.as_deref(),
-        Some("dotenv-owns-this-name (from .env)"),
-        "the declared value and source file must be reported unchanged"
+        Some("(from .env)"),
+        "the source file must still be reported, with the value redacted"
     );
     assert_eq!(
         documentation_markdown(shadowing[0], "shadowing"),
-        expected_documentation(SECRET_NAME, "dotenv-owns-this-name", ".env"),
-        "the documentation panel must report the declared value and source unchanged"
+        expected_documentation(
+            SECRET_NAME,
+            laravel_lsp::completion_display::REDACTED_ENV_VALUE,
+            ".env"
+        ),
+        "the documentation panel must report the redaction string and the source"
     );
 }

@@ -3,7 +3,9 @@
 //! Provides database schema information (tables and columns) for
 //! `exists:` and `unique:` validation rule autocomplete.
 
+use crate::completion_display::{is_sensitive_env_name, mask_url_credentials};
 use regex::Regex;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -471,34 +473,35 @@ fn userinfo(user: &str, password: &str) -> String {
     }
 }
 
-/// Mask the password in a database URL for safe logging. Matches the
-/// standard shape `driver://user:pass@host:...` and replaces the password
-/// segment with `***`. If no password is present (or the URL doesn't match
-/// the expected shape), returns the input unchanged.
+/// Render a `.env`-sourced value for a log line, through both redaction gates.
 ///
-/// This is best-effort — failing gracefully is safer than failing hard,
-/// since logging shouldn't crash the LSP.
-fn mask_url_password(url: &str) -> String {
-    // Find the `://` separator, then the `@` that ends the credentials.
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
-    };
-    let creds_start = scheme_end + 3;
-    let Some(at_offset) = url[creds_start..].find('@') else {
-        return url.to_string();
-    };
-    let creds_end = creds_start + at_offset;
-    let creds = &url[creds_start..creds_end];
-    // Credentials are `user[:password]`. Only mask if there's a `:`.
-    let Some(colon_offset) = creds.find(':') else {
-        return url.to_string();
-    };
-    let user_end = creds_start + colon_offset;
-    let mut masked = String::with_capacity(url.len());
-    masked.push_str(&url[..user_end + 1]); // up to and including the `:`
-    masked.push_str("***");
-    masked.push_str(&url[creds_end..]); // from `@` onwards
-    masked
+/// Logs are a display surface. With `RUST_LOG` unset the server installs
+/// `EnvFilter::new("info,salsa=warn")` over stderr, which Zed shows in a visible
+/// log panel — the same screen-share exposure the completion, hover, `config()`
+/// and warm-start-cache redaction closes (issue #344). A value read under a
+/// variable name that [`is_sensitive_env_name`] matches therefore never reaches a
+/// log in the clear.
+///
+/// Name-matched values render `(set)`, the spelling
+/// [`DatabaseSchemaProvider::parse_database_config`] already prints for the
+/// resolved DB password. There is no `(empty)` arm: every call site logs a value
+/// that came back from [`crate::config::read_env_value`], which filters an empty
+/// value to `None` before it can get here.
+///
+/// A name the predicate does not match is not therefore safe: Laravel's stock
+/// `config/database.php` reads `'url' => env('DATABASE_URL')`, and that value
+/// carries the password inside itself while its name matches no segment. So the
+/// unmatched arm is not the raw value — it is
+/// [`mask_url_credentials`], the same helper `parse_database_config` has always
+/// applied to the assembled `url` line. `DB_HOST` and `DB_DATABASE` still log in
+/// full: neither gate matches them, and redacting them would spend the whole
+/// diagnostic for nothing.
+fn mask_env_value_for_log<'a>(name: &str, value: &'a str) -> Cow<'a, str> {
+    if is_sensitive_env_name(name) {
+        Cow::Borrowed("(set)")
+    } else {
+        mask_url_credentials(value)
+    }
 }
 
 /// One thing the connector should attempt: a URL to connect with, a short
@@ -1118,7 +1121,7 @@ impl DatabaseSchemaProvider {
         if let Some(u) = &url {
             // Mask the password in the URL when logging — common shape is
             // `driver://user:pass@host:port/db`. Best-effort, fail-open.
-            info!("🗄️    url: {}", mask_url_password(u));
+            info!("🗄️    url: {}", mask_url_credentials(u));
         }
         if let Some(s) = &unix_socket {
             info!("🗄️    unix_socket: {}", s);
@@ -1255,7 +1258,10 @@ impl DatabaseSchemaProvider {
 
                     // Try to resolve from .env first
                     if let Some(env_value) = self.resolve_env(&env_var) {
-                        info!("🗄️      → resolved from .env: {}", env_value);
+                        info!(
+                            "🗄️      → resolved from .env: {}",
+                            mask_env_value_for_log(&env_var, &env_value)
+                        );
                         return env_value;
                     }
 
@@ -1420,7 +1426,13 @@ impl DatabaseSchemaProvider {
         // Delegates to the single hardened reader in `config` — see its doc
         // comment for why this logic must not be duplicated.
         let result = crate::config::read_env_value(&self.project_root, key);
-        debug!("🗄️  resolve_env({}): {:?}", key, result);
+        debug!(
+            "🗄️  resolve_env({}): {:?}",
+            key,
+            result
+                .as_deref()
+                .map(|value| mask_env_value_for_log(key, value))
+        );
         result
     }
 
@@ -1456,7 +1468,7 @@ impl DatabaseSchemaProvider {
             info!(
                 "MySQL: trying candidate '{}' with url={}",
                 cand.label,
-                mask_url_password(&cand.url)
+                mask_url_credentials(&cand.url)
             );
             match MySqlPoolOptions::new()
                 .max_connections(1)

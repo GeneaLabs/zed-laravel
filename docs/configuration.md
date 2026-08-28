@@ -42,6 +42,52 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
           }
         },
 
+        // ── Modular monoliths ──────────────────────────────────────────
+        // Where your first-party modules live, as glob patterns relative to
+        // the project root ("*" matches one directory level). OPT-IN: unset
+        // or empty means the feature is off and behavior is exactly today's
+        // — a pattern that matches nothing on disk is likewise a no-op, and
+        // a malformed entry is skipped (logged), never a failure.
+        // What a matched module contributes:
+        //   • config/{group}.php files merge into the top-level config
+        //     group. Precedence mirrors the runtime
+        //     array_replace_recursive: the project config/ file merges
+        //     first, then each module in glob-match order — the LAST-merged
+        //     declaration of a key wins, and nested arrays merge per key
+        //     rather than replacing. The same rule applies uniformly when a
+        //     module group name collides with a core group (app.php,
+        //     database.php) and when two modules define the same group.
+        //   • Service providers named by the module composer.json's
+        //     extra.laravel.providers (never by filename convention) are
+        //     indexed like app/Providers: their loadViewsFrom /
+        //     loadTranslationsFrom / Blade::directive / Livewire
+        //     registrations all resolve. Modules form their own precedence
+        //     tier between packages and the app (framework < package <
+        //     module < app), so on a namespace conflict an app/Providers
+        //     registration always wins — the app boots last — and between
+        //     two modules the later (higher glob-match precedence) one
+        //     wins. Paths a provider registers are containment-checked:
+        //     a registration pointing outside the project is dropped.
+        // All of it is parsed statically (tree-sitter) — no project PHP is
+        // ever executed. Two operational notes: changing "paths" MID-SESSION
+        // re-resolves everything except the file watchers — restart the
+        // server for watcher coverage of newly added module trees. And
+        // independent of this setting, ns::key translation completion covers
+        // every provider-registered namespace (vendor packages included) —
+        // that closes a pre-existing gap in the Salsa translation layer and
+        // arrives regardless of whether modules are configured.
+        // Guide examples:
+        //   "paths": ["app/Common/*", "app/*/*"]        Default: [] (off)
+        "modules": {
+          "paths": [],
+
+          // App-defined wrapper methods that internally call
+          // Livewire::addNamespace(...), so the extractor also recognizes
+          // e.g. $this->registerLivewireNamespace('ns', $path).
+          //              Default: ["loadLivewireComponentsFrom"]
+          "livewireRegistrars": ["loadLivewireComponentsFrom"]
+        },
+
         "codeLens": {
           // Reference-count lenses + unused-symbol diagnostic (opt-in while
           // the feature matures). Guide: docs/code-lens.md.     Default: false

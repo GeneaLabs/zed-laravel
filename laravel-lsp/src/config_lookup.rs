@@ -13,19 +13,39 @@
 //! Pure parsing — no I/O outside the initial `read_to_string`. Easy to unit-test
 //! with synthetic PHP source.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Resolve a dotted Laravel config key (`"app.name"`) against a project root.
 /// Returns the source text of the resolved value, trimmed of surrounding
 /// whitespace. `None` when the file or key is missing.
 pub fn resolve_value(root: &Path, dotted_key: &str) -> Option<String> {
+    resolve_value_with_source(root, &[], dotted_key).map(|(value, _)| value)
+}
+
+/// Like [`resolve_value`], but additionally searches every module config
+/// file contributing to the key's group and reports which file produced
+/// the value. [`crate::config::config_group_files`] already hands the files
+/// over in descending merge precedence — `array_replace_recursive`
+/// semantics: the last-merged module wins, the project `config/` file is
+/// the fallback — so the first file resolving the key is the winner.
+pub fn resolve_value_with_source(
+    root: &Path,
+    module_dirs: &[PathBuf],
+    dotted_key: &str,
+) -> Option<(String, PathBuf)> {
     let mut parts = dotted_key.split('.');
     let file = parts.next()?;
     let key_path: Vec<&str> = parts.collect();
 
-    let config_path = root.join("config").join(format!("{}.php", file));
-    let content = std::fs::read_to_string(&config_path).ok()?;
-    resolve_in_source(&content, &key_path)
+    for config_path in crate::config::config_group_files(root, module_dirs, file) {
+        let Ok(content) = std::fs::read_to_string(&config_path) else {
+            continue;
+        };
+        if let Some(value) = resolve_in_source(&content, &key_path) {
+            return Some((value, config_path));
+        }
+    }
+    None
 }
 
 /// Source-only variant for unit tests — operates on a string rather than
