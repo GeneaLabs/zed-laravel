@@ -18,7 +18,12 @@
 //!
 //! Every leak assertion carries a positive control — the project's own `.env`
 //! variable IS offered — so a fixture that never reached the completion code
-//! cannot pass vacuously on an empty response. The one exception is
+//! cannot pass vacuously on an empty response. The control checks the name
+//! (`label`) and both fields that echo the value and its source: `detail`
+//! (`"<value> (from <file>)"`) and the `documentation` panel, asserted whole so
+//! that deleting any one of `completion()`'s three `CompletionDoc` builder calls
+//! — `.header(…)`, `.summary(…)`, `.section("Source: …")` — is caught. The one
+//! exception is
 //! `prefix_matching_only_a_process_var_returns_no_completions`, whose subject is
 //! the empty response itself; a positive control would contradict what it
 //! asserts, and the siblings sharing its fixture helper establish reachability.
@@ -38,8 +43,9 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionParams, CompletionResponse, PartialResultParams, Position,
-    TextDocumentIdentifier, TextDocumentPositionParams, Url, WorkDoneProgressParams,
+    CompletionItem, CompletionParams, CompletionResponse, Documentation, MarkupContent, MarkupKind,
+    PartialResultParams, Position, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    WorkDoneProgressParams,
 };
 use tower_lsp::{LanguageServer, LspService};
 
@@ -200,9 +206,31 @@ fn assert_no_process_var_leak(
     items
 }
 
+/// The documentation panel's markdown, or a failure naming what arrived instead.
+/// `Source: <file>` lives in this field, not in `detail`, so the assertions read
+/// the field itself rather than the `detail` line that merely resembles it.
+fn documentation_markdown(item: &CompletionItem, context: &str) -> String {
+    match item.documentation.as_ref() {
+        Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        })) => value.clone(),
+        other => panic!("{context}: expected markdown documentation, got {other:?}"),
+    }
+}
+
+/// The panel `completion()` builds for a `.env`-declared variable: the name as
+/// the bolded header, the value as the summary, `Source: <file>` as the trailing
+/// section. Asserted whole rather than by substring, so dropping any one of the
+/// three builder calls fails — not only the `.section(...)` this fix is about.
+fn expected_documentation(name: &str, value: &str, source_file: &str) -> String {
+    format!("**{name}**\n\n{value}\n\nSource: {source_file}")
+}
+
 /// Assert the project's own `.env` variable is still offered, with its value and
-/// source file — the guard against a fix that empties the list entirely, and the
-/// proof that the fixture really reached the env-completion code.
+/// source file in both fields that report them — `detail` and the `documentation`
+/// panel. The guard against a fix that empties the list entirely, and the proof
+/// that the fixture really reached the env-completion code.
 fn assert_declared_var_offered(items: &[CompletionItem], context: &str) {
     let declared = items
         .iter()
@@ -217,6 +245,11 @@ fn assert_declared_var_offered(items: &[CompletionItem], context: &str) {
         declared.detail.as_deref(),
         Some(format!("{DECLARED_VALUE} (from .env)").as_str()),
         "{context}: the .env echo path must be untouched by this fix"
+    );
+    assert_eq!(
+        documentation_markdown(declared, context),
+        expected_documentation(DECLARED_NAME, DECLARED_VALUE, ".env"),
+        "{context}: the .env documentation panel must be untouched by this fix"
     );
 }
 
@@ -428,5 +461,10 @@ async fn dotenv_declaration_shadowing_a_process_var_still_completes_from_the_fil
         shadowing[0].detail.as_deref(),
         Some("dotenv-owns-this-name (from .env)"),
         "the declared value and source file must be reported unchanged"
+    );
+    assert_eq!(
+        documentation_markdown(shadowing[0], "shadowing"),
+        expected_documentation(SECRET_NAME, "dotenv-owns-this-name", ".env"),
+        "the documentation panel must report the declared value and source unchanged"
     );
 }
