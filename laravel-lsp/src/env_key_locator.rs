@@ -163,6 +163,54 @@ pub fn enumerate_keys_in_source(source: &str) -> Vec<(String, KeyPosition)> {
     out
 }
 
+/// Enumerate every *commented-out* key declaration (`# KEY=value`) in a
+/// `.env`-format source, in file order, with column-accurate positions
+/// relative to the whole line. First declaration wins per key, matching
+/// [`enumerate_keys_in_source`].
+///
+/// The companion to [`enumerate_keys_in_source`], which classifies a `#` line
+/// as "not a declaration" and so can never see these. Both delegate to the
+/// same [`parse_key_declaration`], so a commented key is parsed exactly as its
+/// active twin would be — only the leading `#` run and the whitespace after it
+/// are removed first, and the resulting columns shifted back by that offset.
+/// Stripping the whole `#` run (not one `#`) matches `parse_env_source`'s
+/// `trim_start_matches('#')`, so `## KEY=value` reads as a declaration on both
+/// sides of the stack.
+///
+/// The two enumerations are kept separate rather than merged behind a flag:
+/// merging would let a commented `# KEY=` earlier in the file win the
+/// first-match-wins race against an active `KEY=` below it, which would change
+/// what the env code lens anchors on.
+pub fn enumerate_commented_keys_in_source(source: &str) -> Vec<(String, KeyPosition)> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (line_idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') {
+            continue;
+        }
+        // `body` is a suffix of `line` (every trim above is from the start),
+        // so the byte difference is exactly the column the body begins at.
+        let body = trimmed.trim_start_matches('#').trim_start();
+        let offset = (line.len() - body.len()) as u32;
+        let Some((key, start_col, end_col)) = parse_key_declaration(body) else {
+            continue;
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push((
+            key.to_string(),
+            KeyPosition {
+                line: line_idx as u32,
+                start_column: start_col + offset,
+                end_column: end_col + offset,
+            },
+        ));
+    }
+    out
+}
+
 /// Parse one `.env` line into `(key, start_column, end_column)` — the key text
 /// (everything before the first `=`, whitespace-trimmed) and its column span.
 /// Returns `None` for blank lines, `#` comments, lines without `=`, and lines

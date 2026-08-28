@@ -108,6 +108,20 @@ pub fn route_lens_targets(
     out
 }
 
+/// The lens/hover title for a reference count: `0 references`, `1 reference`,
+/// `{n} references`.
+///
+/// One spelling, shared by the code-lens `resolve` handler and the `.env`-key
+/// hover card, so a key's lens and its hover can never disagree about how the
+/// same number reads.
+pub fn reference_count_label(count: usize) -> String {
+    match count {
+        0 => "0 references".to_string(),
+        1 => "1 reference".to_string(),
+        n => format!("{n} references"),
+    }
+}
+
 /// Code-lens targets for the key declarations in an open `.env*` file.
 ///
 /// Each `KEY=value` line gets a lens whose count is the number of `env('KEY')`

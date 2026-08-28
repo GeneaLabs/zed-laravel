@@ -237,6 +237,78 @@ fn enumerate_handles_empty_value_and_leading_whitespace() {
     assert_eq!((keys[1].1.start_column, keys[1].1.end_column), (2, 8));
 }
 
+// ── enumerate_commented_keys_in_source ────────────────────────────────────
+
+#[test]
+fn commented_enumerate_returns_only_commented_declarations() {
+    // The mirror image of `enumerate_keys_in_source`: `#` lines are the only
+    // ones it sees, active declarations the only ones it skips.
+    let src = "# APP_NAME=Laravel\nAPP_ENV=local\n# DB_HOST=db\n";
+    let entries = enumerate_commented_keys_in_source(src);
+    let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["APP_NAME", "DB_HOST"]);
+}
+
+#[test]
+fn commented_enumerate_columns_point_at_the_key_within_the_whole_line() {
+    // The columns a hover compares the cursor against are line-absolute, so
+    // the `#` run and the whitespace around it have to be added back. Each row
+    // is a different offset: one `#` + one space (2), two `#` + one space (3),
+    // indented `#` + two spaces (5).
+    for (src, expected_start) in [
+        ("# APP_NAME=Laravel\n", 2),
+        ("## APP_NAME=Laravel\n", 3),
+        ("  #  APP_NAME=Laravel\n", 5),
+        ("#APP_NAME=Laravel\n", 1),
+    ] {
+        let keys = enumerate_commented_keys_in_source(src);
+        assert_eq!(keys.len(), 1, "{src:?} declares one commented key");
+        assert_eq!(keys[0].0, "APP_NAME");
+        assert_eq!(
+            (keys[0].1.start_column, keys[0].1.end_column),
+            (expected_start, expected_start + 8),
+            "{src:?} must span the key text only"
+        );
+        // The span really does cover the key: slicing the line by it returns
+        // the key and nothing else.
+        let line = src.trim_end_matches('\n');
+        assert_eq!(
+            &line[keys[0].1.start_column as usize..keys[0].1.end_column as usize],
+            "APP_NAME"
+        );
+    }
+}
+
+#[test]
+fn commented_enumerate_skips_prose_comments_and_dedups() {
+    // A prose comment has no `=`, so it is not a declaration; a repeated
+    // commented key keeps its first occurrence, matching
+    // `enumerate_keys_in_source`.
+    let src = "# just a note\n#\n# APP_NAME=first\n# APP_NAME=second\n";
+    let keys = enumerate_commented_keys_in_source(src);
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].0, "APP_NAME");
+    assert_eq!(keys[0].1.line, 2, "first commented occurrence wins");
+}
+
+#[test]
+fn the_two_enumerations_never_return_the_same_line() {
+    // They are complements, not overlapping views: a line is a declaration in
+    // exactly one of them. Kept separate so a commented `# KEY=` above an
+    // active `KEY=` cannot win the first-match-wins race and move the env code
+    // lens onto the comment.
+    let src = "# APP_NAME=commented\nAPP_NAME=active\n";
+    let active = enumerate_keys_in_source(src);
+    let commented = enumerate_commented_keys_in_source(src);
+    assert_eq!(active.len(), 1);
+    assert_eq!(
+        active[0].1.line, 1,
+        "the lens must anchor on the active line"
+    );
+    assert_eq!(commented.len(), 1);
+    assert_eq!(commented[0].1.line, 0);
+}
+
 // ── `is_env_file_name` — the gate every env feature classifies with ──
 
 #[test]

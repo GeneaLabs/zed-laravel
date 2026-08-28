@@ -78,6 +78,23 @@ config('app.name');
 
 This is a deliberately **curated allow-list** of seven helpers — `route`, `view`, `config`, `auth`, `app`, `session`, `cache` — chosen because their framework docblock is thin or generic, so a Laravel-aware synopsis adds value over what Intelephense already shows. That narrow set *is* the dedup policy: every other helper (`bcrypt`, `abort`, `collect`, `str`, …) is simply never indexed, so we never emit a duplicate card next to Intelephense's — no runtime detection needed. The source link points into the vendored framework `helpers.php` when it's present under the workspace root, and falls back to the canonical `laravel.com/docs/helpers` anchor otherwise. (The string *argument* still hovers as before — `route('home')`'s `'home'` resolves to the route definition; the two spans are independent.)
 
+Hover also works the other way round, inside a `.env*` buffer: put the cursor
+on a key's name and the card shows its effective value, the file that
+declaration won from (`.env` outranks `.env.local`, which outranks
+`.env.example`), and how many `env('KEY')` call sites consume it. A key nothing
+consumes still gets a card, reading `0 references`. A commented-out declaration
+says so, as does a key no `.env*` file defines — and that one keeps its
+consumer count, since a stale or mistyped key is exactly when the call sites
+matter.
+
+```
+APP_NAME=Acme
+^^^^^^^^ hover →  APP_NAME
+                  Acme
+                  .env
+                  3 references
+```
+
 **Hovered patterns:** views, Blade components (anonymous *and* class-backed), Livewire components, routes, config keys, env vars, translations (including `vendor::namespace.key`), middleware aliases, container bindings, assets (`asset()`, `Vite::asset()`, `mix()`, `public_path()`, …), `url()`, Blade variables, Eloquent magic members, Artisan command strings, and curated Laravel helper-function identifiers. The bottom-line source path renders as a `file://` link, so the whole card is click-to-open in any LSP client that supports markdown links.
 
 Class-backed components and Livewire components show the `class Foo extends Component` signature and link to the PHP class; anonymous components fall back to the `@props([...])` declaration from the `.blade.php` template. Patterns without a meaningful target (directives, controller actions, Pennant features) stay silent rather than showing an empty card.
