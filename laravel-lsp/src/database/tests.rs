@@ -176,40 +176,6 @@ fn host_candidates_empty_no_fallback() {
     );
 }
 
-// ---- mask_url_password ----
-
-#[test]
-fn mask_url_password_with_credentials() {
-    use super::mask_url_password;
-    assert_eq!(
-        mask_url_password("mysql://sail:secret@127.0.0.1:3306/db"),
-        "mysql://sail:***@127.0.0.1:3306/db"
-    );
-    assert_eq!(
-        mask_url_password("postgres://user:p@ssw0rd@host/db"),
-        // Only the first `@` after creds is treated as the host separator —
-        // best-effort. Any `@` in the password trips this, but it's a
-        // diagnostic helper, not security-critical.
-        "postgres://user:***@ssw0rd@host/db"
-    );
-}
-
-#[test]
-fn mask_url_password_no_password_no_change() {
-    use super::mask_url_password;
-    // No `:` in creds → no password to mask.
-    assert_eq!(
-        mask_url_password("mysql://sail@127.0.0.1/db"),
-        "mysql://sail@127.0.0.1/db"
-    );
-}
-
-#[test]
-fn mask_url_password_no_scheme_returns_input() {
-    use super::mask_url_password;
-    assert_eq!(mask_url_password("not a url"), "not a url");
-}
-
 // ---- build_*_candidates (DB_URL / unix_socket / TCP priority) ----
 
 fn make_config_with(url: Option<&str>, socket: Option<&str>, host: &str) -> super::DatabaseConfig {
@@ -1801,5 +1767,341 @@ async fn decision_cloud_end_to_end_variable_config_plus_sail_override() {
     assert!(
         labels.contains(&"tcp 127.0.0.2:3306".to_string()),
         "Sail override 127.0.0.2 detected once the host is correct: {labels:?}"
+    );
+}
+
+// ---- logs are a display surface (issue #344) ----
+//
+// The four surfaces #344 enumerated all render into the client. Logs are the
+// fifth: with `RUST_LOG` unset the server logs at `info` to stderr, which Zed
+// shows in a visible panel, and `docs/troubleshooting.md` asks users to paste
+// that panel into bug reports. A `.env` value read under a secret-bearing name
+// must therefore be masked there too, by the same predicate the other four use.
+
+/// A plaintext distinctive enough that finding it in a log cannot be a
+/// coincidence.
+const LOG_SECRET: &str = "hunter2-log-issue-344";
+/// A second matched keyword category. One category alone cannot tell the shared
+/// predicate from a hard-coded `contains("PASSWORD")`.
+const LOG_TOKEN: &str = "tok-log-issue-344";
+/// The unmatched control: an ordinary setting whose value must still be logged
+/// in full, or the masking has bought security by deleting the diagnostic.
+const LOG_PLAIN_HOST: &str = "db.internal.example";
+
+/// The credential the *name* gate cannot see. `DATABASE_URL` matches no
+/// segment of `SENSITIVE_ENV_SEGMENTS`, and Laravel's stock
+/// `config/database.php` ships `'url' => env('DATABASE_URL')`, so this value
+/// reaches the log on the default configuration of an ordinary project.
+const LOG_URL_SECRET: &str = "url-hunter2-issue-344";
+
+fn log_fixture_db_url() -> String {
+    format!("mysql://sail:{LOG_URL_SECRET}@{LOG_PLAIN_HOST}:3306/laravel")
+}
+
+/// The same fixture with the credential masked — the positive control. Without
+/// it the leak assertion would also pass on a log line that dropped the URL
+/// altogether, which would be a lost diagnostic rather than a fix.
+fn log_fixture_db_url_masked() -> String {
+    format!("mysql://sail:***@{LOG_PLAIN_HOST}:3306/laravel")
+}
+
+/// `config/database.php` with the `url` setting Laravel ships by default.
+const CONFIG_WITH_URL: &str = r#"<?php
+return [
+    'default' => env('DB_CONNECTION', 'mysql'),
+    'connections' => [
+        'mysql' => [
+            'driver' => 'mysql',
+            'url' => env('DATABASE_URL'),
+            'host' => env('DB_HOST', '127.0.0.1'),
+            'port' => env('DB_PORT', '3306'),
+            'database' => env('DB_DATABASE', 'laravel'),
+            'username' => env('DB_USERNAME', 'root'),
+            'password' => env('DB_PASSWORD', ''),
+        ],
+    ],
+];
+"#;
+
+fn log_fixture_env() -> String {
+    format!(
+        "DB_CONNECTION=mysql\nDB_HOST={LOG_PLAIN_HOST}\nDB_DATABASE=laravel\n\
+         DB_USERNAME=sail\nDB_PASSWORD={LOG_SECRET}\nMAIL_API_TOKEN={LOG_TOKEN}\n"
+    )
+}
+
+thread_local! {
+    /// Everything logged on this thread while a capture is running. `None`
+    /// means this thread is not capturing, and the subscriber's output is
+    /// dropped — which is what every other test in the binary wants.
+    static CAPTURED_LOG: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The writer behind the one subscriber the test binary installs. It routes
+/// each event to the capturing thread's buffer, or to nowhere.
+#[derive(Clone, Copy, Default)]
+struct ThreadLocalLogWriter;
+
+impl std::io::Write for ThreadLocalLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        CAPTURED_LOG.with(|slot| {
+            if let Some(buffer) = slot.borrow_mut().as_mut() {
+                buffer.extend_from_slice(bytes);
+            }
+        });
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        *self
+    }
+}
+
+/// Run `f` and return its result plus everything it logged.
+///
+/// The subscriber is **global and installed once**, rather than scoped per
+/// call with `tracing::subscriber::with_default`. Scoping looks tidier and is
+/// wrong here: `tracing` caches each callsite's `Interest` the first time that
+/// callsite is reached, so an ordinary test touching `resolve_env` on another
+/// thread — with no subscriber in place — caches "never" for that macro and
+/// every later capture silently misses it. That is not theory: it turned this
+/// suite red on one CI runner out of three while passing locally, with the
+/// resolver's own lines absent from a capture that held its neighbours.
+///
+/// A global subscriber makes every callsite register against a real subscriber
+/// (and `set_global_default` rebuilds the interest cache), so the answer is
+/// "yes" for good. Isolation moves to the buffer, which is per-thread: a test
+/// that is not capturing writes into `None` and drops its output, exactly as it
+/// did when no subscriber existed at all.
+fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(ThreadLocalLogWriter)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other global subscriber in the test binary");
+    });
+
+    CAPTURED_LOG.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let result = f();
+    let captured = CAPTURED_LOG.with(|slot| {
+        String::from_utf8(slot.borrow_mut().take().unwrap_or_default())
+            .expect("log output is utf-8")
+    });
+    (result, captured)
+}
+
+#[test]
+fn parsing_the_database_config_never_logs_the_dotenv_password() {
+    let dir = TempDir::new().unwrap();
+    write_config_php(dir.path(), CONFIG_VAR_FORM);
+    write(dir.path(), ".env", &log_fixture_env());
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+
+    let (config, logs) = capture_logs(|| provider.parse_database_config().expect("config parsed"));
+
+    assert_eq!(
+        config.password, LOG_SECRET,
+        "the parse still resolves the real password — masking is a log concern only"
+    );
+    assert!(
+        !logs.contains(LOG_SECRET),
+        "the .env password reached the log in plaintext:\n{logs}"
+    );
+    // Pinned to the line that owns the value. A bare `(set)` search would pass
+    // on the neighbouring `password: (set)` summary, which was already masked
+    // before this change and proves nothing about these sites.
+    assert!(
+        logs.contains("resolved from .env: (set)"),
+        "the resolver's info line carries the masked rendering:\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"resolve_env(DB_PASSWORD): Some("(set)")"#),
+        "the reader's debug line carries the masked rendering:\n{logs}"
+    );
+    assert!(
+        logs.contains(LOG_PLAIN_HOST),
+        "an ordinary DB_HOST value is still logged in full:\n{logs}"
+    );
+}
+
+/// The name gate's blind spot, closed by the shape gate.
+///
+/// `DATABASE_URL` matches no sensitive segment, so `mask_env_value_for_log`
+/// takes its *unmatched* arm — which is why that arm is `mask_url_credentials`
+/// and not the raw value. The resolver's `info!` fires under the default
+/// `EnvFilter("info,salsa=warn")`, so an unmasked password here is on screen in
+/// Zed's log panel out of the box.
+#[test]
+fn parsing_the_database_config_never_logs_a_credential_inside_a_url_value() {
+    let dir = TempDir::new().unwrap();
+    write_config_php(dir.path(), CONFIG_WITH_URL);
+    write(
+        dir.path(),
+        ".env",
+        &format!(
+            "{}DATABASE_URL={}\n",
+            log_fixture_env(),
+            log_fixture_db_url()
+        ),
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+
+    let (config, logs) = capture_logs(|| provider.parse_database_config().expect("config parsed"));
+
+    assert_eq!(
+        config.url.as_deref(),
+        Some(log_fixture_db_url().as_str()),
+        "the parse still hands the driver the real URL — masking is a display concern only"
+    );
+    assert!(
+        !logs.contains(LOG_URL_SECRET),
+        "the password inside DATABASE_URL reached the log in plaintext:\n{logs}"
+    );
+    // Two lines print this value, and both must mask it: the resolver's
+    // `resolved from .env:` line and the config summary's `url:` line. Pinned
+    // separately, because masking one and not its sibling is precisely the
+    // shape this fix exists to close.
+    assert!(
+        logs.contains(&format!(
+            "resolved from .env: {}",
+            log_fixture_db_url_masked()
+        )),
+        "the resolver's line must carry the masked URL, not nothing and not the secret:\n{logs}"
+    );
+    assert!(
+        logs.contains(&format!("url: {}", log_fixture_db_url_masked())),
+        "the config summary's url line must carry the masked URL:\n{logs}"
+    );
+    // The unmatched control still logs in full, so the fix did not buy safety
+    // by blanking the diagnostic.
+    assert!(
+        logs.contains(&format!("host: {LOG_PLAIN_HOST}")),
+        "an ordinary DB_HOST value is still logged in full:\n{logs}"
+    );
+}
+
+/// The same gate on the reader itself, one `RUST_LOG=debug` away from the
+/// default filter — the level an ordinary troubleshooting session turns on, and
+/// whose output gets pasted into bug reports.
+#[test]
+fn resolve_env_masks_a_credential_inside_a_url_value_in_its_debug_log() {
+    let dir = TempDir::new().unwrap();
+    write(
+        dir.path(),
+        ".env",
+        &format!("DATABASE_URL={}\n", log_fixture_db_url()),
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+
+    let (url, logs) = capture_logs(|| provider.resolve_env("DATABASE_URL"));
+
+    assert_eq!(
+        url.as_deref(),
+        Some(log_fixture_db_url().as_str()),
+        "caller still gets the real URL"
+    );
+    assert!(
+        !logs.contains(LOG_URL_SECRET),
+        "the password inside DATABASE_URL reached the debug log in plaintext:\n{logs}"
+    );
+    assert!(
+        logs.contains(&format!(
+            r#"resolve_env(DATABASE_URL): Some("{}")"#,
+            log_fixture_db_url_masked()
+        )),
+        "the debug line must carry the masked URL:\n{logs}"
+    );
+}
+
+#[test]
+fn resolve_env_masks_every_matched_keyword_category_in_its_debug_log() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", &log_fixture_env());
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+
+    let ((password, token, host), logs) = capture_logs(|| {
+        (
+            provider.resolve_env("DB_PASSWORD"),
+            provider.resolve_env("MAIL_API_TOKEN"),
+            provider.resolve_env("DB_HOST"),
+        )
+    });
+
+    assert_eq!(
+        password.as_deref(),
+        Some(LOG_SECRET),
+        "caller still gets it"
+    );
+    assert_eq!(token.as_deref(), Some(LOG_TOKEN), "caller still gets it");
+    assert_eq!(
+        host.as_deref(),
+        Some(LOG_PLAIN_HOST),
+        "caller still gets it"
+    );
+
+    assert!(
+        !logs.contains(LOG_SECRET) && !logs.contains(LOG_TOKEN),
+        "a secret-named value reached the debug log in plaintext:\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"resolve_env(DB_PASSWORD): Some("(set)")"#),
+        "PASSWORD is masked:\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"resolve_env(MAIL_API_TOKEN): Some("(set)")"#),
+        "TOKEN is masked by the same gate, not by a PASSWORD-only check:\n{logs}"
+    );
+    assert!(
+        logs.contains(&format!(
+            r#"resolve_env(DB_HOST): Some("{LOG_PLAIN_HOST}")"#
+        )),
+        "an unmatched name still logs its value in full:\n{logs}"
+    );
+}
+
+#[test]
+fn parse_env_setting_masks_by_the_env_var_name_not_the_config_key() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", &log_fixture_env());
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    // `host` is an innocuous config key fed by a secret-named variable, and
+    // `password` a secret-sounding key fed by an ordinary one: the gate reads
+    // the env var's name, which is the only name the policy is defined over.
+    let block = "'host' => env('MAIL_API_TOKEN', '127.0.0.1'),\n\
+                 'password' => env('DB_HOST', ''),";
+
+    let ((host, password), logs) = capture_logs(|| {
+        (
+            provider.parse_env_setting(block, "host", "127.0.0.1"),
+            provider.parse_env_setting(block, "password", ""),
+        )
+    });
+
+    assert_eq!(host, LOG_TOKEN, "the resolved value is unchanged");
+    assert_eq!(password, LOG_PLAIN_HOST, "the resolved value is unchanged");
+    assert!(
+        !logs.contains(LOG_TOKEN),
+        "the secret-named value leaked through an innocuous config key:\n{logs}"
+    );
+    assert!(
+        logs.contains("resolved from .env: (set)"),
+        "the secret-named value is masked:\n{logs}"
+    );
+    assert!(
+        logs.contains(&format!("resolved from .env: {LOG_PLAIN_HOST}")),
+        "the ordinary value is logged in full even under a `password` key:\n{logs}"
     );
 }

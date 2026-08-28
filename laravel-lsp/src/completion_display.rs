@@ -1,4 +1,7 @@
-//! Length-split rendering for config and translation completion items.
+//! Length-split rendering for config and translation completion items, plus
+//! the two shared gates every `.env` value display consults: a name gate
+//! ([`is_sensitive_env_name`]) and a value-shape gate
+//! ([`mask_url_credentials`]).
 //!
 //! A completion item shows its value in two places that want two different
 //! lengths:
@@ -24,6 +27,112 @@
 
 use crate::completion_format::{CodeBlock, CompletionDoc};
 use crate::display_truncate::truncate_for_display;
+use std::borrow::Cow;
+
+/// What every *client-rendered* surface prints in place of a sensitive `.env`
+/// value.
+///
+/// One constant rather than a per-site literal: the four surfaces that used to
+/// echo dotenv values (env completion, `.env` hover, `config('…')` completion,
+/// and the warm-start disk cache) are meant to be indistinguishable to a
+/// reader, and a second spelling is how they drift apart (issue #344).
+///
+/// The server log is the one masked surface that does *not* use this string.
+/// It renders `(set)` — see `database::mask_env_value_for_log` — because a log
+/// line is read as a diagnostic, not as a popup, and that file already masked
+/// the resolved DB password in exactly that spelling.
+pub const REDACTED_ENV_VALUE: &str = "(redacted — matches sensitive-name pattern)";
+
+/// Name segments that mark a `.env` variable as secret-bearing.
+///
+/// Matched as whole `_`-delimited segments, never as substrings — `AUTHOR_NAME`
+/// and `TOKENIZE_INPUT` are ordinary settings that a `contains` test would
+/// redact for no reason.
+const SENSITIVE_ENV_SEGMENTS: [&str; 8] = [
+    "KEY",
+    "SECRET",
+    "PASSWORD",
+    "TOKEN",
+    "CREDENTIAL",
+    "PRIVATE",
+    "AUTH",
+    "PWD",
+];
+
+/// Whether a `.env` variable's *value* must never be rendered.
+///
+/// A Laravel `.env` routinely holds `APP_KEY`, `DB_PASSWORD`, `MAIL_PASSWORD`
+/// and third-party API tokens, and every surface that echoed them did so in a
+/// popup most likely to be on screen during a screen-share or a recording
+/// (issue #344). The heuristic is deliberately name-based and shared: a custom
+/// name outside these segments still shows its value, but no surface may decide
+/// that question for itself — including the server log, which is as visible in
+/// a screen-share as any popup (`database::mask_env_value_for_log`).
+///
+/// A name gate cannot see a credential that lives *inside* the value, so it is
+/// only half the policy: every caller pairs it with [`mask_url_credentials`],
+/// which catches `DATABASE_URL=mysql://user:hunter2@host/db` — a name this
+/// function correctly returns `false` for.
+///
+/// Case-insensitive, because `.env` keys are conventionally upper-case but
+/// nothing enforces it.
+pub fn is_sensitive_env_name(name: &str) -> bool {
+    name.split('_').any(|segment| {
+        SENSITIVE_ENV_SEGMENTS
+            .iter()
+            .any(|keyword| segment.eq_ignore_ascii_case(keyword))
+    })
+}
+
+/// Mask a credential carried *inside* a `.env` value, whatever the variable is
+/// called.
+///
+/// [`is_sensitive_env_name`] reads the variable's **name**, and stock Laravel
+/// ships `'url' => env('DATABASE_URL')` (and `env('REDIS_URL')`) whose value is
+/// `mysql://user:hunter2@host/db`: the password lives in the value, and
+/// `DATABASE_URL` splits to `DATABASE` / `URL`, matching none of
+/// [`SENSITIVE_ENV_SEGMENTS`]. The two gates are complementary and every
+/// surface applies both — the name gate drops a value whose *name* says it is
+/// secret, this one masks a credential the value's own *shape* reveals
+/// (issue #344).
+///
+/// Matches the standard `scheme://user:password@host…` shape and replaces the
+/// password with `***`. Best-effort and fail-open: a value with no `://`, no
+/// `@`, or no `:` in its credentials comes back borrowed and untouched. A
+/// display surface must not blank a value it merely failed to parse, and a log
+/// line must not panic the server.
+///
+/// Only the first `@` after the credentials is treated as the host separator,
+/// so an `@` inside the password leaves its tail visible
+/// (`postgres://user:***@ssw0rd@host/db`). Deliberate: the characters that
+/// identify the credential are gone, and a stricter parse would trade a
+/// diagnostic that works on real URLs for one that fails on unusual ones.
+///
+/// Lives here rather than in `database`, where it started life as
+/// `mask_url_password`: it is now the second half of the redaction policy the
+/// four display surfaces and the server log share, and a second copy is how the
+/// two spellings drift apart.
+pub fn mask_url_credentials(value: &str) -> Cow<'_, str> {
+    // Find the `://` separator, then the `@` that ends the credentials.
+    let Some(scheme_end) = value.find("://") else {
+        return Cow::Borrowed(value);
+    };
+    let creds_start = scheme_end + 3;
+    let Some(at_offset) = value[creds_start..].find('@') else {
+        return Cow::Borrowed(value);
+    };
+    let creds_end = creds_start + at_offset;
+    // Credentials are `user[:password]`. Only mask if there is a `:`.
+    let Some(colon_offset) = value[creds_start..creds_end].find(':') else {
+        return Cow::Borrowed(value);
+    };
+    let user_end = creds_start + colon_offset;
+    let mut masked = String::with_capacity(value.len());
+    masked.push_str(&value[..user_end + 1]); // up to and including the `:`
+    masked.push_str("***");
+    masked.push_str(&value[creds_end..]); // from the `@` onwards
+    Cow::Owned(masked)
+}
 
 /// Char budget for the inline `detail` line beside a completion label.
 ///
