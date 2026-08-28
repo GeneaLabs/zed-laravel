@@ -1,0 +1,537 @@
+//! Secret-bearing `.env` values never reach a rendered surface (issue #344).
+//!
+//! #342 closed the *process*-environment leak. The project's own `.env` is a
+//! milder but real second source: a Laravel `.env` routinely holds `APP_KEY`,
+//! `DB_PASSWORD`, `MAIL_PASSWORD` and third-party tokens, and four surfaces
+//! echoed them — env completion, `.env` hover, `config('…')` completion, and
+//! the warm-start disk cache.
+//!
+//! All four now consult one predicate,
+//! `completion_display::is_sensitive_env_name`. These tests drive the real
+//! entry points — `completion()`, `hover_for_env`, `get_all_config_keys`, and
+//! a genuine `CacheManager` save/load round trip — with two different matched
+//! keyword categories (`DB_PASSWORD` and `API_TOKEN`) crossing every one of
+//! them, so a surface that re-implemented the check locally and drifted is
+//! caught by observed behaviour rather than by reading the diff.
+//!
+//! Leak assertions run over the **whole serialized response**, not the fields
+//! this change touches: `insertText`, `label`, `sortText` and friends are just
+//! as visible in a screen-share as `detail` is. The cache assertion reads the
+//! deserialized struct rather than the file's bytes, because a reversible
+//! encoding of the value would pass a bytes-only check and still leak.
+//!
+//! Every leak assertion carries a positive control — the ordinary `APP_NAME`
+//! renders exactly as it did before this change — so a fixture that never
+//! reached the code under test cannot pass vacuously on an empty response.
+
+use crate::LaravelLanguageServer;
+use laravel_lsp::cache_manager::CacheManager;
+use laravel_lsp::completion_display::REDACTED_ENV_VALUE;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
+use tower_lsp::lsp_types::{
+    CompletionItem, CompletionParams, CompletionResponse, Documentation, MarkupContent, MarkupKind,
+    PartialResultParams, Position, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    WorkDoneProgressParams,
+};
+use tower_lsp::{LanguageServer, LspService};
+
+/// Two matched names from two different keyword categories. One category alone
+/// cannot tell a shared predicate from a hard-coded `contains("PASSWORD")`.
+const PASSWORD_NAME: &str = "DB_PASSWORD";
+const PASSWORD_VALUE: &str = "hunter2-issue-344";
+const TOKEN_NAME: &str = "API_TOKEN";
+const TOKEN_VALUE: &str = "tok-issue-344-only";
+
+/// The unmatched control. Its value must survive every surface untouched.
+const PLAIN_NAME: &str = "APP_NAME";
+const PLAIN_VALUE: &str = "Example";
+
+/// A matched name that is *commented out* in the fixture. The client-visible
+/// surfaces skip commented entries already; the cache-write loop never did.
+const COMMENTED_NAME: &str = "MAIL_PASSWORD";
+const COMMENTED_VALUE: &str = "mail-hunter2-issue-344";
+
+/// The project `.env` every test registers with Salsa.
+fn dotenv() -> String {
+    format!(
+        "{PLAIN_NAME}={PLAIN_VALUE}\n{PASSWORD_NAME}={PASSWORD_VALUE}\n{TOKEN_NAME}={TOKEN_VALUE}\n# {COMMENTED_NAME}={COMMENTED_VALUE}\n"
+    )
+}
+
+fn test_server() -> LaravelLanguageServer {
+    let (service, _socket) = LspService::new(LaravelLanguageServer::new);
+    service.inner().clone()
+}
+
+/// A project on disk with `dotenv` registered with Salsa (priority 2, matching
+/// `register_env_files_with_salsa`) and `root_path` primed, so both the env and
+/// the `config('…')` completion branches are reachable.
+async fn project(dotenv: &str) -> (TempDir, PathBuf, LaravelLanguageServer) {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let env_path = root.join(".env");
+    std::fs::write(&env_path, dotenv).expect("write .env");
+
+    let server = test_server();
+    *server.root_path.write().await = Some(root.clone());
+    *server.auto_complete_debounce_ms.write().await = 0;
+    server
+        .salsa
+        .register_env_source(env_path, dotenv.to_string(), 2)
+        .await
+        .expect("register .env with salsa");
+    (dir, root, server)
+}
+
+/// Open `file_name` holding the single line `buffer`, and drive the real
+/// completion handler with the cursor at the end of it.
+async fn complete_in(
+    server: &LaravelLanguageServer,
+    root: &Path,
+    file_name: &str,
+    buffer: &str,
+) -> Option<CompletionResponse> {
+    let uri = Url::from_file_path(root.join(file_name)).expect("file url");
+    server
+        .documents
+        .write()
+        .await
+        .insert(uri.clone(), (buffer.to_string(), 1));
+    server
+        .completion(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position {
+                    line: 0,
+                    character: buffer.chars().count() as u32,
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+            context: None,
+        })
+        .await
+        .expect("completion handler must not error")
+}
+
+/// Split a response into its items and its serialized form. `None` is a real
+/// outcome (an empty item list is reported as `None`), so it becomes zero items
+/// and still runs every assertion rather than being skipped.
+fn dissect(response: Option<CompletionResponse>) -> (Vec<CompletionItem>, String) {
+    match response {
+        None => (Vec::new(), String::new()),
+        Some(CompletionResponse::Array(items)) => {
+            let json = serde_json::to_string(&items).expect("serialize items");
+            (items, json)
+        }
+        Some(CompletionResponse::List(list)) => {
+            let json = serde_json::to_string(&list).expect("serialize list");
+            (list.items, json)
+        }
+    }
+}
+
+/// No secret survives anywhere in the serialized response — any field, any
+/// item. Returns the items so callers can add positive assertions.
+fn assert_no_secret_leak(
+    response: Option<CompletionResponse>,
+    context: &str,
+) -> Vec<CompletionItem> {
+    let (items, json) = dissect(response);
+    for secret in [PASSWORD_VALUE, TOKEN_VALUE, COMMENTED_VALUE] {
+        assert!(
+            !json.contains(secret),
+            "{context}: {secret} leaked into the completion response: {json}"
+        );
+    }
+    items
+}
+
+fn item<'a>(items: &'a [CompletionItem], label: &str, context: &str) -> &'a CompletionItem {
+    items.iter().find(|i| i.label == label).unwrap_or_else(|| {
+        panic!(
+            "{context}: expected {label} to be offered, got {:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        )
+    })
+}
+
+fn documentation_markdown(item: &CompletionItem, context: &str) -> String {
+    match item.documentation.as_ref() {
+        Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        })) => value.clone(),
+        other => panic!("{context}: expected markdown documentation, got {other:?}"),
+    }
+}
+
+/// The panel `completion()` builds for a `.env` variable: name, summary,
+/// `Source: <file>`. Asserted whole, so dropping any builder call fails.
+fn expected_panel(name: &str, summary: &str) -> String {
+    format!("**{name}**\n\n{summary}\n\nSource: .env")
+}
+
+// ========================================================================
+// Surface 1 — env completion
+// ========================================================================
+
+#[tokio::test]
+async fn env_completion_redacts_every_matched_category_and_leaves_the_rest_alone() {
+    let (_dir, root, server) = project(&dotenv()).await;
+    let line = "<?php $v = env('";
+    let response = complete_in(&server, &root, "probe.php", line).await;
+    let items = assert_no_secret_leak(response, "env completion");
+
+    for name in [PASSWORD_NAME, TOKEN_NAME] {
+        let redacted = item(&items, name, "env completion");
+        assert_eq!(
+            redacted.detail.as_deref(),
+            Some("(from .env)"),
+            "{name}: the detail line must drop the value but keep the source"
+        );
+        assert_eq!(
+            documentation_markdown(redacted, "env completion"),
+            expected_panel(name, REDACTED_ENV_VALUE),
+            "{name}: the panel must show the redaction string, not the value"
+        );
+    }
+
+    // Positive control: the unmatched variable is byte-for-byte what it was.
+    let plain = item(&items, PLAIN_NAME, "env completion");
+    assert_eq!(
+        plain.detail.as_deref(),
+        Some(format!("{PLAIN_VALUE} (from .env)").as_str())
+    );
+    assert_eq!(
+        documentation_markdown(plain, "env completion"),
+        expected_panel(PLAIN_NAME, PLAIN_VALUE)
+    );
+}
+
+/// The `.env` buffer's own `${…}` interpolation is a second caller of the same
+/// item builder, and it is the surface most likely to be open while the file
+/// full of credentials is on screen.
+#[tokio::test]
+async fn env_file_interpolation_redacts_too() {
+    let (_dir, root, server) = project(&dotenv()).await;
+    let line = "NEW_VAR=${";
+    let response = complete_in(&server, &root, ".env", line).await;
+    let items = assert_no_secret_leak(response, ".env ${…} interpolation");
+
+    assert_eq!(
+        documentation_markdown(
+            item(&items, PASSWORD_NAME, "interpolation"),
+            "interpolation"
+        ),
+        expected_panel(PASSWORD_NAME, REDACTED_ENV_VALUE)
+    );
+    assert_eq!(
+        documentation_markdown(item(&items, PLAIN_NAME, "interpolation"), "interpolation"),
+        expected_panel(PLAIN_NAME, PLAIN_VALUE)
+    );
+}
+
+/// Precedence: redaction runs before the existing empty-value display, so a
+/// declared-but-blank credential reads as redacted rather than as `(empty)` —
+/// which would otherwise tell a reader "this one is not set".
+///
+/// This doubles as the warm-start parity guard. A matched name read back from
+/// the disk cache arrives with an empty value (surface 4), so "identical
+/// whether cached or live" reduces to exactly this fixture: an empty value
+/// under a matched name renders the redaction string either way.
+#[tokio::test]
+async fn an_empty_sensitive_value_redacts_rather_than_reading_empty() {
+    let fixture = format!("{PASSWORD_NAME}=\nAPP_DEBUG=\n");
+    let (_dir, root, server) = project(&fixture).await;
+    let line = "<?php $v = env('";
+    let items = dissect(complete_in(&server, &root, "probe.php", line).await).0;
+
+    assert_eq!(
+        documentation_markdown(item(&items, PASSWORD_NAME, "empty value"), "empty value"),
+        expected_panel(PASSWORD_NAME, REDACTED_ENV_VALUE),
+        "an empty sensitive value must not fall through to the (empty) display"
+    );
+    // Positive control for the branch this one jumps ahead of: an ordinary
+    // blank variable still reads `(empty)`.
+    assert_eq!(
+        documentation_markdown(item(&items, "APP_DEBUG", "empty value"), "empty value"),
+        expected_panel("APP_DEBUG", "(empty)")
+    );
+}
+
+// ========================================================================
+// Surface 2 — hover on `.env` keys
+// ========================================================================
+
+#[tokio::test]
+async fn hover_redacts_every_matched_category() {
+    let (_dir, _root, server) = project(&dotenv()).await;
+
+    for (name, value) in [(PASSWORD_NAME, PASSWORD_VALUE), (TOKEN_NAME, TOKEN_VALUE)] {
+        let markdown = server.hover_for_env(name).await;
+        assert!(
+            !markdown.contains(value),
+            "{name}: the value leaked into the hover markdown: {markdown}"
+        );
+        assert!(
+            markdown.contains(REDACTED_ENV_VALUE),
+            "{name}: the hover must say why it shows nothing: {markdown}"
+        );
+        assert!(
+            markdown.contains(".env"),
+            "{name}: the source link must survive redaction: {markdown}"
+        );
+    }
+}
+
+/// Positive control and regression guard: an unmatched variable still renders
+/// its value in a plain code block.
+#[tokio::test]
+async fn hover_on_an_ordinary_variable_is_unchanged() {
+    let (_dir, _root, server) = project(&dotenv()).await;
+    let markdown = server.hover_for_env(PLAIN_NAME).await;
+    assert!(
+        markdown.contains(&format!("```\n{PLAIN_VALUE}\n```")),
+        "the ordinary hover must keep its code block: {markdown}"
+    );
+    assert!(!markdown.contains(REDACTED_ENV_VALUE));
+}
+
+/// The two paths this change must not disturb: a commented-out entry keeps its
+/// note, and an undefined name keeps its trailer.
+#[tokio::test]
+async fn the_commented_and_not_found_hover_paths_are_untouched() {
+    let (_dir, _root, server) = project(&dotenv()).await;
+
+    let commented = server.hover_for_env(COMMENTED_NAME).await;
+    assert!(
+        commented.contains("*(commented out)*"),
+        "commented hover changed: {commented}"
+    );
+    assert!(!commented.contains(COMMENTED_VALUE));
+
+    let missing = server.hover_for_env("NOT_DECLARED_ANYWHERE").await;
+    assert_eq!(missing, "*(not defined in .env)*");
+}
+
+// ========================================================================
+// Surface 3 — `config('…')` completion
+// ========================================================================
+
+/// `config/app.php` exercising every branch the resolver can take: a dotenv hit
+/// through the plain `env()` spelling, a dotenv hit through the `(bool) env()`
+/// spelling, an unmatched dotenv hit, a literal default, the not-found
+/// placeholder, and a plain literal whose *config key* would match the
+/// predicate if the check were attached to the wrong name.
+fn config_php() -> String {
+    format!(
+        "<?php\nreturn [\n    'password' => env('{PASSWORD_NAME}'),\n    'token' => (bool) env('{TOKEN_NAME}'),\n    'name' => env('{PLAIN_NAME}', 'Laravel'),\n    'fallback' => env('MISSING_PASSWORD', 'fallback-default'),\n    'absent' => env('ABSENT_TOKEN'),\n    'secret_key' => 'plain-literal-value',\n];\n"
+    )
+}
+
+fn write(root: &Path, rel: &str, contents: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, contents).unwrap();
+}
+
+#[tokio::test]
+async fn config_completion_redacts_only_the_dotenv_sourced_sensitive_values() {
+    let (_dir, root, server) = project(&dotenv()).await;
+    write(&root, "config/app.php", &config_php());
+
+    let keys = server.get_all_config_keys().await;
+    let value_of = |key: &str| {
+        keys.iter()
+            .find(|c| c.key == key)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected {key}, got {:?}",
+                    keys.iter().map(|c| &c.key).collect::<Vec<_>>()
+                )
+            })
+            .value
+            .clone()
+    };
+
+    // Both `env()` spellings resolve through one shared redaction helper, so
+    // neither can be fixed without the other.
+    assert_eq!(value_of("app.password"), REDACTED_ENV_VALUE);
+    assert_eq!(value_of("app.token"), REDACTED_ENV_VALUE);
+
+    // The three exemptions, each of which has nothing to leak.
+    assert_eq!(
+        value_of("app.name"),
+        PLAIN_VALUE,
+        "an unmatched dotenv value is untouched"
+    );
+    assert_eq!(
+        value_of("app.fallback"),
+        "fallback-default",
+        "a literal default is already visible in the PHP file being edited"
+    );
+    assert_eq!(
+        value_of("app.absent"),
+        "${ABSENT_TOKEN}",
+        "the not-found placeholder carries no value to redact"
+    );
+    assert_eq!(
+        value_of("app.secret_key"),
+        "plain-literal-value",
+        "the predicate reads the env var's name, never the config key's"
+    );
+}
+
+/// End-to-end through the real handler, so the render sites are covered too:
+/// `completion_detail` and `config_documentation` both receive the redacted
+/// value, and nothing else in the response carries the secret.
+#[tokio::test]
+async fn the_config_completion_response_carries_no_dotenv_secret() {
+    let (_dir, root, server) = project(&dotenv()).await;
+    write(&root, "config/app.php", &config_php());
+
+    let line = "<?php $v = config('app.";
+    let response = complete_in(&server, &root, "probe.php", line).await;
+    let items = assert_no_secret_leak(response, "config completion");
+
+    let password = item(&items, "app.password", "config completion");
+    assert_eq!(
+        password.detail.as_deref(),
+        Some(format!("{REDACTED_ENV_VALUE} (config/app.php)").as_str())
+    );
+    assert!(
+        documentation_markdown(password, "config completion").contains(REDACTED_ENV_VALUE),
+        "the config panel must show the redaction string"
+    );
+
+    // Positive control: an unmatched key still shows its resolved value.
+    let name = item(&items, "app.name", "config completion");
+    assert_eq!(
+        name.detail.as_deref(),
+        Some(format!("{PLAIN_VALUE} (config/app.php)").as_str())
+    );
+}
+
+// ========================================================================
+// Surface 4 — the on-disk warm-start cache
+// ========================================================================
+
+/// Run the real cache-population path and persist it, then load it back with a
+/// fresh `CacheManager`. Returns the reloaded manager.
+async fn round_trip_cache(server: &LaravelLanguageServer, root: &Path) -> CacheManager {
+    *server.cache.write().await = Some(CacheManager::load(root));
+    server.populate_cache_from_salsa().await;
+    server
+        .cache
+        .read()
+        .await
+        .as_ref()
+        .expect("cache present")
+        .save()
+        .expect("cache should persist");
+    CacheManager::load(root)
+}
+
+#[tokio::test]
+async fn the_disk_cache_keeps_sensitive_names_but_never_their_values() {
+    let (_dir, root, server) = project(&dotenv()).await;
+    let reloaded = round_trip_cache(&server, &root).await;
+    let variables = &reloaded
+        .get_env_vars()
+        .expect("env vars should round-trip")
+        .variables;
+
+    // Asserted on the deserialized struct, not on the file's bytes: a
+    // reversible encoding would pass a substring check and still leak.
+    for name in [PASSWORD_NAME, TOKEN_NAME, COMMENTED_NAME] {
+        assert_eq!(
+            variables.get(name).map(String::as_str),
+            Some(""),
+            "{name} must be cached by name with an empty value — present, never plaintext"
+        );
+    }
+    assert_eq!(
+        variables.get(PLAIN_NAME).map(String::as_str),
+        Some(PLAIN_VALUE),
+        "an unmatched variable must round-trip unchanged"
+    );
+}
+
+/// A cache entry survives the round trip byte-for-byte for an unmatched name,
+/// and registering the reloaded map back into a cold server is accepted — the
+/// path `load_cache_data` takes on a warm start.
+///
+/// It stops there deliberately. `register_cached_env_vars` writes the Salsa
+/// actor's `env_variables` map, and **nothing renders from that map**:
+/// `get_env_variable` / `get_env_variable_names` have no caller outside
+/// `salsa_impl`, and all four surfaces read `get_all_parsed_env_vars` /
+/// `get_parsed_env_var`, which walk the registered `.env` *sources* only. So
+/// redaction in the cache is about the plaintext sitting on disk, not about
+/// what a warm start displays; asserting a rendering difference here would be
+/// asserting about code that never runs. The rendering half of the parity
+/// claim is pinned instead by
+/// `an_empty_sensitive_value_redacts_rather_than_reading_empty`, whose fixture
+/// is exactly the shape a cache read produces: a matched name with an empty
+/// value.
+#[tokio::test]
+async fn the_reloaded_cache_registers_cleanly_on_a_cold_server() {
+    let (_dir, root, server) = project(&dotenv()).await;
+    let reloaded = round_trip_cache(&server, &root).await;
+    let cached = reloaded.get_env_vars().expect("env vars").variables.clone();
+    assert_eq!(
+        cached.get(PLAIN_NAME).map(String::as_str),
+        Some(PLAIN_VALUE),
+        "the unmatched value must survive the round trip unchanged"
+    );
+
+    let warm = test_server();
+    warm.salsa
+        .register_cached_env_vars(cached)
+        .await
+        .expect("a redacted cache must still register on warm start");
+}
+
+/// A cache file written by a pre-fix binary already holds plaintext secrets.
+/// The `CACHE_VERSION` bump is what stops it being trusted and served.
+#[test]
+fn a_pre_bump_cache_holding_plaintext_is_rejected() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path().to_path_buf();
+
+    // Write a well-formed current-version cache carrying the plaintext, then
+    // rewind only its version field. Hand-writing the JSON instead would risk
+    // the test passing on a parse error rather than on the version check.
+    let mut cache = CacheManager::load(&root);
+    cache.set_env_vars(laravel_lsp::cache_manager::CachedEnvVars {
+        variables: [(PASSWORD_NAME.to_string(), PASSWORD_VALUE.to_string())]
+            .into_iter()
+            .collect(),
+    });
+    cache.save().expect("cache should persist");
+    let path = cache.cache_path().expect("cache path").to_path_buf();
+
+    let current = std::fs::read_to_string(&path).expect("read cache");
+    let mut json: serde_json::Value = serde_json::from_str(&current).expect("cache json");
+    // Derived from the file rather than written as a literal, so the next
+    // version bump doesn't quietly turn this into a test of nothing.
+    let version = json["version"].as_u64().expect("version field");
+    json["version"] = serde_json::json!(version - 1);
+    let previous = serde_json::to_string_pretty(&json).expect("serialize cache");
+    assert!(
+        previous.contains(PASSWORD_VALUE),
+        "the planted cache must actually hold the plaintext this test is about"
+    );
+    std::fs::write(&path, previous).expect("plant pre-bump cache");
+
+    let loaded = CacheManager::load(&root);
+    assert!(
+        loaded.get_env_vars().is_none(),
+        "a pre-bump cache must be dropped, not served — it holds plaintext secrets"
+    );
+    assert!(
+        !loaded.has_cached_data(),
+        "a rejected cache must force a rescan"
+    );
+}

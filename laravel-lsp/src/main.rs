@@ -7727,7 +7727,23 @@ impl LaravelLanguageServer {
         if let Ok(env_vars) = self.salsa.get_all_parsed_env_vars().await {
             let mut variables = std::collections::HashMap::new();
             for var in &env_vars {
-                variables.insert(var.name.clone(), var.value.clone());
+                // A secret-bearing name is cached by name with an empty value
+                // (issue #344): the plaintext never reaches the cache file,
+                // which is world-readable-ish, long-lived, and outside the
+                // project the developer thinks they are protecting. The key is
+                // kept rather than dropped so a warm start still knows the
+                // variable exists and can offer it — the surfaces redact by
+                // name, so it renders identically to a live parse.
+                //
+                // No `is_commented` filter, matching the loop's existing
+                // behaviour: a commented-out `# DB_PASSWORD=hunter2` is cached
+                // too, so it must be redacted here as well.
+                let value = if laravel_lsp::completion_display::is_sensitive_env_name(&var.name) {
+                    String::new()
+                } else {
+                    var.value.clone()
+                };
+                variables.insert(var.name.clone(), value);
             }
             debug!("Caching {} env variables", variables.len());
             cache.set_env_vars(CachedEnvVars { variables });
@@ -14901,6 +14917,13 @@ impl LaravelLanguageServer {
 
     /// Resolve an env() call to its actual value
     /// Handles: env('VAR'), env('VAR', 'default'), env('VAR', default_value)
+    ///
+    /// A value read out of the project's `.env` for a secret-bearing variable
+    /// name is replaced here, before it reaches `ConfigKeyCompletion` and the
+    /// two render sites, so the config popup cannot echo a credential
+    /// (issue #344). Only the dotenv-sourced path is redacted — a literal
+    /// default written in the PHP source is already on screen in the file being
+    /// edited, and the `${VAR}` placeholder carries no value to leak.
     fn resolve_env_value(
         value: &str,
         env_vars: &std::collections::HashMap<String, String>,
@@ -14915,7 +14938,7 @@ impl LaravelLanguageServer {
 
             // Try to get value from env vars
             if let Some(env_value) = env_vars.get(var_name) {
-                return env_value.clone();
+                return Self::env_display_value(var_name, env_value);
             }
 
             // Fall back to default if provided
@@ -14939,7 +14962,7 @@ impl LaravelLanguageServer {
             let var_name = caps.get(1).unwrap().as_str();
 
             if let Some(env_value) = env_vars.get(var_name) {
-                return env_value.clone();
+                return Self::env_display_value(var_name, env_value);
             }
 
             if let Some(default_match) = caps.get(2) {
@@ -14952,6 +14975,19 @@ impl LaravelLanguageServer {
 
         // Not an env() call, clean up and return as-is
         value.trim_matches('\'').trim_matches('"').to_string()
+    }
+
+    /// A dotenv-sourced value as it may be displayed: the value itself, or the
+    /// shared redaction string when the variable's name is secret-bearing.
+    ///
+    /// Both `env()` regex branches above route through this — a fix applied to
+    /// only one of them leaves the other echoing credentials.
+    fn env_display_value(var_name: &str, env_value: &str) -> String {
+        if laravel_lsp::completion_display::is_sensitive_env_name(var_name) {
+            laravel_lsp::completion_display::REDACTED_ENV_VALUE.to_string()
+        } else {
+            env_value.to_string()
+        }
     }
 
     // ========================================================================
@@ -20220,7 +20256,9 @@ return [
     }
 
     /// Env — value as a plain code block, link to the `.env` file it was
-    /// read from. Commented-out entries render as a detail note.
+    /// read from. Commented-out entries render as a detail note, and a
+    /// secret-bearing name renders the redaction note instead of its value
+    /// (issue #344).
     async fn hover_for_env(&self, name: &str) -> String {
         use laravel_lsp::hover;
         let var = self
@@ -20239,6 +20277,15 @@ return [
         if var.is_commented {
             hover::render(&hover::HoverContent {
                 detail: Some("*(commented out)*"),
+                source_link: Some(&link),
+                ..Default::default()
+            })
+        } else if laravel_lsp::completion_display::is_sensitive_env_name(&var.name) {
+            // The value is dropped, not truncated or masked character-by-character:
+            // a partial credential is still a credential, and the hover has no
+            // second field to hide it in.
+            hover::render(&hover::HoverContent {
+                detail: Some(laravel_lsp::completion_display::REDACTED_ENV_VALUE),
                 source_link: Some(&link),
                 ..Default::default()
             })
@@ -26664,14 +26711,27 @@ impl LanguageServer for LaravelLanguageServer {
                     .and_then(|n| n.to_str())
                     .unwrap_or(".env");
 
+                // A secret-bearing name never shows its value here, whatever
+                // the value is (issue #344). The check precedes the empty-value
+                // display below on purpose: `DB_PASSWORD=` renders as redacted,
+                // not as `(empty)`, so the popup never distinguishes "unset"
+                // from "set" for a credential.
+                let sensitive = laravel_lsp::completion_display::is_sensitive_env_name(&v.name);
+
                 CompletionItem {
                     label: v.name.clone(),
                     kind: Some(CompletionItemKind::VARIABLE),
-                    detail: Some(format!("{} (from {})", v.value, source_file)),
+                    detail: Some(if sensitive {
+                        format!("(from {})", source_file)
+                    } else {
+                        format!("{} (from {})", v.value, source_file)
+                    }),
                     documentation: Some(
                         CompletionDoc::new()
                             .header(&v.name)
-                            .summary(if v.value.is_empty() {
+                            .summary(if sensitive {
+                                laravel_lsp::completion_display::REDACTED_ENV_VALUE.to_string()
+                            } else if v.value.is_empty() {
                                 "(empty)".to_string()
                             } else {
                                 v.value.clone()

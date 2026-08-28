@@ -1,4 +1,5 @@
-//! Length-split rendering for config and translation completion items.
+//! Length-split rendering for config and translation completion items, plus
+//! the shared sensitive-name gate every `.env` value display consults.
 //!
 //! A completion item shows its value in two places that want two different
 //! lengths:
@@ -24,6 +25,49 @@
 
 use crate::completion_format::{CodeBlock, CompletionDoc};
 use crate::display_truncate::truncate_for_display;
+
+/// What every surface prints in place of a sensitive `.env` value.
+///
+/// One constant rather than a per-site literal: the four surfaces that used to
+/// echo dotenv values (env completion, `.env` hover, `config('…')` completion,
+/// and the warm-start disk cache) are meant to be indistinguishable to a
+/// reader, and a second spelling is how they drift apart (issue #344).
+pub const REDACTED_ENV_VALUE: &str = "(redacted — matches sensitive-name pattern)";
+
+/// Name segments that mark a `.env` variable as secret-bearing.
+///
+/// Matched as whole `_`-delimited segments, never as substrings — `AUTHOR_NAME`
+/// and `TOKENIZE_INPUT` are ordinary settings that a `contains` test would
+/// redact for no reason.
+const SENSITIVE_ENV_SEGMENTS: [&str; 8] = [
+    "KEY",
+    "SECRET",
+    "PASSWORD",
+    "TOKEN",
+    "CREDENTIAL",
+    "PRIVATE",
+    "AUTH",
+    "PWD",
+];
+
+/// Whether a `.env` variable's *value* must never be rendered.
+///
+/// A Laravel `.env` routinely holds `APP_KEY`, `DB_PASSWORD`, `MAIL_PASSWORD`
+/// and third-party API tokens, and every surface that echoed them did so in a
+/// popup most likely to be on screen during a screen-share or a recording
+/// (issue #344). The heuristic is deliberately name-based and shared: a custom
+/// name outside these segments still shows its value, but no surface may decide
+/// that question for itself.
+///
+/// Case-insensitive, because `.env` keys are conventionally upper-case but
+/// nothing enforces it.
+pub fn is_sensitive_env_name(name: &str) -> bool {
+    name.split('_').any(|segment| {
+        SENSITIVE_ENV_SEGMENTS
+            .iter()
+            .any(|keyword| segment.eq_ignore_ascii_case(keyword))
+    })
+}
 
 /// Char budget for the inline `detail` line beside a completion label.
 ///

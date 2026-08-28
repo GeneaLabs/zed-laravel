@@ -22,6 +22,7 @@ mod directive_view_fallback;
 mod dynamic_where_sparseness;
 mod env_completion_system_leak;
 mod env_source_registration_gate;
+mod env_value_redaction;
 mod expected_path_diagnostic_containment;
 mod factory_goto_def_handler;
 mod flux_component_context;
