@@ -26633,9 +26633,6 @@ impl LanguageServer for LaravelLanguageServer {
         // Build completion items, filtering by prefix
         let filter_upper = env_ctx.prefix.to_uppercase();
 
-        // Track which var names we've seen (from .env files)
-        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-
         // Create the text_edit range once for reuse
         let edit_range = Range {
             start: Position {
@@ -26648,13 +26645,19 @@ impl LanguageServer for LaravelLanguageServer {
             },
         };
 
-        // First, add .env file vars (project-specific, higher priority)
-        let mut items: Vec<CompletionItem> = env_vars
+        // Only variables the project declares in its `.env` files are offered.
+        // The language server's own process environment is deliberately NOT
+        // merged in (issue #342): it is inherited from Zed and thus from the
+        // login shell, so it routinely holds credentials that have no business
+        // in a completion popup — and `${...}` interpolation in `.env` and
+        // `env()` at runtime both resolve against the dotenv file set, never
+        // against the editor's environment, so those names would not exist
+        // wherever the application actually runs.
+        let items: Vec<CompletionItem> = env_vars
             .into_iter()
             .filter(|v| !v.is_commented)
             .filter(|v| v.name.to_uppercase().starts_with(&filter_upper))
             .map(|v| {
-                seen_names.insert(v.name.clone());
                 let source_file = v
                     .source_file
                     .file_name()
@@ -26684,32 +26687,6 @@ impl LanguageServer for LaravelLanguageServer {
                 }
             })
             .collect();
-
-        // Then, add system env vars (lower priority, only if not already in .env)
-        for (name, value) in std::env::vars() {
-            if !seen_names.contains(&name) && name.to_uppercase().starts_with(&filter_upper) {
-                let doc = CompletionDoc::new()
-                    .header(&name)
-                    .summary(if value.is_empty() {
-                        "(empty)".to_string()
-                    } else {
-                        value.clone()
-                    })
-                    .section("Source: system environment")
-                    .into_documentation();
-                items.push(CompletionItem {
-                    label: name.clone(),
-                    kind: Some(CompletionItemKind::VARIABLE),
-                    detail: Some(format!("{} (from system)", value)),
-                    documentation: Some(doc),
-                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                        range: edit_range,
-                        new_text: name,
-                    })),
-                    ..Default::default()
-                });
-            }
-        }
 
         debug!("   Returning {} env completion items", items.len());
 

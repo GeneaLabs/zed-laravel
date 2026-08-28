@@ -21,6 +21,7 @@ mod directive_navigation_containment;
 mod directive_view_fallback;
 mod dynamic_where_sparseness;
 mod env_completion_context_gate;
+mod env_completion_system_leak;
 mod env_source_registration_gate;
 mod expected_path_diagnostic_containment;
 mod factory_goto_def_handler;
