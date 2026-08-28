@@ -12,13 +12,26 @@
 //!
 //! These tests drive the **real** `textDocument/completion` entry point — not a
 //! hand-built `StringContext` — across all three contexts the env branch serves
-//! (`.env` `${…}`, PHP/Blade `env('…')`, PHPUnit XML `<env name="…">`), with a
-//! real process variable set via `std::env::set_var`. Each asserts two things at
-//! once: the project's own `.env` variable IS offered (so the fixture provably
-//! reaches the completion code, rather than passing vacuously on an empty
-//! response), and the process variable's value appears nowhere in the serialized
-//! response. Restoring the deleted `for (name, value) in std::env::vars()` loop
-//! in `main.rs` turns every one of them red.
+//! (`.env` `${…}`, PHP/Blade `env('…')`, and PHPUnit XML in both spellings
+//! `get_phpunit_env_context` accepts, `<env name="…">` and `<server name="…">`),
+//! with a real process variable set via `std::env::set_var`.
+//!
+//! Every leak assertion carries a positive control — the project's own `.env`
+//! variable IS offered — so a fixture that never reached the completion code
+//! cannot pass vacuously on an empty response. The one exception is
+//! `prefix_matching_only_a_process_var_returns_no_completions`, whose subject is
+//! the empty response itself; a positive control would contradict what it
+//! asserts, and the siblings sharing its fixture helper establish reachability.
+//!
+//! Restoring the deleted `for (name, value) in std::env::vars()` loop in
+//! `main.rs` turns nine of these ten tests red. The tenth,
+//! `dotenv_declaration_shadowing_a_process_var_still_completes_from_the_file`,
+//! stays green under that mutation by design: its fixture `.env` declares the
+//! process variable's own name, so the deleted loop's own
+//! `!seen_names.contains(&name)` guard skipped that variable even before this
+//! fix. A second mutation discriminates it — change the `.env` echo format
+//! (`format!("{} (from {})", …)` in `completion()`) and its `detail` assertion
+//! fails.
 
 use crate::LaravelLanguageServer;
 use std::path::PathBuf;
@@ -253,6 +266,26 @@ async fn phpunit_xml_env_attribute_never_offers_process_vars() {
     assert_declared_var_offered(&items, "PHPUnit <env name=\"…\">");
 }
 
+/// `<server name="…">` is the second spelling `get_phpunit_env_context` accepts
+/// (`main.rs`), and it reaches the completion code through its own arm of the
+/// `(env_pattern, server_pattern)` match — a different literal, a different
+/// offset (`s + 14`, against `e + 11`). The leak filtering below the parse is
+/// shared, so this test also pins that arm's offset arithmetic: get it wrong and
+/// the prefix is mis-sliced, and the declared-variable control fails.
+#[tokio::test]
+async fn phpunit_xml_server_attribute_never_offers_process_vars() {
+    let _serial = ENV_MUTATION_LOCK.lock().await;
+    let _secret = EnvVarGuard::set(SECRET_NAME, SECRET_VALUE);
+
+    let server = test_server();
+    let line = format!("    <server name=\"{TYPED_PREFIX}");
+    let (_dir, uri) = open_project(&server, &dotenv(), "phpunit.xml", &line).await;
+
+    let response = complete_at_end_of_line(&server, uri, &line).await;
+    let items = assert_no_process_var_leak(response, "PHPUnit <server name=\"…\">");
+    assert_declared_var_offered(&items, "PHPUnit <server name=\"…\">");
+}
+
 // ============================================================================
 // The empty-prefix repro from the issue — `FOO=${` with nothing typed yet, the
 // shape that returned 57 items because an empty prefix matches every process
@@ -316,6 +349,26 @@ async fn empty_prefix_in_phpunit_xml_never_offers_process_vars() {
         items.len(),
         2,
         "empty prefix in <env name=\"…\">: only the two declared variables may be offered, got {:?}",
+        items.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn empty_prefix_in_phpunit_xml_server_attribute_never_offers_process_vars() {
+    let _serial = ENV_MUTATION_LOCK.lock().await;
+    let _secret = EnvVarGuard::set(SECRET_NAME, SECRET_VALUE);
+
+    let server = test_server();
+    let line = "    <server name=\"";
+    let (_dir, uri) = open_project(&server, &dotenv(), "phpunit.xml", line).await;
+
+    let response = complete_at_end_of_line(&server, uri, line).await;
+    let items = assert_no_process_var_leak(response, "empty prefix in <server name=\"…\">");
+    assert_declared_var_offered(&items, "empty prefix in <server name=\"…\">");
+    assert_eq!(
+        items.len(),
+        2,
+        "empty prefix in <server name=\"…\">: only the two declared variables may be offered, got {:?}",
         items.iter().map(|i| &i.label).collect::<Vec<_>>()
     );
 }
