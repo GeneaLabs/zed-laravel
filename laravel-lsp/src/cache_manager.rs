@@ -32,12 +32,17 @@ use tracing::{debug, info, warn};
 ///     paths/namespaces). v4 caches lack them, so namespaced components would
 ///     resolve as "not found" until a provider edit forced a rebuild — drop
 ///     v4 on read so the namespace maps are indexed and cached up front.
-/// v6: Env variables whose names match `completion_display::is_sensitive_env_name`
-///     are cached with an empty value instead of their plaintext (issue #344).
-///     A v5 cache was written by a binary that stored `DB_PASSWORD` and friends
-///     in cleartext, so it holds secrets this version refuses to write — drop
-///     it on read rather than keep serving them, and let the rescan rebuild a
-///     redacted one.
+/// v6: Env variables are cached with their secrets removed (issue #344).
+///     A name matching `completion_display::is_sensitive_env_name` is stored
+///     with an empty value instead of its plaintext, and any *other* value is
+///     stored through `completion_display::mask_url_credentials`, so a
+///     `DATABASE_URL=mysql://user:pass@host/db` — a name no segment matches —
+///     reaches the file with its password masked. A v5 cache was written by a
+///     binary that stored `DB_PASSWORD` and friends in cleartext, so it holds
+///     secrets this version refuses to write — drop it on read rather than
+///     keep serving them, and let the rescan rebuild a redacted one.
+///     (The value-shape half arrived while v6 was still unmerged, so no
+///     released binary ever wrote a v6 cache without it; no further bump.)
 const CACHE_VERSION: u32 = 6;
 
 /// The redaction bump must never be walked back (issue #344).
@@ -216,8 +221,11 @@ pub struct CachedLaravelConfig {
 ///
 /// A name matching `completion_display::is_sensitive_env_name` is stored with
 /// an **empty** value: the name is still needed on a warm start, the plaintext
-/// never is (issue #344). The writer in `main.rs` enforces that; readers must
-/// not treat an empty value as "unset", because the surfaces redact by name
+/// never is (issue #344). Every other value goes through
+/// `completion_display::mask_url_credentials` first, because a name the
+/// predicate clears can still carry a credential inside its value
+/// (`DATABASE_URL`). The writer in `main.rs` enforces both; readers must not
+/// treat an empty value as "unset", because the surfaces redact by name
 /// anyway.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CachedEnvVars {

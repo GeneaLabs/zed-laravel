@@ -10,13 +10,17 @@
 //! and is covered next to the code that logs, in `database::tests` — these four
 //! are the client-rendered ones.
 //!
-//! All four now consult one predicate,
-//! `completion_display::is_sensitive_env_name`. These tests drive the real
-//! entry points — `completion()`, `hover_for_env`, `get_all_config_keys`, and
-//! a genuine `CacheManager` save/load round trip — with two different matched
-//! keyword categories (`DB_PASSWORD` and `API_TOKEN`) crossing every one of
-//! them, so a surface that re-implemented the check locally and drifted is
-//! caught by observed behaviour rather than by reading the diff.
+//! All four now consult the same two gates: `is_sensitive_env_name`, which
+//! reads the variable's **name**, and `mask_url_credentials`, which reads the
+//! value's **shape**. The second exists because the first cannot see
+//! `DATABASE_URL=mysql://user:pass@host/db` — a name matching no sensitive
+//! segment, filled by stock Laravel's `'url' => env('DATABASE_URL')`, whose
+//! password sits inside the value. These tests drive the real entry points —
+//! `completion()`, `hover_for_env`, `get_all_config_keys`, and a genuine
+//! `CacheManager` save/load round trip — with two different matched keyword
+//! categories (`DB_PASSWORD` and `API_TOKEN`) plus the URL shape crossing every
+//! one of them, so a surface that re-implemented either check locally and
+//! drifted is caught by observed behaviour rather than by reading the diff.
 //!
 //! Leak assertions run over the **whole serialized response**, not the fields
 //! this change touches: `insertText`, `label`, `sortText` and friends are just
@@ -51,6 +55,23 @@ const TOKEN_VALUE: &str = "tok-issue-344-only";
 const PLAIN_NAME: &str = "APP_NAME";
 const PLAIN_VALUE: &str = "Example";
 
+/// The name gate's blind spot: `DATABASE_URL` splits to `DATABASE` / `URL` and
+/// matches no sensitive segment, yet stock Laravel's `config/database.php`
+/// reads `'url' => env('DATABASE_URL')` and the value carries the password
+/// inside itself. Caught by shape, not by name.
+const URL_NAME: &str = "DATABASE_URL";
+const URL_SECRET: &str = "url-hunter2-issue-344";
+
+fn url_value() -> String {
+    format!("mysql://sail:{URL_SECRET}@db.internal.example:3306/laravel")
+}
+
+/// What every surface must render instead: masked, not dropped. The host, port
+/// and database are the whole reason a developer looks at this value.
+fn url_masked() -> String {
+    "mysql://sail:***@db.internal.example:3306/laravel".to_string()
+}
+
 /// A matched name that is *commented out* in the fixture. The client-visible
 /// surfaces skip commented entries already; the cache-write loop never did.
 const COMMENTED_NAME: &str = "MAIL_PASSWORD";
@@ -59,7 +80,8 @@ const COMMENTED_VALUE: &str = "mail-hunter2-issue-344";
 /// The project `.env` every test registers with Salsa.
 fn dotenv() -> String {
     format!(
-        "{PLAIN_NAME}={PLAIN_VALUE}\n{PASSWORD_NAME}={PASSWORD_VALUE}\n{TOKEN_NAME}={TOKEN_VALUE}\n# {COMMENTED_NAME}={COMMENTED_VALUE}\n"
+        "{PLAIN_NAME}={PLAIN_VALUE}\n{PASSWORD_NAME}={PASSWORD_VALUE}\n{TOKEN_NAME}={TOKEN_VALUE}\n{URL_NAME}={}\n# {COMMENTED_NAME}={COMMENTED_VALUE}\n",
+        url_value()
     )
 }
 
@@ -143,7 +165,7 @@ fn assert_no_secret_leak(
     context: &str,
 ) -> Vec<CompletionItem> {
     let (items, json) = dissect(response);
-    for secret in [PASSWORD_VALUE, TOKEN_VALUE, COMMENTED_VALUE] {
+    for secret in [PASSWORD_VALUE, TOKEN_VALUE, COMMENTED_VALUE, URL_SECRET] {
         assert!(
             !json.contains(secret),
             "{context}: {secret} leaked into the completion response: {json}"
@@ -201,6 +223,20 @@ async fn env_completion_redacts_every_matched_category_and_leaves_the_rest_alone
             "{name}: the panel must show the redaction string, not the value"
         );
     }
+
+    // Matched by shape rather than by name: the credential goes, the rest of
+    // the URL stays — dropping the whole value would be a different, worse bug.
+    let url = item(&items, URL_NAME, "env completion");
+    assert_eq!(
+        url.detail.as_deref(),
+        Some(format!("{} (from .env)", url_masked()).as_str()),
+        "{URL_NAME}: the detail line must show the URL with its password masked"
+    );
+    assert_eq!(
+        documentation_markdown(url, "env completion"),
+        expected_panel(URL_NAME, &url_masked()),
+        "{URL_NAME}: the panel must show the masked URL, not the credential"
+    );
 
     // Positive control: the unmatched variable is byte-for-byte what it was.
     let plain = item(&items, PLAIN_NAME, "env completion");
@@ -290,6 +326,29 @@ async fn hover_redacts_every_matched_category() {
     }
 }
 
+/// The shape gate on the hover surface. The name clears the first gate, so a
+/// hover on `DATABASE_URL` is the one place a developer reads that value —
+/// masked, with the host and database still legible.
+#[tokio::test]
+async fn hover_masks_a_credential_carried_inside_the_value() {
+    let (_dir, _root, server) = project(&dotenv()).await;
+    let markdown = server.hover_for_env(URL_NAME).await;
+
+    assert!(
+        !markdown.contains(URL_SECRET),
+        "the password inside {URL_NAME} leaked into the hover markdown: {markdown}"
+    );
+    assert!(
+        markdown.contains(&format!("```\n{}\n```", url_masked())),
+        "the masked URL must still render as a code block: {markdown}"
+    );
+    assert!(
+        !markdown.contains(REDACTED_ENV_VALUE),
+        "the shape gate masks, it does not fall back to the name gate's \
+         whole-value redaction: {markdown}"
+    );
+}
+
 /// Positive control and regression guard: an unmatched variable still renders
 /// its value in a plain code block.
 #[tokio::test]
@@ -324,14 +383,15 @@ async fn the_commented_and_not_found_hover_paths_are_untouched() {
 // Surface 3 — `config('…')` completion
 // ========================================================================
 
-/// `config/app.php` exercising every branch the resolver can take: a dotenv hit
-/// through the plain `env()` spelling, a dotenv hit through the `(bool) env()`
-/// spelling, an unmatched dotenv hit, a literal default, the not-found
-/// placeholder, and a plain literal whose *config key* would match the
-/// predicate if the check were attached to the wrong name.
+/// `config/app.php` exercising every input shape the resolver can take: a
+/// dotenv hit through the plain `env()` spelling, a dotenv hit written with the
+/// `(bool) env()` cast, a dotenv hit caught by value shape rather than by name,
+/// an unmatched dotenv hit, a literal default, the not-found placeholder, and a
+/// plain literal whose *config key* would match the predicate if the check were
+/// attached to the wrong name.
 fn config_php() -> String {
     format!(
-        "<?php\nreturn [\n    'password' => env('{PASSWORD_NAME}'),\n    'token' => (bool) env('{TOKEN_NAME}'),\n    'name' => env('{PLAIN_NAME}', 'Laravel'),\n    'fallback' => env('MISSING_PASSWORD', 'fallback-default'),\n    'absent' => env('ABSENT_TOKEN'),\n    'secret_key' => 'plain-literal-value',\n];\n"
+        "<?php\nreturn [\n    'password' => env('{PASSWORD_NAME}'),\n    'token' => (bool) env('{TOKEN_NAME}'),\n    'url' => env('{URL_NAME}'),\n    'name' => env('{PLAIN_NAME}', 'Laravel'),\n    'fallback' => env('MISSING_PASSWORD', 'fallback-default'),\n    'absent' => env('ABSENT_TOKEN'),\n    'secret_key' => 'plain-literal-value',\n];\n"
     )
 }
 
@@ -360,10 +420,21 @@ async fn config_completion_redacts_only_the_dotenv_sourced_sensitive_values() {
             .clone()
     };
 
-    // Both `env()` spellings resolve through one shared redaction helper, so
-    // neither can be fixed without the other.
+    // Both `env()` spellings redact, and they do so through the *same* arm of
+    // the resolver: `env_pattern` is unanchored, so it matches the
+    // `env('API_TOKEN')` substring of the cast and the `(bool)` prefix never
+    // reaches a branch of its own. The fixture is here to pin that the cast
+    // spelling resolves and redacts at all — not to claim a second code path
+    // exists, which is what the deleted `bool_env_pattern` arm falsely implied.
     assert_eq!(value_of("app.password"), REDACTED_ENV_VALUE);
     assert_eq!(value_of("app.token"), REDACTED_ENV_VALUE);
+
+    // Caught by shape, not by name: `DATABASE_URL` clears the predicate.
+    assert_eq!(
+        value_of("app.url"),
+        url_masked(),
+        "a credential inside the value is masked even though the name is not sensitive"
+    );
 
     // The three exemptions, each of which has nothing to leak.
     assert_eq!(
@@ -456,6 +527,15 @@ async fn the_disk_cache_keeps_sensitive_names_but_never_their_values() {
             "{name} must be cached by name with an empty value — present, never plaintext"
         );
     }
+    // Not name-matched, so not emptied — but the credential inside it must not
+    // reach the file either. This is the worst of the four surfaces to get
+    // wrong: the cache is long-lived, sits outside the project, and no one
+    // reads it before it leaks.
+    assert_eq!(
+        variables.get(URL_NAME).map(String::as_str),
+        Some(url_masked().as_str()),
+        "{URL_NAME} must be cached with its password masked, never in plaintext"
+    );
     assert_eq!(
         variables.get(PLAIN_NAME).map(String::as_str),
         Some(PLAIN_VALUE),
@@ -498,20 +578,31 @@ async fn the_reloaded_cache_registers_cleanly_on_a_cold_server() {
 }
 
 /// A cache file written by a pre-fix binary already holds plaintext secrets.
-/// The `CACHE_VERSION` bump is what stops it being trusted and served.
-#[test]
-fn a_pre_bump_cache_holding_plaintext_is_rejected() {
-    let dir = TempDir::new().expect("tempdir");
-    let root = dir.path().to_path_buf();
+/// The `CACHE_VERSION` bump is what stops it being trusted and served — and the
+/// rescan it forces must leave an ordinary variable exactly as it was.
+///
+/// Both halves live in one test on purpose: "the old file is dropped" and "the
+/// replacement is correct" are one behaviour, and splitting them let AC #7's
+/// regression guard be satisfied by combining two fixtures neither of which
+/// contained both variables.
+#[tokio::test]
+async fn a_pre_bump_cache_holding_plaintext_is_rejected_and_rescanned() {
+    let (_dir, root, server) = project(&dotenv()).await;
 
     // Write a well-formed current-version cache carrying the plaintext, then
     // rewind only its version field. Hand-writing the JSON instead would risk
     // the test passing on a parse error rather than on the version check.
     let mut cache = CacheManager::load(&root);
     cache.set_env_vars(laravel_lsp::cache_manager::CachedEnvVars {
-        variables: [(PASSWORD_NAME.to_string(), PASSWORD_VALUE.to_string())]
-            .into_iter()
-            .collect(),
+        variables: [
+            (PASSWORD_NAME.to_string(), PASSWORD_VALUE.to_string()),
+            // The regression guard rides in the same planted file: an ordinary
+            // variable is dropped along with the secret, and has to come back
+            // unchanged from the rescan.
+            (PLAIN_NAME.to_string(), PLAIN_VALUE.to_string()),
+        ]
+        .into_iter()
+        .collect(),
     });
     cache.save().expect("cache should persist");
     let path = cache.cache_path().expect("cache path").to_path_buf();
@@ -529,13 +620,34 @@ fn a_pre_bump_cache_holding_plaintext_is_rejected() {
     );
     std::fs::write(&path, previous).expect("plant pre-bump cache");
 
-    let loaded = CacheManager::load(&root);
+    // `get_env_vars()` is the assertion that discriminates: `has_cached_data()`
+    // reads only the vendor/app/config sections and would answer the same with
+    // the version check deleted.
     assert!(
-        loaded.get_env_vars().is_none(),
+        CacheManager::load(&root).get_env_vars().is_none(),
         "a pre-bump cache must be dropped, not served — it holds plaintext secrets"
     );
+
+    // The rescan the rejection forces, through the real populate/save/load path.
+    let rescanned = round_trip_cache(&server, &root).await;
+    let variables = &rescanned
+        .get_env_vars()
+        .expect("the rescan must repopulate the cache")
+        .variables;
+    assert_eq!(
+        variables.get(PLAIN_NAME).map(String::as_str),
+        Some(PLAIN_VALUE),
+        "an ordinary variable must survive the forced rescan unchanged"
+    );
+    assert_eq!(
+        variables.get(PASSWORD_NAME).map(String::as_str),
+        Some(""),
+        "the rescan must rewrite the secret as an empty value, not restore it"
+    );
     assert!(
-        !loaded.has_cached_data(),
-        "a rejected cache must force a rescan"
+        !std::fs::read_to_string(&path)
+            .expect("read rescanned cache")
+            .contains(PASSWORD_VALUE),
+        "the rescanned file must not carry the plaintext the planted one did"
     );
 }

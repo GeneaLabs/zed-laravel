@@ -7738,10 +7738,15 @@ impl LaravelLanguageServer {
                 // No `is_commented` filter, matching the loop's existing
                 // behaviour: a commented-out `# DB_PASSWORD=hunter2` is cached
                 // too, so it must be redacted here as well.
+                //
+                // An unmatched name is still not written raw: `DATABASE_URL`
+                // matches no segment and carries the password inside its value,
+                // so it goes to disk with the credential masked. The plaintext
+                // must not reach this file under either gate.
                 let value = if laravel_lsp::completion_display::is_sensitive_env_name(&var.name) {
                     String::new()
                 } else {
-                    var.value.clone()
+                    laravel_lsp::completion_display::mask_url_credentials(&var.value).into_owned()
                 };
                 variables.insert(var.name.clone(), value);
             }
@@ -14916,7 +14921,8 @@ impl LaravelLanguageServer {
     }
 
     /// Resolve an env() call to its actual value
-    /// Handles: env('VAR'), env('VAR', 'default'), env('VAR', default_value)
+    /// Handles: env('VAR'), env('VAR', 'default'), env('VAR', default_value),
+    /// and the `(bool) env('VAR')` cast spelling.
     ///
     /// A value read out of the project's `.env` for a secret-bearing variable
     /// name is replaced here, before it reaches `ConfigKeyCompletion` and the
@@ -14924,11 +14930,24 @@ impl LaravelLanguageServer {
     /// (issue #344). Only the dotenv-sourced path is redacted — a literal
     /// default written in the PHP source is already on screen in the file being
     /// edited, and the `${VAR}` placeholder carries no value to leak.
+    ///
+    /// **One branch, on purpose.** A `(bool) env('APP_DEBUG', false)` cast used
+    /// to have a second `bool_env_pattern` arm below this one. That arm was
+    /// unreachable: `env_pattern` is unanchored, so it matches the
+    /// `env('APP_DEBUG', false)` *substring* of the cast and returns before the
+    /// second pattern is ever consulted. Two arms that cannot both run are not
+    /// redundancy — they are a place for redaction to be fixed in one and
+    /// forgotten in the other, and a test naming "both branches" that only ever
+    /// drove one. The cast spelling still resolves and still redacts; it does so
+    /// through the single arm below, which
+    /// `config_completion_redacts_only_the_dotenv_sourced_sensitive_values`
+    /// pins with a `(bool) env(…)` fixture.
     fn resolve_env_value(
         value: &str,
         env_vars: &std::collections::HashMap<String, String>,
     ) -> String {
-        // Match env('VAR_NAME') or env('VAR_NAME', default) or env("VAR_NAME", default)
+        // Match env('VAR_NAME') or env('VAR_NAME', default) or env("VAR_NAME", default).
+        // Unanchored, so a `(bool) env('VAR')` cast matches here too.
         let env_pattern =
             regex::Regex::new(r#"env\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"](?:\s*,\s*(.+))?\s*\)"#)
                 .unwrap();
@@ -14952,41 +14971,25 @@ impl LaravelLanguageServer {
             return format!("${{{}}}", var_name);
         }
 
-        // Check for (bool) env(...) pattern
-        let bool_env_pattern = regex::Regex::new(
-            r#"\(bool\)\s*env\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"](?:\s*,\s*(.+))?\s*\)"#,
-        )
-        .unwrap();
-
-        if let Some(caps) = bool_env_pattern.captures(value) {
-            let var_name = caps.get(1).unwrap().as_str();
-
-            if let Some(env_value) = env_vars.get(var_name) {
-                return Self::env_display_value(var_name, env_value);
-            }
-
-            if let Some(default_match) = caps.get(2) {
-                let default = default_match.as_str().trim();
-                return default.to_string();
-            }
-
-            return format!("${{{}}}", var_name);
-        }
-
         // Not an env() call, clean up and return as-is
         value.trim_matches('\'').trim_matches('"').to_string()
     }
 
-    /// A dotenv-sourced value as it may be displayed: the value itself, or the
-    /// shared redaction string when the variable's name is secret-bearing.
+    /// A dotenv-sourced value as it may be displayed: the shared redaction
+    /// string when the variable's name is secret-bearing, otherwise the value
+    /// with any credential embedded in it masked.
     ///
-    /// Both `env()` regex branches above route through this — a fix applied to
-    /// only one of them leaves the other echoing credentials.
+    /// Both gates, because either alone leaks: `DB_PASSWORD` is caught by its
+    /// name and `DATABASE_URL=mysql://user:hunter2@host/db` only by its shape.
+    /// The `env()` resolver above is this function's only caller, and it is the
+    /// only route from the dotenv map into `ConfigKeyCompletion`, so the two
+    /// render sites (`completion_detail` and `config_documentation`) receive a
+    /// value that is already safe to print.
     fn env_display_value(var_name: &str, env_value: &str) -> String {
         if laravel_lsp::completion_display::is_sensitive_env_name(var_name) {
             laravel_lsp::completion_display::REDACTED_ENV_VALUE.to_string()
         } else {
-            env_value.to_string()
+            laravel_lsp::completion_display::mask_url_credentials(env_value).into_owned()
         }
     }
 
@@ -20290,10 +20293,13 @@ return [
                 ..Default::default()
             })
         } else {
+            // Unmatched by name, but the value may still carry a credential of
+            // its own — `DATABASE_URL` is the stock Laravel case (issue #344).
+            let shown = laravel_lsp::completion_display::mask_url_credentials(&var.value);
             hover::render(&hover::HoverContent {
                 code: Some(hover::CodeBlock {
                     language: hover::CodeLanguage::Plain,
-                    content: &var.value,
+                    content: &shown,
                 }),
                 source_link: Some(&link),
                 ..Default::default()
@@ -26717,6 +26723,12 @@ impl LanguageServer for LaravelLanguageServer {
                 // not as `(empty)`, so the popup never distinguishes "unset"
                 // from "set" for a credential.
                 let sensitive = laravel_lsp::completion_display::is_sensitive_env_name(&v.name);
+                // The second gate, for a value whose *name* clears the first
+                // one: `DATABASE_URL` matches no segment, and stock Laravel
+                // fills it with `mysql://user:hunter2@host/db`. Identity for
+                // every value that is not a credential-bearing URL, so an
+                // ordinary variable renders exactly as it did.
+                let shown = laravel_lsp::completion_display::mask_url_credentials(&v.value);
 
                 CompletionItem {
                     label: v.name.clone(),
@@ -26724,7 +26736,7 @@ impl LanguageServer for LaravelLanguageServer {
                     detail: Some(if sensitive {
                         format!("(from {})", source_file)
                     } else {
-                        format!("{} (from {})", v.value, source_file)
+                        format!("{} (from {})", shown, source_file)
                     }),
                     documentation: Some(
                         CompletionDoc::new()
@@ -26734,7 +26746,7 @@ impl LanguageServer for LaravelLanguageServer {
                             } else if v.value.is_empty() {
                                 "(empty)".to_string()
                             } else {
-                                v.value.clone()
+                                shown.to_string()
                             })
                             .section(format!("Source: {}", source_file))
                             .into_documentation(),

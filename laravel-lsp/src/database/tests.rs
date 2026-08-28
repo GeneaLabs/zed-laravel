@@ -176,40 +176,6 @@ fn host_candidates_empty_no_fallback() {
     );
 }
 
-// ---- mask_url_password ----
-
-#[test]
-fn mask_url_password_with_credentials() {
-    use super::mask_url_password;
-    assert_eq!(
-        mask_url_password("mysql://sail:secret@127.0.0.1:3306/db"),
-        "mysql://sail:***@127.0.0.1:3306/db"
-    );
-    assert_eq!(
-        mask_url_password("postgres://user:p@ssw0rd@host/db"),
-        // Only the first `@` after creds is treated as the host separator —
-        // best-effort. Any `@` in the password trips this, but it's a
-        // diagnostic helper, not security-critical.
-        "postgres://user:***@ssw0rd@host/db"
-    );
-}
-
-#[test]
-fn mask_url_password_no_password_no_change() {
-    use super::mask_url_password;
-    // No `:` in creds → no password to mask.
-    assert_eq!(
-        mask_url_password("mysql://sail@127.0.0.1/db"),
-        "mysql://sail@127.0.0.1/db"
-    );
-}
-
-#[test]
-fn mask_url_password_no_scheme_returns_input() {
-    use super::mask_url_password;
-    assert_eq!(mask_url_password("not a url"), "not a url");
-}
-
 // ---- build_*_candidates (DB_URL / unix_socket / TCP priority) ----
 
 fn make_config_with(url: Option<&str>, socket: Option<&str>, host: &str) -> super::DatabaseConfig {
@@ -1822,6 +1788,41 @@ const LOG_TOKEN: &str = "tok-log-issue-344";
 /// in full, or the masking has bought security by deleting the diagnostic.
 const LOG_PLAIN_HOST: &str = "db.internal.example";
 
+/// The credential the *name* gate cannot see. `DATABASE_URL` matches no
+/// segment of `SENSITIVE_ENV_SEGMENTS`, and Laravel's stock
+/// `config/database.php` ships `'url' => env('DATABASE_URL')`, so this value
+/// reaches the log on the default configuration of an ordinary project.
+const LOG_URL_SECRET: &str = "url-hunter2-issue-344";
+
+fn log_fixture_db_url() -> String {
+    format!("mysql://sail:{LOG_URL_SECRET}@{LOG_PLAIN_HOST}:3306/laravel")
+}
+
+/// The same fixture with the credential masked — the positive control. Without
+/// it the leak assertion would also pass on a log line that dropped the URL
+/// altogether, which would be a lost diagnostic rather than a fix.
+fn log_fixture_db_url_masked() -> String {
+    format!("mysql://sail:***@{LOG_PLAIN_HOST}:3306/laravel")
+}
+
+/// `config/database.php` with the `url` setting Laravel ships by default.
+const CONFIG_WITH_URL: &str = r#"<?php
+return [
+    'default' => env('DB_CONNECTION', 'mysql'),
+    'connections' => [
+        'mysql' => [
+            'driver' => 'mysql',
+            'url' => env('DATABASE_URL'),
+            'host' => env('DB_HOST', '127.0.0.1'),
+            'port' => env('DB_PORT', '3306'),
+            'database' => env('DB_DATABASE', 'laravel'),
+            'username' => env('DB_USERNAME', 'root'),
+            'password' => env('DB_PASSWORD', ''),
+        ],
+    ],
+];
+"#;
+
 fn log_fixture_env() -> String {
     format!(
         "DB_CONNECTION=mysql\nDB_HOST={LOG_PLAIN_HOST}\nDB_DATABASE=laravel\n\
@@ -1933,6 +1934,95 @@ fn parsing_the_database_config_never_logs_the_dotenv_password() {
     assert!(
         logs.contains(LOG_PLAIN_HOST),
         "an ordinary DB_HOST value is still logged in full:\n{logs}"
+    );
+}
+
+/// The name gate's blind spot, closed by the shape gate.
+///
+/// `DATABASE_URL` matches no sensitive segment, so `mask_env_value_for_log`
+/// takes its *unmatched* arm — which is why that arm is `mask_url_credentials`
+/// and not the raw value. The resolver's `info!` fires under the default
+/// `EnvFilter("info,salsa=warn")`, so an unmasked password here is on screen in
+/// Zed's log panel out of the box.
+#[test]
+fn parsing_the_database_config_never_logs_a_credential_inside_a_url_value() {
+    let dir = TempDir::new().unwrap();
+    write_config_php(dir.path(), CONFIG_WITH_URL);
+    write(
+        dir.path(),
+        ".env",
+        &format!(
+            "{}DATABASE_URL={}\n",
+            log_fixture_env(),
+            log_fixture_db_url()
+        ),
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+
+    let (config, logs) = capture_logs(|| provider.parse_database_config().expect("config parsed"));
+
+    assert_eq!(
+        config.url.as_deref(),
+        Some(log_fixture_db_url().as_str()),
+        "the parse still hands the driver the real URL — masking is a display concern only"
+    );
+    assert!(
+        !logs.contains(LOG_URL_SECRET),
+        "the password inside DATABASE_URL reached the log in plaintext:\n{logs}"
+    );
+    // Two lines print this value, and both must mask it: the resolver's
+    // `resolved from .env:` line and the config summary's `url:` line. Pinned
+    // separately, because masking one and not its sibling is precisely the
+    // shape this fix exists to close.
+    assert!(
+        logs.contains(&format!(
+            "resolved from .env: {}",
+            log_fixture_db_url_masked()
+        )),
+        "the resolver's line must carry the masked URL, not nothing and not the secret:\n{logs}"
+    );
+    assert!(
+        logs.contains(&format!("url: {}", log_fixture_db_url_masked())),
+        "the config summary's url line must carry the masked URL:\n{logs}"
+    );
+    // The unmatched control still logs in full, so the fix did not buy safety
+    // by blanking the diagnostic.
+    assert!(
+        logs.contains(&format!("host: {LOG_PLAIN_HOST}")),
+        "an ordinary DB_HOST value is still logged in full:\n{logs}"
+    );
+}
+
+/// The same gate on the reader itself, one `RUST_LOG=debug` away from the
+/// default filter — the level an ordinary troubleshooting session turns on, and
+/// whose output gets pasted into bug reports.
+#[test]
+fn resolve_env_masks_a_credential_inside_a_url_value_in_its_debug_log() {
+    let dir = TempDir::new().unwrap();
+    write(
+        dir.path(),
+        ".env",
+        &format!("DATABASE_URL={}\n", log_fixture_db_url()),
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+
+    let (url, logs) = capture_logs(|| provider.resolve_env("DATABASE_URL"));
+
+    assert_eq!(
+        url.as_deref(),
+        Some(log_fixture_db_url().as_str()),
+        "caller still gets the real URL"
+    );
+    assert!(
+        !logs.contains(LOG_URL_SECRET),
+        "the password inside DATABASE_URL reached the debug log in plaintext:\n{logs}"
+    );
+    assert!(
+        logs.contains(&format!(
+            r#"resolve_env(DATABASE_URL): Some("{}")"#,
+            log_fixture_db_url_masked()
+        )),
+        "the debug line must carry the masked URL:\n{logs}"
     );
 }
 

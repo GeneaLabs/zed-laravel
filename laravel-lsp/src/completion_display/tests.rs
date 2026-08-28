@@ -295,3 +295,55 @@ fn single_segment_and_empty_names_are_handled() {
     assert!(!is_sensitive_env_name("PASSWORDS"));
     assert!(!is_sensitive_env_name(""));
 }
+
+// ---- the value-shape gate (issue #344, round 2) --------------------------
+
+/// The shape the name gate cannot see. `DATABASE_URL` splits to `DATABASE` /
+/// `URL` — no segment matches — and stock Laravel's `config/database.php` reads
+/// `'url' => env('DATABASE_URL')`, so this is the default configuration, not a
+/// contrived one.
+#[test]
+fn a_credential_inside_the_value_is_masked_whatever_the_name_says() {
+    assert!(
+        !is_sensitive_env_name("DATABASE_URL"),
+        "the premise: the name gate lets this one through, so the shape gate is \
+         the only thing standing between it and the screen"
+    );
+    assert_eq!(
+        mask_url_credentials("mysql://sail:secret@127.0.0.1:3306/db"),
+        "mysql://sail:***@127.0.0.1:3306/db"
+    );
+    assert_eq!(
+        mask_url_credentials("postgres://user:p@ssw0rd@host/db"),
+        // Only the first `@` after the credentials is treated as the host
+        // separator — best-effort. An `@` inside the password leaves its tail
+        // visible, but the characters that identify the credential are gone.
+        "postgres://user:***@ssw0rd@host/db"
+    );
+    assert_eq!(
+        mask_url_credentials("redis://default:redis-secret@redis:6379"),
+        "redis://default:***@redis:6379"
+    );
+}
+
+/// Fail-open, and borrowed while it is at it: a value the parser does not
+/// recognise is returned untouched rather than blanked. `Cow::Borrowed` is
+/// asserted rather than just string equality because it is the observable proof
+/// that the untouched path never rebuilt the string — the property that lets
+/// every surface call this unconditionally.
+#[test]
+fn a_value_carrying_no_credential_is_returned_untouched() {
+    for value in [
+        "Example",                        // an ordinary setting
+        "not a url",                      // no scheme
+        "mysql://sail@127.0.0.1/db",      // credentials, but no password
+        "https://example.com/webhook",    // no credentials at all
+        "sqlite:///absolute/path.sqlite", // scheme, no `@`
+        "",
+    ] {
+        assert!(
+            matches!(mask_url_credentials(value), std::borrow::Cow::Borrowed(v) if v == value),
+            "{value:?} must come back borrowed and unchanged"
+        );
+    }
+}
