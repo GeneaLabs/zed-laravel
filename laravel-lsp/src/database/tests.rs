@@ -1829,48 +1829,76 @@ fn log_fixture_env() -> String {
     )
 }
 
+thread_local! {
+    /// Everything logged on this thread while a capture is running. `None`
+    /// means this thread is not capturing, and the subscriber's output is
+    /// dropped — which is what every other test in the binary wants.
+    static CAPTURED_LOG: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The writer behind the one subscriber the test binary installs. It routes
+/// each event to the capturing thread's buffer, or to nowhere.
+#[derive(Clone, Copy, Default)]
+struct ThreadLocalLogWriter;
+
+impl std::io::Write for ThreadLocalLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        CAPTURED_LOG.with(|slot| {
+            if let Some(buffer) = slot.borrow_mut().as_mut() {
+                buffer.extend_from_slice(bytes);
+            }
+        });
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        *self
+    }
+}
+
 /// Run `f` and return its result plus everything it logged.
 ///
-/// `with_default` scopes the subscriber to this thread for the duration of the
-/// call, so a capture neither depends on nor disturbs whatever subscriber the
-/// test binary installed globally, and two tests capturing at once cannot read
-/// each other's lines. DEBUG because one of the two masked sites is a `debug!`.
+/// The subscriber is **global and installed once**, rather than scoped per
+/// call with `tracing::subscriber::with_default`. Scoping looks tidier and is
+/// wrong here: `tracing` caches each callsite's `Interest` the first time that
+/// callsite is reached, so an ordinary test touching `resolve_env` on another
+/// thread — with no subscriber in place — caches "never" for that macro and
+/// every later capture silently misses it. That is not theory: it turned this
+/// suite red on one CI runner out of three while passing locally, with the
+/// resolver's own lines absent from a capture that held its neighbours.
+///
+/// A global subscriber makes every callsite register against a real subscriber
+/// (and `set_global_default` rebuilds the interest cache), so the answer is
+/// "yes" for good. Isolation moves to the buffer, which is per-thread: a test
+/// that is not capturing writes into `None` and drops its output, exactly as it
+/// did when no subscriber existed at all.
 fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
-    use std::io::Write;
-    use std::sync::Mutex;
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(ThreadLocalLogWriter)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other global subscriber in the test binary");
+    });
 
-    #[derive(Clone, Default)]
-    struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for Buffer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
-        type Writer = Buffer;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    let buffer = Buffer::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(buffer.clone())
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .finish();
-
-    let result = tracing::subscriber::with_default(subscriber, f);
-    let captured =
-        String::from_utf8(buffer.0.lock().unwrap().clone()).expect("log output is utf-8");
+    CAPTURED_LOG.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let result = f();
+    let captured = CAPTURED_LOG.with(|slot| {
+        String::from_utf8(slot.borrow_mut().take().unwrap_or_default())
+            .expect("log output is utf-8")
+    });
     (result, captured)
 }
 
