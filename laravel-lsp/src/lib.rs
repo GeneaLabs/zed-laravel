@@ -81,6 +81,7 @@ pub mod inertia;
 pub mod laravel_introspector;
 pub mod livewire_config;
 pub mod livewire_declaration_locator;
+pub mod livewire_namespaces;
 pub mod livewire_resolver;
 pub mod livewire_version;
 pub mod method_name_completion;

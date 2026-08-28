@@ -433,7 +433,17 @@ pub fn resolve_component(
     let sub = parents_to_path(parents);
 
     let base_dirs: Vec<&PathBuf> = match namespace {
-        Some(ns) => vec![config.component_namespaces.get(ns)?],
+        Some(ns) => {
+            // A namespace may map to a view directory (config
+            // `component_namespaces`), a registered class namespace
+            // (`Livewire::addNamespace` — checked in the class fallback
+            // below), or both. Unknown namespaces resolve to nothing.
+            let view_dir = config.component_namespaces.get(ns);
+            if view_dir.is_none() && !config.class_namespaces.contains_key(ns) {
+                return None;
+            }
+            view_dir.into_iter().collect()
+        }
         None => config.component_locations.iter().collect(),
     };
 
@@ -464,12 +474,22 @@ pub fn resolve_component(
         }
     }
 
-    // V3 class-based fallback. Class lookups don't go through namespaces —
-    // those are a view-co-located concept. So only the un-namespaced names
-    // ever fall through here.
-    if namespace.is_none() {
-        if let Some(c) = try_v3_class(bare, config) {
-            return Some(c);
+    // Class-based fallback. Un-namespaced names use the global class_path;
+    // a namespaced name resolves through a class namespace registered via
+    // `Livewire::addNamespace(...)` when one exists (see
+    // [`crate::livewire_namespaces`]).
+    match namespace {
+        None => {
+            if let Some(c) = try_v3_class(bare, config) {
+                return Some(c);
+            }
+        }
+        Some(ns) => {
+            if let Some(reg) = config.class_namespaces.get(ns) {
+                if let Some(c) = try_namespaced_class(bare, reg) {
+                    return Some(c);
+                }
+            }
         }
     }
 
@@ -540,6 +560,17 @@ fn candidate_livewire_names(path: &Path, config: &LivewireConfig) -> Vec<String>
             if let Some(stem) = rel.to_str().and_then(|s| s.strip_suffix(".php")) {
                 if let Some(name) = kebab_dotted(stem.split(['/', '\\']), "") {
                     out.push(name);
+                }
+            }
+        }
+        // Registered class namespaces (`Livewire::addNamespace`) — same
+        // shape, prefixed with the namespace.
+        for (ns, reg) in &config.class_namespaces {
+            if let Ok(rel) = path.strip_prefix(&reg.class_path) {
+                if let Some(stem) = rel.to_str().and_then(|s| s.strip_suffix(".php")) {
+                    if let Some(name) = kebab_dotted(stem.split(['/', '\\']), "") {
+                        out.push(format!("{ns}::{name}"));
+                    }
                 }
             }
         }
@@ -650,6 +681,26 @@ fn try_volt(parent_dir: &Path, leaf: &str, require_signature: bool) -> Option<Li
     Some(LivewireComponent {
         kind: LivewireComponentKind::Volt,
         paths: vec![candidate],
+    })
+}
+
+/// Class lookup for a namespaced name registered via
+/// `Livewire::addNamespace` — `{class_path}/{Pascal}.php`, dotted parents
+/// mapping to subdirectories exactly like the global class path.
+fn try_namespaced_class(
+    bare: &str,
+    reg: &crate::livewire_namespaces::LivewireClassNamespace,
+) -> Option<LivewireComponent> {
+    let class_file = reg
+        .class_path
+        .join(naming::dotted_to_class_path(bare))
+        .with_extension("php");
+    if !class_file.is_file() {
+        return None;
+    }
+    Some(LivewireComponent {
+        kind: LivewireComponentKind::V3Class,
+        paths: vec![class_file],
     })
 }
 

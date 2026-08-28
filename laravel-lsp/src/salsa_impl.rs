@@ -136,7 +136,7 @@ pub struct ServiceProviderFile {
     #[returns(ref)]
     pub text: String,
 
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     #[returns(copy)]
     pub priority: u8,
 }
@@ -1796,6 +1796,13 @@ pub struct TranslationCache {
     /// The discovered provider set. `None` until the first scan, and reset by
     /// [`Self::invalidate_providers`] so a create or delete is picked up.
     provider_files: Option<TranslationProviderFiles>,
+    /// Additional first-party provider files registered by the LSP host —
+    /// module service providers discovered via the `modules.paths` setting,
+    /// which live outside `app/Providers/` (e.g.
+    /// `app/{Parent}/{Module}/Providers/`). Scanned like app providers, but
+    /// ordered BEFORE them so a real `app/Providers/` registration still
+    /// wins on a namespace conflict (the app boots last).
+    extra_provider_files: Vec<PathBuf>,
     /// How many times this cache has touched disk — one per
     /// `fs::read_to_string` or `read_dir` that actually ran. Lets a test prove
     /// a second resolution is served from Salsa rather than re-read.
@@ -2048,48 +2055,93 @@ impl TranslationCache {
         db: &mut LaravelDatabase,
         root: &Path,
     ) -> Vec<TranslationKeyCompletionData> {
-        let Some(lang_root) = crate::translation_lookup::project_lang_roots(root)
-            .into_iter()
-            .find(|dir| dir.exists())
-        else {
-            return Vec::new();
-        };
-        let listing = self.ensure_dir(db, &lang_root, root);
-        // `locales_in_dir` preserves the directory listing order, which is
-        // filesystem-dependent — APFS hands entries back sorted, ext4 does
-        // not. So the choice must never depend on position in that list:
-        // `completion_locale` selects by name, and its own last resort is the
-        // alphabetical minimum rather than whatever the filesystem listed
-        // first (the platform split CI caught on ubuntu while macOS stayed
-        // green).
-        let candidates = locales_in_dir(&*db, listing).clone();
-        let Some(locale) = completion_locale(root, &candidates) else {
-            return Vec::new();
-        };
-
-        let locale_dir = lang_root.join(&locale);
-        let files = self.ensure_dir(db, &locale_dir, root).entries(&*db).clone();
-
+        // Root-catalogue scan. Its absence must not end the request early:
+        // a project whose ONLY catalogues live under registered namespaces
+        // (never published to a root `lang/`) still gets the namespaced
+        // completions below.
         let mut completions = Vec::new();
-        for (name, is_dir) in files {
-            if is_dir {
-                continue;
+        let lang_root = crate::translation_lookup::project_lang_roots(root)
+            .into_iter()
+            .find(|dir| dir.exists());
+        let locale = lang_root.as_ref().and_then(|lang_root| {
+            let listing = self.ensure_dir(db, lang_root, root);
+            // `completion_locale` selects by NAME (configured locale first,
+            // alphabetical minimum as the last resort) — never by position
+            // in the filesystem-dependent listing order.
+            let candidates = locales_in_dir(&*db, listing).clone();
+            completion_locale(root, &candidates)
+        });
+        if let (Some(lang_root), Some(locale)) = (lang_root, locale) {
+            let locale_dir = lang_root.join(&locale);
+            let files = self.ensure_dir(db, &locale_dir, root).entries(&*db).clone();
+
+            for (name, is_dir) in files {
+                if is_dir {
+                    continue;
+                }
+                let path = locale_dir.join(&name);
+                if path.extension().is_none_or(|ext| ext != "php") {
+                    continue;
+                }
+                let Some(base_key) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let source = format!("lang/{}/{}", locale, name);
+                let file = self.ensure_file(db, &path, root);
+                for (key, value) in
+                    translation_keys_in_file(&*db, file, base_key.to_string()).clone()
+                {
+                    completions.push(TranslationKeyCompletionData {
+                        key,
+                        value,
+                        source: source.clone(),
+                    });
+                }
             }
-            let path = locale_dir.join(&name);
-            if path.extension().is_none_or(|ext| ext != "php") {
-                continue;
-            }
-            let Some(base_key) = path.file_stem().and_then(|s| s.to_str()) else {
+        }
+
+        // Namespaced catalogues — every provider-registered `ns::` lang
+        // directory (vendor packages, modules, app `loadTranslationsFrom`
+        // calls). Without these, a project that keeps a namespace's
+        // catalogues only under its registered directory (never published
+        // to root `lang/vendor/…`) gets zero completions for
+        // `ns::file.key`. Same locale-selection rule as the root scan.
+        let namespaces = self.vendor_namespaces(db, root);
+        let mut namespace_pairs: Vec<(String, PathBuf)> = namespaces.into_iter().collect();
+        namespace_pairs.sort();
+        for (namespace, ns_dir) in namespace_pairs {
+            let listing = self.ensure_dir(db, &ns_dir, root);
+            let ns_locales = locales_in_dir(&*db, listing).clone();
+            let Some(ns_locale) = completion_locale(root, &ns_locales) else {
                 continue;
             };
-            let source = format!("lang/{}/{}", locale, name);
-            let file = self.ensure_file(db, &path, root);
-            for (key, value) in translation_keys_in_file(&*db, file, base_key.to_string()).clone() {
-                completions.push(TranslationKeyCompletionData {
-                    key,
-                    value,
-                    source: source.clone(),
-                });
+            let ns_locale_dir = ns_dir.join(&ns_locale);
+            let files = self
+                .ensure_dir(db, &ns_locale_dir, root)
+                .entries(&*db)
+                .clone();
+            for (name, is_dir) in files {
+                if is_dir {
+                    continue;
+                }
+                let path = ns_locale_dir.join(&name);
+                if path.extension().is_none_or(|ext| ext != "php") {
+                    continue;
+                }
+                let Some(base_key) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let source = format!("{}::lang/{}/{}", namespace, ns_locale, name);
+                let file = self.ensure_file(db, &path, root);
+                for (key, value) in
+                    translation_keys_in_file(&*db, file, base_key.to_string()).clone()
+                {
+                    completions.push(TranslationKeyCompletionData {
+                        key: format!("{}::{}", namespace, key),
+                        value,
+                        source: source.clone(),
+                    });
+                }
             }
         }
 
@@ -2176,6 +2228,19 @@ impl TranslationCache {
         self.providers.clear();
     }
 
+    /// Replace the host-registered extra provider files (module providers
+    /// from the `modules.paths` setting). A no-op when the set is unchanged;
+    /// otherwise the discovered provider set is dropped so the next lookup
+    /// folds the new files in.
+    pub fn set_extra_provider_files(&mut self, mut files: Vec<PathBuf>) {
+        files.sort();
+        if files == self.extra_provider_files {
+            return;
+        }
+        self.extra_provider_files = files;
+        self.invalidate_providers();
+    }
+
     /// The Salsa input for one provider's text, registering it on first touch.
     ///
     /// No containment guard here, unlike [`Self::ensure_file`], and the
@@ -2212,7 +2277,8 @@ impl TranslationCache {
         }
         self.disk_reads += 1;
         let vendor = crate::vendor_translations::vendor_provider_candidates(root);
-        let app = crate::vendor_translations::app_provider_candidates(root);
+        let mut app = self.extra_provider_files.clone();
+        app.extend(crate::vendor_translations::app_provider_candidates(root));
         self.version += 1;
         let files = TranslationProviderFiles::new(&*db, self.version, vendor, app);
         self.provider_files = Some(files);
@@ -2497,7 +2563,7 @@ pub struct ParsedMiddlewareReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2522,7 +2588,7 @@ pub struct ParsedBindingReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2553,7 +2619,7 @@ pub struct ParsedMacroReg<'db> {
     /// 0-based definition line — the closure's line, or the mixin method's line.
     #[returns(copy)]
     pub decl_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
 }
@@ -2570,7 +2636,7 @@ pub struct ParsedViewNamespaceReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2593,7 +2659,7 @@ pub struct ParsedBladeComponentReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2613,7 +2679,7 @@ pub struct ParsedComponentNamespaceReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2634,7 +2700,7 @@ pub struct ParsedAnonymousComponentPathReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2655,7 +2721,7 @@ pub struct ParsedAnonymousComponentNamespaceReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -5353,7 +5419,7 @@ pub struct MiddlewareRegistrationData {
     pub source_file: Option<PathBuf>,
     /// Line number in source file (0-based)
     pub source_line: Option<usize>,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5381,7 +5447,7 @@ pub struct BindingRegistrationData {
     pub source_file: Option<PathBuf>,
     /// Line number in source file (0-based)
     pub source_line: Option<usize>,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5399,7 +5465,7 @@ pub struct MacroRegistrationData {
     pub decl_file: PathBuf,
     /// 0-based definition line.
     pub decl_line: u32,
-    /// Priority: 0=framework, 1=package, 2=app (higher wins on key collision).
+    /// Priority: 0=framework, 1=package, 2=module, 3=app (higher wins on key collision).
     pub priority: u8,
 }
 
@@ -5574,7 +5640,7 @@ pub struct ViewNamespaceData {
     pub source_file: PathBuf,
     /// Line number in source file
     pub source_line: u32,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5592,7 +5658,7 @@ pub struct BladeComponentRegData {
     pub source_file: PathBuf,
     /// Line number in source file
     pub source_line: u32,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5608,7 +5674,7 @@ pub struct ComponentNamespaceData {
     pub source_file: PathBuf,
     /// Line number in source file
     pub source_line: u32,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5648,7 +5714,7 @@ pub struct ParsedMiddlewareData {
     pub file_path: Option<PathBuf>,
     /// Line in source file
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     pub priority: u8,
     /// Source file path
     pub source_file: PathBuf,
@@ -5667,7 +5733,7 @@ pub struct ParsedBindingData {
     pub binding_type: BindingTypeEnum,
     /// Line in source file
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     pub priority: u8,
     /// Source file path
     pub source_file: PathBuf,
@@ -6511,6 +6577,13 @@ pub enum SalsaRequest {
     },
     /// Drop everything derived from service providers
     InvalidateTranslationProviders { reply: oneshot::Sender<()> },
+
+    /// Replace the host-registered extra translation-provider files (module
+    /// providers from the `modules.paths` setting).
+    SetTranslationProviderExtras {
+        files: Vec<PathBuf>,
+        reply: oneshot::Sender<()>,
+    },
     /// How many times the translation cache has touched disk
     LangDiskReads { reply: oneshot::Sender<usize> },
 
@@ -7861,6 +7934,25 @@ impl SalsaHandle {
             .map_err(|_| "Salsa actor dropped reply channel")
     }
 
+    /// Register module service-provider files (from the `modules.paths`
+    /// setting) as first-party translation-namespace providers.
+    pub async fn set_translation_provider_extras(
+        &self,
+        files: Vec<PathBuf>,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SetTranslationProviderExtras {
+                files,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
     /// Drop everything derived from service providers after one changed.
     pub async fn invalidate_translation_providers(&self) -> Result<(), &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -9092,6 +9184,10 @@ impl SalsaActor {
                     self.translations.invalidate_providers();
                     let _ = reply.send(());
                 }
+                SalsaRequest::SetTranslationProviderExtras { files, reply } => {
+                    self.translations.set_extra_provider_files(files);
+                    let _ = reply.send(());
+                }
                 SalsaRequest::LangDiskReads { reply } => {
                     let _ = reply.send(self.translations.disk_reads());
                 }
@@ -10055,9 +10151,12 @@ impl SalsaActor {
             livewire_config,
         );
 
-        // Collect view namespaces from all parsed service providers
-        let mut view_namespaces: HashMap<String, PathBuf> = HashMap::new();
-        let mut component_namespaces: HashMap<String, String> = HashMap::new();
+        // Collect view namespaces from all parsed service providers.
+        // Both maps carry (priority, value) while merging — app > module >
+        // package > framework, last-wins on ties — and drop the priority
+        // once the winner is settled.
+        let mut view_namespaces: HashMap<String, (u8, PathBuf)> = HashMap::new();
+        let mut component_namespaces: HashMap<String, (u8, String)> = HashMap::new();
         let mut anonymous_component_paths: HashMap<String, PathBuf> = HashMap::new();
         let mut anonymous_component_namespaces: HashMap<String, String> = HashMap::new();
         // tag → (priority, class file); higher priority (app > package >
@@ -10070,28 +10169,34 @@ impl SalsaActor {
             for sp_file in self.sorted_sp_files() {
                 let parsed = parse_service_provider_source(&self.db, sp_file, sp_root.clone());
 
-                // Collect view namespaces
+                // Collect view namespaces. Higher priority wins (the app
+                // boots last, so app > module > package); on EQUAL priority
+                // the later provider in the deterministic lexicographic
+                // order wins — matching the documented last-registered-wins
+                // rule and the translation-namespace merge.
                 for vn in parsed.view_namespaces(&self.db) {
                     let ns = vn.namespace(&self.db).namespace(&self.db).clone();
+                    let prio = vn.priority(&self.db);
                     if let Some(path) = vn.view_path(&self.db).clone() {
-                        // Higher priority wins
                         match view_namespaces.get(&ns) {
-                            Some(_) => {} // Keep existing (first wins for now)
-                            None => {
-                                view_namespaces.insert(ns, path);
+                            Some((existing_prio, _)) if *existing_prio > prio => {}
+                            _ => {
+                                view_namespaces.insert(ns, (prio, path));
                             }
                         }
                     }
                 }
 
-                // Collect component namespaces
+                // Collect component namespaces — same precedence rule as the
+                // view namespaces above.
                 for cn in parsed.component_namespaces(&self.db) {
                     let prefix = cn.prefix(&self.db).namespace(&self.db).clone();
+                    let prio = cn.priority(&self.db);
                     let php_ns = cn.php_namespace(&self.db).clone();
                     match component_namespaces.get(&prefix) {
-                        Some(_) => {} // Keep existing (first wins for now)
-                        None => {
-                            component_namespaces.insert(prefix, php_ns);
+                        Some((existing_prio, _)) if *existing_prio > prio => {}
+                        _ => {
+                            component_namespaces.insert(prefix, (prio, php_ns));
                         }
                     }
                 }
@@ -10130,18 +10235,19 @@ impl SalsaActor {
             }
         }
 
-        // Also include any from the legacy cache
+        // Also include any from the legacy cache — fallback-only, so it
+        // never displaces a live parse (priority 0 on insert).
         for (ns, data) in &self.sp_view_namespaces {
             if let Some(path) = &data.view_path {
                 view_namespaces
                     .entry(ns.clone())
-                    .or_insert_with(|| path.clone());
+                    .or_insert_with(|| (0, path.clone()));
             }
         }
         for (prefix, data) in &self.sp_component_namespaces {
             component_namespaces
                 .entry(prefix.clone())
-                .or_insert_with(|| data.php_namespace.clone());
+                .or_insert_with(|| (0, data.php_namespace.clone()));
         }
         for (tag, data) in &self.sp_blade_components {
             if let Some(file) = &data.file_path {
@@ -10173,8 +10279,14 @@ impl SalsaActor {
             component_paths: config_ref.component_paths(&self.db).clone(),
             livewire_path: config_ref.livewire_path(&self.db).clone(),
             has_livewire: config_ref.has_livewire(&self.db),
-            view_namespaces,
-            component_namespaces,
+            view_namespaces: view_namespaces
+                .into_iter()
+                .map(|(ns, (_prio, path))| (ns, path))
+                .collect(),
+            component_namespaces: component_namespaces
+                .into_iter()
+                .map(|(prefix, (_prio, php_ns))| (prefix, php_ns))
+                .collect(),
             anonymous_component_paths,
             anonymous_component_namespaces,
             component_aliases,

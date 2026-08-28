@@ -1114,6 +1114,240 @@ pub fn kebab_to_pascal_case(s: &str) -> String {
 }
 
 // ============================================================================
+// Modular-monolith support (`modules.paths` LSP setting)
+// ============================================================================
+
+/// Expand the configured module-directory patterns against the project root.
+///
+/// Patterns are relative to `root`; a `*` segment matches every child
+/// directory (one level, no recursion), any other segment must match
+/// literally. Results keep the pattern order (ascending config-merge
+/// precedence); within one `*` expansion children are sorted for
+/// determinism; a directory matched by several patterns keeps its first
+/// position. Only existing directories are returned.
+///
+/// A PATTERN escaping the root (a `..` segment) is rejected — that is a
+/// configuration error, not a deliberate layout. Symlinked results are
+/// deliberately followed and NOT containment-checked, by the
+/// configured-vs-discovered split `path_containment` encodes: these paths
+/// come from the user's own `modules.paths` setting, and composer path
+/// repositories legitimately symlink local packages to targets outside the
+/// repository — refusing them would break local package development. Paths
+/// DISCOVERED under a module (the provider-class walk) are gated instead.
+///
+/// Each pattern logs its match count, and a pattern matching nothing warns:
+/// a typo'd glob (`app/**` matches only a directory literally named `**` —
+/// this expansion has no recursive wildcard) is otherwise indistinguishable
+/// from a working one.
+pub fn expand_module_dirs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    for pattern in patterns {
+        let mut current: Vec<PathBuf> = vec![root.to_path_buf()];
+        for segment in pattern.split('/').filter(|s| !s.is_empty()) {
+            if segment == ".." {
+                current.clear();
+                break;
+            }
+            let mut next = Vec::new();
+            if segment == "*" {
+                for dir in &current {
+                    let Ok(entries) = fs::read_dir(dir) else {
+                        continue;
+                    };
+                    let mut children: Vec<PathBuf> = entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir())
+                        .collect();
+                    children.sort();
+                    next.extend(children);
+                }
+            } else {
+                for dir in &current {
+                    let candidate = dir.join(segment);
+                    if candidate.is_dir() {
+                        next.push(candidate);
+                    }
+                }
+            }
+            current = next;
+        }
+        let mut matched = 0usize;
+        for dir in current {
+            if dir != *root && seen.insert(dir.clone()) {
+                out.push(dir);
+                matched += 1;
+            }
+        }
+        if matched == 0 {
+            tracing::warn!(
+                "modules.paths pattern {pattern:?} matched no directories — \
+                 a typo'd glob is a silent no-op (note: `*` matches one \
+                 level; there is no recursive `**`)"
+            );
+        } else {
+            tracing::debug!("modules.paths pattern {pattern:?} matched {matched} directories");
+        }
+    }
+
+    out
+}
+
+/// Service-provider files of the configured module directories, discovered
+/// through each module's own `composer.json`: the classes its
+/// `extra.laravel.providers` array names are the providers Laravel actually
+/// boots (via the merged manifests), so THAT list — not a filename
+/// convention — decides what gets indexed. A `*ServiceProvider.php` file the
+/// manifest doesn't name is not a booted provider and is not indexed; a
+/// provider the manifest names under any filename is.
+///
+/// Each named FQCN resolves to a file through the module manifest's
+/// `autoload.psr-4` mapping (longest matching prefix wins), falling back to
+/// a bounded walk for `{ClassBasename}.php` inside the module when no PSR-4
+/// prefix matches. A module without a `composer.json`, without the `extra`
+/// entry, or whose entries don't resolve on disk simply contributes nothing.
+pub fn module_provider_files(module_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for module_dir in module_dirs {
+        out.extend(composer_declared_providers(module_dir));
+    }
+    out
+}
+
+/// The provider files one module's `composer.json` declares. See
+/// [`module_provider_files`].
+fn composer_declared_providers(module_dir: &Path) -> Vec<PathBuf> {
+    let Ok(manifest) = std::fs::read_to_string(module_dir.join("composer.json")) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return Vec::new();
+    };
+    let Some(providers) = json
+        .pointer("/extra/laravel/providers")
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    let psr4: Vec<(String, String)> = json
+        .pointer("/autoload/psr-4")
+        .and_then(|v| v.as_object())
+        .map(|map| {
+            map.iter()
+                .filter_map(|(prefix, dir)| Some((prefix.clone(), dir.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    providers
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter_map(|fqcn| resolve_provider_class_file(module_dir, &psr4, fqcn))
+        .collect()
+}
+
+/// Resolve one provider FQCN to a file inside `module_dir`: PSR-4 first
+/// (longest matching prefix), then a bounded `{Basename}.php` walk.
+fn resolve_provider_class_file(
+    module_dir: &Path,
+    psr4: &[(String, String)],
+    fqcn: &str,
+) -> Option<PathBuf> {
+    let fqcn = fqcn.trim_start_matches('\\');
+    let mut best: Option<(usize, PathBuf)> = None;
+    for (prefix, dir) in psr4 {
+        let prefix_trimmed = prefix.trim_end_matches('\\');
+        // Composer matches PSR-4 prefixes at a NAMESPACE boundary — prefix
+        // `App\Legal\ContractManagement` must not match FQCN
+        // `App\Legal\ContractManagementSupport\X`. After stripping a
+        // non-empty prefix the remainder therefore has to start with `\`;
+        // only the empty catch-all prefix (`"": "src/"`) takes the FQCN
+        // whole.
+        let Some(rest) = fqcn.strip_prefix(prefix_trimmed) else {
+            continue;
+        };
+        let rest = if prefix_trimmed.is_empty() {
+            rest
+        } else {
+            match rest.strip_prefix('\\') {
+                Some(r) => r,
+                None => continue,
+            }
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        let candidate = module_dir
+            .join(dir)
+            .join(format!("{}.php", rest.replace('\\', "/")));
+        // The manifest's `autoload.psr-4` value is DISCOVERED data: an
+        // absolute path replaces the join base entirely and `..` segments
+        // walk out, so the candidate is gated against the module dir
+        // before it is ever probed — lexically first (no out-of-root
+        // existence oracle), then canonicalized (#228 convention).
+        if !crate::path_containment::path_within_root_lexical(&candidate, module_dir) {
+            continue;
+        }
+        if candidate.is_file() && best.as_ref().is_none_or(|(len, _)| prefix.len() > *len) {
+            best = Some((prefix.len(), candidate));
+        }
+    }
+    if let Some((_, path)) = best {
+        return Some(path);
+    }
+
+    let basename = fqcn.rsplit('\\').next()?;
+    let file_name = format!("{basename}.php");
+    // `follow_links(true)` matches `expand_module_dirs`'s `is_dir()`
+    // behaviour, so a symlinked module looks the same to both. These paths
+    // are DISCOVERED rather than configured, so each yielded entry is gated
+    // (#228 convention) — against the module dir, which is itself trusted
+    // configuration: a symlink INSIDE the module escaping it is refused,
+    // while a module that is itself a symlinked composer path repository
+    // keeps working.
+    walkdir::WalkDir::new(module_dir)
+        .follow_links(true)
+        .max_depth(6)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            name != "vendor" && name != "node_modules"
+        })
+        .filter_map(|e| e.ok())
+        .map(|e| e.into_path())
+        .find(|p| {
+            p.is_file()
+                && p.file_name().and_then(|n| n.to_str()) == Some(file_name.as_str())
+                && crate::path_containment::path_within_root_walk_entry(p, module_dir)
+        })
+}
+
+/// All files that contribute to the config group `group` (the top-level
+/// `config('group.…')` key), in **descending merge precedence** — the file
+/// whose value wins at runtime FIRST: each module's `config/{group}.php` in
+/// reverse module order (the last-merged module wins), then the project
+/// `config/{group}.php` as the fallback. Mirrors the runtime pattern where
+/// a module service provider `array_replace_recursive`s its config files
+/// over the existing repository state. Only existing files are returned.
+///
+/// This helper owns precedence, not just discovery: consumers iterate the
+/// returned order as-is and take the first hit — none of them re-reverses,
+/// so a new consumer cannot silently invert the rule by forgetting a
+/// `.rev()`.
+pub fn config_group_files(root: &Path, module_dirs: &[PathBuf], group: &str) -> Vec<PathBuf> {
+    let file_name = format!("{group}.php");
+    module_dirs
+        .iter()
+        .rev()
+        .map(|m| m.join("config").join(&file_name))
+        .chain(std::iter::once(root.join("config").join(&file_name)))
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

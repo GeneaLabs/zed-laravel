@@ -106,6 +106,7 @@ pub fn build_watchers(
     view_paths: &[PathBuf],
     livewire_path: Option<&Path>,
     psr4_roots: &[PathBuf],
+    module_dirs: &[PathBuf],
 ) -> Vec<FileSystemWatcher> {
     // Watch creates, changes, and deletes — all three matter for
     // keeping the pattern cache aligned with disk. The LSP spec's
@@ -113,10 +114,12 @@ pub fn build_watchers(
     // could leave it None; we pass it explicitly for clarity.
     let kind = Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete);
 
-    // 5 fixed (controllers, routes, migrations, vendor php + blade) + 4 Inertia
-    // page-extension globs + 6 lang-catalogue globs (3 per lang root) + 1
-    // optional livewire + 2 per view path + 1 per PSR-4 source root.
-    let mut watchers = Vec::with_capacity(16 + 2 * view_paths.len() + psr4_roots.len());
+    // 6 fixed (controllers, routes, migrations, config, vendor php + blade)
+    // + 4 Inertia page-extension globs + 6 lang-catalogue globs (3 per lang
+    // root) + 1 optional livewire + 2 per view path + 1 per PSR-4 source
+    // root + 2 per module dir (php + blade).
+    let mut watchers =
+        Vec::with_capacity(17 + 2 * view_paths.len() + psr4_roots.len() + 2 * module_dirs.len());
 
     // Controllers — current default path. If a project moves them, we
     // miss those changes until a future improvement makes this glob
@@ -144,6 +147,16 @@ pub fn build_watchers(
             "{}/database/migrations/**/*.php",
             root.display()
         )),
+        kind,
+    });
+
+    // Config files — external edits (git pull, artisan config publishes)
+    // must invalidate the cached config layer and the file-existence cache
+    // that `config()` goto/diagnostics consult. Module config dirs
+    // (`modules.paths`) get their own per-module watcher pair below — this
+    // glob only covers the root `config/` tree.
+    watchers.push(FileSystemWatcher {
+        glob_pattern: GlobPattern::String(format!("{}/config/**/*.php", root.display())),
         kind,
     });
 
@@ -260,6 +273,28 @@ pub fn build_watchers(
         });
     }
 
+    // One watcher pair per expanded `modules.paths` directory — a module
+    // tree outside every PSR-4 source root (the `Modules/*` shape) would
+    // otherwise get no watcher at all: edits to its config, providers,
+    // views, or lang catalogues would go unseen until a server restart.
+    // The `.php` glob covers config/providers/lang, the `.blade.php` one
+    // the module's views. The dedup is exact-string, same as the PSR-4
+    // loop: it collapses a module dir that IS a watched source root, but a
+    // module nested UNDER one still registers its own (overlapping) pair —
+    // harmless duplication of coverage, not a missed watch.
+    for module_dir in module_dirs {
+        for suffix in ["**/*.php", "**/*.blade.php"] {
+            let glob = format!("{}/{}", glob_base(module_dir), suffix);
+            if !existing.insert(glob.clone()) {
+                continue;
+            }
+            watchers.push(FileSystemWatcher {
+                glob_pattern: GlobPattern::String(glob),
+                kind,
+            });
+        }
+    }
+
     watchers
 }
 
@@ -271,8 +306,9 @@ pub fn build_registration(
     view_paths: &[PathBuf],
     livewire_path: Option<&Path>,
     psr4_roots: &[PathBuf],
+    module_dirs: &[PathBuf],
 ) -> Registration {
-    let watchers = build_watchers(root, view_paths, livewire_path, psr4_roots);
+    let watchers = build_watchers(root, view_paths, livewire_path, psr4_roots, module_dirs);
     let opts = DidChangeWatchedFilesRegistrationOptions { watchers };
     Registration {
         id: REGISTRATION_ID.to_string(),
