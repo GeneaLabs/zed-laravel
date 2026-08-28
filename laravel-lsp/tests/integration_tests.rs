@@ -16,6 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 // Import the library crate for pattern extraction testing
+use laravel_lsp::env_key_locator::is_env_file_name;
 use laravel_lsp::parser::{language_blade, language_php, parse_blade, parse_php};
 use laravel_lsp::queries::{extract_all_blade_patterns, extract_all_php_patterns};
 
@@ -862,14 +863,28 @@ mod architectural_enforcement {
     /// This enforces the architectural routing documented in CLAUDE.md
     #[test]
     fn test_file_type_detection() {
-        // Helper to determine expected Salsa input type
-        // This MUST match the logic in execute_salsa_update() in main.rs
+        // Helper mirroring the dispatch chain of execute_salsa_update() in
+        // main.rs.
+        //
+        // The env arm is not a mirror. It calls `is_env_file_name` — the same
+        // shared gate production calls at main.rs:9066 — so the two cannot
+        // drift apart. Hand-rolling `starts_with(".env")` here once did, and
+        // silently: this table only exercised `.env`, `.env.local` and
+        // `.env.example`, the three inputs where a prefix test and the gate
+        // agree, so the copy stayed green while production was fixed.
+        //
+        // The path-shape arms below ARE approximations, and they are known to
+        // differ from production: `execute_salsa_update` normalizes separators
+        // through `Backend::with_forward_slashes` (private to main.rs, so
+        // unreachable from here) and requires a leading slash on `/config/`.
+        // That divergence predates the shared-gate work and is not touched
+        // here. Only the env classification is claimed to be exact.
         fn expected_salsa_type(filename: &str, path: &str) -> &'static str {
             if (filename == "app.php" && path.contains("bootstrap"))
                 || (path.contains("app/Providers") && filename.ends_with(".php"))
             {
                 "ServiceProviderFile"
-            } else if filename.starts_with(".env") {
+            } else if is_env_file_name(filename) {
                 "EnvFile"
             } else if path.contains("config/") && filename.ends_with(".php") {
                 // Note: no leading "/" - matches partial path
@@ -900,6 +915,15 @@ mod architectural_enforcement {
             (".env", ".env", "EnvFile"),
             (".env.local", ".env.local", "EnvFile"),
             (".env.example", ".env.example", "EnvFile"),
+            // Discriminating cases. A `starts_with(".env")` prefix test
+            // admits all three; the shared gate admits none. They are what
+            // makes a regression to the prefix test fail this suite instead
+            // of passing it, and they mirror the production-side pins in
+            // src/tests/env_source_registration_gate.rs. `.envrc` is
+            // direnv's, and common in Laravel repositories.
+            (".envrc", ".envrc", "Unknown"),
+            (".environment", ".environment", "Unknown"),
+            (".env-backup", ".env-backup", "Unknown"),
             ("app.php", "config/app.php", "ConfigFile"),
             ("database.php", "config/database.php", "ConfigFile"),
             ("composer.json", "composer.json", "ConfigFile"),

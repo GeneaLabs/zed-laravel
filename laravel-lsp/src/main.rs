@@ -9063,8 +9063,14 @@ impl LaravelLanguageServer {
                     debug!("Failed to update service provider in Salsa: {}", e);
                 }
             }
-        } else if filename.starts_with(".env") {
-            // Env file (.env, .env.local, .env.example)
+        } else if laravel_lsp::env_key_locator::is_env_file_name(filename) {
+            // Env file (.env, .env.local, .env.example).
+            //
+            // Gated on the shared predicate, not `starts_with(".env")`: that
+            // prefix also swallows `.envrc` (direnv's file, common in Laravel
+            // repositories), `.environment`, and `.env-backup`, registering
+            // each as a Laravel env source that Salsa then merges into
+            // completion and hover results.
             let priority = match filename {
                 ".env" => 2,
                 ".env.local" => 1,
@@ -21550,7 +21556,7 @@ impl LaravelLanguageServer {
 
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let file_stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
-        let is_env = file_name == ".env" || file_name.starts_with(".env.");
+        let is_env = laravel_lsp::env_key_locator::is_env_file_name(file_name);
         let root = self.root_path.read().await.clone();
         // A `config/<file>.php` (direct child of the project's config dir).
         let is_config = file_name.ends_with(".php")
@@ -24892,7 +24898,12 @@ impl LanguageServer for LaravelLanguageServer {
 
         // Determine context based on file type
         let path = uri.path();
-        let is_env_file = path.contains(".env");
+        // Gate on the file NAME, not the whole path. `path.contains(".env")`
+        // also matches anything under a directory like `.envs/`, which routed
+        // shell scripts — and `.php` files, checked before the PHP branch
+        // below — into env-interpolation completion. Same gate the code-lens
+        // and semantic-token paths use.
+        let is_env_file = laravel_lsp::env_key_locator::path_is_env_file(path);
         let is_phpunit_file = path.ends_with("phpunit.xml")
             || path.ends_with("phpunit.xml.dist")
             || path.ends_with("phpunit.dist.xml");
@@ -26711,7 +26722,7 @@ impl LanguageServer for LaravelLanguageServer {
             .and_then(|n| n.to_str())
             .unwrap_or("");
         let is_blade = path.ends_with(".blade.php");
-        let is_env = file_name == ".env" || file_name.starts_with(".env.");
+        let is_env = laravel_lsp::env_key_locator::is_env_file_name(file_name);
         if !is_blade && !is_env {
             return Ok(None);
         }

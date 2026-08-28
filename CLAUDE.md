@@ -378,14 +378,21 @@ When working on this project:
 ---
 ## Session State (2026-08-26)
 
-### `.env` handling — settled
+### `.env` handling — settled (updated 2026-08-28, #337)
 
 Zed classifies **every** env file as Shell Script: bare `.env` via the bash
 grammar's `path_suffixes`, and `.env.*` variants via `"Shell Script": [".env.*"]`
 in Zed's own `assets/settings/default.json`. The extension therefore attaches to
 `.env` through the single `"Shell Script"` entry in `extension.toml`, and the LSP
-dispatches env features on **filename** (`main.rs` `is_env` / `is_env_file`), not
-on Zed's language classification.
+dispatches env features on **filename**, not on Zed's language classification:
+every env feature routes through one shared gate,
+`env_key_locator::is_env_file_name` (and its path form `path_is_env_file`),
+which matches `.env` exactly or a `.env.` variant prefix. The Salsa ingestion
+in `execute_salsa_update` joined that gate last — it read `starts_with(".env")`
+until #337, and so admitted `.envrc`, `.environment`, and `.env-backup` as
+Laravel env sources. Startup registration is the one env path that does not
+consult the gate, because it names its three files outright and classifies
+nothing.
 
 Consequences, all verified against primary sources:
 
@@ -394,19 +401,26 @@ Consequences, all verified against primary sources:
   the `.env.*` variants sit at the `UserConfigured` tier that only a user's own
   `file_types` can override. Shipping one would fix `.env` and leave
   `.env.local` shell-linted — a split worse than the uniform status quo.
-- **`zarifpour/zed-env` is not recommended, but the `"env"` attach entry stays.**
-  Its `path_suffixes` are a bare `"env"` (loses the length tie to `".env"`), so
-  it never claims the files it appears to; and its bare `"conf"` / `"example"` /
-  `"local"` / `"test"` entries reclassify unrelated files project-wide (e.g.
-  `laravel/sail`'s `supervisord.conf`). The docs argue against remapping — but
-  arguing against a path is not the same as breaking it. `extension.toml` keeps
-  `"env"` in its `languages` list so a user who wants a purpose-built dotenv
-  grammar does not thereby lose this extension's `.env` features. Docs express
-  a recommendation; the manifest expresses a capability. Don't conflate them.
-- **SC2034 noise is silenced automatically** in Laravel worktrees via the
-  extension's additional-workspace-configuration hook (`src/lib.rs`). A user's
-  own `bashIde.shellcheckArguments` containing `SC2034` short-circuits the
-  injection and passes through untouched.
+- **`zarifpour/zed-env` is not recommended, and the `"env"` attach entry was
+  dropped in v0.7.4 (#337).** Its `path_suffixes` are a bare `"env"` (loses the
+  length tie to `".env"`), so it never claims the files it appears to; and its
+  bare `"conf"` / `"example"` / `"local"` / `"test"` entries reclassify
+  unrelated files project-wide (e.g. `laravel/sail`'s `supervisord.conf`).
+  Because it never claims `.env`, the `"env"` attach entry never fired — it
+  bought no capability, while reading to a registry reviewer as this extension
+  claiming another extension's language. `extension.toml` now attaches to
+  `"PHP"`, `"Blade"`, `"XML"` and `"Shell Script"` only, and its comment block
+  carries the written justification for the `"Shell Script"` entry.
+- **SC2034 noise is NOT silenced by this extension.** The
+  `language_server_additional_workspace_configuration` hook that injected
+  `--exclude=SC2034` into bash-language-server shipped in v0.7.2–v0.7.3 and was
+  removed entirely in v0.7.4 (#337). It reconfigured a language server this
+  extension neither provides nor owns, which Zed's publishing prerequisites
+  forbid, and the registry rejected v0.7.3 over it
+  (zed-industries/extensions#7370). `src/lib.rs` now writes workspace
+  configuration for `laravel-lsp` and nothing else. The manual workarounds in
+  `docs/environment.md` are the whole answer by design: document how, do not do
+  it to the user's other servers.
 
 ### Blade language definition — still open
 

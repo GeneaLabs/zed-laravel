@@ -236,3 +236,49 @@ fn enumerate_handles_empty_value_and_leading_whitespace() {
     // Leading whitespace is reflected in the start column.
     assert_eq!((keys[1].1.start_column, keys[1].1.end_column), (2, 8));
 }
+
+// ── `is_env_file_name` — the gate every env feature classifies with ──
+
+#[test]
+fn env_file_name_matches_bare_env_and_every_variant() {
+    assert!(is_env_file_name(".env"));
+    for variant in [".env.local", ".env.example", ".env.testing", ".env.prod.1"] {
+        assert!(is_env_file_name(variant), "{variant} is a Laravel env file");
+    }
+}
+
+#[test]
+fn env_file_name_rejects_names_that_merely_start_with_dot_env() {
+    // `.envrc` is direnv's file, not Laravel's — the variant arm requires
+    // the separating dot, so a bare `starts_with(".env")` would be wrong.
+    assert!(!is_env_file_name(".envrc"));
+    assert!(!is_env_file_name(".env-backup"));
+    assert!(!is_env_file_name(".environment"));
+}
+
+#[test]
+fn env_file_name_rejects_names_that_only_contain_env() {
+    assert!(!is_env_file_name("env"));
+    assert!(!is_env_file_name("app.env"));
+    assert!(!is_env_file_name("deploy.sh"));
+}
+
+#[test]
+fn env_gate_reads_the_file_name_not_the_path() {
+    // Regression: the completion path gated on `path.contains(".env")`, so a
+    // shell script or a `.php` file under a directory such as `.envs/` was
+    // treated as an env file. Callers must reduce to the file name first.
+    for path in [
+        "/srv/app/.envs/deploy.sh",
+        "/srv/.env-config/app/config.php",
+        "/home/me/.env.d/notes.md",
+    ] {
+        assert!(
+            !path_is_env_file(path),
+            "{path} is not an env file — only its directory mentions .env"
+        );
+    }
+    for path in ["/srv/app/.env", "/srv/app/.env.local"] {
+        assert!(path_is_env_file(path), "{path} is a real env file");
+    }
+}

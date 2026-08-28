@@ -8,31 +8,17 @@ Open a `.env` in Zed and every single line lights up with a warning:
 
 Nothing is wrong with your file. The message is shellcheck's [SC2034](https://www.shellcheck.net/wiki/SC2034). Zed classifies `.env` files as the **Shell Script** language and runs its bundled bash language server on them, which calls shellcheck. SC2034 flags any variable that's assigned but never *referenced in the same file* — and a `.env` is nothing but assignments that Laravel reads at runtime through `config()` / `env()`, never inside the file itself. So shellcheck flags **every line**. It's shell-script linting applied to a data file.
 
-## ✅ Fixed automatically in Laravel projects (v0.7.2+)
+## 🔧 How to silence SC2034
 
-This extension quiets the noise for you. In any worktree whose `composer.json` depends on the `laravel/*` or `illuminate/*` vendor namespaces (full apps **and** packages — detection doesn't rely on `artisan` existing), the extension injects `--exclude=SC2034` into the bash language server's shellcheck arguments.
-
-- **Your own arguments are preserved.** Anything you've set under `lsp.bash-language-server.settings.bashIde.shellcheckArguments` is kept, with the exclusion appended — and if your arguments already mention `SC2034` (excluded *or* deliberately kept), they pass through untouched.
-- **Scope:** shellcheck configuration is per-server, not per-file, so SC2034 is muted for every shell file in that worktree — real `.sh` scripts included. Every *other* shellcheck rule still applies to them. Non-Laravel worktrees are never touched.
-- **Works on every Zed version**, including releases where `lsp.bash-language-server.settings` itself is silently dropped (see the warning below) — the injection travels through Zed's extension hook for configuring *other* language servers, which is delivered independently.
-
-Opt out per-project or globally:
-
-```json
-{
-  "lsp": {
-    "laravel-lsp": {
-      "settings": {
-        "shellcheck": { "suppressUnusedVarWarnings": false }
-      }
-    }
-  }
-}
-```
-
-The approaches below remain useful for non-Laravel worktrees, opted-out setups, and editors other than Zed.
-
-## 🔧 Manual approaches
+**You pick the approach — the extension does not do it for you.** Versions
+0.7.2 and 0.7.3 injected `--exclude=SC2034` into the bash language server's
+shellcheck arguments on your behalf. That was removed in 0.7.4: it
+reconfigured a language server this extension neither provides nor owns,
+which Zed's [extension publishing prerequisites](https://zed.dev/docs/extensions/publishing/prerequisites)
+do not permit. If your `.env` files went quiet under 0.7.2 or 0.7.3 and are
+noisy again, pick one of the four approaches below. Each is a one-time
+setting; approach 2 (`.shellcheckrc`) is the one that works in any editor and
+on every Zed version, so start there if you want the shortest route.
 
 ### 1. Silence the rule via Zed settings
 
@@ -102,7 +88,7 @@ Map `.env` files to a non-shell language in `settings.json`. A `.env` is `KEY=va
 
 Install the Ini extension (`zed: extensions`, search "INI") if you don't already have it. To avoid any extra install, map to the built-in **Plain Text** instead — the warnings disappear, but `.env` renders without highlighting.
 
-> ⚠️ **This detaches our `.env` features.** The reference-count lens, hover, and go-to attach to the **Shell Script** language — Zed's default classification for `.env` and every `.env.*` variant. Remap to Ini or Plain Text and you trade shellcheck noise for losing them. Since v0.7.2 silences that noise automatically, approach 4 is now rarely the right trade.
+> ⚠️ **This detaches our `.env` features.** The reference-count lens and the inline-comment highlighting below attach to the **Shell Script** language — Zed's default classification for `.env` and every `.env.*` variant. Remap to Ini or Plain Text and you trade shellcheck noise for losing them. Approaches 1–3 silence SC2034 without giving anything up, so reach for this one only when you actually want a different grammar on `.env`.
 
 ### A note on dedicated dotenv extensions
 
@@ -143,7 +129,40 @@ The extension corrects this via LSP semantic tokens, which Zed leaves **off** by
 
 Any of the `settings.json` blocks above also work in `.zed/settings.json` at the project root, scoping the change to one project instead of all of Zed. (The `.shellcheckrc` approach is already project-scoped by nature.)
 
-## What the extension can — and can't — do for you
+## Why this extension attaches to `Shell Script`
 
-- **Can (and does):** configure the bash language server. Zed lets one extension contribute *additional workspace configuration* to another server, merged into that server's own config — that's how the automatic fix above is delivered, and why it works even on Zed versions that drop your own `bash-language-server` settings.
-- **Can't:** change how Zed classifies files. The extension manifest has no `file_types` field, so the only lever an extension has is a language of its own with matching `path_suffixes` — and that lever reaches exactly half the problem. Bare `.env` is claimed by the bash grammar's `path_suffixes`, which an extension language could tie and win; the `.env.*` variants are claimed by Zed's *default settings*, a tier no extension can reach and only *your* `file_types` can override. Shipping a language would therefore fix `.env` and leave `.env.local` shell-linted — a split we'd rather not hand you. That's why approach 4 is one line in your config, and why this extension attaches to Shell Script instead of trying to replace it.
+`extension.toml` lists `Shell Script` under the `languages` key for the
+`laravel-lsp` server. That key is an *attach* list — "run my server on files
+Zed has already classified this way" — not an ownership claim:
+
+- **This extension defines no languages and ships no grammars.** There is no
+  `languages/` directory and no `[grammars]` section in its manifest. It
+  cannot register, override, or take over a language, and it does not try to.
+- **The `.env` features are gated on the filename, never on Zed's
+  classification.** The server checks that a file is named `.env` or
+  `.env.<something>` before it does anything env-specific, and hover,
+  go-to-definition, find-references and rename only ever run on `.php` and
+  `.blade.php`. Open a real `.sh` script and this extension contributes
+  nothing to it — no hover, no go-to-definition, no diagnostics.
+- **`Shell Script` is the only route to your `.env` files.** Zed ships no
+  `env` language, and classifies every env file as Shell Script: bare `.env`
+  via the bash grammar's `path_suffixes`, and the `.env.*` variants via Zed's
+  own default settings. That one attach entry reaches `.env` and every
+  variant alike, with no configuration from you.
+
+## What the extension can't do for you
+
+- **Silence shellcheck.** Writing configuration into the bash language server
+  would mean reaching outside this extension's own environment. Zed's
+  publishing prerequisites rule that out, so the approaches above are your
+  levers, not ours.
+- **Change how Zed classifies files.** The extension manifest has no
+  `file_types` field, so the only lever an extension has is a language of its
+  own with matching `path_suffixes` — and that lever reaches exactly half the
+  problem. Bare `.env` is claimed by the bash grammar's `path_suffixes`, which
+  an extension language could tie and win; the `.env.*` variants are claimed
+  by Zed's *default settings*, a tier no extension can reach and only *your*
+  `file_types` can override. Shipping a language would therefore fix `.env`
+  and leave `.env.local` shell-linted — a split we'd rather not hand you.
+  That's why approach 4 is one line in your config, and why this extension
+  attaches to Shell Script instead of trying to replace it.
