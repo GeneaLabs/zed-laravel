@@ -26,6 +26,35 @@ pub struct EnvKeyLocation {
     pub position: KeyPosition,
 }
 
+/// Whether `name` is a file name Laravel reads as an environment file:
+/// exactly `.env`, or a `.env.<suffix>` variant (`.env.local`,
+/// `.env.example`, `.env.testing`, …).
+///
+/// This is the single gate every env feature dispatches on, and it takes a
+/// **file name** — never a path. A substring test against a whole path
+/// (`path.contains(".env")`) also matches every file under a directory such
+/// as `.envs/`, which attaches env behaviour to shell scripts and `.php`
+/// files that are not env files at all.
+///
+/// Note `.env` alone is matched exactly: `.envrc` starts with `.env` but is
+/// direnv's file, not Laravel's, so the variant arm requires the dot.
+pub fn is_env_file_name(name: &str) -> bool {
+    name == ".env" || name.starts_with(".env.")
+}
+
+/// Whether the file at `path` is an environment file, judged by its file
+/// name alone. The convenience form of [`is_env_file_name`] for callers that
+/// hold a path (an LSP request carries a URI, not a name).
+///
+/// Reducing to the file name first is the whole point: a path that merely
+/// *mentions* `.env` — `/srv/app/.envs/deploy.sh` — is not an env file.
+pub fn path_is_env_file(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_env_file_name)
+}
+
 /// Find every `.env*` file at the project root that declares `key`.
 /// Returns one entry per matching file. A key absent from a particular
 /// file simply contributes nothing — that file is left alone.
@@ -56,7 +85,7 @@ pub fn locate_keys_across_env_files(root: &Path, key: &str) -> Vec<EnvKeyLocatio
         // `.env` exact match OR `.env.<suffix>` prefix match. We
         // deliberately don't recurse into subdirectories — Laravel
         // doesn't read env files from anywhere but the project root.
-        if !(name == ".env" || name.starts_with(".env.")) {
+        if !is_env_file_name(name) {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&path) else {
