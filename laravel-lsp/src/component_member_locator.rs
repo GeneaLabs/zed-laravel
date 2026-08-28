@@ -172,17 +172,24 @@ pub fn public_property_types(source: &str) -> Vec<(String, String)> {
                     // `static` property isn't part of the component's
                     // template surface — Livewire only serializes instance
                     // state — so it's excluded like a non-public one.
+                    // Separate flags, exactly as `public_action_method_names`
+                    // below keeps them: PHP accepts either modifier order,
+                    // and a shared flag let `static public string $x` slip
+                    // through — the `static_modifier` child is visited
+                    // first, and the `visibility_modifier` then reset the
+                    // flag back to true.
                     let mut public = n.kind() == "property_declaration";
+                    let mut is_static = false;
                     for ch in n.children(&mut c) {
                         match ch.kind() {
                             "visibility_modifier" => {
                                 public = ch.utf8_text(bytes).ok() == Some("public");
                             }
-                            "static_modifier" => public = false,
+                            "static_modifier" => is_static = true,
                             _ => {}
                         }
                     }
-                    public
+                    public && !is_static
                 };
                 if is_public {
                     let type_text = n

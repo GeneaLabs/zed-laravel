@@ -773,6 +773,15 @@ fn front_matter_window(content: &str) -> &str {
 /// Line-granular by design: a binding and a use on the same line count as
 /// in scope (`@foreach ($users as $user)` — cursor on `$user`).
 pub fn is_template_local_binding(content: &str, line: u32, var: &str) -> bool {
+    // Blade (`{{-- --}}`) and HTML (`<!-- -->`) comments never execute, so a
+    // directive inside one binds nothing — a commented-out `@foreach` is the
+    // routine debugging move, and without this it would shadow its loop
+    // variable for the rest of the file (a single-line comment leaves no
+    // `@endforeach` to pop). Blanked rather than removed so line numbers
+    // stay stable. A directive in ordinary prose is deliberately still
+    // honored: Blade genuinely compiles those (that is what `@@` escaping
+    // is for).
+    let content = blank_template_comments(content);
     let mut loop_stack: Vec<Vec<String>> = Vec::new();
     let mut for_stack: Vec<Vec<String>> = Vec::new();
     let mut persistent: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -841,6 +850,38 @@ pub fn is_template_local_binding(content: &str, line: u32, var: &str) -> bool {
             .iter()
             .any(|names| names.iter().any(|n| n == var))
         || for_stack.iter().any(|names| names.iter().any(|n| n == var))
+}
+
+/// `content` with every Blade (`{{-- --}}`) and HTML (`<!-- -->`) comment
+/// blanked to spaces — newlines kept, so per-line scans keep their line
+/// numbers. An unterminated comment blanks to end of input, matching how
+/// the compiler would swallow the rest of the template.
+fn blank_template_comments(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let mut out = content.as_bytes().to_vec();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (open, close): (&[u8], &[u8]) = if bytes[i..].starts_with(b"{{--") {
+            (b"{{--", b"--}}")
+        } else if bytes[i..].starts_with(b"<!--") {
+            (b"<!--", b"-->")
+        } else {
+            i += 1;
+            continue;
+        };
+        let body_start = i + open.len();
+        let end = content[body_start..]
+            .find(std::str::from_utf8(close).unwrap())
+            .map(|rel| body_start + rel + close.len())
+            .unwrap_or(bytes.len());
+        for b in &mut out[i..end] {
+            if *b != b'\n' {
+                *b = b' ';
+            }
+        }
+        i = end;
+    }
+    String::from_utf8(out).expect("only ASCII bytes were replaced")
 }
 
 /// The text following `@{name}` on `line`, when the directive occurs with a
@@ -926,12 +967,30 @@ fn collect_assignments(s: &str, out: &mut std::collections::HashSet<String>) {
     out.extend(names);
 }
 
-/// Every `'name'` / `"name"` string key or entry in a `@props([...])` /
-/// `@aware([...])` argument on this line.
+/// Every `'name'` / `"name"` string KEY or bare entry in a `@props([...])` /
+/// `@aware([...])` argument on this line. A quoted string right after `=>`
+/// is a prop's default VALUE (`['size' => 'md']` declares `$size`, never
+/// `$md`) and binds nothing.
 fn collect_quoted_names(s: &str, out: &mut std::collections::HashSet<String>) {
     let mut chars = s.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
         if c == '\'' || c == '"' {
+            if s[..i].trim_end().ends_with("=>") {
+                // Skip the whole default-value string.
+                if let Some(rel) = s[i + c.len_utf8()..].find(c) {
+                    let end = i + c.len_utf8() + rel;
+                    while let Some(&(j, _)) = chars.peek() {
+                        if j <= end {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    continue;
+                } else {
+                    break;
+                }
+            }
             if let Some(rel) = s[i + 1..].find(c) {
                 let name = &s[i + 1..i + 1 + rel];
                 if !name.is_empty()

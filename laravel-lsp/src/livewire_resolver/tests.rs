@@ -824,3 +824,60 @@ fn cursor_past_end_of_line_does_not_panic() {
     assert!(wire_attribute_completion_context(line, past).is_none());
     assert!(wire_attribute_target_at(line, past).is_none());
 }
+
+#[test]
+fn commented_out_foreach_binds_nothing() {
+    // Commenting out a loop while debugging is routine — a single-line
+    // Blade comment leaves no @endforeach, so without comment-blanking the
+    // variable stayed "shadowed" for the rest of the file and a real class
+    // property stopped navigating.
+    let content = "\
+{{-- @foreach ($rows as $row) --}}
+<span>{{ $row }}</span>";
+    assert!(!is_template_local_binding(content, 1, "row"));
+}
+
+#[test]
+fn multiline_blade_comment_blanks_its_whole_body() {
+    let content = "\
+{{--
+@foreach ($rows as $row)
+    {{ $row }}
+@endforeach
+--}}
+<span>{{ $row }}</span>";
+    assert!(!is_template_local_binding(content, 5, "row"));
+}
+
+#[test]
+fn html_comment_does_not_open_a_php_block() {
+    // `<!-- @php -->` used to open a block that never closes, so every
+    // later `$name = …` line registered as a local.
+    let content = "\
+<!-- @php -->
+<span>{{ $total }}</span>
+{{ $x = 'not php, just an echo of an assignment' }}";
+    assert!(!is_template_local_binding(content, 1, "total"));
+}
+
+#[test]
+fn uncommented_directives_still_bind_next_to_commented_ones() {
+    let content = "\
+{{-- @foreach ($old as $item) --}}
+@foreach ($rows as $item)
+    {{ $item }}
+@endforeach";
+    assert!(is_template_local_binding(content, 2, "item"));
+}
+
+#[test]
+fn props_default_values_are_not_bindings() {
+    // #339 item 8: `['size' => 'md']` declares $size — 'md' is its default
+    // VALUE and must not shadow a class property named $md.
+    let content = "\
+@props(['variant', 'size' => 'md'])
+<span>{{ $md }} {{ $size }} {{ $variant }}</span>";
+    assert!(is_template_local_binding(content, 1, "variant"));
+    assert!(is_template_local_binding(content, 1, "size"));
+    assert!(!is_template_local_binding(content, 1, "md"));
+}
