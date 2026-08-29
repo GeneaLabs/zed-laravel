@@ -187,7 +187,7 @@ fn an_empty_config_value_omits_the_code_block() {
     let doc = panel(config_documentation("app.name", "", "config/app.php"));
 
     assert!(!doc.contains("```"), "no value means no PHP block: {doc:?}");
-    assert!(doc.contains("**app.name**"));
+    assert!(doc.contains("**app\\.name**"));
     assert!(doc.contains("Source: config/app.php"));
 }
 
@@ -200,7 +200,7 @@ fn an_empty_translation_value_falls_back_to_a_generic_summary() {
     ));
 
     assert!(doc.contains("Translation key."));
-    assert!(doc.contains("**auth.failed**"));
+    assert!(doc.contains("**auth\\.failed**"));
     assert!(doc.contains("Source: lang/en/auth.php"));
 }
 

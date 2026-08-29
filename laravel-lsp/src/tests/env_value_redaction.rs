@@ -195,7 +195,16 @@ fn documentation_markdown(item: &CompletionItem, context: &str) -> String {
 
 /// The panel `completion()` builds for a `.env` variable: name, summary,
 /// `Source: <file>`. Asserted whole, so dropping any builder call fails.
+///
+/// The header arrives markdown-escaped (`markdown_safety::escape_inline`),
+/// because a `.env` key has no charset and the panel is rendered as markdown.
+/// Building the expectation with the same helper is not circular: the escaping
+/// itself is pinned by `markdown_safety`'s own literal-expectation tests and by
+/// the link/image fixtures in `env_key_navigation.rs`. What *this* helper
+/// asserts is the panel's structure and its redaction, and those must not
+/// become unreadable to spell an underscore.
 fn expected_panel(name: &str, summary: &str) -> String {
+    let name = laravel_lsp::markdown_safety::escape_inline(name);
     format!("**{name}**\n\n{summary}\n\nSource: .env")
 }
 

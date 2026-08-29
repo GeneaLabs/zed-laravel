@@ -83,7 +83,8 @@ impl CompletionDoc {
 
     /// The qualified identifier shown on the first line — `Model::with`,
     /// `users.email`, `app.name`, `route('home')`, etc. Plain text;
-    /// matches how Intelephense leads its panels.
+    /// matches how Intelephense leads its panels. [`render`](Self::render)
+    /// escapes it, so an unconstrained identifier (a `.env` key) is safe here.
     pub fn header(mut self, header: impl Into<String>) -> Self {
         let h = header.into();
         if !h.is_empty() {
@@ -95,6 +96,12 @@ impl CompletionDoc {
     /// One-line prose summary. For methods this is the PHPDoc summary; for
     /// other items it's a short description ("Route definition", a config
     /// value, the translated string, …).
+    ///
+    /// **Markdown-bearing, unlike [`header`](Self::header).** A PHPDoc summary
+    /// legitimately carries emphasis and inline code, so [`render`](Self::render)
+    /// must not escape this field. A call site putting *untrusted* text here
+    /// (rather than in [`code`](Self::code), which is fence-safe) owns the
+    /// escaping itself.
     pub fn summary(mut self, summary: impl Into<String>) -> Self {
         let s = summary.into();
         if !s.is_empty() {
@@ -200,7 +207,13 @@ impl CompletionDoc {
         let mut blocks: Vec<String> = Vec::new();
 
         if let Some(header) = &self.header {
-            blocks.push(format!("**{}**", header));
+            // Escaped for the same reason `hover::render` escapes its own
+            // header: the `.env` branch of the `completion` handler feeds this
+            // field a raw key, and a `.env` key has no charset restriction.
+            blocks.push(format!(
+                "**{}**",
+                crate::markdown_safety::escape_inline(header)
+            ));
         }
         if let Some(summary) = &self.summary {
             blocks.push(summary.clone());
@@ -215,7 +228,9 @@ impl CompletionDoc {
             } else {
                 code.code.clone()
             };
-            blocks.push(format!("```{}\n{}\n```", code.language, body));
+            // Fence length negotiated against the body — the same `.env`
+            // completion path puts an unconstrained value in here.
+            blocks.push(crate::markdown_safety::fenced_block(&code.language, &body));
         }
         for section in &self.sections {
             if section.trim_start().starts_with('@') {

@@ -229,7 +229,15 @@ fn documentation_markdown(item: &CompletionItem, context: &str) -> String {
 /// the bolded header, the value as the summary, `Source: <file>` as the trailing
 /// section. Asserted whole rather than by substring, so dropping any one of the
 /// three builder calls fails — not only the `.section(...)` this fix is about.
+/// The header arrives markdown-escaped (`markdown_safety::escape_inline`),
+/// because a `.env` key has no charset and the panel is rendered as markdown.
+/// Building the expectation with the same helper is not circular: the escaping
+/// itself is pinned by `markdown_safety`'s own literal-expectation tests and by
+/// the link/image fixtures in `env_key_navigation.rs`. What *this* helper
+/// asserts is the panel's structure and its redaction, and those must not
+/// become unreadable to spell an underscore.
 fn expected_documentation(name: &str, value: &str, source_file: &str) -> String {
+    let name = laravel_lsp::markdown_safety::escape_inline(name);
     format!("**{name}**\n\n{value}\n\nSource: {source_file}")
 }
 
