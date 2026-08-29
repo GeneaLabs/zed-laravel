@@ -441,3 +441,104 @@ async fn completion_and_the_shared_helper_agree_on_precedence() {
         "…which is the module's value, per the documented rule"
     );
 }
+
+// ---- the label these surfaces render ---------------------------------------
+
+#[test]
+fn the_config_source_label_normalizes_separators() {
+    // The unit check, written to fail on EVERY platform rather than only on
+    // Windows: `config\app.php` is one legal file name on Unix, so the
+    // relative part arrives carrying a backslash here exactly as it would
+    // arrive from a Windows `strip_prefix`. Drop the normalization in
+    // `config_source_label` and this reddens locally, not just in Windows CI.
+    let root = Path::new("/project");
+    assert_eq!(
+        crate::config_source_label(&root.join(r"config\app.php"), root),
+        "config/app.php",
+        "a platform separator must not reach the user-visible label"
+    );
+    assert_eq!(
+        crate::config_source_label(&root.join("config").join("app.php"), root),
+        "config/app.php",
+        "a component-built path renders the same label"
+    );
+}
+
+#[test]
+fn an_out_of_root_config_file_keeps_its_full_path_in_the_label() {
+    // The fallback is not `route_source_label`'s: a module config dir may sit
+    // outside the project root, and the bare `app.php` a file-name fallback
+    // would produce could not say which module declared the key.
+    let label = crate::config_source_label(
+        Path::new("/elsewhere/mod/config/app.php"),
+        Path::new("/project"),
+    );
+    assert_eq!(label, "/elsewhere/mod/config/app.php");
+}
+
+#[tokio::test]
+async fn completion_labels_the_root_config_file_with_forward_slashes() {
+    // The end-to-end pin at the real call site: a unit test of the helper says
+    // nothing about whether `get_all_config_keys` consults it. This is the
+    // assertion that reddens on Windows if the label site regresses again.
+    let tmp = tempfile::TempDir::new().unwrap();
+    modular_fixture(tmp.path());
+    let (service, _socket) = LspService::new(LaravelLanguageServer::new);
+    let backend = service.inner().clone();
+    *backend.root_path.write().await = Some(tmp.path().to_path_buf());
+
+    let keys = backend.get_all_config_keys().await;
+    let name = keys
+        .iter()
+        .find(|k| k.key == "app.name")
+        .expect("root config key offered");
+    assert_eq!(
+        name.source, "config/app.php",
+        "the root config label is the same string on every host OS"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_completion_label_is_built_by_the_shared_helper() {
+    // Why the fixture name looks wrong: a backslash is a legal character in a
+    // Unix directory name, so a module at `app/Legal/Contract\Management`
+    // hands `get_all_config_keys` a relative path carrying the character
+    // Windows uses as a separator. That makes the call site's use of
+    // `config_source_label` observable on the developer's own machine, rather
+    // than only in Windows CI.
+    //
+    // `#[cfg(unix)]` because the same literal is a genuine separator on
+    // Windows: the fixture would create two directory levels there, the
+    // `app/*/*` glob would stop at `Contract`, and the module would never be
+    // discovered. Windows keeps its coverage from the root-label test above,
+    // which is the assertion its CI actually reddens on.
+    //
+    // It also pins the tradeoff: such a directory is displayed with `/`. That
+    // is the same tradeoff `route_source_label` has always made for route
+    // files, and the label is display text, never a path that gets opened.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let module = tmp.path().join("app/Legal").join(r"Contract\Management");
+    fs::create_dir_all(module.join("config")).unwrap();
+    fs::write(module.join("composer.json"), "{}").unwrap();
+    fs::write(
+        module.join("config/contract-management.php"),
+        "<?php\nreturn ['chunk' => 250];\n",
+    )
+    .unwrap();
+
+    let (service, _socket) = LspService::new(LaravelLanguageServer::new);
+    let backend = service.inner().clone();
+    *backend.root_path.write().await = Some(tmp.path().to_path_buf());
+    *backend.module_path_patterns.write().await = vec!["app/*/*".to_string()];
+
+    let keys = backend.get_all_config_keys().await;
+    let entry = keys
+        .iter()
+        .find(|k| k.key == "contract-management.chunk")
+        .expect("module key offered");
+    assert_eq!(
+        entry.source, "app/Legal/Contract/Management/config/contract-management.php",
+        "the completion label must come from `config_source_label`"
+    );
+}

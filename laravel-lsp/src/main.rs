@@ -216,6 +216,25 @@ fn route_source_label(file: &Path, root: &Path) -> String {
         .unwrap_or_else(|| file.to_string_lossy().into_owned())
 }
 
+/// Render a config file as a short, project-relative label for the completion
+/// detail and documentation lines (e.g. `config/app.php`), with separators
+/// normalized to `/` the way [`route_source_label`] normalizes its own.
+///
+/// The label is user-visible text a client renders verbatim, so it must not
+/// change shape with the host OS. Until #336 it was a hardcoded
+/// `format!("config/{group}.php")`; moving to `strip_prefix` to support module
+/// config dirs picked up the platform separator with it, and rendered
+/// `config\app.php` on Windows alone.
+///
+/// Unlike [`route_source_label`], an out-of-root file keeps its full path: a
+/// module config dir can legitimately sit outside the project root, and the
+/// bare file name (`app.php`) would no longer say which module declared the key.
+fn config_source_label(file: &Path, root: &Path) -> String {
+    LaravelLanguageServer::with_forward_slashes(
+        &file.strip_prefix(root).unwrap_or(file).to_string_lossy(),
+    )
+}
+
 /// A view name for autocomplete
 struct ViewNameCompletion {
     /// The view name in dot notation (e.g., "users.profile")
@@ -9444,6 +9463,12 @@ impl LaravelLanguageServer {
             }
             // Also invalidate the cached config so next lookup refetches
             *self.cached_config.write().await = None;
+            // And the translation cache's own copy of this file (issue #349).
+            // `did_change_watched_files` skips paths open in the editor, so
+            // this arm is the ONLY notice the actor gets that an open
+            // `config/app.php` changed — leaving it out would make the
+            // completion locale stale for exactly the file the user is editing.
+            let _ = self.salsa.invalidate_config_path(path.clone()).await;
             // Also update as SourceFile for pattern extraction (env() diagnostics)
             debug!(
                 "📦 Updating Salsa: SourceFile ({}) for pattern extraction",
@@ -14680,11 +14705,7 @@ impl LaravelLanguageServer {
 
         for group in &groups {
             for path in laravel_lsp::config::config_group_files(&root, &module_dirs, group) {
-                let source = path
-                    .strip_prefix(&root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
+                let source = config_source_label(&path, &root);
                 let Ok(content) = std::fs::read_to_string(&path) else {
                     continue;
                 };
@@ -24042,10 +24063,23 @@ impl LanguageServer for LaravelLanguageServer {
             // Substring match covers module config dirs (`modules.paths`)
             // as well as the root `config/`.
             {
-                let p = path.to_string_lossy();
+                // `.php` stays a raw suffix test — a filename extension has no
+                // separators. The directory test does not: `/config/` never
+                // matched a Windows path, so this whole arm was dead there
+                // (issue #292, the same trap as `/Commands/` below). Normalized
+                // through the same helper `execute_salsa_update` uses, so the
+                // two config gates are one predicate spelled once.
+                let p = Self::with_forward_slashes(&path.to_string_lossy());
                 if p.ends_with(".php") && p.contains("/config/") {
                     self.file_exists_cache.lock().unwrap().pop(&path);
                     self.invalidate_config_cache().await;
+                    // Translation autocomplete reads `config/app.php` once per
+                    // session to pick the locale it previews (issue #349).
+                    // That read has its own cache, in the Salsa actor rather
+                    // than in `cached_config`, so it needs its own eviction —
+                    // without it an external `app.locale` edit would keep
+                    // previewing the pre-edit locale until the LSP restarted.
+                    let _ = self.salsa.invalidate_config_path(path.clone()).await;
                 }
             }
             // A Command class can live anywhere, but conventionally sits under a

@@ -1668,41 +1668,6 @@ pub fn locales_in_dir(db: &dyn Db, dir: LangDir) -> Vec<String> {
     locales
 }
 
-/// The locale whose catalogues supply autocomplete's preview values.
-///
-/// Completion offers keys from exactly one locale (see
-/// [`TranslationCache::completion_keys`]), so *which* one decides every value
-/// previewed next to a key. That used to be the alphabetically-first
-/// directory, which is deterministic but arbitrary: a project with `lang/de/`,
-/// `lang/en/` and `'locale' => 'en'` previewed German for every key
-/// (issue #340).
-///
-/// The chain, first match wins:
-///
-/// 1. `app.locale` from `config/app.php`, normalized by
-///    [`config_string_literal`], when it names one of `candidates`;
-/// 2. `app.fallback_locale`, under the same normalization and the same
-///    membership check — Laravel ships it `env()`-wrapped, so it needs the
-///    normalization just as much as `app.locale` does;
-/// 3. the alphabetically-first candidate, preserving the pre-#340 behaviour
-///    for any project whose config cannot be read statically.
-///
-/// `candidates` is read, never mutated: step 3 sees the whole list
-/// [`locales_in_dir`] returned, not what the earlier steps failed to match, so
-/// the fallback answers with the same locale it always did.
-///
-/// `None` only when `candidates` is empty — a project with no locale
-/// directories has nothing to preview, whatever its config says.
-fn completion_locale(root: &Path, candidates: &[String]) -> Option<String> {
-    ["app.locale", "app.fallback_locale"]
-        .into_iter()
-        .find_map(|key| {
-            let locale = config_string_literal(&crate::config_lookup::resolve_value(root, key)?)?;
-            candidates.contains(&locale).then_some(locale)
-        })
-        .or_else(|| candidates.iter().min().cloned())
-}
-
 /// The string a PHP config value denotes, or `None` when it denotes none
 /// statically.
 ///
@@ -1772,13 +1737,31 @@ pub fn translation_namespaces_in_provider(
 ///
 /// # Containment
 ///
-/// [`Self::ensure_file`] and [`Self::ensure_dir`] are the **only** places this
-/// module touches disk, and both are fail-closed: a path that cannot be proven
-/// inside the project root is never read (issue #248). Candidate paths are built
-/// from `vendor::` namespaces and `loadTranslationsFrom` arguments lifted
-/// verbatim out of parsed source, so they are untrusted and may carry traversal
-/// or be absolute. Keeping the guard at these two functions is what lets
-/// `translation_lookup` be pure path arithmetic without weakening #248.
+/// Five methods read from disk — each counted by [`Self::disk_reads`]. The
+/// containment guard applies to exactly the two that build a path out of
+/// untrusted text:
+///
+/// - [`Self::ensure_file`] and [`Self::ensure_dir`] are **guarded** and
+///   fail-closed: a path that cannot be proven inside the project root is never
+///   read (issue #248). Their candidate paths are built from `vendor::`
+///   namespaces and `loadTranslationsFrom` arguments lifted verbatim out of
+///   parsed source, so they are untrusted and may carry traversal or be
+///   absolute. Keeping the guard here is what lets `translation_lookup` be pure
+///   path arithmetic without weakening #248.
+/// - [`Self::ensure_provider`], [`Self::ensure_provider_files`] and
+///   [`Self::ensure_config`] are **unguarded**, and deliberately so: none of
+///   them joins attacker-controlled text onto the root. The first two walk the
+///   project's own `vendor/` and `app/Providers/` trees (see
+///   `ensure_provider`'s own note); `ensure_config` names
+///   `<root>/config/<group>.php` from a group segment that is hardcoded at its
+///   only call site — `"app.locale"` and `"app.fallback_locale"` — never from
+///   parsed source. There is nothing for #248 to fence.
+///
+/// A read is not the only way to touch disk: [`Self::completion_keys`] *stats*
+/// the lang roots, and [`Self::ensure_config`] stats the config path through
+/// `config_group_files`. Neither is counted, because neither opens a file —
+/// the distinction is what lets a test attribute an exact number of reads to
+/// one code path.
 #[derive(Default)]
 pub struct TranslationCache {
     /// Catalogues keyed by absolute path. An entry with **empty text** is a
@@ -1789,6 +1772,18 @@ pub struct TranslationCache {
     /// Directory listings backing locale discovery, keyed by absolute path. An
     /// empty listing likewise caches "absent, or nothing in it".
     dirs: HashMap<PathBuf, LangDir>,
+    /// Config-file texts backing completion's locale choice, keyed by the
+    /// project config path the group resolves to (`<root>/config/<group>.php`).
+    /// A `None` value is a negative cache: the group contributes no readable
+    /// file, and the *absence* is what must not be re-probed — without it every
+    /// completion request on a project with no `config/app.php` would re-stat
+    /// it, which is the shape [`Self::ensure_file`] already fail-closes for.
+    ///
+    /// Not a Salsa input: nothing derives from this text through a tracked
+    /// query, so there is no memoized result for a version bump to invalidate.
+    /// A plain map keyed by path is the whole mechanism, and
+    /// [`Self::invalidate_config`] is its only eviction.
+    configs: HashMap<PathBuf, Option<String>>,
     /// Version counter shared by files and directories; bumped on every
     /// registration so Salsa sees a changed input.
     version: i32,
@@ -1914,6 +1909,102 @@ impl TranslationCache {
         let handle = LangDir::new(&*db, dir.to_path_buf(), self.version, entries);
         self.dirs.insert(dir.to_path_buf(), handle);
         handle
+    }
+
+    /// The text of the config file backing group `group` (`config/app.php` for
+    /// `app`), read at most once per cache instance.
+    ///
+    /// `None` — cached as such — when no readable file contributes to the
+    /// group. `config_group_files` owns which files those are and in what
+    /// precedence; called with no module directories, as
+    /// [`crate::config_lookup::resolve_value`] itself does, it yields the
+    /// project file alone, so its first entry is the whole group. Completion
+    /// deliberately keeps that no-module scope: widening which files decide the
+    /// preview locale is a change of a different kind from caching the read.
+    ///
+    /// The `is_file()` inside `config_group_files` is why an absent file costs
+    /// no counted read: the probe is a stat, and only a file that exists is
+    /// opened. That is what lets a test attribute exactly one
+    /// [`Self::disk_reads`] to config resolution by differencing two fixtures.
+    fn ensure_config(&mut self, root: &Path, group: &str) -> Option<&str> {
+        let key = root.join("config").join(format!("{group}.php"));
+        if !self.configs.contains_key(&key) {
+            let files = crate::config::config_group_files(root, &[], group);
+            let mut text = None;
+            if let Some(path) = files.first() {
+                self.disk_reads += 1;
+                text = std::fs::read_to_string(path).ok();
+            }
+            self.configs.insert(key.clone(), text);
+        }
+        self.configs[&key].as_deref()
+    }
+
+    /// The source text of the value at `dotted_key`, resolved against the
+    /// cached config text rather than a fresh read.
+    ///
+    /// A wrapper around [`crate::config_lookup::resolve_in_source`], not a
+    /// change to [`crate::config_lookup::resolve_value`]: that function still
+    /// reads on every call, and `hover_for_config` still uses it, so a hover
+    /// keeps reflecting an edit immediately. Only this completion path is
+    /// cached, and only it needs the invalidation wiring that comes with a
+    /// cache.
+    fn config_value(&mut self, root: &Path, dotted_key: &str) -> Option<String> {
+        let mut parts = dotted_key.split('.');
+        let group = parts.next()?;
+        let key_path: Vec<&str> = parts.collect();
+        let text = self.ensure_config(root, group)?;
+        crate::config_lookup::resolve_in_source(text, &key_path)
+    }
+
+    /// Drop a config file's cached text, so the next completion re-reads it.
+    ///
+    /// Clears a negative entry as well as a positive one: a `config/app.php`
+    /// that did not exist when completion first asked is exactly the case a
+    /// `CREATED` event reports, and leaving the cached absence in place would
+    /// make the new file invisible for the rest of the session.
+    pub fn invalidate_config(&mut self, path: &Path) {
+        self.configs.remove(path);
+    }
+
+    /// The locale whose catalogues supply autocomplete's preview values.
+    ///
+    /// Completion offers keys from exactly one locale (see
+    /// [`Self::completion_keys`]), so *which* one decides every value previewed
+    /// next to a key. That used to be the alphabetically-first directory, which
+    /// is deterministic but arbitrary: a project with `lang/de/`, `lang/en/` and
+    /// `'locale' => 'en'` previewed German for every key (issue #340).
+    ///
+    /// The chain, first match wins:
+    ///
+    /// 1. `app.locale` from `config/app.php`, normalized by
+    ///    [`config_string_literal`], when it names one of `candidates`;
+    /// 2. `app.fallback_locale`, under the same normalization and the same
+    ///    membership check — Laravel ships it `env()`-wrapped, so it needs the
+    ///    normalization just as much as `app.locale` does;
+    /// 3. the alphabetically-first candidate, preserving the pre-#340 behaviour
+    ///    for any project whose config cannot be read statically.
+    ///
+    /// Both lookups go through [`Self::config_value`], so a project whose chain
+    /// runs to step 2 still pays one read of `config/app.php`, not two — and a
+    /// second completion request pays none (issue #349). Before that, this read
+    /// bypassed [`Self::disk_reads`] entirely, so the cache-hit regression tests
+    /// could not see it at all.
+    ///
+    /// `candidates` is read, never mutated: step 3 sees the whole list
+    /// [`locales_in_dir`] returned, not what the earlier steps failed to match,
+    /// so the fallback answers with the same locale it always did.
+    ///
+    /// `None` only when `candidates` is empty — a project with no locale
+    /// directories has nothing to preview, whatever its config says.
+    fn completion_locale(&mut self, root: &Path, candidates: &[String]) -> Option<String> {
+        ["app.locale", "app.fallback_locale"]
+            .into_iter()
+            .find_map(|key| {
+                let locale = config_string_literal(&self.config_value(root, key)?)?;
+                candidates.contains(&locale).then_some(locale)
+            })
+            .or_else(|| candidates.iter().min().cloned())
     }
 
     /// Resolve `key` in `locale`, returning the value and the catalogue it came
@@ -2070,7 +2161,7 @@ impl TranslationCache {
             // alphabetical minimum as the last resort) — never by position
             // in the filesystem-dependent listing order.
             let candidates = locales_in_dir(&*db, listing).clone();
-            completion_locale(root, &candidates)
+            self.completion_locale(root, &candidates)
         });
         if let (Some(lang_root), Some(locale)) = (lang_root, locale) {
             let locale_dir = lang_root.join(&locale);
@@ -2113,7 +2204,7 @@ impl TranslationCache {
         for (namespace, ns_dir) in namespace_pairs {
             let listing = self.ensure_dir(db, &ns_dir, root);
             let ns_locales = locales_in_dir(&*db, listing).clone();
-            let Some(ns_locale) = completion_locale(root, &ns_locales) else {
+            let Some(ns_locale) = self.completion_locale(root, &ns_locales) else {
                 continue;
             };
             let ns_locale_dir = ns_dir.join(&ns_locale);
@@ -6553,6 +6644,12 @@ pub enum SalsaRequest {
         path: PathBuf,
         reply: oneshot::Sender<()>,
     },
+    /// Drop a config path's cached text, so the next completion re-reads it.
+    /// Covers external create, change and delete, and an in-editor edit.
+    InvalidateConfigPath {
+        path: PathBuf,
+        reply: oneshot::Sender<()>,
+    },
     /// Locate a key's declaration inside one catalogue
     LocateTranslationKey {
         root: PathBuf,
@@ -7998,6 +8095,26 @@ impl SalsaHandle {
             .map_err(|_| "Salsa actor dropped reply channel")
     }
 
+    /// Drop a config path's cached text after a create, change or delete, so
+    /// the next completion re-reads it.
+    ///
+    /// The counterpart to the cache added in #349: completion resolves the
+    /// preview locale from `config/app.php` once per session, which without
+    /// this call would keep answering with the pre-edit locale.
+    pub async fn invalidate_config_path(&self, path: PathBuf) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::InvalidateConfigPath {
+                path,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
     // === Salsa-based Service Provider Methods (New - Phase 1) ===
 
     /// Register a raw service provider file for Salsa to parse
@@ -9148,6 +9265,10 @@ impl SalsaActor {
                 }
                 SalsaRequest::InvalidateLangPath { path, reply } => {
                     self.handle_invalidate_lang_path(&path);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::InvalidateConfigPath { path, reply } => {
+                    self.handle_invalidate_config_path(&path);
                     let _ = reply.send(());
                 }
                 SalsaRequest::LocateTranslationKey {
@@ -11782,6 +11903,11 @@ impl SalsaActor {
     /// Drop a lang path's cached entry so the next lookup re-reads disk.
     fn handle_invalidate_lang_path(&mut self, path: &Path) {
         self.translations.invalidate(path);
+    }
+
+    /// Drop a config path's cached text so the next completion re-reads disk.
+    fn handle_invalidate_config_path(&mut self, path: &Path) {
+        self.translations.invalidate_config(path);
     }
 
     /// Whether `candidate` replaces `current` as the merged declaration of a
