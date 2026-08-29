@@ -23820,7 +23820,13 @@ impl LanguageServer for LaravelLanguageServer {
             // Substring match covers module config dirs (`modules.paths`)
             // as well as the root `config/`.
             {
-                let p = path.to_string_lossy();
+                // `.php` stays a raw suffix test — a filename extension has no
+                // separators. The directory test does not: `/config/` never
+                // matched a Windows path, so this whole arm was dead there
+                // (issue #292, the same trap as `/Commands/` below). Normalized
+                // through the same helper `execute_salsa_update` uses, so the
+                // two config gates are one predicate spelled once.
+                let p = Self::with_forward_slashes(&path.to_string_lossy());
                 if p.ends_with(".php") && p.contains("/config/") {
                     self.file_exists_cache.lock().unwrap().pop(&path);
                     self.invalidate_config_cache().await;
