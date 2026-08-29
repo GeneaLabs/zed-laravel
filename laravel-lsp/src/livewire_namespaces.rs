@@ -43,6 +43,7 @@ pub fn extract_livewire_namespaces(
     source: &str,
     provider_path: &Path,
     root: &Path,
+    module_dir: Option<&Path>,
     registrar_methods: &[String],
 ) -> HashMap<String, LivewireClassNamespace> {
     let mut out = HashMap::new();
@@ -59,12 +60,16 @@ pub fn extract_livewire_namespaces(
     let bytes = source.as_bytes();
     let provider_dir = provider_path.parent().unwrap_or(provider_path);
     let file_namespace = php_file_namespace(tree.root_node(), bytes);
+    // A module provider is contained by its OWN module, an app provider by
+    // the project root — see `contained_class_path`.
+    let gate_dir = module_dir.unwrap_or(root);
 
     walk(
         tree.root_node(),
         bytes,
         provider_dir,
         root,
+        gate_dir,
         registrar_methods,
         file_namespace.as_deref(),
         &mut out,
@@ -77,13 +82,16 @@ fn walk(
     bytes: &[u8],
     provider_dir: &Path,
     root: &Path,
+    gate_dir: &Path,
     registrar_methods: &[String],
     file_namespace: Option<&str>,
     out: &mut HashMap<String, LivewireClassNamespace>,
 ) {
     match node.kind() {
         "scoped_call_expression" => {
-            if let Some((prefix, reg)) = classify_add_namespace(node, bytes, provider_dir, root) {
+            if let Some((prefix, reg)) =
+                classify_add_namespace(node, bytes, provider_dir, root, gate_dir)
+            {
                 out.insert(prefix, reg);
             }
         }
@@ -93,6 +101,7 @@ fn walk(
                 bytes,
                 provider_dir,
                 root,
+                gate_dir,
                 registrar_methods,
                 file_namespace,
             ) {
@@ -108,6 +117,7 @@ fn walk(
             bytes,
             provider_dir,
             root,
+            gate_dir,
             registrar_methods,
             file_namespace,
             out,
@@ -123,6 +133,7 @@ fn classify_add_namespace(
     bytes: &[u8],
     provider_dir: &Path,
     root: &Path,
+    gate_dir: &Path,
 ) -> Option<(String, LivewireClassNamespace)> {
     let scope = node.child_by_field_name("scope")?.utf8_text(bytes).ok()?;
     if scope != "Livewire" && !scope.ends_with("\\Livewire") {
@@ -139,7 +150,8 @@ fn classify_add_namespace(
     // quoted text instead of the (truncated) first string_content chunk.
     let class_namespace =
         unescape_php_namespace(&string_literal_raw(*args.get(1)?.as_ref()?, bytes)?);
-    let class_path = contained_class_path(*args.get(2)?.as_ref()?, bytes, provider_dir, root)?;
+    let class_path =
+        contained_class_path(*args.get(2)?.as_ref()?, bytes, provider_dir, root, gate_dir)?;
 
     Some((
         prefix,
@@ -158,6 +170,7 @@ fn classify_registrar_call(
     bytes: &[u8],
     provider_dir: &Path,
     root: &Path,
+    gate_dir: &Path,
     registrar_methods: &[String],
     file_namespace: Option<&str>,
 ) -> Option<(String, LivewireClassNamespace)> {
@@ -170,7 +183,8 @@ fn classify_registrar_call(
     }
 
     let args = collect_arguments(node, bytes, &["path", "prefix"])?;
-    let class_path = contained_class_path(*args.first()?.as_ref()?, bytes, provider_dir, root)?;
+    let class_path =
+        contained_class_path(*args.first()?.as_ref()?, bytes, provider_dir, root, gate_dir)?;
     let prefix = string_literal_text(*args.get(1)?.as_ref()?, bytes)?;
     if prefix.is_empty() {
         return None;
@@ -187,25 +201,44 @@ fn classify_registrar_call(
     ))
 }
 
-/// Resolve, canonicalize, and CONTAIN a registration's class path.
+/// Resolve and CONTAIN a registration's class path, then canonicalize it.
 ///
 /// The path argument is provider-source-derived — discovered data — and the
 /// resolved value is consumed without further gating by the component
 /// completion walk and by `try_namespaced_class`. Gating here, at the single
 /// point where a registration is minted, covers both: a
 /// `__DIR__.'/../../../..'` never enters the config, so nothing downstream
-/// can walk or probe outside the project. Fail-closed via
-/// [`crate::path_containment::path_within_root`]: a path that cannot be
-/// proven inside `root` yields no registration.
+/// can walk or probe outside the project.
+///
+/// `gate_dir` is the provider's OWNING MODULE directory
+/// ([`crate::config::owning_module`]) and falls back to the project root for
+/// an app-level provider. Two things follow, and both are the point:
+///
+/// - A module symlinked in from a composer path repository canonicalizes
+///   OUTSIDE the project root, so gating the canonical path against the root
+///   dropped its every Livewire registration — silently, with no diagnostic —
+///   while [`crate::config::expand_module_dirs`] deliberately admits exactly
+///   that layout. Gating LEXICALLY against the owning module, before
+///   canonicalizing, is what `resolve_provider_class_file` already does for
+///   the PSR-4 provider branch, and it keeps the symlinked module working.
+/// - The gate gets STRICTER for a module provider, not looser: a
+///   registration reaching into a sibling module or into bare `app/` is
+///   inside the root but outside its own module, and is dropped.
+///
+/// Fail-closed via [`crate::path_containment::path_within_root_lexical`]: a
+/// path that cannot be proven inside `gate_dir` yields no registration.
+/// Canonicalization happens only after the gate passes, so the value handed
+/// downstream still resolves symlinks as it always did.
 fn contained_class_path(
     arg: tree_sitter::Node,
     bytes: &[u8],
     provider_dir: &Path,
     root: &Path,
+    gate_dir: &Path,
 ) -> Option<PathBuf> {
     let resolved = resolve_path_arg(arg, bytes, provider_dir, root)?;
-    let canonical = resolved.canonicalize().unwrap_or(resolved);
-    crate::path_containment::path_within_root(&canonical, root).then_some(canonical)
+    crate::path_containment::path_within_root_lexical(&resolved, gate_dir)
+        .then(|| resolved.canonicalize().unwrap_or(resolved))
 }
 
 /// Order a call's arguments by the given parameter names: positional

@@ -9126,10 +9126,16 @@ impl LaravelLanguageServer {
             let Ok(provider_source) = std::fs::read_to_string(&provider_path) else {
                 continue;
             };
+            // A module provider's registrations are contained by its own
+            // module directory (a symlinked composer path repo resolves
+            // outside the root); an app provider's by the root.
+            let module_dir = laravel_lsp::config::owning_module(&module_dirs, &provider_path)
+                .map(|(_rank, dir)| dir);
             for (prefix, reg) in laravel_lsp::livewire_namespaces::extract_livewire_namespaces(
                 &provider_source,
                 &provider_path,
                 root,
+                module_dir,
                 &registrars,
             ) {
                 config.class_namespaces.insert(prefix, reg);

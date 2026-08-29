@@ -32,7 +32,7 @@ class AppServiceProvider extends AbstractModuleServiceProvider
     }
 }
 "#;
-    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    let map = extract_livewire_namespaces(source, &provider_path, &root, None, &registrars());
     let reg = map.get("common-ui").expect("common-ui registered");
     assert_eq!(reg.class_namespace, "App\\Common\\UI\\Livewire");
     assert_eq!(
@@ -64,7 +64,7 @@ class AppServiceProvider
     }
 }
 "#;
-    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    let map = extract_livewire_namespaces(source, &provider_path, &root, None, &registrars());
     let reg = map.get("common-ui").expect("common-ui registered");
     assert_eq!(reg.class_namespace, "App\\Common\\UI\\Livewire");
     assert_eq!(
@@ -87,7 +87,7 @@ class AppServiceProvider {
     }
 }
 "#;
-    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    let map = extract_livewire_namespaces(source, &provider_path, &root, None, &registrars());
     assert_eq!(
         map.get("common-ui").unwrap().class_namespace,
         "App\\Common\\UI\\Livewire"
@@ -112,7 +112,7 @@ abstract class AbstractModuleServiceProvider {
     }
 }
 "#;
-    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    let map = extract_livewire_namespaces(source, &provider_path, &root, None, &registrars());
     assert!(map.is_empty());
 }
 
@@ -127,7 +127,7 @@ class AppServiceProvider {
     }
 }
 "#;
-    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    let map = extract_livewire_namespaces(source, &provider_path, &root, None, &registrars());
     assert!(map.is_empty());
 }
 
@@ -168,7 +168,7 @@ class AppServiceProvider
     }
 }
 "#;
-    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    let map = extract_livewire_namespaces(source, &provider_path, &root, None, &registrars());
     let reg = map.get("common-ui").expect("common-ui registered");
     assert_eq!(reg.class_namespace, "App\\Common\\UI\\Livewire");
 }
@@ -197,7 +197,7 @@ class AppServiceProvider
     }
 }
 "#;
-    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    let map = extract_livewire_namespaces(source, &provider_path, &root, None, &registrars());
     assert!(
         map.contains_key("common-ui"),
         "one unknown flag must not drop the registration: {map:?}"
@@ -225,7 +225,7 @@ class AppServiceProvider
     }
 }
 "#;
-    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    let map = extract_livewire_namespaces(source, &provider_path, &root, None, &registrars());
     let reg = map.get("common-ui").expect("registered");
     assert_eq!(
         reg.class_namespace, "App\\Common\\UI\\Alt",
@@ -253,7 +253,7 @@ class AppServiceProvider
     }
 }
 "#;
-    let map = extract_livewire_namespaces(source, &provider_path, &root, &registrars());
+    let map = extract_livewire_namespaces(source, &provider_path, &root, None, &registrars());
     assert!(
         map.is_empty(),
         "the literals stay in their own slots, so nothing resolves: {map:?}"
@@ -278,7 +278,7 @@ class AppServiceProvider
 }
 "#;
     let configured = vec!["registerModuleLivewire".to_string()];
-    let map = extract_livewire_namespaces(source, &provider_path, &root, &configured);
+    let map = extract_livewire_namespaces(source, &provider_path, &root, None, &configured);
     assert!(
         map.contains_key("common-ui"),
         "the configured wrapper name is recognized: {map:?}"
@@ -286,7 +286,7 @@ class AppServiceProvider
 
     let defaults = registrars();
     assert!(
-        !extract_livewire_namespaces(source, &provider_path, &root, &defaults)
+        !extract_livewire_namespaces(source, &provider_path, &root, None, &defaults)
             .contains_key("common-ui"),
         "negative control: an unconfigured wrapper name registers nothing"
     );
