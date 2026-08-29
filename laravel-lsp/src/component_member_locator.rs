@@ -17,6 +17,7 @@
 use tree_sitter::Node;
 
 use crate::parser::parse_php;
+use crate::volt_functional;
 
 /// The declaration shape [`locate_member`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,22 +38,44 @@ pub struct MemberLocation {
 
 /// Find `member`'s declaration in `source`. Checks every `method_declaration`,
 /// property (`property_declaration` → `property_element`), and promoted
-/// constructor property in the file, in document order; returns the first
-/// match. A method and a property never share a name within one class, so in
-/// practice there's nothing to disambiguate between the two kinds.
+/// constructor property in the file, then returns the FIRST in true document
+/// order.
 ///
 /// Returns `None` when `source` doesn't parse, or no member named `member`
 /// is declared.
 pub fn locate_member(source: &str, member: &str) -> Option<MemberLocation> {
-    let tree = parse_php(source).ok()?;
+    locate_member_of_kind(source, member, None)
+}
+
+/// [`locate_member`], restricted to one declaration kind.
+///
+/// `want` is what the REFERENCE demands: a `wire:model="save"` binds a
+/// property, so it must not resolve to a `save()` method even though one is
+/// declared. `None` accepts either kind, for references that carry no kind of
+/// their own (`$this->member`, a bare `$var`, `wire:target`).
+///
+/// Every candidate is collected by a full traversal — no early return — and
+/// the list is sorted by `(line, column)` before the first is taken. The walk
+/// itself is a `stack.pop()` DFS, which visits children in reverse order and
+/// nested bodies out of order, so the sort is what makes "first" mean
+/// document order rather than traversal order.
+pub fn locate_member_of_kind(
+    source: &str,
+    member: &str,
+    want: Option<MemberKind>,
+) -> Option<MemberLocation> {
+    let Ok(tree) = parse_php(source) else {
+        return volt_functional::locate_member(source, member, want);
+    };
     let bytes = source.as_bytes();
+    let mut found: Vec<MemberLocation> = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(n) = stack.pop() {
         match n.kind() {
             "method_declaration" => {
                 if let Some(name) = n.child_by_field_name("name") {
                     if name.utf8_text(bytes).ok() == Some(member) {
-                        return Some(node_location(name, 0, MemberKind::Method));
+                        found.push(node_location(name, 0, MemberKind::Method));
                     }
                 }
             }
@@ -64,7 +87,7 @@ pub fn locate_member(source: &str, member: &str) -> Option<MemberLocation> {
                     }
                     if let Some(name) = element.child_by_field_name("name") {
                         if matches_dollar_name(name, bytes, member) {
-                            return Some(node_location(name, 1, MemberKind::Property));
+                            found.push(node_location(name, 1, MemberKind::Property));
                         }
                     }
                 }
@@ -72,7 +95,7 @@ pub fn locate_member(source: &str, member: &str) -> Option<MemberLocation> {
             "property_promotion_parameter" => {
                 if let Some(name) = n.child_by_field_name("name") {
                     if matches_dollar_name(name, bytes, member) {
-                        return Some(node_location(name, 1, MemberKind::Property));
+                        found.push(node_location(name, 1, MemberKind::Property));
                     }
                 }
             }
@@ -83,7 +106,14 @@ pub fn locate_member(source: &str, member: &str) -> Option<MemberLocation> {
             stack.push(ch);
         }
     }
-    None
+    found.retain(|loc| want.is_none_or(|k| k == loc.kind));
+    found.sort_by_key(|loc| (loc.line, loc.start_column));
+    // A functional Volt file declares no class, so the walk above finds
+    // nothing in it — its state keys and closure actions are the members.
+    found
+        .into_iter()
+        .next()
+        .or_else(|| volt_functional::locate_member(source, member, want))
 }
 
 /// The declaration header of `member` in `source`, for a hover card: a
@@ -91,9 +121,15 @@ pub fn locate_member(source: &str, member: &str) -> Option<MemberLocation> {
 /// parameters, return type — or a property's declaration up to (not
 /// including) its initializer. Whitespace runs are collapsed so a multiline
 /// signature renders as one line. `None` when the member isn't declared.
+///
+/// Candidates are collected and sorted the same way [`locate_member`] sorts
+/// them, so the summary always describes the declaration goto lands on.
 pub fn member_declaration_summary(source: &str, member: &str) -> Option<String> {
-    let tree = parse_php(source).ok()?;
+    let Ok(tree) = parse_php(source) else {
+        return volt_functional::declaration_summary(source, member);
+    };
     let bytes = source.as_bytes();
+    let mut found: Vec<(u32, u32, String)> = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(n) = stack.pop() {
         match n.kind() {
@@ -104,7 +140,11 @@ pub fn member_declaration_summary(source: &str, member: &str) -> Option<String> 
                             .child_by_field_name("body")
                             .map(|b| b.start_byte())
                             .unwrap_or_else(|| n.end_byte());
-                        return Some(collapse_ws(&source[n.start_byte()..end]));
+                        found.push(with_position(
+                            name,
+                            0,
+                            collapse_ws(&source[n.start_byte()..end]),
+                        ));
                     }
                 }
             }
@@ -120,7 +160,11 @@ pub fn member_declaration_summary(source: &str, member: &str) -> Option<String> 
                             // NAME (modifiers + type), then the `$name`
                             // itself — the initializer stays out.
                             let head = collapse_ws(&source[n.start_byte()..name.start_byte()]);
-                            return Some(format!("{} ${}", head.trim_end(), member));
+                            found.push(with_position(
+                                name,
+                                1,
+                                format!("{} ${}", head.trim_end(), member),
+                            ));
                         }
                     }
                 }
@@ -129,7 +173,11 @@ pub fn member_declaration_summary(source: &str, member: &str) -> Option<String> 
                 if let Some(name) = n.child_by_field_name("name") {
                     if matches_dollar_name(name, bytes, member) {
                         let head = collapse_ws(&source[n.start_byte()..name.start_byte()]);
-                        return Some(format!("{} ${}", head.trim_end(), member));
+                        found.push(with_position(
+                            name,
+                            1,
+                            format!("{} ${}", head.trim_end(), member),
+                        ));
                     }
                 }
             }
@@ -140,27 +188,81 @@ pub fn member_declaration_summary(source: &str, member: &str) -> Option<String> 
             stack.push(ch);
         }
     }
-    None
+    found.sort_by_key(|(line, column, _)| (*line, *column));
+    found
+        .into_iter()
+        .next()
+        .map(|(_, _, text)| text)
+        .or_else(|| volt_functional::declaration_summary(source, member))
 }
 
-/// Collapse every whitespace run (including newlines) to a single space.
-fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+/// `(line, column, payload)` keyed on a name node's position, so summaries
+/// sort in the same document order [`locate_member`] picks from.
+fn with_position(node: Node, dollar_skip: u32, payload: String) -> (u32, u32, String) {
+    let loc = node_location(node, dollar_skip, MemberKind::Property);
+    (loc.line, loc.start_column, payload)
 }
 
-/// Every PUBLIC property of the class in `source`, as `(name, declared type
-/// text)` — `"mixed"` when untyped. Includes promoted public constructor
-/// properties. Unlike the render-index surface (which keeps only
-/// class-typed properties, since scalars have no members to resolve), this
-/// keeps scalar and untyped publics too: a Livewire/Filament template reads
-/// them as bare `$vars`, so `$`-completion must offer all of them.
+/// The declaration that OWNS the component's member surface: the first
+/// class-like declaration in document order — a named `class`, or the
+/// anonymous class of a `new class extends Component` front matter.
+///
+/// Completion must not offer members declared by anything else in the file. A
+/// trait declared beside the component, a second unrelated top-level class,
+/// an enum — all of them are separate declarations whose members are not on
+/// `$this`, and offering them contradicts the documented
+/// trait-provided-members limitation.
+///
+/// Falls back to the first trait/enum/interface when the file declares no
+/// class, and finally to the whole file when it declares nothing at all — a
+/// file with a single declaration has nothing to scope away.
+fn owning_declaration<'tree>(root: Node<'tree>) -> Node<'tree> {
+    let mut class_like: Option<Node> = None;
+    let mut other: Option<Node> = None;
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        let candidate = match n.kind() {
+            "class_declaration" => Some((true, n)),
+            // `new class extends Component { … }` — the front-matter shape
+            // of a Livewire SFC and a class-based Volt component.
+            "anonymous_class" => Some((true, n)),
+            "trait_declaration" | "enum_declaration" | "interface_declaration" => {
+                Some((false, n))
+            }
+            _ => None,
+        };
+        if let Some((is_class, node)) = candidate {
+            let slot = if is_class {
+                &mut class_like
+            } else {
+                &mut other
+            };
+            if slot.is_none_or(|best| node.start_byte() < best.start_byte()) {
+                *slot = Some(node);
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    class_like.or(other).unwrap_or(root)
+}
+
+/// Every PUBLIC property of the component's own declaration (see
+/// [`owning_declaration`]), as `(name, declared type text)` — `"mixed"` when
+/// untyped. Includes promoted public constructor properties. Unlike the
+/// render-index surface (which keeps only class-typed properties, since
+/// scalars have no members to resolve), this keeps scalar and untyped publics
+/// too: a Livewire/Filament template reads them as bare `$vars`, so
+/// `$`-completion must offer all of them.
 pub fn public_property_types(source: &str) -> Vec<(String, String)> {
     let Ok(tree) = parse_php(source) else {
-        return Vec::new();
+        return volt_functional::property_types(source);
     };
     let bytes = source.as_bytes();
     let mut out = Vec::new();
-    let mut stack = vec![tree.root_node()];
+    let mut stack = vec![owning_declaration(tree.root_node())];
     while let Some(n) = stack.pop() {
         match n.kind() {
             "property_declaration" | "property_promotion_parameter" => {
@@ -221,15 +323,19 @@ pub fn public_property_types(source: &str) -> Vec<(String, String)> {
             stack.push(ch);
         }
     }
+    if out.is_empty() {
+        out = volt_functional::property_types(source);
+    }
     out
 }
 
-/// Every PUBLIC, non-static method of the class in `source` that can be a
-/// Livewire action target, sorted by name. Magic methods (`__*`) and the
-/// Livewire/Filament lifecycle surface (`mount`, `render`, `boot`, `booted`,
-/// `rendering`, `rendered`, `exception`, and the `updated*` / `updating*` /
-/// `hydrate*` / `dehydrate*` hook families) are excluded — they exist on
-/// every component and are never what a `wire:click` wants to call.
+/// Every PUBLIC, non-static method of the component's own declaration (see
+/// [`owning_declaration`]) that can be a Livewire action target, sorted by
+/// name. Magic methods (`__*`) and the Livewire/Filament lifecycle surface
+/// (`mount`, `render`, `boot`, `booted`, `rendering`, `rendered`,
+/// `exception`, and the `updated*` / `updating*` / `hydrate*` / `dehydrate*`
+/// hook families) are excluded — they exist on every component and are never
+/// what a `wire:click` wants to call.
 pub fn public_action_method_names(source: &str) -> Vec<String> {
     const LIFECYCLE: &[&str] = &[
         "mount",
@@ -243,11 +349,11 @@ pub fn public_action_method_names(source: &str) -> Vec<String> {
     const LIFECYCLE_PREFIXES: &[&str] = &["updated", "updating", "hydrate", "dehydrate"];
 
     let Ok(tree) = parse_php(source) else {
-        return Vec::new();
+        return volt_functional::action_names(source);
     };
     let bytes = source.as_bytes();
     let mut out = Vec::new();
-    let mut stack = vec![tree.root_node()];
+    let mut stack = vec![owning_declaration(tree.root_node())];
     while let Some(n) = stack.pop() {
         if n.kind() == "method_declaration" {
             let mut public = true; // PHP methods default to public
@@ -293,8 +399,16 @@ pub fn public_action_method_names(source: &str) -> Vec<String> {
             stack.push(ch);
         }
     }
+    if out.is_empty() {
+        out = volt_functional::action_names(source);
+    }
     out.sort();
     out
+}
+
+/// Collapse every whitespace run (including newlines) to a single space.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Whether `name` node's text, with a leading `$` stripped, equals `member`.

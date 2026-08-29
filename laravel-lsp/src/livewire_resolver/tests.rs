@@ -866,3 +866,115 @@ fn namespaced_component_resolution_with_negative_controls() {
         "true negative: a missing component under the valid namespace stays missing"
     );
 }
+
+// ---- @props / @aware bind KEYS, never default values (issue #339, item 8) --
+
+#[test]
+fn props_binds_the_key_and_not_its_default_value() {
+    let content = "@props(['color' => 'blue'])\n<div>{{ $color }} {{ $blue }}</div>\n";
+    assert!(
+        is_template_local_binding(content, 1, "color"),
+        "the declared prop is locally bound"
+    );
+    assert!(
+        !is_template_local_binding(content, 1, "blue"),
+        "a default VALUE is not a prop name"
+    );
+}
+
+#[test]
+fn props_ignores_unrelated_quoted_text_later_on_the_same_line() {
+    let content = "@props(['color' => 'blue']) <div title=\"literal\">\n{{ $literal }}\n";
+    assert!(is_template_local_binding(content, 1, "color"));
+    assert!(
+        !is_template_local_binding(content, 1, "blue"),
+        "the default value is still excluded"
+    );
+    assert!(
+        !is_template_local_binding(content, 1, "literal"),
+        "scanning stops at the directive's closing paren"
+    );
+}
+
+#[test]
+fn props_parses_the_multiline_array_form() {
+    let content = "@props([\n    'color' => 'blue',\n    'size',\n])\n<div>{{ $color }}</div>\n";
+    assert!(
+        is_template_local_binding(content, 4, "color"),
+        "a key on a continuation line still binds"
+    );
+    assert!(
+        is_template_local_binding(content, 4, "size"),
+        "a bare entry declares a prop with no default"
+    );
+    assert!(
+        !is_template_local_binding(content, 4, "blue"),
+        "its default value does not"
+    );
+}
+
+#[test]
+fn aware_binds_keys_the_same_way_as_props() {
+    let content = "@aware(['variant' => 'primary'])\n<div>{{ $variant }}</div>\n";
+    assert!(is_template_local_binding(content, 1, "variant"));
+    assert!(!is_template_local_binding(content, 1, "primary"));
+}
+
+#[test]
+fn props_with_a_nested_default_array_keeps_the_nesting_out_of_the_names() {
+    let content = "@props(['options' => ['a' => 'b'], 'label'])\n<div></div>\n";
+    assert!(is_template_local_binding(content, 1, "options"));
+    assert!(is_template_local_binding(content, 1, "label"));
+    assert!(
+        !is_template_local_binding(content, 1, "a"),
+        "a nested array's own keys are not props"
+    );
+    assert!(!is_template_local_binding(content, 1, "b"));
+}
+
+// ---- wire:target navigates (issue #339, item 4) ---------------------------
+
+#[test]
+fn wire_target_resolves_the_segment_under_the_cursor() {
+    let line = r#"<div wire:target="save, delete">"#;
+    let save_col = line.find("save").unwrap() as u32;
+    let delete_col = line.find("delete").unwrap() as u32;
+    assert_eq!(
+        wire_attribute_target_at(line, save_col),
+        Some(WireTarget::Member("save".to_string())),
+        "cursor on the first entry"
+    );
+    assert_eq!(
+        wire_attribute_target_at(line, delete_col),
+        Some(WireTarget::Member("delete".to_string())),
+        "cursor on the second entry"
+    );
+}
+
+#[test]
+fn wire_target_single_value_is_still_a_member() {
+    let line = r#"<div wire:target="save">"#;
+    let col = line.find("save").unwrap() as u32;
+    assert_eq!(
+        wire_attribute_target_at(line, col),
+        Some(WireTarget::Member("save".to_string()))
+    );
+}
+
+#[test]
+fn wire_target_completion_prefix_is_the_current_entry() {
+    let line = r#"<div wire:target="save, del">"#;
+    let cursor = (line.find("del").unwrap() + 3) as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, cursor),
+        Some((WireValueKind::Member, "del".to_string())),
+        "a list completes per entry, not across the whole value"
+    );
+}
+
+#[test]
+fn attributes_that_name_no_member_still_resolve_to_nothing() {
+    let line = r#"<div wire:key="row-{{ $id }}" wire:ignore>"#;
+    let col = line.find("row-").unwrap() as u32;
+    assert_eq!(wire_attribute_target_at(line, col), None);
+}

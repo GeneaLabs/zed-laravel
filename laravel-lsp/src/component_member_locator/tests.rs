@@ -249,3 +249,99 @@ new class extends Component {
     assert_eq!(loc.kind, MemberKind::Property);
     assert_eq!(loc.line, 5);
 }
+
+// ---- true document order + declaration scoping (issue #339, item 6) -------
+
+#[test]
+fn locate_member_returns_the_first_declaration_in_document_order() {
+    let source = "<?php\nclass A { public $dup = 1; }\n\nclass B { public $dup = 2; }\n";
+    let loc = locate_member(source, "dup").expect("both classes declare $dup");
+    assert_eq!(
+        loc.line, 1,
+        "the FIRST declaration wins, not the last-visited one"
+    );
+}
+
+#[test]
+fn a_deeply_nested_earlier_candidate_beats_a_shallow_later_one() {
+    // The trait's `$dup` sits one level deeper in the tree than the class's,
+    // and comes first in the document. A breadth-first or reverse-DFS walk
+    // returns the shallow/later one; true `(line, column)` order returns the
+    // trait's.
+    let source = "<?php\ntrait T {\n    public $dup = 1;\n}\nclass C { public $dup = 2; }\n";
+    let loc = locate_member(source, "dup").expect("both declare $dup");
+    assert_eq!(loc.line, 2, "the trait's declaration is earlier in the file");
+}
+
+#[test]
+fn member_summary_describes_the_same_declaration_goto_lands_on() {
+    let source = "<?php\nclass A { public int $dup = 1; }\n\nclass B { public string $dup = 2; }\n";
+    assert_eq!(
+        member_declaration_summary(source, "dup").as_deref(),
+        Some("public int $dup"),
+        "the summary follows the same document-order pick as locate_member"
+    );
+}
+
+#[test]
+fn kind_filter_keeps_a_property_reference_off_a_same_named_method() {
+    let source = "<?php\nclass C {\n    public $save = 1;\n    public function save() {}\n}\n";
+    let as_property = locate_member_of_kind(source, "save", Some(MemberKind::Property))
+        .expect("the property is declared");
+    assert_eq!(as_property.line, 2);
+    let as_method = locate_member_of_kind(source, "save", Some(MemberKind::Method))
+        .expect("the method is declared");
+    assert_eq!(as_method.line, 3);
+}
+
+#[test]
+fn kind_filter_returns_nothing_when_only_the_other_kind_exists() {
+    let source = "<?php\nclass C {\n    public function save() {}\n}\n";
+    assert!(
+        locate_member_of_kind(source, "save", Some(MemberKind::Property)).is_none(),
+        "a wire:model binding must not resolve to a method"
+    );
+}
+
+#[test]
+fn completion_excludes_members_of_every_other_top_level_declaration() {
+    let source = "<?php\nclass Component1 {\n    public $owned = 1;\n    public function act() {}\n}\n\nclass Unrelated {\n    public $foreign = 2;\n    public function stranger() {}\n}\n";
+    let props: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(props, vec!["owned"], "only the component's own properties");
+    assert_eq!(
+        public_action_method_names(source),
+        vec!["act"],
+        "only the component's own actions"
+    );
+}
+
+#[test]
+fn completion_excludes_a_trait_declared_beside_the_component() {
+    let source = "<?php\nclass C {\n    public $owned = 1;\n}\n\ntrait Helper {\n    public $fromTrait = 2;\n    public function helperAction() {}\n}\n";
+    let props: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(props, vec!["owned"]);
+    assert!(
+        public_action_method_names(source).is_empty(),
+        "trait-provided members stay a documented limitation"
+    );
+}
+
+#[test]
+fn an_inline_anonymous_component_class_owns_the_members() {
+    let source = "<?php\ntrait Helper {\n    public $fromTrait = 1;\n}\n\nnew class extends Component {\n    public $owned = 2;\n};\n";
+    let props: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(
+        props,
+        vec!["owned"],
+        "the anonymous class is the component even with a trait above it"
+    );
+}

@@ -145,6 +145,7 @@ pub mod member_resolver;
 
 // Controller/Volt → Blade view-variable type inference (magic members in Blade)
 pub mod view_var_index;
+pub mod volt_functional;
 
 // M1 single-parse capture: compile a file's own-source resolution context at
 // parse so the magic-member resolve passes never re-read/re-parse it.
