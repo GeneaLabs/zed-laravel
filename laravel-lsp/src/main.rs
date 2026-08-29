@@ -13101,7 +13101,12 @@ impl LaravelLanguageServer {
     /// Salsa memo intact, which is the whole point of the conversion: what was
     /// an O(entire index) sweep plus an uncached read-and-parse *per keystroke*
     /// now recomputes only when the index or a backing file's content changes.
-    async fn blade_backing_class_resolution(
+    ///
+    /// This is the DIRECT resolution — `blade_path`'s own backing classes.
+    /// A partial that has none resolves through its rendering ancestors
+    /// instead; see [`Self::blade_backing_class_resolution`], which calls this
+    /// first and walks up only when it comes back empty.
+    async fn blade_backing_class_resolution_direct(
         &self,
         blade_path: &Path,
     ) -> laravel_lsp::salsa_impl::BladeBackingResolutionData {
@@ -13148,6 +13153,108 @@ impl LaravelLanguageServer {
                 livewire_paths,
                 live_blade_text,
             )
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Every PHP class backing what `blade_path` renders — its own backing
+    /// classes when it has any, otherwise those of the nearest Livewire
+    /// component that renders it (#339, item 1).
+    ///
+    /// An anonymous Blade partial (`resources/views/components/save-button.blade.php`,
+    /// used as `<x-save-button />`) has no backing class of its own: nobody
+    /// calls `view('components.save-button')`, it doesn't live under Livewire's
+    /// view path, and it declares no inline class. Its `wire:click="save"`,
+    /// `$this->save` and bare `$count` nevertheless resolve at runtime, against
+    /// the component that rendered it. So when the direct resolution is empty
+    /// we climb the usage graph — `<x-…>` and `<livewire:…>` tags alike — and
+    /// answer with the first ancestor that HAS a backing class.
+    ///
+    /// **First match, not all matches.** At runtime a partial has exactly one
+    /// `$this`; a multi-target result would be honest about the static
+    /// ambiguity and wrong about how the code runs. Order is therefore
+    /// load-bearing, and pinned twice over: breadth-first, so a nearer ancestor
+    /// always outranks a further one, and lexicographic by path within each
+    /// level (`handle_files_rendering_component` sorts), so two equidistant
+    /// parents resolve the same way on every call.
+    ///
+    /// **Direct beats walked-up.** The direct resolution runs first, so a
+    /// partial that IS rendered by a `view('components.save-button')` call site
+    /// keeps that answer and never climbs.
+    ///
+    /// **The cycle guard is a visited set, not a depth cap.** `a` including `b`
+    /// including `a` terminates because each file is expanded at most once —
+    /// and a cycle on one branch prunes only that branch, leaving a resolvable
+    /// path elsewhere in the level to answer. A depth cap would instead cut off
+    /// legitimately deep nesting, which is why it isn't one.
+    async fn blade_backing_class_resolution(
+        &self,
+        blade_path: &Path,
+    ) -> laravel_lsp::salsa_impl::BladeBackingResolutionData {
+        let direct = self.blade_backing_class_resolution_direct(blade_path).await;
+        if !direct.sources.is_empty() {
+            return direct;
+        }
+
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        visited.insert(blade_path.to_path_buf());
+        let mut frontier = self.blade_rendering_ancestors(blade_path).await;
+
+        while !frontier.is_empty() {
+            let mut next: Vec<PathBuf> = Vec::new();
+            for ancestor in frontier {
+                if !visited.insert(ancestor.clone()) {
+                    continue;
+                }
+                let resolved = self.blade_backing_class_resolution_direct(&ancestor).await;
+                if !resolved.sources.is_empty() {
+                    return resolved;
+                }
+                next.extend(self.blade_rendering_ancestors(&ancestor).await);
+            }
+            next.sort();
+            next.dedup();
+            frontier = next;
+        }
+
+        direct
+    }
+
+    /// The Blade templates that render `blade_path` as a component — one step
+    /// up the graph [`Self::blade_backing_class_resolution`] walks, sorted.
+    ///
+    /// The identities are derived from the path and matched against the
+    /// parser's classified tag names: `component_name_for_blade_path` gives the
+    /// `<x-…>` name, `livewire_name_for_path` the `<livewire:…>` name. A file
+    /// that is neither has no ancestors to climb to, and the actor is never
+    /// asked.
+    async fn blade_rendering_ancestors(&self, blade_path: &Path) -> Vec<PathBuf> {
+        let mut component_names: Vec<String> = Vec::new();
+        if let Some(config) = self.cached_config.read().await.as_ref() {
+            if let Some(name) =
+                laravel_lsp::component_declaration_locator::component_name_for_blade_path(
+                    blade_path, config,
+                )
+            {
+                component_names.push(name);
+            }
+        }
+
+        let mut livewire_names: Vec<String> = Vec::new();
+        if let Some((lw_config, lw_version)) = self.get_cached_livewire().await {
+            if let Some(name) = laravel_lsp::livewire_resolver::livewire_name_for_path(
+                blade_path, &lw_config, lw_version,
+            ) {
+                livewire_names.push(name);
+            }
+        }
+
+        if component_names.is_empty() && livewire_names.is_empty() {
+            return Vec::new();
+        }
+
+        self.salsa
+            .files_rendering_component(component_names, livewire_names)
             .await
             .unwrap_or_default()
     }

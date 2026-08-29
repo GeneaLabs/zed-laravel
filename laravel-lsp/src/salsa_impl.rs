@@ -1482,9 +1482,12 @@ pub fn render_source_files(db: &dyn Db, index: RenderIndex, view_name: String) -
 ///   2. `livewire_paths`, the conventionally-resolved Livewire component class
 ///      for a Blade file that lives under Livewire's view path.
 ///
-/// (1) comes first so a direct render site outranks the Livewire convention,
-/// and — once the up-walk of item 1 feeds this — a partial's own render site
-/// outranks any component ancestor.
+/// (1) comes first so a direct render site outranks the Livewire convention.
+/// A partial that has NEITHER resolves through the component that rendered it,
+/// one level up — but that walk lives in `Backend::blade_backing_class_
+/// resolution` (#339, item 1), which calls this query per candidate rather than
+/// climbing inside it, so a direct render site is always tried before any
+/// ancestor.
 ///
 /// Deduped, and restricted to plain `.php` paths. Existence is NOT checked
 /// here: this query is pure, and the actor drops paths it cannot read when it
@@ -6424,8 +6427,9 @@ pub struct FacadeReceiverTarget {
 /// inline.
 ///
 /// Both halves come from the same pair of memoized queries in one actor
-/// round-trip, so a caller that needs only the paths (the item 1 up-walk)
-/// never pays for a second request that would recompute the same lookup.
+/// round-trip, so a caller that needs only the paths (the item 1 up-walk, which
+/// calls this once per ancestor) never pays for a second request that would
+/// recompute the same lookup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BladeBackingResolutionData {
     /// Backing `.php` paths that exist and could be read, in precedence order.
@@ -6569,6 +6573,19 @@ pub enum SalsaRequest {
     FindViewReferences {
         view_name: String,
         reply: oneshot::Sender<Vec<ViewReferenceLocationData>>,
+    },
+    /// Every Blade template that RENDERS one of these components — the reverse
+    /// edge the item-1 up-walk climbs (#339). `component_names` are matched
+    /// against `<x-…>` tags (`ParsedPatternsData::components`) and
+    /// `livewire_names` against `<livewire:…>` tags
+    /// (`ParsedPatternsData::livewire_refs`), because a partial is used through
+    /// either syntax and indexing only the first would leave the other silent.
+    ///
+    /// Replies with the rendering `.blade.php` paths, sorted and deduped.
+    FilesRenderingComponent {
+        component_names: Vec<String>,
+        livewire_names: Vec<String>,
+        reply: oneshot::Sender<Vec<PathBuf>>,
     },
     /// Find all references to a classified symbol across the project.
     /// Iterates `ProjectFiles` and filters parser-classified patterns by name —
@@ -7419,6 +7436,29 @@ impl SalsaHandle {
         self.sender
             .send(SalsaRequest::FindViewReferences {
                 view_name,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Every Blade template that renders one of `component_names` (as
+    /// `<x-…>`) or `livewire_names` (as `<livewire:…>`), sorted and deduped.
+    /// Backs the item-1 up-walk from a partial to the component that rendered
+    /// it (#339).
+    pub async fn files_rendering_component(
+        &self,
+        component_names: Vec<String>,
+        livewire_names: Vec<String>,
+    ) -> Result<Vec<PathBuf>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::FilesRenderingComponent {
+                component_names,
+                livewire_names,
                 reply: reply_tx,
             })
             .await
@@ -9192,6 +9232,15 @@ impl SalsaActor {
                 }
                 SalsaRequest::FindViewReferences { view_name, reply } => {
                     let result = self.handle_find_view_references(&view_name);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::FilesRenderingComponent {
+                    component_names,
+                    livewire_names,
+                    reply,
+                } => {
+                    let result =
+                        self.handle_files_rendering_component(&component_names, &livewire_names);
                     let _ = reply.send(result);
                 }
                 SalsaRequest::FindReferences {
@@ -11138,6 +11187,60 @@ impl SalsaActor {
                 entry.insert(file);
             }
         }
+    }
+
+    /// The Blade templates that render any of `component_names` (`<x-…>`) or
+    /// `livewire_names` (`<livewire:…>`) — one step UP the usage graph, for the
+    /// item-1 walk from an anonymous partial to the Livewire component that
+    /// rendered it (#339).
+    ///
+    /// Both tag families are read, from the per-file `ParsedPatternsData` the
+    /// parse pass already produced: `<x-save-button>` lands in `components` and
+    /// `<livewire:save-button>` in `livewire_refs`, and a partial is reachable
+    /// through either. Matching is on the parser-classified NAME, never on raw
+    /// text, exactly as [`Self::handle_find_view_references`] matches its
+    /// directives.
+    ///
+    /// Only `.blade.php` files are returned. A plain `.php` parent (a class
+    /// rendering a tag from a heredoc) is not a rendering ancestor for this
+    /// purpose: the `$this` inside the partial belongs to the component whose
+    /// TEMPLATE contains the tag, and that template is what the walk needs.
+    ///
+    /// Sorted and deduped, because the walk takes the first match and an
+    /// unsorted result would flap between two parents that both qualify.
+    fn handle_files_rendering_component(
+        &mut self,
+        component_names: &[String],
+        livewire_names: &[String],
+    ) -> Vec<PathBuf> {
+        if component_names.is_empty() && livewire_names.is_empty() {
+            return Vec::new();
+        }
+
+        let mut files: Vec<PathBuf> = Vec::new();
+        for path in &self.view_files.clone() {
+            if !path.to_string_lossy().ends_with(".blade.php") {
+                continue;
+            }
+            let Some(patterns) = self.handle_get_patterns(path) else {
+                continue;
+            };
+            let renders = patterns
+                .components
+                .iter()
+                .any(|c| component_names.contains(&c.name))
+                || patterns
+                    .livewire_refs
+                    .iter()
+                    .any(|l| livewire_names.contains(&l.name));
+            if renders {
+                files.push(path.clone());
+            }
+        }
+
+        files.sort();
+        files.dedup();
+        files
     }
 
     /// Handle find view references request
