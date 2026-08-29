@@ -462,15 +462,82 @@ pub enum DbBreakerEvent {
 /// the handshake skips the password packet entirely — accepted by more
 /// permissive MySQL configs.
 ///
-/// Special-character escaping is the caller's concern — Laravel's
-/// `.env` values don't typically need URL-encoding in production
-/// credentials, and adding it here would risk double-encoding.
+/// Both components are percent-encoded by [`encode_userinfo_component`], so a
+/// `.env` credential holding a delimiter cannot escape its own slot (issue
+/// #362). Splicing raw let it: sqlx routes every connection string through
+/// `Url::parse`, which ends the authority at the first `/`, `?` or `#`
+/// whether or not that character was meant as a delimiter. A password `p/ss`
+/// yields `mysql://user:p/ss@host:3306/db`, whose authority is `user:p` — host
+/// `user`, port `p` — and the connection fails with *invalid port number*.
+///
+/// Worse is the case that does not fail: when the run before the delimiter is
+/// all digits and fits a `u16`, the authority parses, so `mysql://user:12/34@host/db`
+/// connects to host `user` on port 12 and reports no password at all. Base64
+/// passwords (`openssl rand -base64`) mix digits and `/` routinely, so this is
+/// an ordinary shape, and any redactor that decides the credential span by
+/// parsing the URL is told there is nothing to mask.
 fn userinfo(user: &str, password: &str) -> String {
+    let user = encode_userinfo_component(user);
     if password.is_empty() {
-        user.to_string()
+        user
     } else {
-        format!("{user}:{password}")
+        format!("{user}:{}", encode_userinfo_component(password))
     }
+}
+
+/// Percent-encode one userinfo component (a username or a password) for
+/// splicing into a connection URL.
+///
+/// Passes through exactly RFC 3986's `unreserved` (`ALPHA DIGIT - . _ ~`) and
+/// `sub-delims` (`! $ & ' ( ) * + , ; =`) sets; every other byte becomes `%XX`,
+/// including `:`, `/`, `?`, `#`, `[`, `]`, `@`, `%`, space, control bytes, and
+/// each byte of a non-ASCII UTF-8 sequence. A credential built only from the
+/// pass-through sets is returned byte-for-byte unchanged, so the URLs this
+/// server has always produced for ordinary credentials do not move.
+///
+/// `:` is encoded even in the *username*, where RFC 3986's userinfo grammar
+/// permits it: [`userinfo`] overloads `:` as its own username/password
+/// separator, so an unencoded one there mis-splits the credential exactly as an
+/// unencoded `/` mis-splits the authority.
+///
+/// Encoding is safe against double-encoding because it is applied at the single
+/// point of construction and the value arrives raw from the `.env` file: `%` is
+/// itself encoded to `%25`, so `sec%3Dret` round-trips to the literal
+/// `sec%3Dret` rather than decoding to `sec=ret`. sqlx percent-decodes both
+/// components on the way back out (`sqlx-mysql/src/options/parse.rs`,
+/// `sqlx-postgres/src/options/parse.rs`), so the driver receives the original
+/// bytes.
+fn encode_userinfo_component(raw: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'=' => out.push(byte as char),
+            _ => {
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 /// Render a `.env`-sourced value for a log line, through both redaction gates.
@@ -2246,11 +2313,23 @@ impl DatabaseSchemaProvider {
         }
 
         if let Some(socket) = &config.unix_socket {
-            // libpq-style socket connection: `postgres://user[:pass]@/db?host=/path`.
+            // libpq-style socket connection: the socket path rides in a `host=`
+            // query parameter, not the authority.
+            //
+            // The authority still needs a literal `localhost`, the same
+            // placeholder the MySQL socket branch uses. The WHATWG URL rules
+            // sqlx's `Url::parse` implements reject an empty host that follows
+            // a userinfo component, so the shorter
+            // `postgres://user@/db?host=/path` this branch used to emit came
+            // back as *empty host* and the candidate could never connect —
+            // independent of the credential, and true for every username. sqlx
+            // reads `host=` after the authority and stores it as the socket, so
+            // `localhost` is inert: verified against sqlx 0.9, the parsed
+            // options carry socket `/tmp/.s.PGSQL.5432` with host `localhost`.
             out.push(ConnCandidate {
                 label: format!("unix_socket={socket}"),
                 url: format!(
-                    "postgres://{}@/{}?host={}",
+                    "postgres://{}@localhost/{}?host={}",
                     userinfo(&config.username, &config.password),
                     config.database,
                     socket

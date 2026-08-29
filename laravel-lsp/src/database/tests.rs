@@ -286,6 +286,34 @@ fn postgres_candidates_socket_uses_libpq_style_url() {
     );
 }
 
+#[test]
+fn postgres_socket_candidate_url_actually_parses() {
+    use sqlx::postgres::PgConnectOptions;
+    use std::str::FromStr;
+
+    // `postgres_candidates_socket_uses_libpq_style_url` above pins the `?host=`
+    // shape by string match, which a URL the driver cannot parse satisfies just
+    // as well — and the authority this branch emitted did exactly that. Hand the
+    // candidate to the parser sqlx will actually use.
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = make_config_with(None, Some("/tmp/.s.PGSQL.5432"), "localhost");
+    cfg.driver = "pgsql".to_string();
+    cfg.port = 5432;
+    let socket = provider
+        .build_postgres_candidates(&cfg)
+        .into_iter()
+        .find(|c| c.label.starts_with("unix_socket"))
+        .expect("socket candidate");
+    let opts = PgConnectOptions::from_str(&socket.url)
+        .unwrap_or_else(|e| panic!("`{}` should parse: {e}", socket.url));
+    assert_eq!(
+        opts.get_socket().map(|p| p.to_string_lossy().into_owned()),
+        Some("/tmp/.s.PGSQL.5432".to_string()),
+        "the `host=` parameter must still reach sqlx as the socket path"
+    );
+    assert_eq!(opts.get_username(), "u");
+}
+
 // ---- classify_mysql_error: actionable per-error-code toasts (Phase 5.8b) ---
 
 #[test]
@@ -454,6 +482,261 @@ fn mysql_candidates_non_empty_password_keeps_colon() {
         "non-empty password should use the user:pass@ shape; got: {}",
         tcp.url
     );
+}
+
+// ---- userinfo percent-encoding (issue #362) ------------------------------
+//
+// Every assertion below is settled by the real driver's own connection-string
+// parser rather than by string comparison against a hand-written expectation:
+// the defect these tests pin is that `Url::parse` reads a raw delimiter as
+// structure, so only a parse can prove the credential survives.
+
+/// Parse `url` with the driver sqlx will actually use, and assert it yields
+/// exactly `user` and `password`.
+///
+/// `MySqlConnectOptions` exposes `get_username()` but no password accessor, so
+/// the password is pinned differentially: `to_url_lossy()` of the parsed
+/// options against `to_url_lossy()` of the *same* options with the expected
+/// password set. Every other field is identical by construction (it is a clone
+/// of the parsed value), so the two URLs are equal exactly when the parsed
+/// password is the expected one.
+fn assert_mysql_credentials(url: &str, user: &str, password: &str) {
+    use sqlx::mysql::MySqlConnectOptions;
+    use sqlx::ConnectOptions;
+    use std::str::FromStr;
+
+    let parsed = MySqlConnectOptions::from_str(url)
+        .unwrap_or_else(|e| panic!("`{url}` should parse as a MySQL connection string: {e}"));
+    assert_eq!(parsed.get_username(), user, "username parsed from `{url}`");
+    assert_eq!(
+        parsed.to_url_lossy(),
+        parsed.clone().password(password).to_url_lossy(),
+        "password parsed from `{url}` is not `{password}`"
+    );
+}
+
+/// Postgres twin of [`assert_mysql_credentials`], same differential technique.
+fn assert_postgres_credentials(url: &str, user: &str, password: &str) {
+    use sqlx::postgres::PgConnectOptions;
+    use sqlx::ConnectOptions;
+    use std::str::FromStr;
+
+    let parsed = PgConnectOptions::from_str(url)
+        .unwrap_or_else(|e| panic!("`{url}` should parse as a Postgres connection string: {e}"));
+    assert_eq!(parsed.get_username(), user, "username parsed from `{url}`");
+    assert_eq!(
+        parsed.to_url_lossy(),
+        parsed.clone().password(password).to_url_lossy(),
+        "password parsed from `{url}` is not `{password}`"
+    );
+}
+
+/// A config carrying the given credentials, on the loopback host. Defaults to
+/// MySQL; the Postgres cases override `driver` and `port`.
+fn creds_config(username: &str, password: &str) -> super::DatabaseConfig {
+    let mut cfg = make_config_with(None, None, "127.0.0.1");
+    cfg.username = username.to_string();
+    cfg.password = password.to_string();
+    cfg
+}
+
+fn mysql_tcp_url(username: &str, password: &str) -> String {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    provider
+        .build_mysql_candidates(&creds_config(username, password))
+        .into_iter()
+        .find(|c| c.label.starts_with("tcp "))
+        .expect("tcp candidate")
+        .url
+}
+
+#[test]
+fn userinfo_encodes_reserved_delimiters_in_password() {
+    use super::userinfo;
+    // The four delimiters issue #362 names: each one ends the authority (or
+    // begins the credential) when `Url::parse` meets it unencoded.
+    assert_eq!(userinfo("u", "p/ss"), "u:p%2Fss");
+    assert_eq!(userinfo("u", "p?ss"), "u:p%3Fss");
+    assert_eq!(userinfo("u", "p#ss"), "u:p%23ss");
+    assert_eq!(userinfo("u", "p@ss"), "u:p%40ss");
+}
+
+#[test]
+fn userinfo_encodes_username_symmetrically() {
+    use super::userinfo;
+    // A username is spliced into the same slot and needs the same treatment.
+    // `:` is encoded there too: `userinfo` uses it as its own separator, so a
+    // raw one would mis-split the credential.
+    assert_eq!(userinfo("foo@bar", "pw"), "foo%40bar:pw");
+    assert_eq!(userinfo("a:b", "pw"), "a%3Ab:pw");
+    assert_eq!(userinfo("a/b", "pw"), "a%2Fb:pw");
+}
+
+#[test]
+fn userinfo_leaves_legal_characters_byte_for_byte() {
+    use super::userinfo;
+    // RFC 3986 `unreserved` + `sub-delims` pass through untouched, so the URLs
+    // this server has always built for ordinary credentials do not move.
+    let legal = "aZ09-._~!$&'()*+,;=";
+    assert_eq!(userinfo(legal, legal), format!("{legal}:{legal}"));
+    assert_eq!(userinfo("sail", "password"), "sail:password");
+    // …and the assembled URL is byte-for-byte what this server built before.
+    assert_eq!(
+        mysql_tcp_url("sail", "password"),
+        "mysql://sail:password@127.0.0.1:3306/testdb"
+    );
+    assert_eq!(
+        mysql_tcp_url(legal, legal),
+        format!("mysql://{legal}:{legal}@127.0.0.1:3306/testdb")
+    );
+}
+
+#[test]
+fn userinfo_encodes_space_control_and_non_ascii_bytes() {
+    use super::userinfo;
+    assert_eq!(userinfo("u", "a b"), "u:a%20b");
+    assert_eq!(userinfo("u", "a\tb"), "u:a%09b");
+    assert_eq!(userinfo("u", "a\nb"), "u:a%0Ab");
+    assert_eq!(userinfo("u", "[::1]"), "u:%5B%3A%3A1%5D");
+    // Each byte of a multi-byte UTF-8 sequence is encoded on its own; sqlx
+    // percent-decodes back to the original string.
+    assert_eq!(userinfo("u", "pä"), "u:p%C3%A4");
+}
+
+#[test]
+fn userinfo_encodes_percent_so_hex_pairs_do_not_decode() {
+    use super::userinfo;
+    // A literal `%` must become `%25`, otherwise `sec%3Dret` would round-trip
+    // through sqlx's percent-decode as `sec=ret` — a different password.
+    assert_eq!(userinfo("u", "sec%3Dret"), "u:sec%253Dret");
+    assert_eq!(userinfo("u", "100%"), "u:100%25");
+    assert_mysql_credentials(&mysql_tcp_url("u", "sec%3Dret"), "u", "sec%3Dret");
+}
+
+#[test]
+fn userinfo_empty_password_still_omits_the_colon() {
+    use super::userinfo;
+    // Encoding must not disturb the "no password" shape: `root:` tells sqlx an
+    // empty password *was* supplied and MySQL answers `using password: YES`.
+    assert_eq!(userinfo("root", ""), "root");
+    assert_eq!(userinfo("ro@ot", ""), "ro%40ot");
+}
+
+#[test]
+fn mysql_url_round_trips_reserved_password_characters() {
+    for password in ["p/ss", "p?ss", "p#ss", "p@ss", "pa:ss", "p ss", "p%ss"] {
+        assert_mysql_credentials(&mysql_tcp_url("sail", password), "sail", password);
+    }
+}
+
+#[test]
+fn mysql_url_round_trips_digit_run_before_a_delimiter() {
+    // The silent class from issue #362. The leading run before the delimiter is
+    // all digits and fits a `u16`, so the authority parses instead of erroring:
+    // every shape below resolved to host `sail`, the digits as the port, and
+    // the default `root` user, with no password at all. Nothing surfaces — the
+    // connection just goes somewhere else, and a redactor that locates the
+    // credential by parsing the URL is told there is nothing to mask.
+    for password in [
+        "12/34",
+        "1234/56",
+        "012345/aG9zdG5hbWU=",
+        "12?34",
+        "1234?56",
+        "12#34",
+        "1234#56",
+    ] {
+        assert_mysql_credentials(&mysql_tcp_url("sail", password), "sail", password);
+    }
+}
+
+#[test]
+fn mysql_url_round_trips_reserved_username_characters() {
+    for username in ["foo@bar", "a:b", "a/b", "a?b", "a#b"] {
+        assert_mysql_credentials(&mysql_tcp_url(username, "pw"), username, "pw");
+    }
+}
+
+#[test]
+fn mysql_socket_candidate_round_trips_credentials_and_socket() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = make_config_with(None, Some("/tmp/mysql.sock"), "localhost");
+    cfg.username = "sa/il".to_string();
+    cfg.password = "012345/aG9zdG5hbWU=".to_string();
+    let socket = provider
+        .build_mysql_candidates(&cfg)
+        .into_iter()
+        .find(|c| c.label.starts_with("unix_socket"))
+        .expect("socket candidate");
+    assert_mysql_credentials(&socket.url, "sa/il", "012345/aG9zdG5hbWU=");
+    // The encoded credential must not disturb the trailing `socket=` param.
+    let opts = <sqlx::mysql::MySqlConnectOptions as std::str::FromStr>::from_str(&socket.url)
+        .expect("socket URL should parse");
+    assert_eq!(
+        opts.get_socket().map(|p| p.to_string_lossy().into_owned()),
+        Some("/tmp/mysql.sock".to_string())
+    );
+}
+
+#[test]
+fn postgres_tcp_candidate_round_trips_credentials() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = creds_config("fo@o", "012345/aG9zdG5hbWU=");
+    cfg.driver = "pgsql".to_string();
+    cfg.port = 5432;
+    let tcp = provider
+        .build_postgres_candidates(&cfg)
+        .into_iter()
+        .find(|c| c.label.starts_with("tcp "))
+        .expect("tcp candidate");
+    assert_postgres_credentials(&tcp.url, "fo@o", "012345/aG9zdG5hbWU=");
+}
+
+#[test]
+fn postgres_socket_candidate_round_trips_credentials_and_socket() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = make_config_with(None, Some("/tmp/.s.PGSQL.5432"), "localhost");
+    cfg.driver = "pgsql".to_string();
+    cfg.port = 5432;
+    cfg.username = "fo@o".to_string();
+    cfg.password = "12/34".to_string();
+    let socket = provider
+        .build_postgres_candidates(&cfg)
+        .into_iter()
+        .find(|c| c.label.starts_with("unix_socket"))
+        .expect("socket candidate");
+    assert_postgres_credentials(&socket.url, "fo@o", "12/34");
+    // The encoded credential must not disturb the trailing `host=` param.
+    let opts = <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(&socket.url)
+        .expect("socket URL should parse");
+    assert_eq!(
+        opts.get_socket().map(|p| p.to_string_lossy().into_owned()),
+        Some("/tmp/.s.PGSQL.5432".to_string())
+    );
+}
+
+#[test]
+fn db_url_passthrough_is_never_re_encoded() {
+    // `config.url` is a full connection string the user supplied verbatim. It
+    // never goes through `userinfo`, and encoding it would corrupt credentials
+    // the user already encoded themselves.
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let raw = "mysql://heroku:ab%2Fc@db.heroku.com/x";
+    let mut cfg = make_config_with(Some(raw), None, "mysql");
+    cfg.username = "ignored@me".to_string();
+    cfg.password = "ignored/me".to_string();
+    let mysql = provider.build_mysql_candidates(&cfg);
+    assert_eq!(mysql[0].label, "DB_URL");
+    assert_eq!(mysql[0].url, raw);
+
+    let pg_raw = "postgres://heroku:ab%2Fc@db.heroku.com/x";
+    let mut pg_cfg = make_config_with(Some(pg_raw), None, "postgres");
+    pg_cfg.driver = "pgsql".to_string();
+    pg_cfg.username = "ignored@me".to_string();
+    pg_cfg.password = "ignored/me".to_string();
+    let pg = provider.build_postgres_candidates(&pg_cfg);
+    assert_eq!(pg[0].label, "DB_URL");
+    assert_eq!(pg[0].url, pg_raw);
 }
 
 // ---- resolve_env: empty value should NOT swallow next line (Phase 5.5) ----
