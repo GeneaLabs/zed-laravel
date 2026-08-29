@@ -24150,6 +24150,30 @@ impl LanguageServer for LaravelLanguageServer {
         // model buffer, dropping its `$this->status` entry). External edits to
         // a closed file are still picked up via `did_change_watched_files`,
         // and a real delete still goes through `RemoveFile`.
+        //
+        // What DOES end here is the buffer's OWNERSHIP of that text.
+        // `did_open`/`did_change` stamp `ExternalPhpText::PushedByClient` so
+        // the backing-class loader never reads disk over an unsaved edit —
+        // a promise to keep pushing that only holds while the buffer is open.
+        // Discarding changes on close writes nothing to disk, so no
+        // `did_change_watched_files` event ever arrives to correct it, and the
+        // loader would go on serving text that exists neither on disk nor in
+        // any buffer. Releasing ownership is the matching edge to that
+        // acquire: the path downgrades to unowned and the next resolution
+        // re-reads disk. It evicts NOTHING, which is what makes it compatible
+        // with the paragraph above.
+        //
+        // Unlike the acquire, this call can fail — but only by the actor
+        // being unreachable, and the loader whose read the release exists to
+        // unblock runs INSIDE that same actor. A failed release therefore
+        // cannot leave phantom text behind for anything to serve; there is no
+        // live reader left to serve it. Logging is the whole remedy, at the
+        // level `did_open` already uses for its own Salsa push.
+        if let Ok(path) = uri.to_file_path() {
+            if let Err(e) = self.salsa.release_external_php_ownership(path).await {
+                debug!("did_close: external-PHP ownership release failed: {e}");
+            }
+        }
 
         // Publish empty diagnostics to clear them from the client
         self.client.publish_diagnostics(uri, vec![], None).await;

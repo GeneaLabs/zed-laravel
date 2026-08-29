@@ -6464,6 +6464,13 @@ pub enum SalsaRequest {
         path: PathBuf,
         reply: oneshot::Sender<()>,
     },
+    /// Hand a client-pushed path's text back to the backing-class loader,
+    /// evicting nothing — see
+    /// [`SalsaActor::release_external_php_ownership`].
+    ReleaseExternalPhpOwnership {
+        path: PathBuf,
+        reply: oneshot::Sender<()>,
+    },
 
     /// Tell the actor to update its per-category file lists in
     /// response to a filesystem event from the language client. The
@@ -7240,6 +7247,24 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::RemoveFile {
+                path,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Release a client push's ownership of `path`'s text, so the
+    /// backing-class loader re-reads disk on its next resolution. Evicts
+    /// nothing — see [`SalsaActor::release_external_php_ownership`] for why
+    /// this is not [`SalsaHandle::remove_file`].
+    pub async fn release_external_php_ownership(&self, path: PathBuf) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ReleaseExternalPhpOwnership {
                 path,
                 reply: reply_tx,
             })
@@ -8696,6 +8721,14 @@ enum ExternalPhpText {
     /// pusher owns invalidation for this path and the loader must not read
     /// disk over it: a live buffer would lose the user's unsaved edits, and a
     /// watched file is already being kept current by the watcher.
+    ///
+    /// The promise to push again lasts exactly as long as the pusher does.
+    /// The watcher never goes away, so a watched file holds this state for the
+    /// session; an editor buffer does, so `textDocument/didClose` hands the
+    /// path back via [`SalsaActor::release_external_php_ownership`]. Closing a
+    /// buffer whose edits were DISCARDED writes nothing to disk and fires no
+    /// watcher event, so without that release this state would outlive every
+    /// source able to correct it.
     PushedByClient,
 }
 
@@ -9136,6 +9169,10 @@ impl SalsaActor {
                         self.class_hierarchy_index.remove_file(&path);
                         self.class_files_snapshot = None; // hierarchy changed
                     }
+                    let _ = reply.send(());
+                }
+                SalsaRequest::ReleaseExternalPhpOwnership { path, reply } => {
+                    self.release_external_php_ownership(&path);
                     let _ = reply.send(());
                 }
 
@@ -9842,6 +9879,42 @@ impl SalsaActor {
     fn mark_pushed_by_client(&mut self, path: &Path) {
         self.external_php_text
             .insert(path.to_path_buf(), ExternalPhpText::PushedByClient);
+    }
+
+    /// Hand `path`'s text back to the loader — the release edge matching
+    /// [`SalsaActor::mark_pushed_by_client`]'s acquire, driven by
+    /// `textDocument/didClose`.
+    ///
+    /// Dropping the entry restores the "nobody installed text here" state,
+    /// the one [`SalsaActor::ensure_external_php_source_loaded`] reads as
+    /// "read disk unconditionally". That is the whole point: a buffer can be
+    /// closed with its edits DISCARDED, which writes nothing to disk and so
+    /// fires no `did_change_watched_files`. Without a release the pusher's
+    /// promise to push again outlives the pusher, and the loader keeps
+    /// serving text that exists neither on disk nor in any open buffer.
+    ///
+    /// The drop is unconditional rather than gated on the entry actually
+    /// being `PushedByClient`. `did_open` pushes every opened path through
+    /// `update_file`, and the loader refuses to write over a pushed path, so
+    /// an open document's entry stays `PushedByClient` for as long as it is
+    /// open — a `LoadedFromDisk` guard here would be a branch no `didClose`
+    /// can reach, and therefore one no test can honestly pin. Were it
+    /// reached, the two spellings differ by one disk read and not by any
+    /// answer: the loader re-reads, re-stamps the mtime, and serves the same
+    /// text. Dropping is also the safe direction for the defect this closes —
+    /// every divergence falls toward consulting disk, never toward serving a
+    /// buffer nobody holds.
+    ///
+    /// Infallible and idempotent by the same token: `didClose` fires for every
+    /// closed document, most of which never enter this map, and removing an
+    /// absent key is a no-op.
+    ///
+    /// Deliberately NOT `RemoveFile`. The `SourceFile` input, the per-file
+    /// caches and the resolved magic-member entries all stay; only ownership
+    /// changes, and the next loader read replaces the text. See the comment in
+    /// `Backend::did_close` for why eviction on close is the wrong tool.
+    fn release_external_php_ownership(&mut self, path: &Path) {
+        self.external_php_text.remove(path);
     }
 
     /// Handle a Blade loop-blocks query. Memoized via Salsa + actor LRU.
