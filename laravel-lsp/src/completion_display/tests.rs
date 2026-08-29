@@ -314,16 +314,57 @@ fn a_credential_inside_the_value_is_masked_whatever_the_name_says() {
         "mysql://sail:***@127.0.0.1:3306/db"
     );
     assert_eq!(
-        mask_url_credentials("postgres://user:p@ssw0rd@host/db"),
-        // Only the first `@` after the credentials is treated as the host
-        // separator — best-effort. An `@` inside the password leaves its tail
-        // visible, but the characters that identify the credential are gone.
-        "postgres://user:***@ssw0rd@host/db"
-    );
-    assert_eq!(
         mask_url_credentials("redis://default:redis-secret@redis:6379"),
         "redis://default:***@redis:6379"
     );
+}
+
+// ---- the authority parse (issue #355) ------------------------------------
+
+/// RFC 3986 wants an `@` in a password percent-encoded as `%40`, but nothing
+/// stops a developer typing one — and `database::userinfo` interpolates the
+/// `.env` password into a connection URL verbatim, so the server builds this
+/// shape itself before logging it through this function.
+///
+/// Reading the *first* `@` as the host separator left everything after it on
+/// screen; the password's tail is exactly the part long enough to be worth
+/// stealing. The credentials end at the last `@` in the authority instead.
+#[test]
+fn an_unencoded_at_in_the_password_does_not_end_the_credentials_early() {
+    for (value, expected) in [
+        (
+            "postgres://user:p@ssw0rd@host/db",
+            "postgres://user:***@host/db",
+        ),
+        // More than one, and a port after the host: the *last* `@` wins, not
+        // the second one either.
+        (
+            "mysql://sail:p@ss@w0rd@127.0.0.1:3306/db",
+            "mysql://sail:***@127.0.0.1:3306/db",
+        ),
+        // The no-username Redis form, which starts its credentials with the
+        // `:` the mask keys on.
+        ("redis://:p@ss@redis:6379", "redis://:***@redis:6379"),
+        // The libpq socket URL `build_postgres_candidates` generates: the
+        // authority ends immediately after the `@`, and the socket path lives
+        // in the query string.
+        (
+            "postgres://user:p@ss@/laravel?host=/var/run/postgresql",
+            "postgres://user:***@/laravel?host=/var/run/postgresql",
+        ),
+        // An `@` in the query must not be mistaken for the separator and drag
+        // the real credentials into the "host" half.
+        (
+            "mysql://sail:secret@127.0.0.1/db?user=a@b",
+            "mysql://sail:***@127.0.0.1/db?user=a@b",
+        ),
+    ] {
+        assert_eq!(
+            mask_url_credentials(value),
+            expected,
+            "{value:?} must mask the whole credential"
+        );
+    }
 }
 
 /// Fail-open, and borrowed while it is at it: a value the parser does not
@@ -340,6 +381,21 @@ fn a_value_carrying_no_credential_is_returned_untouched() {
         "https://example.com/webhook",    // no credentials at all
         "sqlite:///absolute/path.sqlite", // scheme, no `@`
         "",
+        // An `@` in the *path*, and a `:` that is a port rather than a
+        // credential separator. Reading the first `@` in the whole value made
+        // this `mysql://host:***@x` — the port masked as a password, host,
+        // port and database all gone (issue #355).
+        "mysql://host:3306/db@x",
+        // The same host and port with nothing after them to mislead the parse.
+        "mysql://host:3306/db",
+        // An `@` in the query string of a URL that carries no credentials.
+        "https://example.com/webhook?notify=ops@example.com",
+        // A documented limitation, pinned so it stays deliberate: an unencoded
+        // `/` in the password ends the authority before the `@`, so the value
+        // fails open. `postgres://user:p/ss@host/db` cannot be told apart from
+        // `mysql://host:3306/db@x` above, and honouring the later `@` there
+        // masks a port and throws the host away.
+        "postgres://user:p/ss@host/db",
     ] {
         assert!(
             matches!(mask_url_credentials(value), std::borrow::Cow::Borrowed(v) if v == value),

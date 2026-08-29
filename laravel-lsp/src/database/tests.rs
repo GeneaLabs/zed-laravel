@@ -1792,7 +1792,11 @@ const LOG_PLAIN_HOST: &str = "db.internal.example";
 /// segment of `SENSITIVE_ENV_SEGMENTS`, and Laravel's stock
 /// `config/database.php` ships `'url' => env('DATABASE_URL')`, so this value
 /// reaches the log on the default configuration of an ordinary project.
-const LOG_URL_SECRET: &str = "url-hunter2-issue-344";
+const LOG_URL_SECRET: &str = "url-hunter2@tail-355";
+/// The half of `LOG_URL_SECRET` the old first-`@` parse left in the log
+/// (issue #355). Asserted on its own: a whole-secret check passes vacuously on
+/// a partially masked line, which is the defect this fixture now pins.
+const LOG_URL_SECRET_TAIL: &str = "tail-355";
 
 fn log_fixture_db_url() -> String {
     format!("mysql://sail:{LOG_URL_SECRET}@{LOG_PLAIN_HOST}:3306/laravel")
@@ -1966,10 +1970,12 @@ fn parsing_the_database_config_never_logs_a_credential_inside_a_url_value() {
         Some(log_fixture_db_url().as_str()),
         "the parse still hands the driver the real URL — masking is a display concern only"
     );
-    assert!(
-        !logs.contains(LOG_URL_SECRET),
-        "the password inside DATABASE_URL reached the log in plaintext:\n{logs}"
-    );
+    for secret in [LOG_URL_SECRET, LOG_URL_SECRET_TAIL] {
+        assert!(
+            !logs.contains(secret),
+            "the password inside DATABASE_URL reached the log in plaintext:\n{logs}"
+        );
+    }
     // Two lines print this value, and both must mask it: the resolver's
     // `resolved from .env:` line and the config summary's `url:` line. Pinned
     // separately, because masking one and not its sibling is precisely the
@@ -2013,10 +2019,12 @@ fn resolve_env_masks_a_credential_inside_a_url_value_in_its_debug_log() {
         Some(log_fixture_db_url().as_str()),
         "caller still gets the real URL"
     );
-    assert!(
-        !logs.contains(LOG_URL_SECRET),
-        "the password inside DATABASE_URL reached the debug log in plaintext:\n{logs}"
-    );
+    for secret in [LOG_URL_SECRET, LOG_URL_SECRET_TAIL] {
+        assert!(
+            !logs.contains(secret),
+            "the password inside DATABASE_URL reached the debug log in plaintext:\n{logs}"
+        );
+    }
     assert!(
         logs.contains(&format!(
             r#"resolve_env(DATABASE_URL): Some("{}")"#,

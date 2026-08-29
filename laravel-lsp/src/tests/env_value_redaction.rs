@@ -60,7 +60,14 @@ const PLAIN_VALUE: &str = "Example";
 /// reads `'url' => env('DATABASE_URL')` and the value carries the password
 /// inside itself. Caught by shape, not by name.
 const URL_NAME: &str = "DATABASE_URL";
-const URL_SECRET: &str = "url-hunter2-issue-344";
+/// Carries an unencoded `@`, the shape issue #355 fixed: `database::userinfo`
+/// interpolates a `.env` password into a connection URL verbatim, so a
+/// developer who types one gets this value across all five surfaces.
+const URL_SECRET: &str = "url-hunter2@tail-355";
+/// The half of `URL_SECRET` that survived the old first-`@` parse. Asserted on
+/// its own because every whole-secret check passes vacuously on a *partially*
+/// masked value — `sail:***@tail-355@host` contains no `URL_SECRET`.
+const URL_SECRET_TAIL: &str = "tail-355";
 
 fn url_value() -> String {
     format!("mysql://sail:{URL_SECRET}@db.internal.example:3306/laravel")
@@ -165,7 +172,13 @@ fn assert_no_secret_leak(
     context: &str,
 ) -> Vec<CompletionItem> {
     let (items, json) = dissect(response);
-    for secret in [PASSWORD_VALUE, TOKEN_VALUE, COMMENTED_VALUE, URL_SECRET] {
+    for secret in [
+        PASSWORD_VALUE,
+        TOKEN_VALUE,
+        COMMENTED_VALUE,
+        URL_SECRET,
+        URL_SECRET_TAIL,
+    ] {
         assert!(
             !json.contains(secret),
             "{context}: {secret} leaked into the completion response: {json}"
@@ -334,10 +347,12 @@ async fn hover_masks_a_credential_carried_inside_the_value() {
     let (_dir, _root, server) = project(&dotenv()).await;
     let markdown = server.hover_for_env(URL_NAME).await;
 
-    assert!(
-        !markdown.contains(URL_SECRET),
-        "the password inside {URL_NAME} leaked into the hover markdown: {markdown}"
-    );
+    for secret in [URL_SECRET, URL_SECRET_TAIL] {
+        assert!(
+            !markdown.contains(secret),
+            "the password inside {URL_NAME} leaked into the hover markdown: {markdown}"
+        );
+    }
     assert!(
         markdown.contains(&format!("```\n{}\n```", url_masked())),
         "the masked URL must still render as a code block: {markdown}"

@@ -102,23 +102,40 @@ pub fn is_sensitive_env_name(name: &str) -> bool {
 /// display surface must not blank a value it merely failed to parse, and a log
 /// line must not panic the server.
 ///
-/// Only the first `@` after the credentials is treated as the host separator,
-/// so an `@` inside the password leaves its tail visible
-/// (`postgres://user:***@ssw0rd@host/db`). Deliberate: the characters that
-/// identify the credential are gone, and a stricter parse would trade a
-/// diagnostic that works on real URLs for one that fails on unusual ones.
+/// The credentials end at the **last** `@` inside the authority component —
+/// the run between `://` and the first `/`, `?` or `#` — which is the standard
+/// RFC 3986 authority parse. Taking the *first* `@` anywhere in the value left
+/// the tail of an unencoded-`@` password on screen
+/// (`postgres://user:***@ssw0rd@host/db`, issue #355) and read an `@` in the
+/// *path* as a credential separator, masking a host's port
+/// (`mysql://host:3306/db@x`).
+///
+/// One malformed shape still fails open: an unencoded `/`, `?` or `#` *inside*
+/// the password ends the authority early, so no `@` is found and the value
+/// comes back untouched. RFC 3986 requires all four characters percent-encoded
+/// in userinfo, and `postgres://user:p/ss@host/db` is indistinguishable from
+/// `mysql://host:3306/db@x` — honouring the later `@` for one masks the other's
+/// port and destroys the host, which is the more common URL and the more
+/// misleading diagnostic.
 ///
 /// Lives here rather than in `database`, where it started life as
 /// `mask_url_password`: it is now the second half of the redaction policy the
 /// four display surfaces and the server log share, and a second copy is how the
 /// two spellings drift apart.
 pub fn mask_url_credentials(value: &str) -> Cow<'_, str> {
-    // Find the `://` separator, then the `@` that ends the credentials.
+    // Find the `://` separator, then the authority component it opens.
     let Some(scheme_end) = value.find("://") else {
         return Cow::Borrowed(value);
     };
     let creds_start = scheme_end + 3;
-    let Some(at_offset) = value[creds_start..].find('@') else {
+    // The authority ends at the first `/`, `?` or `#`. Past that is path, query
+    // or fragment, where an `@` is an ordinary character and not a separator.
+    let authority_end = value[creds_start..]
+        .find(['/', '?', '#'])
+        .map_or(value.len(), |offset| creds_start + offset);
+    // The credentials end at the *last* `@` in the authority, so an unencoded
+    // `@` in the password does not end them early (issue #355).
+    let Some(at_offset) = value[creds_start..authority_end].rfind('@') else {
         return Cow::Borrowed(value);
     };
     let creds_end = creds_start + at_offset;
