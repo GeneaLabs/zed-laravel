@@ -226,7 +226,9 @@ fn items_carry_rich_markdown_documentation() {
     match where_item.documentation.as_ref() {
         Some(Documentation::MarkupContent(MarkupContent { kind, value })) => {
             assert_eq!(*kind, MarkupKind::Markdown);
-            assert!(value.contains("**Illuminate\\Database\\Eloquent\\Builder::where**"));
+            // Escaped header (`markdown_safety::escape_inline`): the FQN
+            // separators are backslashed on the wire, unchanged on screen.
+            assert!(value.contains("**Illuminate\\\\Database\\\\Eloquent\\\\Builder\\:\\:where**"));
             assert!(value.contains("```php"));
         }
         other => panic!("expected MarkupContent documentation, got {other:?}"),
@@ -303,7 +305,7 @@ fn documentation_panel_carries_intelephense_structure() {
 
     // Header: bolded FQCN::method (Intelephense-style)
     assert!(
-        value.starts_with("**Illuminate\\Database\\Eloquent\\Builder::where**"),
+        value.starts_with("**Illuminate\\\\Database\\\\Eloquent\\\\Builder\\:\\:where**"),
         "panel should lead with a bolded qualified identifier:\n{value}"
     );
     // Summary prose
@@ -339,7 +341,7 @@ fn documentation_panel_for_method_without_docblock_still_has_signature() {
         Some(Documentation::MarkupContent(MarkupContent { value, .. })) => value.clone(),
         other => panic!("expected MarkupContent, got {other:?}"),
     };
-    assert!(value.contains("**Illuminate\\Database\\Eloquent\\Builder::find**"));
+    assert!(value.contains("**Illuminate\\\\Database\\\\Eloquent\\\\Builder\\:\\:find**"));
     assert!(value.contains("```php\n<?php\npublic function find($id, $columns = ['*'])\n```"));
 }
 

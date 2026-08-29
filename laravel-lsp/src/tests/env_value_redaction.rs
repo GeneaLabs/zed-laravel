@@ -38,6 +38,15 @@
 //! Every leak assertion carries a positive control — the ordinary `APP_NAME`
 //! renders exactly as it did before this change — so a fixture that never
 //! reached the code under test cannot pass vacuously on an empty response.
+//!
+//! One test here is about a second property of the same surface rather than
+//! about redaction: `a_value_spelling_a_markdown_link_renders_inert_in_the_panel`.
+//! Redaction decides *whether* a value is displayed; that one decides whether
+//! the displayed one can act, since a `.env` value has no charset restriction
+//! and the completion panel is rendered as markdown. It lives here because it
+//! shares this module's subject — what the LSP puts on screen from `.env`
+//! content — and its fixture is the completion panel these helpers already
+//! model. The hover card's matching property is pinned in `env_key_navigation`.
 
 use crate::LaravelLanguageServer;
 use laravel_lsp::cache_manager::CacheManager;
@@ -169,6 +178,25 @@ fn dissect(response: Option<CompletionResponse>) -> (Vec<CompletionItem>, String
     }
 }
 
+/// The serialized response, with backslashes stripped so a search for a secret
+/// keeps the "any field" reach the assertion below claims.
+///
+/// The documentation panel's summary arrives markdown-escaped
+/// (`markdown_safety::escape_inline`, applied at the `.env` completion site),
+/// and every needle here carries hyphens — `hunter2-issue-344` spells
+/// `hunter2\-issue\-344` in that field. `detail` is not escaped, so a value
+/// reaching it still matches raw and this is not what catches a wholesale
+/// redaction failure; it is what stops `summary` becoming a field the search
+/// silently stopped covering.
+///
+/// A file-local copy of the sibling in `env_completion_system_leak.rs`, which
+/// is the same shape: these test modules are self-contained by convention (the
+/// `dissect` above is duplicated the same way), and there is no shared
+/// test-support module to hang it on.
+fn searchable(json: &str) -> String {
+    json.replace('\\', "")
+}
+
 /// No secret survives anywhere in the serialized response — any field, any
 /// item. Returns the items so callers can add positive assertions.
 fn assert_no_secret_leak(
@@ -176,13 +204,39 @@ fn assert_no_secret_leak(
     context: &str,
 ) -> Vec<CompletionItem> {
     let (items, json) = dissect(response);
+    let haystack = searchable(&json);
     for secret in [PASSWORD_VALUE, TOKEN_VALUE, COMMENTED_VALUE, URL_SECRET] {
         assert!(
-            !json.contains(secret),
+            !haystack.contains(secret),
             "{context}: {secret} leaked into the completion response: {json}"
         );
     }
     items
+}
+
+/// `searchable` is load-bearing for `assert_no_secret_leak`, and nothing in the
+/// green suite exercises it: the escaping only hides a needle when there is a
+/// leak to hide, so deleting the strip leaves every test here passing and
+/// silently narrows the search to the plain-text fields. This pins it at its
+/// own definition instead, over the same four needles the helper searches.
+///
+/// The first assertion is what keeps the second honest — it fails if a needle
+/// ever loses its ASCII punctuation, at which point the escaping no longer
+/// transforms it and this test would prove nothing about that row.
+#[test]
+fn the_leak_search_still_finds_a_needle_the_panel_spells_with_escapes() {
+    for secret in [PASSWORD_VALUE, TOKEN_VALUE, COMMENTED_VALUE, URL_SECRET] {
+        let escaped = laravel_lsp::markdown_safety::escape_inline(secret);
+        assert!(
+            !escaped.contains(secret),
+            "this fixture is only meaningful while the escaping transforms the \
+             needle; {secret} now survives escape_inline unchanged: {escaped}"
+        );
+        assert!(
+            searchable(&escaped).contains(secret),
+            "the leak search must see through the panel's escaping: {escaped}"
+        );
+    }
 }
 
 fn item<'a>(items: &'a [CompletionItem], label: &str, context: &str) -> &'a CompletionItem {
@@ -206,7 +260,25 @@ fn documentation_markdown(item: &CompletionItem, context: &str) -> String {
 
 /// The panel `completion()` builds for a `.env` variable: name, summary,
 /// `Source: <file>`. Asserted whole, so dropping any builder call fails.
+///
+/// Both the name and the value arrive markdown-escaped
+/// (`markdown_safety::escape_inline`), because neither a `.env` key nor a
+/// `.env` value has a charset and the panel is rendered as markdown. The two
+/// are escaped in different places — `hover::render` and
+/// `CompletionDoc::render` escape the header for every caller, while
+/// `summary` is markdown-bearing by contract and leaves it to the call site —
+/// but the panel text is the same either way, which is what this models.
+///
+/// Building the expectation with the same helper is not circular: the escaping
+/// itself is pinned by `markdown_safety`'s own literal-expectation tests, by
+/// the link/image fixtures in `env_key_navigation.rs`, and by
+/// `a_value_spelling_a_markdown_link_renders_inert_in_the_panel` below, which
+/// asserts against literal escaped text rather than through this helper. What
+/// *this* helper asserts is the panel's structure and its redaction, and those
+/// must not become unreadable to spell an underscore.
 fn expected_panel(name: &str, summary: &str) -> String {
+    let name = laravel_lsp::markdown_safety::escape_inline(name);
+    let summary = laravel_lsp::markdown_safety::escape_inline(summary);
     format!("**{name}**\n\n{summary}\n\nSource: .env")
 }
 
@@ -309,6 +381,70 @@ async fn an_empty_sensitive_value_redacts_rather_than_reading_empty() {
     assert_eq!(
         documentation_markdown(item(&items, "APP_DEBUG", "empty value"), "empty value"),
         expected_panel("APP_DEBUG", "(empty)")
+    );
+}
+
+/// Redaction decides *whether* a value is shown; this decides whether the shown
+/// one can act. A `.env` value is everything after the first `=`, with no
+/// charset restriction, and the panel is `MarkupKind::Markdown` — so a value
+/// spelling a link renders a live clickable one, and the image variant is
+/// fetched with no click at all.
+///
+/// The hover card's key had the identical property through its header
+/// (`env_key_navigation`); `hover::render` escapes that field for its callers.
+/// `CompletionDoc::summary` cannot do the same — a PHPDoc summary legitimately
+/// carries markdown — so its contract puts the escaping on the call site, and
+/// this is the call site that hands it untrusted text.
+#[tokio::test]
+async fn a_value_spelling_a_markdown_link_renders_inert_in_the_panel() {
+    // Neither name matches a sensitive segment and neither value has the
+    // `user:pass@host` shape, so both reach the panel unredacted and unmasked —
+    // this test is about the value that *is* displayed, not the ones that
+    // aren't.
+    const LINK_NAME: &str = "SUPPORT_NOTICE";
+    const IMAGE_NAME: &str = "BANNER";
+    let link = "[Update your credentials here](https://evil.example/harvest)";
+    let image = "![](https://evil.example/pixel)";
+    let fixture = format!("{LINK_NAME}={link}\n{IMAGE_NAME}={image}\n");
+    let (_dir, root, server) = project(&fixture).await;
+
+    // The `.env` buffer's own `${…}` interpolation: the popup most likely to be
+    // open while the file holding these lines is the one on screen.
+    let items = dissect(complete_in(&server, &root, ".env", "NEW_VAR=${").await).0;
+
+    let panel = documentation_markdown(item(&items, LINK_NAME, "link value"), "link value");
+    assert_eq!(
+        panel,
+        expected_panel(LINK_NAME, link),
+        "the value must render as itself, not as a live link"
+    );
+    // Literal, not routed through `expected_panel` — that helper escapes with
+    // the same function production does, so on its own it would still pass if
+    // both sides stopped escaping together.
+    assert!(
+        !panel.contains("](https://evil.example/harvest)"),
+        "the link's target must not survive unescaped: {panel}"
+    );
+    assert!(
+        panel.contains(r"\[Update your credentials here\]"),
+        "the value's brackets must arrive escaped: {panel}"
+    );
+
+    let panel = documentation_markdown(item(&items, IMAGE_NAME, "image value"), "image value");
+    assert_eq!(
+        panel,
+        expected_panel(IMAGE_NAME, image),
+        "the value must render as itself, not as an inline image"
+    );
+    // The image variant needs no click — the client fetches the URL to render
+    // it — so the leading `!` is the load-bearing character here.
+    assert!(
+        !panel.contains("!["),
+        "the image marker must not survive unescaped: {panel}"
+    );
+    assert!(
+        panel.contains(r"\!\["),
+        "the image marker must arrive escaped: {panel}"
     );
 }
 
@@ -470,6 +606,18 @@ async fn config_completion_redacts_only_the_dotenv_sourced_sensitive_values() {
     );
 }
 
+/// The project-relative label `config_source_label` renders beside a config
+/// value, spelled with a forward slash on **every** platform.
+///
+/// Typed as a literal on purpose. The label is user-visible text, and
+/// `config_source_label` normalizes separators precisely so it does not change
+/// shape with the host OS. An expectation built with `Path::join(...).display()`
+/// would mirror that production logic instead of pinning it: were the
+/// normalization dropped, the built expectation would pick up the native
+/// separator too and the test would stay green on the one platform — Windows —
+/// where the regression is visible.
+const CONFIG_APP_LABEL: &str = "config/app.php";
+
 /// End-to-end through the real handler, so the render sites are covered too:
 /// `completion_detail` and `config_documentation` both receive the redacted
 /// value, and nothing else in the response carries the secret.
@@ -485,7 +633,7 @@ async fn the_config_completion_response_carries_no_dotenv_secret() {
     let password = item(&items, "app.password", "config completion");
     assert_eq!(
         password.detail.as_deref(),
-        Some(format!("{REDACTED_ENV_VALUE} (config/app.php)").as_str())
+        Some(format!("{REDACTED_ENV_VALUE} ({CONFIG_APP_LABEL})").as_str())
     );
     assert!(
         documentation_markdown(password, "config completion").contains(REDACTED_ENV_VALUE),
@@ -496,7 +644,7 @@ async fn the_config_completion_response_carries_no_dotenv_secret() {
     let name = item(&items, "app.name", "config completion");
     assert_eq!(
         name.detail.as_deref(),
-        Some(format!("{PLAIN_VALUE} (config/app.php)").as_str())
+        Some(format!("{PLAIN_VALUE} ({CONFIG_APP_LABEL})").as_str())
     );
 }
 

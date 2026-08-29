@@ -21086,6 +21086,230 @@ return [
         }
     }
 
+    /// De-duplicated reference locations for `symbols`, combined across every
+    /// symbol and keyed by (file, line, column).
+    ///
+    /// Shared by the code-lens `resolve` handler (which sums a compound lens's
+    /// several identities) and `.env`-key navigation (one `Env` symbol), so a
+    /// key's lens count and its hover count come from one call and can never
+    /// disagree.
+    async fn reference_locations(
+        &self,
+        symbols: Vec<laravel_lsp::salsa_impl::SymbolRefData>,
+    ) -> Vec<Location> {
+        let mut locations: Vec<Location> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, u32, u32)> =
+            std::collections::HashSet::new();
+        for symbol in symbols {
+            for loc in self
+                .salsa
+                .find_references(symbol, false)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter_map(reference_location_to_lsp)
+            {
+                let key = (
+                    loc.uri.to_string(),
+                    loc.range.start.line,
+                    loc.range.start.character,
+                );
+                if seen.insert(key) {
+                    locations.push(loc);
+                }
+            }
+        }
+        locations
+    }
+
+    /// The buffer text for `uri` as the LSP last saw it, falling back to the
+    /// file on disk for a document that was never opened through `did_open`.
+    /// Mirrors the fallback `hover` already uses for its line-text lookup.
+    async fn buffer_text(&self, uri: &Url, path: &Path) -> String {
+        match self.documents.read().await.get(uri).cloned() {
+            Some((content, _version)) => content,
+            None => std::fs::read_to_string(path).unwrap_or_default(),
+        }
+    }
+
+    /// The env-key declaration whose *name text* sits under `position` in an
+    /// open `.env*` buffer, or `None` when the cursor is anywhere else — the
+    /// `=`, the value, a blank line, a bare comment.
+    ///
+    /// Reads the declarations out of the buffer rather than out of Salsa: the
+    /// question is "which key is at this position in *this* file", and the
+    /// Salsa env table is keyed by name and merged across files by priority, so
+    /// it cannot answer it (a key declared in both `.env` and `.env.example`
+    /// keeps only the `.env` entry's position). Active declarations come from
+    /// `enumerate_keys_in_source` — the same enumeration the env code lens
+    /// anchors on, so a key the lens shows is exactly a key that hovers —
+    /// and commented ones from its `#`-line companion.
+    async fn env_key_at_position(
+        &self,
+        uri: &Url,
+        path: &Path,
+        position: Position,
+    ) -> Option<EnvDeclarationAtCursor> {
+        use laravel_lsp::env_key_locator::{
+            enumerate_commented_keys_in_source, enumerate_keys_in_source,
+        };
+
+        let source = self.buffer_text(uri, path).await;
+        if let Some(key) = key_at_cursor(&enumerate_keys_in_source(&source), position) {
+            return Some(EnvDeclarationAtCursor {
+                key,
+                is_commented: false,
+            });
+        }
+        key_at_cursor(&enumerate_commented_keys_in_source(&source), position).map(|key| {
+            EnvDeclarationAtCursor {
+                key,
+                is_commented: true,
+            }
+        })
+    }
+
+    /// Hover for the env key declaration under the cursor in a `.env*` buffer:
+    /// the key, its effective value and declaring file, and how many
+    /// `env('KEY')` call sites consume it.
+    ///
+    /// **Commented state comes from the cursor, never from a lookup.**
+    /// `at.is_commented` says which enumeration matched the position, and that
+    /// is the declaration this card describes; `get_parsed_env_var` is keyed by
+    /// name and merged across files, so asking it "is this one commented?"
+    /// invites a different declaration to answer. A `.env` holding
+    /// `# APP_NAME=old` above `APP_NAME=new` is the ordinary case — two
+    /// declarations of one key, tied on file priority.
+    ///
+    /// Value and declaring file for an **active** declaration still come from
+    /// `get_parsed_env_var` — the same priority-merged lookup `hover_for_env`
+    /// reads for the reverse direction (`env('KEY')` in PHP), so both
+    /// directions agree on which file's declaration is in effect. A commented
+    /// one needs no lookup at all: it is the line under the cursor, in this
+    /// buffer, and it has no value in effect to report.
+    ///
+    /// The consumer count comes from the same `find_references` call the code
+    /// lens resolves with.
+    async fn hover_for_env_declaration(
+        &self,
+        at: &EnvDeclarationAtCursor,
+        path: &Path,
+        references: usize,
+    ) -> String {
+        use laravel_lsp::hover;
+        let key = at.key.as_str();
+        let label = laravel_lsp::code_lens::reference_count_label(references);
+        if at.is_commented {
+            let link = self.source_link(path, None).await;
+            return hover::render(&hover::HoverContent {
+                header: Some(key),
+                detail: Some("*(commented out)*"),
+                source_link: Some(&link),
+                trailer: Some(&label),
+                ..Default::default()
+            });
+        }
+        let var = self
+            .salsa
+            .get_parsed_env_var(key.to_string())
+            .await
+            .ok()
+            .flatten()
+            // A commented winner means the ladder's top declaration of this key
+            // is switched off (`# KEY=` in `.env`, active in `.env.local`), so
+            // no value is in effect. Reporting the outranked value would be a
+            // value the application never sees; reporting "commented out" would
+            // describe a line other than the active one under the cursor.
+            .filter(|var| !var.is_commented);
+        let Some(var) = var else {
+            // Either the key is absent from the merged env table — an unsaved or
+            // unregistered file — or every declaration that outranks this one is
+            // commented out. Mirrors `hover_for_env`'s not-defined trailer, and
+            // keeps the consumer count, which is the whole reason someone hovers
+            // a key the project cannot resolve.
+            let trailer = format!("*(not defined in .env)* — {label}");
+            return hover::render(&hover::HoverContent {
+                header: Some(key),
+                trailer: Some(&trailer),
+                ..Default::default()
+            });
+        };
+        let link = self.source_link(&var.source_file, None).await;
+        if laravel_lsp::completion_display::is_sensitive_env_name(&var.name) {
+            // Same two redaction guards `hover_for_env` applies to the reverse
+            // direction (issues #344, #348). The value being on screen already
+            // is not a reason to skip them: this card is LSP output like any
+            // other, and the name-matched value is dropped rather than masked
+            // because a partial credential is still a credential.
+            hover::render(&hover::HoverContent {
+                header: Some(key),
+                detail: Some(laravel_lsp::completion_display::REDACTED_ENV_VALUE),
+                source_link: Some(&link),
+                trailer: Some(&label),
+                ..Default::default()
+            })
+        } else {
+            // Unmatched by name, but the value may still carry a credential of
+            // its own — `DATABASE_URL` is the stock Laravel case.
+            let shown = laravel_lsp::completion_display::mask_url_credentials(&var.value);
+            hover::render(&hover::HoverContent {
+                header: Some(key),
+                code: Some(hover::CodeBlock {
+                    language: hover::CodeLanguage::Plain,
+                    content: &shown,
+                }),
+                source_link: Some(&link),
+                trailer: Some(&label),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// `textDocument/hover` for a `.env*` buffer (issue #341).
+    async fn env_key_hover(&self, uri: &Url, path: &Path, position: Position) -> Option<Hover> {
+        let at = self.env_key_at_position(uri, path, position).await?;
+        let references = self
+            .reference_locations(vec![laravel_lsp::salsa_impl::SymbolRefData::Env(
+                at.key.clone(),
+            )])
+            .await
+            .len();
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: self.hover_for_env_declaration(&at, path, references).await,
+            }),
+            range: None,
+        })
+    }
+
+    /// `textDocument/definition` for a `.env*` buffer (issue #341): a key
+    /// declaration navigates *forwards*, to the `env('KEY')` call sites that
+    /// consume it.
+    ///
+    /// A key nothing consumes has nowhere to jump, so this returns `None` where
+    /// hover still renders a card — the two handlers diverge there by design.
+    async fn env_key_definition(
+        &self,
+        uri: &Url,
+        path: &Path,
+        position: Position,
+    ) -> Option<GotoDefinitionResponse> {
+        // Name-keyed by design: `find_references` does not distinguish a
+        // commented declaration from an active one, so both jump alike.
+        let at = self.env_key_at_position(uri, path, position).await?;
+        let mut locations = self
+            .reference_locations(vec![laravel_lsp::salsa_impl::SymbolRefData::Env(at.key)])
+            .await;
+        match locations.len() {
+            0 => None,
+            // Every consumer, never just the first: the LSP spec allows an
+            // array here and Zed renders it as a picker.
+            1 => Some(GotoDefinitionResponse::Scalar(locations.remove(0))),
+            _ => Some(GotoDefinitionResponse::Array(locations)),
+        }
+    }
+
     /// Translation — the key and locale on a detail line, the resolved value
     /// (outer quotes stripped) in a plain code block, link to the lang file.
     async fn hover_for_translation(&self, key: &str, root: Option<&Path>) -> String {
@@ -22296,6 +22520,37 @@ async fn collect_route_declaration_targets(
     targets
 }
 
+/// The env-key declaration a cursor landed on: the key, and whether the line
+/// it was declared on is commented out.
+///
+/// The commented flag records *which enumeration matched*, so the hover card
+/// describes the declaration under the cursor rather than re-deriving one by
+/// name — a name-keyed lookup merges every file's declarations and cannot tell
+/// two lines of the same file apart.
+struct EnvDeclarationAtCursor {
+    key: String,
+    is_commented: bool,
+}
+
+/// The key whose name text covers `position`, from a `.env` key enumeration.
+///
+/// The span is half-open — `[start_column, end_column)` — so the cursor resting
+/// one past the last character of `KEY` (i.e. on the `=`) belongs to no key,
+/// the same convention the code lens anchors its range with.
+fn key_at_cursor(
+    declarations: &[(String, laravel_lsp::config_key_locator::KeyPosition)],
+    position: Position,
+) -> Option<String> {
+    declarations
+        .iter()
+        .find(|(_, pos)| {
+            pos.line == position.line
+                && position.character >= pos.start_column
+                && position.character < pos.end_column
+        })
+        .map(|(key, _)| key.clone())
+}
+
 /// Convert a Salsa `ReferenceLocationData` into an LSP `Location`. Positions
 /// are 0-based throughout (matches `tree-sitter` and `lsp-types`). Returns
 /// `None` when the file path can't be expressed as a `file://` URL.
@@ -23360,35 +23615,8 @@ impl LanguageServer for LaravelLanguageServer {
         // so the count fills in. (Zed currently doesn't re-query already-open
         // docs on that refresh — a reopen/edit refreshes them — see the upstream
         // bug; the disk cache keeps warm fast so the window is short.)
-        let mut locations: Vec<Location> = Vec::new();
-        let mut seen: std::collections::HashSet<(String, u32, u32)> =
-            std::collections::HashSet::new();
-        for symbol in symbols {
-            for loc in self
-                .salsa
-                .find_references(symbol, false)
-                .await
-                .unwrap_or_default()
-                .iter()
-                .filter_map(reference_location_to_lsp)
-            {
-                let key = (
-                    loc.uri.to_string(),
-                    loc.range.start.line,
-                    loc.range.start.character,
-                );
-                if seen.insert(key) {
-                    locations.push(loc);
-                }
-            }
-        }
-
-        let count = locations.len();
-        let title = match count {
-            0 => "0 references".to_string(),
-            1 => "1 reference".to_string(),
-            n => format!("{n} references"),
-        };
+        let locations = self.reference_locations(symbols).await;
+        let title = laravel_lsp::code_lens::reference_count_label(locations.len());
 
         // `editor.action.showReferences` opens the references peek/multibuffer
         // with `[uri, anchor position, locations]`. Fall back to display-only
@@ -24038,6 +24266,25 @@ impl LanguageServer for LaravelLanguageServer {
         // Coalescing window: skip duplicate requests within ~16ms (~60fps)
         const COALESCE_MS: u64 = 16;
 
+        // Convert URI to file path
+        let file_path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+
+        // `.env*` buffers navigate forwards, from a key declaration to the
+        // `env('KEY')` call sites that consume it (issue #341). Classified on
+        // the file *name* through the shared `is_env_file_name` gate — the same
+        // predicate the env code lens, semantic tokens and Salsa ingestion
+        // dispatch on — and answered here, ahead of the PHP pattern index
+        // below, which holds no entries for a `.env` buffer.
+        if file_path
+            .to_str()
+            .is_some_and(laravel_lsp::env_key_locator::path_is_env_file)
+        {
+            return Ok(self.env_key_definition(&uri, &file_path, position).await);
+        }
+
         // Early return: only process PHP files
         let is_php = uri.path().ends_with(".php");
         if !is_php {
@@ -24068,12 +24315,6 @@ impl LanguageServer for LaravelLanguageServer {
         if !self.documents.read().await.contains_key(&uri) {
             return Ok(None);
         }
-
-        // Convert URI to file path
-        let file_path = match uri.to_file_path() {
-            Ok(path) => path,
-            Err(_) => return Ok(None),
-        };
 
         // Get patterns from Salsa (cached, O(1) lookup)
         let patterns = match self.salsa.get_patterns(file_path.clone()).await {
@@ -24326,6 +24567,15 @@ impl LanguageServer for LaravelLanguageServer {
             Some(s) => s,
             None => return Ok(None),
         };
+
+        // `.env*` buffers hover on the key declaration under the cursor
+        // (issue #341). Classified on the file *name* through the shared
+        // `is_env_file_name` gate, and answered here, ahead of the Salsa
+        // pattern lookup below, which holds no entries for a `.env` buffer.
+        if laravel_lsp::env_key_locator::path_is_env_file(path) {
+            return Ok(self.env_key_hover(uri, &file_path, position).await);
+        }
+
         let is_blade = path.ends_with(".blade.php");
         let is_php = path.ends_with(".php");
         if !is_blade && !is_php {
@@ -27747,13 +27997,26 @@ impl LanguageServer for LaravelLanguageServer {
                     documentation: Some(
                         CompletionDoc::new()
                             .header(&v.name)
-                            .summary(if sensitive {
+                            // Escaped, because `summary` is markdown-bearing by
+                            // contract and so leaves the escaping to whoever
+                            // fills it — unlike `header`, which the renderer
+                            // escapes for every caller. A `.env` value has no
+                            // charset restriction any more than a key does, so
+                            // an unescaped one renders a live link (or an image
+                            // the client fetches unprompted) in the panel.
+                            //
+                            // Applied to the whole expression rather than to the
+                            // untrusted arm alone: every arm here is plain text
+                            // meant to render as itself, and escaping the field
+                            // instead of one branch of it means a fourth arm
+                            // added later cannot reopen this.
+                            .summary(laravel_lsp::markdown_safety::escape_inline(&if sensitive {
                                 laravel_lsp::completion_display::REDACTED_ENV_VALUE.to_string()
                             } else if v.value.is_empty() {
                                 "(empty)".to_string()
                             } else {
                                 shown.to_string()
-                            })
+                            }))
                             .section(format!("Source: {}", source_file))
                             .into_documentation(),
                     ),
