@@ -141,7 +141,7 @@ Names with dedicated handling (`@component`, `@livewire`, `@feature`, `@includeF
 {{-- ^^^^^^^^^^^^ → public string $prefillStatus in the backing class --}}
 ```
 
-A `wire:` value that isn't a plain member reference (`$wire.count++`, `count++`, `open = true`) is left alone entirely, so nothing conflicts with Alpine. A bare `$variable` bound locally in the template first — an enclosing `@foreach`/`@for` loop variable, a `@php` assignment, a component `@props` entry, or Blade's own `$loop` — is NOT treated as a class member: local scope wins and no navigation is offered. Members inherited from traits or parent classes are a known limitation — only members declared in the component's own class file (or front matter) resolve.
+A `wire:` value that isn't a plain member reference (`$wire.count++`, `count++`, `open = true`) is left alone entirely, so nothing conflicts with Alpine. A bare `$variable` bound locally in the template first — an enclosing `@foreach`/`@for` loop variable, a `@php` assignment, a component `@props` entry, or Blade's own `$loop` — is NOT treated as a class member: local scope wins and no navigation is offered. Members declared in the component's own class file resolve (front matter included), as do those of a trait it `use`s in that same file. Traits declared in another file, and parent-class members, are a known limitation — they do not resolve.
 
 ## Env keys, in reverse
 

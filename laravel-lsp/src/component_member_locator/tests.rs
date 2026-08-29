@@ -331,7 +331,7 @@ fn completion_excludes_a_trait_declared_beside_the_component() {
     assert_eq!(props, vec!["owned"]);
     assert!(
         public_action_method_names(source).is_empty(),
-        "trait-provided members stay a documented limitation"
+        "a trait the class never `use`s is not on $this, so it stays excluded"
     );
 }
 
@@ -489,6 +489,20 @@ class Counter extends Component
         properties.contains(&"deep".to_string()),
         "a trait's own `use` clauses count too: {properties:?}"
     );
+}
+
+/// Goto over a used same-file trait, which `docs/go-to-definition.md` now
+/// states outright. The walk searches the whole file, so this holds for the
+/// same reason completion holds — but the docs claim it, so a test pins it.
+#[test]
+fn a_used_same_file_traits_member_is_locatable() {
+    let property = locate_member(USED_TRAIT, "fromTrait").expect("the trait's property is found");
+    assert_eq!(
+        property.line, 3,
+        "`public $fromTrait` is declared on line 3"
+    );
+    let action = locate_member(USED_TRAIT, "bumpFromTrait").expect("the trait's method is found");
+    assert_eq!(action.line, 5, "`bumpFromTrait()` is declared on line 5");
 }
 
 /// A `use` naming a trait declared in another file resolves to nothing — the

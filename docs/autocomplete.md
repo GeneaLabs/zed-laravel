@@ -176,7 +176,7 @@ Inside a `wire:*="…"` value, completion offers the backing component's members
 - **Data bindings** (`wire:model` with any modifiers, `wire:show`, `wire:text`) offer public, non-static **properties**. Dotted paths complete segment by segment: each leading segment resolves to its declared class, and that class's properties are offered — at any depth while the types stay resolvable.
 - Values that are already a JS expression (`$wire.count++`, `open = true`) get no member completion, so nothing conflicts with Alpine.
 
-`$` completion in the template body offers the same public, non-static property surface, merged (and de-duplicated) with the view-data variables below — properties declared only on framework base classes are not offered. Trait- and parent-provided members are a known limitation: only members declared in the component's own class (or SFC/Volt front matter) appear.
+`$` completion in the template body offers the same public, non-static property surface, merged (and de-duplicated) with the view-data variables below — properties declared only on framework base classes are not offered. Members the component's own class declares appear, plus those of any trait it `use`s **in the same file** (transitively — a trait's own `use` clauses count). Traits declared in another file, and parent-class members, are a known limitation: they do not appear.
 
 ## 🔄 Loop Variables (Scope-Aware)
 
