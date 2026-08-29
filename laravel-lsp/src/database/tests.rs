@@ -1798,6 +1798,15 @@ const LOG_URL_SECRET: &str = "url-hunter2@tail-355";
 /// a partially masked line, which is the defect this fixture now pins.
 const LOG_URL_SECRET_TAIL: &str = "tail-355";
 
+/// The credential *neither* gate could see. `JDBC_URL` matches no sensitive
+/// segment, and a `jdbc:` value parses to an opaque path with no authority, so
+/// `url` reports no password and the shape gate returned the whole line
+/// untouched — into an `info!` that renders in Zed's log panel by default.
+const LOG_JDBC_SECRET: &str = "jdbc-hunter2@tail-358";
+/// `LOG_JDBC_SECRET`'s surviving half, for the same reason as
+/// `LOG_URL_SECRET_TAIL`.
+const LOG_JDBC_SECRET_TAIL: &str = "tail-358";
+
 fn log_fixture_db_url() -> String {
     format!("mysql://sail:{LOG_URL_SECRET}@{LOG_PLAIN_HOST}:3306/laravel")
 }
@@ -1807,6 +1816,14 @@ fn log_fixture_db_url() -> String {
 /// altogether, which would be a lost diagnostic rather than a fix.
 fn log_fixture_db_url_masked() -> String {
     format!("mysql://sail:***@{LOG_PLAIN_HOST}:3306/laravel")
+}
+
+fn log_fixture_jdbc_url() -> String {
+    format!("jdbc:mysql://sail:{LOG_JDBC_SECRET}@{LOG_PLAIN_HOST}:3306/laravel")
+}
+
+fn log_fixture_jdbc_url_masked() -> String {
+    format!("jdbc:mysql://sail:***@{LOG_PLAIN_HOST}:3306/laravel")
 }
 
 /// `config/database.php` with the `url` setting Laravel ships by default.
@@ -2004,34 +2021,46 @@ fn parsing_the_database_config_never_logs_a_credential_inside_a_url_value() {
 /// whose output gets pasted into bug reports.
 #[test]
 fn resolve_env_masks_a_credential_inside_a_url_value_in_its_debug_log() {
-    let dir = TempDir::new().unwrap();
-    write(
-        dir.path(),
-        ".env",
-        &format!("DATABASE_URL={}\n", log_fixture_db_url()),
-    );
-    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    // Both routes through the shape gate. `DATABASE_URL` parses with an
+    // authority and `url` reports its password; `JDBC_URL` parses to an opaque
+    // path with no authority, where `url` reports none however many the value
+    // holds. Masking the first says nothing about the second.
+    for (name, value, masked, secrets) in [
+        (
+            "DATABASE_URL",
+            log_fixture_db_url(),
+            log_fixture_db_url_masked(),
+            [LOG_URL_SECRET, LOG_URL_SECRET_TAIL],
+        ),
+        (
+            "JDBC_URL",
+            log_fixture_jdbc_url(),
+            log_fixture_jdbc_url_masked(),
+            [LOG_JDBC_SECRET, LOG_JDBC_SECRET_TAIL],
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".env", &format!("{name}={value}\n"));
+        let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
 
-    let (url, logs) = capture_logs(|| provider.resolve_env("DATABASE_URL"));
+        let (resolved, logs) = capture_logs(|| provider.resolve_env(name));
 
-    assert_eq!(
-        url.as_deref(),
-        Some(log_fixture_db_url().as_str()),
-        "caller still gets the real URL"
-    );
-    for secret in [LOG_URL_SECRET, LOG_URL_SECRET_TAIL] {
+        assert_eq!(
+            resolved.as_deref(),
+            Some(value.as_str()),
+            "caller still gets the real URL"
+        );
+        for secret in secrets {
+            assert!(
+                !logs.contains(secret),
+                "the password inside {name} reached the debug log in plaintext:\n{logs}"
+            );
+        }
         assert!(
-            !logs.contains(secret),
-            "the password inside DATABASE_URL reached the debug log in plaintext:\n{logs}"
+            logs.contains(&format!(r#"resolve_env({name}): Some("{masked}")"#)),
+            "the debug line must carry the masked URL:\n{logs}"
         );
     }
-    assert!(
-        logs.contains(&format!(
-            r#"resolve_env(DATABASE_URL): Some("{}")"#,
-            log_fixture_db_url_masked()
-        )),
-        "the debug line must carry the masked URL:\n{logs}"
-    );
 }
 
 #[test]

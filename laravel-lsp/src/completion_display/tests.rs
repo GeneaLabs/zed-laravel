@@ -459,6 +459,10 @@ fn a_value_carrying_no_credential_is_returned_untouched() {
 /// `url` rejects, and `database::userinfo` splices the `.env` password in raw —
 /// so a first-`@` scan would mask `p` and print `ss@` from `p@ss` into a log
 /// line. The authority's *last* `@` is what closes that.
+///
+/// The parser's *other* silent arm — accepted, but with no authority — is
+/// covered by
+/// `a_credential_survives_a_successful_parse_that_never_read_the_userinfo`.
 #[test]
 fn a_value_the_url_parser_rejects_is_still_masked_by_the_fallback_scan() {
     for (value, expected) in [
@@ -554,6 +558,125 @@ fn a_successful_parse_is_the_only_thing_keeping_the_fallback_off_these_shapes() 
              the fallback, which masks the path's `@` — over-masking, not a leak"
         );
     }
+}
+
+/// The second member of the "parser never read the userinfo" arm: a value
+/// [`url::Url::parse`] *accepts* while reporting no authority.
+///
+/// `Url::password` gates on `has_authority`, so it answers `None` for every
+/// such value whatever its path holds — `jdbc:mysql://user:secret@host/db`
+/// included. Routing on "the parse succeeded" alone therefore handed that
+/// string straight back in the clear, which was a regression against the
+/// greedy scan this function replaced. `JDBC_URL` and `SPRING_DATASOURCE_URL`
+/// clear the name gate untouched, so nothing else stops it reaching a display
+/// surface.
+///
+/// The membership assertion above each fixture is what makes this test about
+/// the *arm* rather than about the strings: it fails if a fixture stops being
+/// an accepted-but-authority-less parse, at which point it is pinning some
+/// other code path and the sweep behind it has silently narrowed.
+#[test]
+fn a_credential_survives_a_successful_parse_that_never_read_the_userinfo() {
+    for (value, expected) in [
+        // The reported instance: a JDBC connection string.
+        (
+            "jdbc:mysql://user:secret@host:3306/db",
+            "jdbc:mysql://user:***@host:3306/db",
+        ),
+        // The same defect with the `@`-bearing password issue #355 is about.
+        (
+            "jdbc:mysql://user:p@ssword@host/db",
+            "jdbc:mysql://user:***@host/db",
+        ),
+        // A `/` password, which the *rejected* arm would also have masked.
+        (
+            "jdbc:postgresql://user:p/ss@host/db",
+            "jdbc:postgresql://user:***@host/db",
+        ),
+        // Multibyte on both sides of the `:`, to pin that every index still
+        // derives from an ASCII `find`/`rfind` and cannot split a codepoint.
+        (
+            "jdbc:mysql://usér:pässwörd@host/db",
+            "jdbc:mysql://usér:***@host/db",
+        ),
+        // Two scheme colons before the `://`.
+        (
+            "spring:datasource:mysql://user:secret@host/db",
+            "spring:datasource:mysql://user:***@host/db",
+        ),
+        // Not the `jdbc:` prefix — the *absence of an authority*. Here the
+        // `://` is only ever path, and `cannot_be_a_base()` is false, so a
+        // rule written against opaque schemes alone would still leak this one.
+        (
+            "foo:/bar://user:secret@host/db",
+            "foo:/bar://user:***@host/db",
+        ),
+    ] {
+        let parsed = url::Url::parse(value)
+            .unwrap_or_else(|e| panic!("{value:?} must parse, or it is in the rejected arm: {e}"));
+        assert!(
+            !parsed.has_authority(),
+            "{value:?} is in this test only because the parse reports no authority"
+        );
+        assert!(
+            parsed.password().is_none(),
+            "{value:?} must report no password — that silence is the whole defect"
+        );
+        assert_eq!(
+            mask_url_credentials(value),
+            expected,
+            "{value:?} carries a password the parser never looked for; the scan \
+             has to find it"
+        );
+    }
+}
+
+/// The price of the arm above, pinned so it stays a known trade.
+///
+/// A value with no authority reaches the scan, and the scan cannot tell a
+/// path's `@` from a credential separator — so a credential-*free* value in
+/// the same family is over-masked. That is not new behaviour invented here:
+/// the rejected-parse arm has always done it, and the second half of this test
+/// is the byte-for-byte proof, differing only in what stops the parse.
+///
+/// Over-masking rather than a leak, and the alternative is the leak the test
+/// above closes.
+#[test]
+fn a_credential_free_value_with_no_authority_is_over_masked_by_the_scan() {
+    for (value, expected) in [
+        ("jdbc:mysql://host:3306/db@x", "jdbc:mysql://host:***@x"),
+        (
+            "jdbc:mysql://host:3306?notify=ops@example.com",
+            "jdbc:mysql://host:***@example.com",
+        ),
+        // A bracketed IPv6 host is mangled mid-bracket, because the `:` the
+        // scan cuts at is inside the brackets.
+        ("jdbc:mysql://[::1]/db@x", "jdbc:mysql://[:***@x"),
+    ] {
+        assert_eq!(
+            mask_url_credentials(value),
+            expected,
+            "{value:?} has no authority, so the scan masks its path `@`"
+        );
+    }
+
+    // The same shapes, an authority away. These parse *with* an authority and
+    // so keep the untouched arm — the discriminating half of this fixture.
+    for value in ["mysql://host:3306/db@x", "mysql://[::1]/db@x"] {
+        assert!(
+            matches!(mask_url_credentials(value), std::borrow::Cow::Borrowed(v) if v == value),
+            "{value:?} has an authority, so it must still come back untouched"
+        );
+    }
+
+    // And the same over-masking from the rejected arm, which is where this
+    // behaviour has always lived: an unparseable port, not a missing authority.
+    assert_eq!(
+        mask_url_credentials("mysql://[::1]:70000/db@x"),
+        "mysql://[:***@x",
+        "the rejected arm mangles a bracketed host identically — this trade is \
+         inherited, not introduced"
+    );
 }
 
 /// The one shape that still fails open, pinned so it stays deliberate.

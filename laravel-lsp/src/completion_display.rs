@@ -117,22 +117,49 @@ pub fn is_sensitive_env_name(name: &str) -> bool {
 ///   it ends at the last `@` in the authority (the run from `://` to the first
 ///   `/`, `?` or `#`). A raw `/`, `?` or `#` inside userinfo would have ended
 ///   the authority in the parser too, so that window always holds the `@`;
-/// - the parse succeeds and reports **no password** — either what looks like
-///   credentials is `host:port` and every `@` after it is path, query or
-///   fragment, or the userinfo carries a `:` with nothing after it
-///   (`mysql://user:@host/db`), which [`url`] reports identically to no
-///   password at all. Untouched on both counts — neither shape holds a secret,
-///   though the second is the one place this function is *less* eager than
-///   `main`'s scan, which rewrote it to `mysql://user:***@host/db`;
-/// - the parse **fails** — the value is not a URL any parser accepts, so the
-///   scan is all that is left. It prefers the last `@` in the authority and
+/// - the parse reports **no password, and the value has an authority** — the
+///   only shape returned untouched. That is the *rule*, not a list of the
+///   shapes it admits: [`Url::password`] gates on [`Url::has_authority`], so an
+///   authority is exactly the condition under which the parser read a userinfo
+///   component. Only then is its silence evidence that no password was there.
+///   (`mysql://host:3306/db@x` is a host, a port and a path `@`;
+///   `https://example.com/webhook` has no userinfo at all; `mysql://user:@host/db`
+///   carries a `:` with nothing after it, which [`url`] reports identically to
+///   no password — the one place this function is *less* eager than `main`'s
+///   scan, which rewrote it to `mysql://user:***@host/db`. Those are examples
+///   of the rule and not a definition of it — earlier revisions of this comment
+///   listed members instead of stating the rule, and each rewrite added the one
+///   the last had missed while the arm below stayed hidden entirely.);
+/// - **everything else** — the parse fails, or it succeeds with no authority.
+///   Both are parses that never looked at a userinfo component, so the scan is
+///   all that is left. It prefers the last `@` in the authority window and
 ///   falls back to the first `@` anywhere, which is `main`'s original rule.
 ///
-/// That third arm is not a rare corner. `database::build_postgres_candidates`
-/// builds the libpq socket URL `postgres://user:pass@/db?host=/var/run/…`,
-/// whose host is deliberately empty — [`url`] rejects it, and it is logged with
-/// a password spliced in raw by `database::userinfo`. Preferring the authority's
-/// last `@` there is what keeps an `@`-bearing password out of that log line.
+/// That last arm is not a rare corner, and it has two members.
+///
+/// A **rejected** parse: `database::build_postgres_candidates` builds the libpq
+/// socket URL `postgres://user:pass@/db?host=/var/run/…`, whose host is
+/// deliberately empty — [`url`] rejects it, and it is logged with a password
+/// spliced in raw by `database::userinfo`. Preferring the authority's last `@`
+/// there is what keeps an `@`-bearing password out of that log line.
+///
+/// An **accepted** parse with no authority: `jdbc:mysql://user:secret@host/db`.
+/// `jdbc` is a valid scheme and the bytes after its colon are not `//`, so
+/// [`url`] takes its opaque-path branch and never parses userinfo — and
+/// [`Url::password`] then answers `None` however many credentials that path
+/// holds. `JDBC_URL`, `SPRING_DATASOURCE_URL` and `DB_URL` match no
+/// [`SENSITIVE_ENV_SEGMENTS`] keyword, so this function is the only gate
+/// standing between such a value and every display surface. The family is not
+/// the `jdbc:` prefix, either: any `://` that is only ever path
+/// (`foo:/bar://user:secret@host/db`) parses the same way, which is why the
+/// rule is "has an authority" and not a list of opaque schemes.
+///
+/// The price is **over-masking** on that same family when it carries no
+/// credential: `jdbc:mysql://host:3306/db@x` renders as
+/// `jdbc:mysql://host:***@x`, because the scan cannot tell that `@` from a
+/// credential separator. It is the trade the rejected-parse arm has always made
+/// — `mysql://host:70000/db@x` mangles identically — and a mangled display beats
+/// a printed password.
 ///
 /// **One shape still fails open**: a password holding a raw `/`, `?` or `#`
 /// whose leading run happens to parse as a port, as in
@@ -142,7 +169,10 @@ pub fn is_sensitive_env_name(name: &str) -> bool {
 /// four characters, and `database::userinfo` not doing so is a
 /// connection-string defect rather than a display one. Every other `/`, `?` or
 /// `#` password (`postgres://user:p/ss@host/db` and friends) is rejected by the
-/// parse and masked by the fallback.
+/// parse and masked by the fallback. The residue is bounded by the rule above,
+/// too: the same password behind an opaque scheme
+/// (`jdbc:mysql://user:12/34@host/db`) has no authority, so it takes the scan
+/// and masks.
 ///
 /// **Name the baseline, because the residue is narrower than one predecessor
 /// and not the other.** It is narrower than the authority-bounded scan this
@@ -173,8 +203,13 @@ pub fn mask_url_credentials(value: &str) -> Cow<'_, str> {
     // Offsets are relative to `creds_start` on every arm.
     let at_offset = match Url::parse(value) {
         Ok(parsed) if parsed.password().is_some() => authority_at(),
-        Ok(_) => return Cow::Borrowed(value),
-        Err(_) => authority_at().or_else(|| value[creds_start..].find('@')),
+        // The only arm whose silence is evidence. `Url::password` gates on
+        // `has_authority`, so an authority is exactly the condition under
+        // which the parser read a userinfo component at all.
+        Ok(parsed) if parsed.has_authority() => return Cow::Borrowed(value),
+        // Rejected, or accepted with no authority: either way the parser never
+        // looked where a credential lives, so the scan has to.
+        _ => authority_at().or_else(|| value[creds_start..].find('@')),
     };
     let Some(at_offset) = at_offset else {
         return Cow::Borrowed(value);
