@@ -898,6 +898,325 @@ async fn autocomplete_is_empty_when_a_configured_locale_has_no_directories_to_re
 }
 
 // ---------------------------------------------------------------------------
+// The completion path's config read is cached, and the counter can see it
+// (issue #349)
+//
+// `completion_locale` resolves `app.locale` out of `config/app.php` on every
+// completion request. That read went through `config_lookup::resolve_value`, a
+// free function in another module — so it never touched `TranslationCache`'s
+// `disk_reads`, and the cache-hit regression tests above were structurally
+// blind to it. Worse, the fixture they used writes no `config/app.php` at all,
+// so both requests failed to resolve it identically and the assertion held
+// whether the read was cached or repeated. It could not fail.
+//
+// These close both halves. The read is now counted, so it can be isolated by
+// differencing two fixtures that differ only by `config/app.php`; and it is
+// cached per `TranslationCache` instance, positively and negatively, with the
+// invalidation that a cache obliges.
+// ---------------------------------------------------------------------------
+
+/// Two locale directories holding the same single catalogue, translated
+/// differently. `de` sorts before `en`, so a preview reading `Welcome` can
+/// only come from config resolution — the alphabetical fallback answers
+/// `Willkommen` and cannot reach the same answer by coincidence.
+///
+/// Both locales carry exactly one file, so two fixtures built this way read
+/// the same number of catalogues whichever locale wins. That is what makes
+/// the read counts differenceable.
+fn write_two_locales(root: &Path) {
+    write(
+        root,
+        "lang/de/messages.php",
+        "<?php\nreturn [\n    'welcome' => 'Willkommen',\n];\n",
+    );
+    write(
+        root,
+        "lang/en/messages.php",
+        "<?php\nreturn [\n    'welcome' => 'Welcome',\n];\n",
+    );
+}
+
+/// Every completion this backend offers, as `(key, preview value)`.
+async fn previews(backend: &LaravelLanguageServer) -> Vec<(String, String)> {
+    backend
+        .get_all_translation_keys()
+        .await
+        .into_iter()
+        .map(|c| (c.key, c.value))
+        .collect()
+}
+
+/// The one completion a [`write_two_locales`] fixture offers, previewed from
+/// whichever locale answered.
+fn welcome(value: &str) -> Vec<(String, String)> {
+    vec![("messages.welcome".to_string(), value.to_string())]
+}
+
+#[tokio::test]
+async fn resolving_the_configured_locale_costs_exactly_one_extra_disk_read() {
+    // Identical but for `config/app.php`, so every other read — the lang root
+    // listing, the locale listing, the one catalogue — is common to both and
+    // cancels in the difference. "More reads than before" would be satisfied
+    // by the pre-existing catalogue reads alone; an exact delta of one cannot.
+    let with = TempDir::new().unwrap();
+    write_two_locales(with.path());
+    write(
+        with.path(),
+        "config/app.php",
+        &app_config("    'locale' => 'en',"),
+    );
+    let with_backend = backend_for(with.path()).await;
+
+    let without = TempDir::new().unwrap();
+    write_two_locales(without.path());
+    let without_backend = backend_for(without.path()).await;
+
+    assert_eq!(
+        previews(&with_backend).await,
+        welcome("Welcome"),
+        "the configured locale must answer — `de` sorts first, so a German preview \
+         here would mean config resolution never happened"
+    );
+    assert_eq!(
+        previews(&without_backend).await,
+        welcome("Willkommen"),
+        "precondition: with no config the alphabetical fallback answers, so the two \
+         fixtures really do exercise different branches"
+    );
+
+    assert_eq!(
+        disk_reads(&with_backend).await,
+        disk_reads(&without_backend).await + 1,
+        "config resolution must cost exactly one counted read — an uncounted one \
+         leaves the cache-hit assertions blind to it, which is issue #349"
+    );
+}
+
+#[tokio::test]
+async fn both_locale_keys_in_one_request_share_a_single_config_read() {
+    // `es` has no catalogue, so the chain cannot stop at `app.locale`: it runs
+    // on to `app.fallback_locale`, and both keys read the same file. One read
+    // must serve both.
+    let with = TempDir::new().unwrap();
+    write_two_locales(with.path());
+    write(
+        with.path(),
+        "config/app.php",
+        &app_config("    'locale' => 'es',\n    'fallback_locale' => 'en',"),
+    );
+    let with_backend = backend_for(with.path()).await;
+
+    let without = TempDir::new().unwrap();
+    write_two_locales(without.path());
+    let without_backend = backend_for(without.path()).await;
+
+    assert_eq!(
+        previews(&with_backend).await,
+        welcome("Welcome"),
+        "precondition: `es` is untranslated, so `fallback_locale` answers — which \
+         means both config keys were looked up"
+    );
+    assert_eq!(previews(&without_backend).await, welcome("Willkommen"));
+
+    assert_eq!(
+        disk_reads(&with_backend).await,
+        disk_reads(&without_backend).await + 1,
+        "two lookups against one `config/app.php` must share one read, not take two"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_config_file_is_negative_cached_for_the_session() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    write_two_locales(&root);
+    let backend = backend_for(&root).await;
+
+    assert_eq!(
+        previews(&backend).await,
+        welcome("Willkommen"),
+        "precondition: no config, so the alphabetical fallback answers"
+    );
+    let after_first = disk_reads(&backend).await;
+
+    // Appears on disk with no watcher event behind it. A cache that recorded
+    // only successful reads would re-probe here and find it.
+    write(
+        &root,
+        "config/app.php",
+        &app_config("    'locale' => 'en',"),
+    );
+
+    assert_eq!(
+        previews(&backend).await,
+        welcome("Willkommen"),
+        "the absence must be cached like an unreadable catalogue is: nothing \
+         re-stats `config/app.php` until an event says it changed"
+    );
+    assert_eq!(
+        disk_reads(&backend).await,
+        after_first,
+        "a second request must touch disk not at all"
+    );
+}
+
+#[tokio::test]
+async fn a_cached_config_file_is_not_re_read_until_it_changes() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    write_two_locales(&root);
+    let config = write(
+        &root,
+        "config/app.php",
+        &app_config("    'locale' => 'en',"),
+    );
+    let backend = backend_for(&root).await;
+
+    assert_eq!(
+        previews(&backend).await,
+        welcome("Welcome"),
+        "precondition: the configured locale answers"
+    );
+    let after_first = disk_reads(&backend).await;
+
+    fs::write(&config, app_config("    'locale' => 'de',")).unwrap();
+
+    assert_eq!(
+        previews(&backend).await,
+        welcome("Welcome"),
+        "no event has arrived, so the cached text still answers"
+    );
+    assert_eq!(
+        disk_reads(&backend).await,
+        after_first,
+        "a repeat request must not re-read the config file"
+    );
+}
+
+#[tokio::test]
+async fn autocomplete_reflects_an_external_config_edit() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    write_two_locales(&root);
+    let config = write(
+        &root,
+        "config/app.php",
+        &app_config("    'locale' => 'en',"),
+    );
+    let backend = backend_for(&root).await;
+
+    assert_eq!(
+        previews(&backend).await,
+        welcome("Welcome"),
+        "precondition: cached"
+    );
+
+    fs::write(&config, app_config("    'locale' => 'de',")).unwrap();
+    watched_event(&backend, &config, FileChangeType::CHANGED).await;
+
+    assert_eq!(
+        previews(&backend).await,
+        welcome("Willkommen"),
+        "a `git pull` switching `app.locale` must change what autocomplete previews \
+         without restarting the LSP"
+    );
+}
+
+#[tokio::test]
+async fn autocomplete_reflects_a_config_file_created_after_the_first_request() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    write_two_locales(&root);
+    let backend = backend_for(&root).await;
+
+    assert_eq!(
+        previews(&backend).await,
+        welcome("Willkommen"),
+        "precondition: no config yet, so the alphabetical fallback answers"
+    );
+
+    let config = write(
+        &root,
+        "config/app.php",
+        &app_config("    'locale' => 'en',"),
+    );
+    watched_event(&backend, &config, FileChangeType::CREATED).await;
+
+    assert_eq!(
+        previews(&backend).await,
+        welcome("Welcome"),
+        "the negative entry must be evicted too — a cache that only cleared \
+         positive entries would hide a newly-published `config/app.php` forever"
+    );
+}
+
+#[tokio::test]
+async fn autocomplete_reflects_a_deleted_config_file() {
+    // The third event type. Create and change are covered above; without this
+    // one, "covers create, change and delete" is a claim with two fixtures.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    write_two_locales(&root);
+    let config = write(
+        &root,
+        "config/app.php",
+        &app_config("    'locale' => 'en',"),
+    );
+    let backend = backend_for(&root).await;
+
+    assert_eq!(
+        previews(&backend).await,
+        welcome("Welcome"),
+        "precondition: the configured locale answers, and is cached"
+    );
+
+    fs::remove_file(&config).unwrap();
+    watched_event(&backend, &config, FileChangeType::DELETED).await;
+
+    assert_eq!(
+        previews(&backend).await,
+        welcome("Willkommen"),
+        "with the config gone the alphabetical fallback must answer again — a \
+         cached text outliving its file is the same staleness in the other direction"
+    );
+}
+
+#[tokio::test]
+async fn autocomplete_reflects_a_config_edit_made_in_the_editor() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    write_two_locales(&root);
+    let config = write(
+        &root,
+        "config/app.php",
+        &app_config("    'locale' => 'en',"),
+    );
+    let backend = backend_for(&root).await;
+
+    assert_eq!(
+        previews(&backend).await,
+        welcome("Welcome"),
+        "precondition: cached"
+    );
+
+    // The file is open in the editor, so `did_change_watched_files` skips its
+    // events by design (open-document precedence) and this notification is the
+    // only word the actor gets. Written to disk as well, because completion
+    // reads the saved file — the cache is dropped here, not overwritten with
+    // buffer text.
+    let edited = app_config("    'locale' => 'de',");
+    fs::write(&config, &edited).unwrap();
+    did_change(&backend, &config, &edited, 2).await;
+
+    assert_eq!(
+        previews(&backend).await,
+        welcome("Willkommen"),
+        "editing `config/app.php` in Zed must change the previewed locale — the \
+         watched-files path never sees an open document"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The vendor translation-namespace map must not outlive the providers it was
 // scanned from
 //

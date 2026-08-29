@@ -9444,6 +9444,12 @@ impl LaravelLanguageServer {
             }
             // Also invalidate the cached config so next lookup refetches
             *self.cached_config.write().await = None;
+            // And the translation cache's own copy of this file (issue #349).
+            // `did_change_watched_files` skips paths open in the editor, so
+            // this arm is the ONLY notice the actor gets that an open
+            // `config/app.php` changed — leaving it out would make the
+            // completion locale stale for exactly the file the user is editing.
+            let _ = self.salsa.invalidate_config_path(path.clone()).await;
             // Also update as SourceFile for pattern extraction (env() diagnostics)
             debug!(
                 "📦 Updating Salsa: SourceFile ({}) for pattern extraction",
@@ -23818,6 +23824,13 @@ impl LanguageServer for LaravelLanguageServer {
                 if p.ends_with(".php") && p.contains("/config/") {
                     self.file_exists_cache.lock().unwrap().pop(&path);
                     self.invalidate_config_cache().await;
+                    // Translation autocomplete reads `config/app.php` once per
+                    // session to pick the locale it previews (issue #349).
+                    // That read has its own cache, in the Salsa actor rather
+                    // than in `cached_config`, so it needs its own eviction —
+                    // without it an external `app.locale` edit would keep
+                    // previewing the pre-edit locale until the LSP restarted.
+                    let _ = self.salsa.invalidate_config_path(path.clone()).await;
                 }
             }
             // A Command class can live anywhere, but conventionally sits under a

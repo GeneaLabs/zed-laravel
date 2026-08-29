@@ -200,6 +200,31 @@ fn watchers_include_vendor_php_and_blade_globs() {
     );
 }
 
+#[test]
+fn watchers_include_the_config_tree() {
+    // The glob has been here since the config layer got its own cache, but
+    // nothing pinned it — and since #349 the translation cache reads
+    // `config/app.php` too, so an unwatched config tree would strand the
+    // previewed autocomplete locale at whatever it was when the LSP started.
+    // Deleting the watcher must redden something.
+    let root = PathBuf::from("/projects/laravel-app");
+    let globs = globs_of(&build_watchers(
+        &root,
+        &[root.join("resources/views")],
+        None,
+        &[],
+        &[],
+    ));
+
+    assert!(
+        globs
+            .iter()
+            .any(|g| g == "/projects/laravel-app/config/**/*.php"),
+        "missing config glob: {:?}",
+        globs
+    );
+}
+
 fn globs_of(watchers: &[FileSystemWatcher]) -> Vec<String> {
     watchers
         .iter()
