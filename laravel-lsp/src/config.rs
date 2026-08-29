@@ -1195,6 +1195,39 @@ pub fn expand_module_dirs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     out
 }
 
+/// The configured module directory that owns `path`, plus that module's rank
+/// in `modules.paths` glob-match order.
+///
+/// `module_dirs` is [`expand_module_dirs`]'s output, and its order **is** the
+/// configured precedence order — later pattern, higher precedence. The rank
+/// returned is therefore 1-based, so `0` is free to mean "no owning module"
+/// in the plain tuple comparison the registration merge uses. On nesting the
+/// LONGEST matching directory wins: a module inside another module is owned
+/// by the inner one, the module whose `composer.json` actually boots it.
+///
+/// Matching is lexical on `..`/`.`-collapsed paths — never `canonicalize` —
+/// because a module may legitimately be a symlinked composer path repository
+/// whose real target sits outside the project ([`expand_module_dirs`]).
+/// Resolving either side would move the provider out from under its own
+/// module and lose the ownership this answers.
+///
+/// One lookup, two callers, by design: the Livewire containment gate
+/// (`livewire_namespaces`) gates a registration against its *owning module*
+/// instead of the project root, and the Salsa registration merge
+/// (`salsa_impl::handle_get_laravel_config`) breaks an equal-priority tie by
+/// `modules.paths` rank. Both ask the same question — which module owns this
+/// provider file, and where does it sit in the configured order — so both
+/// read one answer rather than two path-prefix implementations that drift.
+pub fn owning_module<'a>(module_dirs: &'a [PathBuf], path: &Path) -> Option<(usize, &'a Path)> {
+    let normalized = crate::route_discovery::normalize_path(path);
+    module_dirs
+        .iter()
+        .enumerate()
+        .filter(|(_, dir)| normalized.starts_with(crate::route_discovery::normalize_path(dir)))
+        .max_by_key(|(_, dir)| crate::route_discovery::normalize_path(dir).components().count())
+        .map(|(index, dir)| (index + 1, dir.as_path()))
+}
+
 /// Service-provider files of the configured module directories, discovered
 /// through each module's own `composer.json`: the classes its
 /// `extra.laravel.providers` array names are the providers Laravel actually
