@@ -6206,3 +6206,89 @@ fn without_modules_the_gate_is_the_project_root() {
         .expect("an in-root class still loads with no modules configured");
     assert_eq!(*file.text(&actor.db), source);
 }
+
+// ─── Ownership release, at the actor's own state (#365) ────────────────
+//
+// The release does two things — hands the `PushedByClient` stamp back, and
+// drops the text that stamp was protecting — and the second MASKS the first
+// from every behavioural test. With the input gone, the loader's
+// "marked as pushed, yet the input is gone" arm falls through to the disk
+// read anyway, so a release that dropped the text and kept the stamp answers
+// identically through every handle-driven assertion. It is not identical:
+// a stamp left behind re-arms the original defect the moment anything
+// re-registers `files[path]` without clearing it — `ensure_file_registered`
+// does exactly that on the next hover of the closed file, and the loader then
+// treats the path as client-owned again and never re-reads disk.
+//
+// So the stamp gets its own assertion, against the actor's own map.
+
+#[test]
+fn releasing_the_last_buffer_hands_the_stamp_back_and_drops_the_text() {
+    let (_dir, root, _outside) = root_and_outside();
+    let class = root.join("app/Livewire/Counter.php");
+    std::fs::write(&class, "<?php\nclass Counter {}\n").unwrap();
+
+    let mut actor = loader_test_actor(Some(root));
+
+    // The acquire-then-push pair `did_open` performs, in that order.
+    actor.acquire_external_php_ownership(&class);
+    actor.handle_update_file(
+        class.clone(),
+        1,
+        "<?php\nclass Counter { public $unsaved = true; }\n".to_string(),
+    );
+    assert_eq!(
+        actor.external_php_text.get(&class),
+        Some(&ExternalPhpText::PushedByClient),
+        "precondition: the push claims ownership",
+    );
+    assert!(actor.files.contains_key(&class));
+
+    actor.release_external_php_ownership(&class);
+
+    assert!(
+        !actor.external_php_text.contains_key(&class),
+        "the stamp must be handed back, not merely rendered inert by the \
+         text going away — a stamp left behind re-arms the defect as soon as \
+         anything re-registers this path",
+    );
+    assert!(
+        !actor.external_php_open_buffers.contains_key(&class),
+        "the last buffer's count must go with it",
+    );
+    assert!(
+        !actor.files.contains_key(&class),
+        "and the text it installed must go, so every reader re-derives",
+    );
+}
+
+#[test]
+fn a_release_below_the_last_buffer_keeps_both_the_stamp_and_the_text() {
+    let (_dir, root, _outside) = root_and_outside();
+    let class = root.join("app/Livewire/Counter.php");
+    std::fs::write(&class, "<?php\nclass Counter {}\n").unwrap();
+
+    let mut actor = loader_test_actor(Some(root));
+
+    // Two buffers on one path — a split view, or a reopen that overtook its
+    // own close.
+    actor.acquire_external_php_ownership(&class);
+    actor.acquire_external_php_ownership(&class);
+    let buffer = "<?php\nclass Counter { public $unsaved = true; }\n";
+    actor.handle_update_file(class.clone(), 1, buffer.to_string());
+
+    actor.release_external_php_ownership(&class);
+
+    assert_eq!(
+        actor.external_php_text.get(&class),
+        Some(&ExternalPhpText::PushedByClient),
+        "one buffer is still open, so the path is still owned",
+    );
+    let file = actor
+        .files
+        .get(&class)
+        .copied()
+        .expect("the surviving buffer's text must not be dropped");
+    assert_eq!(*file.text(&actor.db), buffer);
+    assert_eq!(actor.external_php_open_buffers.get(&class), Some(&1));
+}

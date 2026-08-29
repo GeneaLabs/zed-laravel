@@ -23935,6 +23935,22 @@ impl LanguageServer for LaravelLanguageServer {
             self.try_discover_from_file(&file_path).await;
             info!("   ⏱️  try_discover_from_file: {:?}", t1.elapsed());
 
+            // Take the buffer's claim on this path's text, which `did_close`
+            // hands back (see there). It goes BEFORE the push, not after: a
+            // `didClose` for a previous buffer of this same path can still be
+            // in flight — tower-lsp runs notification handlers concurrently —
+            // and only acquire-first leaves every landing point for it safe.
+            // Push-first leaves one window where the close lands between the
+            // push and the acquire, releasing the buffer that just installed
+            // its text.
+            if let Err(e) = self
+                .salsa
+                .acquire_external_php_ownership(file_path.clone())
+                .await
+            {
+                debug!("did_open: external-PHP ownership acquire failed: {e}");
+            }
+
             // Update Salsa database with new file content
             let t2 = std::time::Instant::now();
             if let Err(e) = self
@@ -24150,6 +24166,47 @@ impl LanguageServer for LaravelLanguageServer {
         // model buffer, dropping its `$this->status` entry). External edits to
         // a closed file are still picked up via `did_change_watched_files`,
         // and a real delete still goes through `RemoveFile`.
+        //
+        // What DOES end here is the buffer's OWNERSHIP of that text.
+        // `did_open`/`did_change` stamp `ExternalPhpText::PushedByClient` so
+        // the backing-class loader never reads disk over an unsaved edit —
+        // a promise to keep pushing that only holds while the buffer is open.
+        // Discarding changes on close writes nothing to disk, so no
+        // `did_change_watched_files` event ever arrives to correct it, and the
+        // loader would go on serving text that exists neither on disk nor in
+        // any buffer. Releasing ownership is the matching edge to that
+        // acquire: once the path's LAST buffer closes it downgrades to
+        // unowned and the next resolution re-reads disk.
+        //
+        // The release drops that path's Salsa text and its per-file caches
+        // along with the claim, because the loader is not the only reader of
+        // what a buffer installed — `handle_get_patterns` and the three
+        // per-file cache queries read `files[path]` directly, and the pattern
+        // cache is served with no version check. Dropping the input makes them
+        // all re-derive from disk on their next question, still lazily: nothing
+        // is read here. It evicts NOTHING ELSE — the symbol index, the reverse
+        // component-usage index, the class-hierarchy index and the resolved
+        // magic-member entries all stand, which is what makes this compatible
+        // with the paragraph above.
+        //
+        // "Last buffer" is not pedantry. This notification and the `didOpen`
+        // of a buffer that reopens the same path — a revert, an editor
+        // relaunching a tab — run concurrently under tower-lsp, so this close
+        // can reach the Salsa actor after that open. `did_open` counts its
+        // buffer in before pushing, and the release only downgrades the path
+        // when that count runs out, so a reopened buffer keeps its text.
+        //
+        // Unlike the acquire, this call can fail — but only by the actor
+        // being unreachable, and the loader whose read the release exists to
+        // unblock runs INSIDE that same actor. A failed release therefore
+        // cannot leave phantom text behind for anything to serve; there is no
+        // live reader left to serve it. Logging is the whole remedy, at the
+        // level `did_open` already uses for its own Salsa push.
+        if let Ok(path) = uri.to_file_path() {
+            if let Err(e) = self.salsa.release_external_php_ownership(path).await {
+                debug!("did_close: external-PHP ownership release failed: {e}");
+            }
+        }
 
         // Publish empty diagnostics to clear them from the client
         self.client.publish_diagnostics(uri, vec![], None).await;
