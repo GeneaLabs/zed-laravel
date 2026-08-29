@@ -28,14 +28,17 @@
 use crate::completion_format::{CodeBlock, CompletionDoc};
 use crate::display_truncate::truncate_for_display;
 use std::borrow::Cow;
+use url::Url;
 
 /// What every *client-rendered* surface prints in place of a sensitive `.env`
 /// value.
 ///
-/// One constant rather than a per-site literal: the four surfaces that used to
-/// echo dotenv values (env completion, `.env` hover, `config('…')` completion,
-/// and the warm-start disk cache) are meant to be indistinguishable to a
-/// reader, and a second spelling is how they drift apart (issue #344).
+/// One constant rather than a per-site literal: the three surfaces that used to
+/// echo dotenv values (env completion, `.env` hover and `config('…')`
+/// completion) are meant to be indistinguishable to a reader, and a second
+/// spelling is how they drift apart (issue #344). A fourth, the warm-start disk
+/// cache, was one of them until issue #356 deleted the cache outright — nothing
+/// ever read its map back.
 ///
 /// The server log is the one masked surface that does *not* use this string.
 /// It renders `(set)` — see `database::mask_env_value_for_log` — because a log
@@ -102,28 +105,46 @@ pub fn is_sensitive_env_name(name: &str) -> bool {
 /// display surface must not blank a value it merely failed to parse, and a log
 /// line must not panic the server.
 ///
-/// The credentials end at the **last** `@` inside the authority component —
-/// the run between `://` and the first `/`, `?` or `#` — which is the standard
-/// RFC 3986 authority parse. Taking the *first* `@` anywhere in the value left
-/// the tail of an unencoded-`@` password on screen
-/// (`postgres://user:***@ssw0rd@host/db`, issue #355) and read an `@` in the
-/// *path* as a credential separator, masking a host's port
-/// (`mysql://host:3306/db@x`).
+/// **Where the credentials end is decided by [`url`], not by scanning.** The two
+/// shapes a scanner confuses are `mysql://host:3306/db@x` — host, port and a
+/// path that happens to hold an `@` — and `postgres://user:p@ssword@host/db`,
+/// whose password holds one. They are the same shape to any hand-rolled rule,
+/// and taking the first `@` mangled the former into `mysql://host:***@x` while
+/// leaving the latter's tail on screen as `postgres://user:***@ssword@host/db`
+/// (issue #355). An RFC 3986 parse separates them outright, so:
 ///
-/// One malformed shape still fails open: an unencoded `/`, `?` or `#` *inside*
-/// the password ends the authority early, so no `@` is found and the value
-/// comes back untouched. RFC 3986 requires all four characters percent-encoded
-/// in userinfo, and `postgres://user:p/ss@host/db` is indistinguishable from
-/// `mysql://host:3306/db@x` — honouring the later `@` for one masks the other's
-/// port and destroys the host, which is the more common URL and the more
-/// misleading diagnostic.
+/// - the parse succeeds and reports a **password** — the userinfo is real, and
+///   it ends at the last `@` in the authority (the run from `://` to the first
+///   `/`, `?` or `#`). A raw `/`, `?` or `#` inside userinfo would have ended
+///   the authority in the parser too, so that window always holds the `@`;
+/// - the parse succeeds and reports **no password** — what looks like
+///   credentials is `host:port`, and every `@` after it is path, query or
+///   fragment. Untouched;
+/// - the parse **fails** — the value is not a URL any parser accepts, so the
+///   scan is all that is left. It prefers the last `@` in the authority and
+///   falls back to the first `@` anywhere, which is `main`'s original rule.
+///
+/// That third arm is not a rare corner. `database::build_postgres_candidates`
+/// builds the libpq socket URL `postgres://user:pass@/db?host=/var/run/…`,
+/// whose host is deliberately empty — [`url`] rejects it, and it is logged with
+/// a password spliced in raw by `database::userinfo`. Preferring the authority's
+/// last `@` there is what keeps an `@`-bearing password out of that log line.
+///
+/// **One shape still fails open**, narrower than the scan-only version it
+/// replaces: a password holding a raw `/`, `?` or `#` whose leading run happens
+/// to parse as a port, as in `mysql://user:12/34@host/db`. The parser reads
+/// `user` as the host and `12` as its port, exactly as it reads
+/// `mysql://host:3306/db@x`, because per RFC 3986 that *is* what the two strings
+/// say — a password must percent-encode all four characters, and `database::userinfo`
+/// not doing so is a connection-string defect rather than a display one. Every
+/// other `/`, `?` or `#` password (`postgres://user:p/ss@host/db` and friends)
+/// is rejected by the parse and masked by the fallback.
 ///
 /// Lives here rather than in `database`, where it started life as
 /// `mask_url_password`: it is now the second half of the redaction policy the
-/// four display surfaces and the server log share, and a second copy is how the
+/// three display surfaces and the server log share, and a second copy is how the
 /// two spellings drift apart.
 pub fn mask_url_credentials(value: &str) -> Cow<'_, str> {
-    // Find the `://` separator, then the authority component it opens.
     let Some(scheme_end) = value.find("://") else {
         return Cow::Borrowed(value);
     };
@@ -133,9 +154,15 @@ pub fn mask_url_credentials(value: &str) -> Cow<'_, str> {
     let authority_end = value[creds_start..]
         .find(['/', '?', '#'])
         .map_or(value.len(), |offset| creds_start + offset);
-    // The credentials end at the *last* `@` in the authority, so an unencoded
-    // `@` in the password does not end them early (issue #355).
-    let Some(at_offset) = value[creds_start..authority_end].rfind('@') else {
+    let authority_at = || value[creds_start..authority_end].rfind('@');
+
+    // Offsets are relative to `creds_start` on every arm.
+    let at_offset = match Url::parse(value) {
+        Ok(parsed) if parsed.password().is_some() => authority_at(),
+        Ok(_) => return Cow::Borrowed(value),
+        Err(_) => authority_at().or_else(|| value[creds_start..].find('@')),
+    };
+    let Some(at_offset) = at_offset else {
         return Cow::Borrowed(value);
     };
     let creds_end = creds_start + at_offset;
