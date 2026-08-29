@@ -5,7 +5,7 @@
 //! `slot_navigation.rs`, and an inline `retain` in `salsa_impl.rs`), each with
 //! its own fallback behaviour that could drift apart (issue #156). They are
 //! consolidated here behind one canonical-first core ([`canonical_containment`])
-//! and **three** public entry points that differ only in what they do when a
+//! and **five** public entry points that differ only in what they do when a
 //! path can't be canonicalized:
 //!
 //! - [`path_within_root`] is **fail-closed**: an unverifiable path is refused.
@@ -52,6 +52,19 @@
 //!   the root passes, and anything that escapes (or can't be canonicalized) is
 //!   refused. Used by `scan_dir` in `component_completion.rs` and the
 //!   `controllers_dir` walk in `main.rs`.
+//! - [`path_within_root_registration`] is the fail-closed guard for a path
+//!   **minted from discovered provider source that will be READ downstream**
+//!   (issue #354 item 1). It is the missing combination of the two axes above:
+//!   it refuses an out-of-root candidate lexically, with no disk probe (#145),
+//!   AND fail-closes on anything it cannot canonicalize (#134/#155) — a
+//!   dangling under-root symlink, an unsearchable parent, a path with nothing
+//!   on disk. [`path_within_root_lexical`] admits all three and
+//!   [`path_within_root_emit_safe`] admits the last, which is correct for a
+//!   speculative *create target* and wrong for a value that becomes a read
+//!   primitive. Gate against the provider's OWNING MODULE rather than the
+//!   project root and a symlinked composer path repository still passes: both
+//!   sides canonicalize to the real target. Used by `contained_class_path` in
+//!   `livewire_namespaces.rs`.
 
 use std::path::Path;
 
@@ -190,9 +203,40 @@ pub fn path_within_root_emit_safe(path: &Path, root: &Path) -> bool {
     }
 }
 
-/// The lexical containment gate shared by [`path_within_root_lexical`] and
-/// [`path_within_root_emit_safe`]. True when `path`, with interior `..`/`.`
-/// collapsed by `normalize_path`, is a `starts_with` prefix-match of `root` —
+/// True if `path` is contained within `root` and its real target is **proven**
+/// so — the guard for a path that is minted from *discovered* source data and
+/// then READ (issue #354 item 1).
+///
+/// Two invariants meet at such a call site, and the four guards above each
+/// satisfy only one of them:
+///
+/// - The candidate comes from provider source, so canonicalizing it upfront
+///   would leak an out-of-root existence oracle (#145). Hence the
+///   [`lexically_in_root`] pre-gate: an out-of-root candidate is refused with
+///   no `stat`/`realpath` probe of it.
+/// - The value is consumed as a read primitive, so an unverifiable path must
+///   be refused, not admitted (#134/#155). Hence `unwrap_or(false)`: a
+///   dangling under-root symlink, an `EACCES`/`ELOOP` parent, or a path with
+///   nothing on disk all yield `false`.
+///
+/// [`path_within_root_lexical`] fails the second (it admits every
+/// unverifiable in-root path) and [`path_within_root_emit_safe`] fails it for
+/// the genuinely-absent case — correct when the path is a speculative
+/// *create target*, wrong when it becomes a directory that gets walked and
+/// read. [`path_within_root`] satisfies the second but fails the first.
+///
+/// Gate against the provider's owning module rather than the project root and
+/// a symlinked composer path repository still passes: `canonical_containment`
+/// canonicalizes BOTH sides, so the module's real target contains its own
+/// registrations.
+pub fn path_within_root_registration(path: &Path, root: &Path) -> bool {
+    lexically_in_root(path, root) && canonical_containment(path, root).unwrap_or(false)
+}
+
+/// The lexical containment gate shared by [`path_within_root_lexical`],
+/// [`path_within_root_emit_safe`] and [`path_within_root_registration`]. True
+/// when `path`, with interior `..`/`.` collapsed by `normalize_path`, is a
+/// `starts_with` prefix-match of `root` —
 /// first against the root as given, then (only if that fails) against the root's
 /// canonicalized form. **Never canonicalizes the candidate**, so an out-of-root
 /// candidate is refused before any `stat`/`realpath` probe of it (the existence
@@ -807,5 +851,165 @@ mod tests {
         std::fs::write(&escapee, "<?php\n").unwrap();
 
         assert!(!path_within_root_walk_entry(&escapee, &root));
+    }
+
+    #[test]
+    fn registration_admits_in_root_existing_dir() {
+        // The ordinary case: a real directory under the gate dir. Both sides
+        // canonicalize and the real path starts with the real gate dir.
+        let root = TempDir::new().unwrap();
+        let classes = root.path().join("src").join("Livewire");
+        std::fs::create_dir_all(&classes).unwrap();
+
+        assert!(path_within_root_registration(&classes, root.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_admits_classes_under_a_symlinked_gate_dir() {
+        // #354 item 1: a composer path-repo module symlinked into the project
+        // canonicalizes OUTSIDE the project root, which is why the gate dir is
+        // the OWNING MODULE and not the root. `canonical_containment`
+        // canonicalizes both sides, so the module's real target contains its
+        // own registrations and the registration survives.
+        let tmp = TempDir::new().unwrap();
+        let real_module = tmp.path().join("packages").join("ui-kit");
+        let classes = real_module.join("src").join("Livewire");
+        std::fs::create_dir_all(&classes).unwrap();
+
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        let module_link = root.join("app").join("UiKit");
+        std::os::unix::fs::symlink(&real_module, &module_link).unwrap();
+
+        // Precondition: the module's real target escapes the project root, so
+        // gating against the ROOT is what used to drop this registration.
+        assert!(
+            !module_link
+                .canonicalize()
+                .unwrap()
+                .starts_with(root.canonicalize().unwrap()),
+            "the symlinked module resolves outside the project root"
+        );
+
+        assert!(
+            path_within_root_registration(&module_link.join("src").join("Livewire"), &module_link),
+            "a symlinked path-repo module contains its own registrations"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_refuses_dangling_under_root_symlink() {
+        // The #134/#155 case this guard exists for: the link path is lexically
+        // inside the gate dir, but the target is missing so `canonicalize`
+        // cannot prove where it resolves. `path_within_root_lexical` ADMITS
+        // this (it falls back to the lexical result) — which is why that guard
+        // is wrong for a value that becomes a read primitive.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let dangling = root.join("Livewire");
+        std::os::unix::fs::symlink(root.join("NEVER_CREATED"), &dangling).unwrap();
+
+        assert!(
+            dangling.starts_with(&root),
+            "the link path is lexically inside the gate dir"
+        );
+        assert!(
+            dangling.canonicalize().is_err(),
+            "the dangling link cannot be canonicalized"
+        );
+
+        assert!(
+            path_within_root_lexical(&dangling, &root),
+            "precondition: the lexical guard admits it — the behaviour this guard corrects"
+        );
+        assert!(
+            !path_within_root_registration(&dangling, &root),
+            "a dangling under-root symlink is unverifiable and must be refused"
+        );
+    }
+
+    #[test]
+    fn registration_refuses_genuinely_absent_candidate() {
+        // Where this guard deliberately parts company with
+        // `path_within_root_emit_safe`: nothing on disk is a legitimate
+        // *create target*, but not a legitimate directory to walk and read.
+        // Fail closed, matching the pre-#354 behaviour of this call site.
+        let root = TempDir::new().unwrap();
+        let absent = root.path().join("src").join("Livewire");
+
+        assert!(
+            path_within_root_emit_safe(&absent, root.path()),
+            "precondition: emit_safe admits a genuinely-absent path"
+        );
+        assert!(
+            !path_within_root_registration(&absent, root.path()),
+            "an absent path proves nothing about where it will resolve — refuse it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_refuses_out_of_root_candidate_without_probing() {
+        // Issue #145: the candidate is provider-source-derived, so an upfront
+        // `canonicalize()` of it would leak an out-of-root existence oracle.
+        // The candidate here is an out-of-root symlink that WOULD resolve back
+        // inside the gate dir — so only a lexical-first check can refuse it,
+        // and `false` proves no disk probe of the out-of-root path decided it.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        let classes = root.join("src").join("Livewire");
+        std::fs::create_dir_all(&classes).unwrap();
+
+        let outside_link = tmp.path().join("outside-link");
+        std::os::unix::fs::symlink(&classes, &outside_link).unwrap();
+
+        assert!(
+            !outside_link.starts_with(&root),
+            "the link path is lexically outside the gate dir"
+        );
+        assert_eq!(
+            outside_link.canonicalize().unwrap(),
+            classes.canonicalize().unwrap(),
+            "the link resolves back inside the gate dir"
+        );
+
+        assert!(
+            !path_within_root_registration(&outside_link, &root),
+            "an out-of-root candidate must be refused lexically, before any disk probe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_refuses_in_root_symlink_escaping_the_gate_dir() {
+        // No containment downgrade (#55/#134): a link path lexically inside
+        // the gate dir whose real target escapes it is refused by the
+        // canonicalize step. This is the sibling-module reach in #354 item 1.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let escaping = root.join("Livewire");
+        std::os::unix::fs::symlink(&outside, &escaping).unwrap();
+
+        assert!(escaping.starts_with(&root));
+        assert!(
+            !escaping
+                .canonicalize()
+                .unwrap()
+                .starts_with(root.canonicalize().unwrap()),
+            "the link's real target escapes the gate dir"
+        );
+
+        assert!(
+            !path_within_root_registration(&escaping, &root),
+            "an in-root symlink whose target escapes the gate dir must be refused"
+        );
     }
 }

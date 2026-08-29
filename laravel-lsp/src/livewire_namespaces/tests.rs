@@ -291,3 +291,84 @@ class AppServiceProvider
         "negative control: an unconfigured wrapper name registers nothing"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_class_path_yields_no_registration() {
+    // #354 item 1 regression: gating with `path_within_root_lexical` admitted
+    // any in-root path it could not canonicalize, so a DANGLING under-root
+    // symlink minted a registration whose real target is unprovable. The class
+    // path is walked and read downstream (the component-completion walk,
+    // `try_namespaced_class`), so a target created later could resolve outside
+    // the module — issues #134/#155. It must fail closed.
+    let (_tmp, root, provider_path) = module_layout();
+    let module_dir = root.join("app/Common/UI");
+    let dangling = module_dir.join("app/Dangling");
+    std::os::unix::fs::symlink(module_dir.join("NEVER_CREATED"), &dangling).unwrap();
+
+    assert!(
+        dangling.canonicalize().is_err(),
+        "precondition: the link dangles, so it cannot be canonicalized"
+    );
+
+    let source = r#"<?php
+
+namespace App\Common\UI\Providers;
+
+class AppServiceProvider
+{
+    public function boot(): void
+    {
+        $this->loadLivewireComponentsFrom(__DIR__.'/../Dangling', 'common-ui');
+    }
+}
+"#;
+    let map = extract_livewire_namespaces(
+        source,
+        &provider_path,
+        &root,
+        Some(&module_dir),
+        &registrars(),
+    );
+
+    assert!(
+        !map.contains_key("common-ui"),
+        "a dangling under-root symlink is unverifiable and must yield no registration"
+    );
+}
+
+#[test]
+fn a_genuinely_absent_class_path_yields_no_registration() {
+    // The guard is fail-closed, not merely dangling-aware: a class path with
+    // nothing on disk proves nothing about where it will later resolve, so it
+    // is refused too. This is where `path_within_root_registration` parts
+    // company with `path_within_root_emit_safe`, which admits an absent path
+    // because a *create target* legitimately does not exist yet.
+    let (_tmp, root, provider_path) = module_layout();
+    let module_dir = root.join("app/Common/UI");
+
+    let source = r#"<?php
+
+namespace App\Common\UI\Providers;
+
+class AppServiceProvider
+{
+    public function boot(): void
+    {
+        $this->loadLivewireComponentsFrom(__DIR__.'/../NotCreatedYet', 'common-ui');
+    }
+}
+"#;
+    let map = extract_livewire_namespaces(
+        source,
+        &provider_path,
+        &root,
+        Some(&module_dir),
+        &registrars(),
+    );
+
+    assert!(
+        !map.contains_key("common-ui"),
+        "an absent class path yields no registration — the gate fails closed"
+    );
+}

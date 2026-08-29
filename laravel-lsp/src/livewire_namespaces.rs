@@ -202,27 +202,36 @@ fn classify_registrar_call(
 /// an app-level provider. Two things follow, and both are the point:
 ///
 /// - A module symlinked in from a composer path repository canonicalizes
-///   OUTSIDE the project root, so gating the canonical path against the root
-///   dropped its every Livewire registration — silently, with no diagnostic —
-///   while [`crate::config::expand_module_dirs`] deliberately admits exactly
-///   that layout. Gating LEXICALLY against the owning module, before
-///   canonicalizing, is what `resolve_provider_class_file` already does for
-///   the PSR-4 provider branch, and it keeps the symlinked module working.
+///   OUTSIDE the project root, so gating against the ROOT dropped its every
+///   Livewire registration — silently, with no diagnostic — while
+///   [`crate::config::expand_module_dirs`] deliberately admits exactly that
+///   layout. Gating against the owning module keeps it working:
+///   [`crate::path_containment::path_within_root_registration`] canonicalizes
+///   both sides, so the module's real target contains its own registrations.
 /// - The gate gets STRICTER for a module provider, not looser: a
 ///   registration reaching into a sibling module or into bare `app/` is
 ///   inside the root but outside its own module, and is dropped.
 ///
-/// Fail-closed via [`crate::path_containment::path_within_root_lexical`]: a
-/// path that cannot be proven inside `gate_dir` yields no registration.
-/// Canonicalization happens only after the gate passes, so the value handed
-/// downstream still resolves symlinks as it always did.
+/// **Fail-closed**, via
+/// [`crate::path_containment::path_within_root_registration`]: an out-of-root
+/// candidate is refused lexically without a disk probe, and a path whose real
+/// target cannot be PROVEN inside `gate_dir` yields no registration — a
+/// dangling under-root symlink, an unsearchable parent, or a path with
+/// nothing on disk.
+///
+/// The weaker `path_within_root_lexical` is deliberately NOT used here even
+/// though it shares the same lexical pre-gate. It admits every in-root path
+/// it cannot canonicalize, which is right for a speculative *candidate* and
+/// wrong here: this value is a directory that later gets walked and read, so
+/// admitting a dangling symlink would let a target created afterwards resolve
+/// outside the module (issues #134/#155).
 fn contained_class_path(
     arg: tree_sitter::Node,
     bytes: &[u8],
     paths: &PathContext,
 ) -> Option<PathBuf> {
     let resolved = resolve_path_arg(arg, bytes, paths.provider_dir, paths.root)?;
-    crate::path_containment::path_within_root_lexical(&resolved, paths.gate_dir)
+    crate::path_containment::path_within_root_registration(&resolved, paths.gate_dir)
         .then(|| resolved.canonicalize().unwrap_or(resolved))
 }
 
