@@ -8963,67 +8963,7 @@ impl SalsaActor {
         let documents_for_actor = documents.clone();
 
         std::thread::spawn(move || {
-            let mut actor = SalsaActor {
-                db: LaravelDatabase::new(),
-                receiver: rx,
-                // Pre-allocate with reasonable capacity to avoid early reallocations
-                files: HashMap::with_capacity(64),
-                // Bootstrap table, big enough for the handful of `didOpen`
-                // buffers an editor may send before registration finishes.
-                // Replaced with a correctly-sized one — carrying those
-                // entries over — by `size_and_publish_pattern_cache`.
-                pattern_cache: Arc::new(dashmap::DashMap::with_capacity(
-                    PATTERN_CACHE_INITIAL_CAPACITY,
-                )),
-                pattern_cache_slot: pattern_cache_slot_for_actor,
-                documents: documents_for_actor,
-                loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
-                php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
-                document_symbols_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
-                external_php_text: HashMap::with_capacity(64),
-                text_revision: 0,
-                file_text_revisions: HashMap::with_capacity(64),
-                // Config management
-                config_root: None,
-                config_files: HashMap::with_capacity(4),
-                config_version: 0,
-                config_cache: None,
-                registration_baselines: HashMap::new(),
-                // Reference finding
-                render_index: None,
-                render_index_version: 0,
-                render_index_generation: 0,
-                project_files: None,
-                project_files_version: 0,
-                controller_files: Vec::new(),
-                view_files: Vec::new(),
-                livewire_files: Vec::new(),
-                route_files: Vec::new(),
-                vendor_files: Vec::new(),
-                source_files: Vec::new(),
-                project_root_paths: ProjectRootPaths::default(),
-                symbol_index: crate::symbol_index::SymbolIndex::default(),
-                component_usage_index: crate::component_usage_index::ComponentUsageIndex::default(),
-                class_hierarchy_index: crate::class_hierarchy_index::ClassHierarchyIndex::default(),
-                class_files_snapshot: None,
-                // Service provider registry
-                sp_middleware_aliases: HashMap::new(),
-                sp_bindings: HashMap::new(),
-                sp_singletons: HashMap::new(),
-                sp_view_namespaces: HashMap::new(),
-                sp_blade_components: HashMap::new(),
-                sp_component_namespaces: HashMap::new(),
-                // Salsa-based env tracking
-                salsa_env_files: HashMap::with_capacity(4),
-                salsa_env_version: 0,
-                // Salsa-based translation tracking (issue #293)
-                translations: TranslationCache::default(),
-                // Salsa-based service provider tracking
-                salsa_sp_files: HashMap::with_capacity(32),
-                module_dirs: Vec::new(),
-                salsa_sp_version: 0,
-                salsa_sp_root: None,
-            };
+            let mut actor = SalsaActor::new(rx, pattern_cache_slot_for_actor, documents_for_actor);
 
             // Pre-warm query cache on actor thread (background)
             // This runs before any file parsing requests arrive,
@@ -9037,6 +8977,83 @@ impl SalsaActor {
             sender: tx,
             pattern_cache: pattern_cache_slot,
             documents,
+        }
+    }
+
+    /// Build the actor's initial state.
+    ///
+    /// Extracted from [`Self::spawn`] so the struct literal has exactly one
+    /// home and the in-crate test module can construct an actor to drive
+    /// `&mut self` methods directly — the only way to assert on `files` and
+    /// `external_php_text`, which no `SalsaHandle` message exposes (#364).
+    /// `spawn` still owns the threading; this owns the fields.
+    fn new(
+        receiver: mpsc::Receiver<SalsaRequest>,
+        pattern_cache_slot: Arc<
+            std::sync::OnceLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>,
+        >,
+        documents: Arc<OnceLock<Arc<RwLock<HashMap<Url, (String, i32)>>>>>,
+    ) -> Self {
+        SalsaActor {
+            db: LaravelDatabase::new(),
+            receiver,
+            // Pre-allocate with reasonable capacity to avoid early reallocations
+            files: HashMap::with_capacity(64),
+            // Bootstrap table, big enough for the handful of `didOpen`
+            // buffers an editor may send before registration finishes.
+            // Replaced with a correctly-sized one — carrying those
+            // entries over — by `size_and_publish_pattern_cache`.
+            pattern_cache: Arc::new(dashmap::DashMap::with_capacity(
+                PATTERN_CACHE_INITIAL_CAPACITY,
+            )),
+            pattern_cache_slot,
+            documents,
+            loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
+            php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
+            document_symbols_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
+            external_php_text: HashMap::with_capacity(64),
+            text_revision: 0,
+            file_text_revisions: HashMap::with_capacity(64),
+            // Config management
+            config_root: None,
+            config_files: HashMap::with_capacity(4),
+            config_version: 0,
+            config_cache: None,
+            registration_baselines: HashMap::new(),
+            // Reference finding
+            render_index: None,
+            render_index_version: 0,
+            render_index_generation: 0,
+            project_files: None,
+            project_files_version: 0,
+            controller_files: Vec::new(),
+            view_files: Vec::new(),
+            livewire_files: Vec::new(),
+            route_files: Vec::new(),
+            vendor_files: Vec::new(),
+            source_files: Vec::new(),
+            project_root_paths: ProjectRootPaths::default(),
+            symbol_index: crate::symbol_index::SymbolIndex::default(),
+            component_usage_index: crate::component_usage_index::ComponentUsageIndex::default(),
+            class_hierarchy_index: crate::class_hierarchy_index::ClassHierarchyIndex::default(),
+            class_files_snapshot: None,
+            // Service provider registry
+            sp_middleware_aliases: HashMap::new(),
+            sp_bindings: HashMap::new(),
+            sp_singletons: HashMap::new(),
+            sp_view_namespaces: HashMap::new(),
+            sp_blade_components: HashMap::new(),
+            sp_component_namespaces: HashMap::new(),
+            // Salsa-based env tracking
+            salsa_env_files: HashMap::with_capacity(4),
+            salsa_env_version: 0,
+            // Salsa-based translation tracking (issue #293)
+            translations: TranslationCache::default(),
+            // Salsa-based service provider tracking
+            salsa_sp_files: HashMap::with_capacity(32),
+            module_dirs: Vec::new(),
+            salsa_sp_version: 0,
+            salsa_sp_root: None,
         }
     }
 
