@@ -2246,11 +2246,23 @@ impl DatabaseSchemaProvider {
         }
 
         if let Some(socket) = &config.unix_socket {
-            // libpq-style socket connection: `postgres://user[:pass]@/db?host=/path`.
+            // libpq-style socket connection: the socket path rides in a `host=`
+            // query parameter, not the authority.
+            //
+            // The authority still needs a literal `localhost`, the same
+            // placeholder the MySQL socket branch uses. The WHATWG URL rules
+            // sqlx's `Url::parse` implements reject an empty host that follows
+            // a userinfo component, so the shorter
+            // `postgres://user@/db?host=/path` this branch used to emit came
+            // back as *empty host* and the candidate could never connect —
+            // independent of the credential, and true for every username. sqlx
+            // reads `host=` after the authority and stores it as the socket, so
+            // `localhost` is inert: verified against sqlx 0.9, the parsed
+            // options carry socket `/tmp/.s.PGSQL.5432` with host `localhost`.
             out.push(ConnCandidate {
                 label: format!("unix_socket={socket}"),
                 url: format!(
-                    "postgres://{}@/{}?host={}",
+                    "postgres://{}@localhost/{}?host={}",
                     userinfo(&config.username, &config.password),
                     config.database,
                     socket

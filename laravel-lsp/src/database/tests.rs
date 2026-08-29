@@ -286,6 +286,34 @@ fn postgres_candidates_socket_uses_libpq_style_url() {
     );
 }
 
+#[test]
+fn postgres_socket_candidate_url_actually_parses() {
+    use sqlx::postgres::PgConnectOptions;
+    use std::str::FromStr;
+
+    // `postgres_candidates_socket_uses_libpq_style_url` above pins the `?host=`
+    // shape by string match, which a URL the driver cannot parse satisfies just
+    // as well — and the authority this branch emitted did exactly that. Hand the
+    // candidate to the parser sqlx will actually use.
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = make_config_with(None, Some("/tmp/.s.PGSQL.5432"), "localhost");
+    cfg.driver = "pgsql".to_string();
+    cfg.port = 5432;
+    let socket = provider
+        .build_postgres_candidates(&cfg)
+        .into_iter()
+        .find(|c| c.label.starts_with("unix_socket"))
+        .expect("socket candidate");
+    let opts = PgConnectOptions::from_str(&socket.url)
+        .unwrap_or_else(|e| panic!("`{}` should parse: {e}", socket.url));
+    assert_eq!(
+        opts.get_socket().map(|p| p.to_string_lossy().into_owned()),
+        Some("/tmp/.s.PGSQL.5432".to_string()),
+        "the `host=` parameter must still reach sqlx as the socket path"
+    );
+    assert_eq!(opts.get_username(), "u");
+}
+
 // ---- classify_mysql_error: actionable per-error-code toasts (Phase 5.8b) ---
 
 #[test]
