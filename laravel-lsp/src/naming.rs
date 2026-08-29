@@ -87,13 +87,53 @@ pub fn dotted_to_namespace(s: &str) -> String {
     join_pascal_segments(s, '\\')
 }
 
-/// Convert a dotted component name to a forward-slash file path with each
-/// segment in PascalCase.
+/// Convert a dotted component name to a forward-slash **relative** file path
+/// with each segment in PascalCase.
 ///
-/// `"admin.user-list"` → `"Admin/UserList"`. The caller appends `.php` or
-/// joins with a root directory.
-pub fn dotted_to_class_path(s: &str) -> String {
-    join_pascal_segments(s, '/')
+/// `"admin.user-list"` → `Some("Admin/UserList")`.
+///
+/// Returns `None` when any segment is not a valid single path segment, so the
+/// result is always safe to hand to `Path::join`. Every caller joins this onto
+/// a trusted base directory, and `Path::join` REPLACES the base when the
+/// right-hand side is absolute — so `"/etc/passwd"` reaching this function
+/// unchecked made `class_path.join(..)` resolve to `/etc/passwd`, escaping the
+/// registered directory entirely. The component name is discovered data (it
+/// comes from a `<livewire:…>` tag or an `@livewire('…')` literal), so it is
+/// exactly the kind of input that must not be able to name a path.
+///
+/// Splitting on `.` already destroys `..` (it becomes two empty segments), so
+/// the traversal that remains is a separator or an absolute/drive prefix. A
+/// segment is rejected when it is empty or contains `/`, `\\`, or `:`, and the
+/// check runs on the PascalCase-converted segments — the ones actually joined
+/// — because `kebab_to_pascal` collapses an all-dashes segment to nothing.
+/// Rejecting rather than sanitizing keeps this total: there is no "cleaned"
+/// name that silently resolves somewhere the author did not write.
+pub fn dotted_to_class_path(s: &str) -> Option<String> {
+    // Check the segments that are actually JOINED, not the raw ones.
+    // `kebab_to_pascal` splits on `-` and maps every empty part to an empty
+    // string, so a segment of only dashes passes a raw check (non-empty, no
+    // separator) and collapses to `""` here — and an empty FIRST segment
+    // makes the join start with `/`, i.e. absolute, which is the exact shape
+    // this guard exists to refuse. `"-.foo"` was minting `"/Foo"`.
+    let segments: Vec<String> = split_dotted(s).into_iter().map(kebab_to_pascal).collect();
+    if !segments.iter().all(|seg| is_safe_path_segment(seg)) {
+        return None;
+    }
+    Some(segments.join("/"))
+}
+
+/// True if `s` is usable as exactly ONE path segment: non-empty, and free of
+/// any separator or prefix that `Path::join` would treat as re-rooting.
+///
+/// Public because component names become path components in two different
+/// shapes: [`dotted_to_class_path`] checks the PascalCase-CONVERTED segments
+/// it joins, while `livewire_resolver::resolve_component` checks the RAW
+/// segments, which it pushes verbatim as directory names and file stems.
+/// Both need the same answer to "is this one segment, or is it path syntax?"
+/// `\\` and `:` matter on Windows (`C:`, `\\\\server\\share`, NTFS streams) and are
+/// refused on every platform so behaviour does not diverge by host.
+pub fn is_safe_path_segment(s: &str) -> bool {
+    !s.is_empty() && !s.contains(['/', '\\', ':'])
 }
 
 fn join_pascal_segments(s: &str, sep: char) -> String {

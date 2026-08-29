@@ -1236,3 +1236,48 @@ async fn app_file_open_does_not_trigger_vendor_refresh() {
         "an app open must not occupy a vendor-LRU slot"
     );
 }
+
+/// A provider changing ON DISK must drop the cached Livewire class-namespace
+/// map, not just the vendor translation namespaces.
+///
+/// The map's registrations are gated on the class DIRECTORY existing, so a
+/// registration that failed that gate at index time stayed failed for the rest
+/// of the session. `artisan module:make-livewire Counter Blog` creates the
+/// first component — and `Livewire/` with it — through the watcher, never the
+/// editor, so `<livewire:blog::counter>` stayed dead until the user happened
+/// to edit a provider in the editor or restarted the server. Same for a
+/// `git pull` or a branch switch that adds a provider.
+#[tokio::test]
+async fn a_watched_provider_change_drops_the_cached_livewire_config() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    fs::write(root.join("composer.json"), COMPOSER).unwrap();
+    let backend = backend_for(root).await;
+
+    let provider = write_file(
+        root,
+        "app/Providers/AppServiceProvider.php",
+        "<?php\nnamespace App\\Providers;\nclass AppServiceProvider {}\n",
+    );
+
+    // Prime the cache the way `get_cached_livewire` does.
+    *backend.cached_livewire.write().await = Some((
+        root.to_path_buf(),
+        laravel_lsp::livewire_config::LivewireConfig::defaults(root),
+        laravel_lsp::livewire_version::LivewireVersion::V3,
+    ));
+    assert!(
+        backend.cached_livewire.read().await.is_some(),
+        "precondition: the cache is primed"
+    );
+
+    backend
+        .did_change_watched_files(watched(&provider, FileChangeType::CHANGED))
+        .await;
+    drain_batch(&backend).await;
+
+    assert!(
+        backend.cached_livewire.read().await.is_none(),
+        "a provider change on disk must invalidate the Livewire namespace map"
+    );
+}

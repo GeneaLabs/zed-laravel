@@ -866,3 +866,89 @@ fn namespaced_component_resolution_with_negative_controls() {
         "true negative: a missing component under the valid namespace stays missing"
     );
 }
+
+#[test]
+fn an_absolute_component_name_cannot_escape_the_class_path() {
+    // Regression: `bare` is discovered data — whatever follows `::` in a
+    // `<livewire:…>` tag or an `@livewire('…')` literal. Because
+    // `Path::join` replaces the base on an absolute right-hand side, an
+    // absolute name resolved to a file completely outside the registered
+    // class directory and was handed back as a goto-definition target.
+    // A dot-free temp prefix matters: `TempDir::new()` names its directory
+    // `.tmpXXXX`, and splitting the name on `.` would mangle the probe path
+    // before it could escape — making this test pass for the wrong reason.
+    let tmp = tempfile::Builder::new().prefix("zz").tempdir().unwrap();
+    let root = tmp.path();
+    let mut cfg = config_for(root);
+
+    // A decoy outside every configured location.
+    let outside = tmp.path().join("outside");
+    let decoy = outside.join("Secret.php");
+    write(&decoy, "<?php // not yours");
+
+    cfg.class_namespaces.insert(
+        "ui".to_string(),
+        crate::livewire_namespaces::LivewireClassNamespace {
+            class_namespace: "App\\UiKit\\Livewire".to_string(),
+            class_path: root.join("app/UiKit/Livewire"),
+        },
+    );
+
+    let absolute = outside.join("Secret");
+    let absolute = absolute.to_string_lossy();
+
+    assert!(
+        decoy.is_file(),
+        "precondition: the decoy exists, so only the guard can refuse it"
+    );
+    assert!(
+        !absolute.contains('.'),
+        "precondition: the probe name must be dot-free, or `split_dotted` mangles \
+         it and this test passes without exercising the guard at all"
+    );
+    assert!(
+        resolve_component(&format!("ui::{absolute}"), &cfg, LivewireVersion::V3).is_none(),
+        "a namespaced absolute name must not resolve outside the class path"
+    );
+    assert!(
+        resolve_component(&absolute, &cfg, LivewireVersion::V3).is_none(),
+        "an un-namespaced absolute name must not resolve outside the class path"
+    );
+}
+
+#[test]
+fn absolute_parent_segments_cannot_escape_via_the_v4_branch() {
+    // The V4 SFC/MFC/Volt branch runs BEFORE the class branch and builds its
+    // search directory with `parents_to_path`, which uses `PathBuf::push` —
+    // and an ABSOLUTE segment replaces the whole path. So gating only the
+    // class branch left the first branch wide open: the parent segments of a
+    // dotted name could name any directory on disk.
+    let proj = tempfile::Builder::new().prefix("zzproj").tempdir().unwrap();
+    let ext = tempfile::Builder::new().prefix("zzext").tempdir().unwrap();
+    let root = proj.path();
+    fs::create_dir_all(root.join("resources/views/livewire")).unwrap();
+
+    // A real V4 SFC sitting entirely outside the project root.
+    let outside = ext.path().join("resources/views/livewire");
+    let decoy = outside.join(format!("{}secret.blade.php", naming::LIVEWIRE_EMOJI));
+    write(
+        &decoy,
+        "<?php new class extends Component {}; ?><div></div>",
+    );
+
+    let cfg = config_for(root);
+    let name = format!("{}.secret", outside.display());
+
+    assert!(
+        decoy.is_file(),
+        "precondition: the decoy resolves if the guard is absent"
+    );
+    assert!(
+        !name.contains(char::is_whitespace),
+        "precondition: the probe name is a single component name"
+    );
+    assert!(
+        resolve_component(&name, &cfg, LivewireVersion::V4).is_none(),
+        "absolute parent segments must not re-root the V4 component search"
+    );
+}

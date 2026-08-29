@@ -1177,6 +1177,26 @@ pub fn expand_module_dirs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
         let mut matched = 0usize;
         for dir in current {
             if dir != *root && seen.insert(dir.clone()) {
+                // A module directory whose real target sits outside the
+                // project is admitted on purpose — that is the composer
+                // path-repository layout this expansion exists to support.
+                // It is not, however, something to do SILENTLY: the
+                // directory becomes a containment gate, so everything under
+                // the symlink's target is in scope for indexing. Announce it
+                // so an accidental link (a stray `Modules/Shared ->
+                // ../../other-checkout`) is visible rather than inferred
+                // from surprising results.
+                if let (Ok(real_dir), Ok(real_root)) = (dir.canonicalize(), root.canonicalize()) {
+                    if !real_dir.starts_with(&real_root) {
+                        tracing::warn!(
+                            module = %dir.display(),
+                            resolves_to = %real_dir.display(),
+                            "modules.paths entry resolves OUTSIDE the project root — it is \
+                             admitted (composer path repositories legitimately link outward) \
+                             and becomes a containment gate for everything under it"
+                        );
+                    }
+                }
                 out.push(dir);
                 matched += 1;
             }
@@ -1193,6 +1213,49 @@ pub fn expand_module_dirs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     }
 
     out
+}
+
+/// The configured module directory that owns `path`, plus that module's rank
+/// in `modules.paths` glob-match order.
+///
+/// `module_dirs` is [`expand_module_dirs`]'s output, and its order **is** the
+/// configured precedence order — later pattern, higher precedence. The rank
+/// returned is therefore 1-based, so `0` is free to mean "no owning module"
+/// in the plain tuple comparison the registration merge uses. On nesting the
+/// LONGEST matching directory wins: a module inside another module is owned
+/// by the inner one, the module whose `composer.json` actually boots it.
+///
+/// Matching is lexical on `..`/`.`-collapsed paths — never `canonicalize` —
+/// because a module may legitimately be a symlinked composer path repository
+/// whose real target sits outside the project ([`expand_module_dirs`]).
+/// Resolving either side would move the provider out from under its own
+/// module and lose the ownership this answers.
+///
+/// Used by the Salsa registration merge
+/// (`salsa_impl::handle_get_laravel_config`) to break an equal-priority tie by
+/// `modules.paths` rank, where a prefix match is the only signal available:
+/// the merge sees a provider file, not the discovery that produced it.
+///
+/// The Livewire containment gate deliberately does NOT use this. A gate needs
+/// to know which module a provider *was discovered as belonging to*, and a
+/// prefix match only guesses at that: a `modules.paths` glob such as `app/*`
+/// expands to include `app/Providers`, so the guess labels an APP provider a
+/// module provider and gates its registrations against `app/Providers` —
+/// silently dropping the ordinary `__DIR__.'/../Livewire'`. That call site
+/// carries provenance down from `module_provider_files` instead. Prefer the
+/// same wherever the answer must be exact rather than indicative.
+pub fn owning_module<'a>(module_dirs: &'a [PathBuf], path: &Path) -> Option<(usize, &'a Path)> {
+    let normalized = crate::route_discovery::normalize_path(path);
+    module_dirs
+        .iter()
+        .enumerate()
+        .filter(|(_, dir)| normalized.starts_with(crate::route_discovery::normalize_path(dir)))
+        .max_by_key(|(_, dir)| {
+            crate::route_discovery::normalize_path(dir)
+                .components()
+                .count()
+        })
+        .map(|(index, dir)| (index + 1, dir.as_path()))
 }
 
 /// Service-provider files of the configured module directories, discovered

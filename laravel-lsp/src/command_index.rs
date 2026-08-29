@@ -18,8 +18,10 @@
 //!
 //! Two classes can declare the same command name (a package ships
 //! `queue:work`, an app overrides it). The index keeps the highest-priority
-//! declaration, matching the convention in `CLAUDE.md`
-//! (*Framework=0, Package=1, App=2 — higher wins*):
+//! declaration. Higher wins, as everywhere else in the codebase, but this
+//! index has its own three-tier scale derived from the file path — it is NOT
+//! the four-tier service-provider scale (`0=framework, 1=package, 2=module,
+//! 3=app`), which no command declaration carries:
 //!
 //! | Source | Priority | Detected by |
 //! |--------|----------|-------------|

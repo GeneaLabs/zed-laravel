@@ -205,7 +205,10 @@ fn component_rename_class_based_locates_both_files() {
         root.join("resources/views/components/alert-button.blade.php")
     );
     let new_class = conventional_class_file_path("alert-button", &config);
-    assert_eq!(new_class, root.join("app/View/Components/AlertButton.php"));
+    assert_eq!(
+        new_class,
+        Some(root.join("app/View/Components/AlertButton.php"))
+    );
 }
 
 #[test]
