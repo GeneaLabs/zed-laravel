@@ -5346,7 +5346,9 @@ fn configured_locale_beats_the_alphabetically_first() {
     let (_tmp, root) = root_with_app_config("    'locale' => 'en',");
 
     assert_eq!(
-        completion_locale(&root, &locales(&["de", "en", "fr"])).as_deref(),
+        TranslationCache::default()
+            .completion_locale(&root, &locales(&["de", "en", "fr"]))
+            .as_deref(),
         Some("en"),
         "the app renders `en`; previewing `de` because it sorts first is issue #340"
     );
@@ -5357,7 +5359,9 @@ fn a_missing_app_locale_falls_through_to_fallback_locale() {
     let (_tmp, root) = root_with_app_config("    'fallback_locale' => 'fr',");
 
     assert_eq!(
-        completion_locale(&root, &locales(&["de", "en", "fr"])).as_deref(),
+        TranslationCache::default()
+            .completion_locale(&root, &locales(&["de", "en", "fr"]))
+            .as_deref(),
         Some("fr"),
         "no `locale` key at all must consult `fallback_locale`, not give up on the config"
     );
@@ -5369,7 +5373,9 @@ fn a_configured_locale_with_no_directory_falls_through_to_fallback_locale() {
         root_with_app_config("    'locale' => 'es',\n    'fallback_locale' => 'fr',");
 
     assert_eq!(
-        completion_locale(&root, &locales(&["de", "en", "fr"])).as_deref(),
+        TranslationCache::default()
+            .completion_locale(&root, &locales(&["de", "en", "fr"]))
+            .as_deref(),
         Some("fr"),
         "a locale the project does not translate has nothing to preview — but that \
          is a reason to try `fallback_locale`, not to jump straight to alphabetical"
@@ -5382,7 +5388,9 @@ fn a_non_literal_app_locale_is_unresolved() {
         root_with_app_config("    'locale' => APP_DEFAULT_LOCALE,\n    'fallback_locale' => 'fr',");
 
     assert_eq!(
-        completion_locale(&root, &locales(&["de", "en", "fr"])).as_deref(),
+        TranslationCache::default()
+            .completion_locale(&root, &locales(&["de", "en", "fr"]))
+            .as_deref(),
         Some("fr"),
         "a constant reference is not statically readable; it must never be matched \
          as raw text, and must not panic"
@@ -5394,7 +5402,9 @@ fn a_concatenated_app_locale_is_unresolved() {
     let (_tmp, root) = root_with_app_config("    'locale' => 'e' . 'n',");
 
     assert_eq!(
-        completion_locale(&root, &locales(&["fr", "de", "en"])).as_deref(),
+        TranslationCache::default()
+            .completion_locale(&root, &locales(&["fr", "de", "en"]))
+            .as_deref(),
         Some("de"),
         "a concatenation is not a literal — fall all the way through to alphabetical \
          rather than evaluating PHP"
@@ -5409,7 +5419,9 @@ fn neither_key_resolving_falls_back_to_alphabetically_first() {
     // entry rather than its minimum would answer `fr` here, which is precisely
     // the filesystem-order bug the sort was introduced to kill.
     assert_eq!(
-        completion_locale(&root, &locales(&["fr", "de", "en"])).as_deref(),
+        TranslationCache::default()
+            .completion_locale(&root, &locales(&["fr", "de", "en"]))
+            .as_deref(),
         Some("de"),
         "the pre-#340 guarantee: deterministic on every filesystem"
     );
@@ -5421,7 +5433,9 @@ fn a_project_with_no_config_directory_falls_back_to_alphabetically_first() {
     let _ = dir;
 
     assert_eq!(
-        completion_locale(&root, &locales(&["en", "de"])).as_deref(),
+        TranslationCache::default()
+            .completion_locale(&root, &locales(&["en", "de"]))
+            .as_deref(),
         Some("de"),
         "an unreadable config must degrade to the old behaviour, not to no completions"
     );
@@ -5435,12 +5449,21 @@ fn the_alphabetical_fallback_sees_every_candidate_the_chain_tried() {
     // Both configured locales exist as directories, so the chain matches at
     // step 1 — but if a failing step ever removed what it tried from the list,
     // this project's fallback would answer `fr` instead of `de`.
+    //
+    // One cache across both calls, deliberately: the config read is memoized
+    // per instance since #349, so a second call answers from cached text. A
+    // cache that mutated or consumed what it stored would show up right here.
+    let mut cache = TranslationCache::default();
     assert_eq!(
-        completion_locale(&root, &locales(&["de", "en", "fr"])).as_deref(),
+        cache
+            .completion_locale(&root, &locales(&["de", "en", "fr"]))
+            .as_deref(),
         Some("de"),
     );
     assert_eq!(
-        completion_locale(&root, &locales(&["gr", "fr"])).as_deref(),
+        cache
+            .completion_locale(&root, &locales(&["gr", "fr"]))
+            .as_deref(),
         Some("fr"),
         "neither configured locale exists here, so the fallback must still see the \
          whole candidate list"
@@ -5452,7 +5475,9 @@ fn an_env_wrapped_app_locale_uses_its_default_argument() {
     let (_tmp, root) = root_with_app_config("    'locale' => env('APP_LOCALE', 'en'),");
 
     assert_eq!(
-        completion_locale(&root, &locales(&["de", "en"])).as_deref(),
+        TranslationCache::default()
+            .completion_locale(&root, &locales(&["de", "en"]))
+            .as_deref(),
         Some("en"),
         "Laravel ships `app.locale` env-wrapped; matching the raw `env(...)` text \
          against directory names would silently reproduce issue #340"
@@ -5466,7 +5491,9 @@ fn an_env_wrapped_fallback_locale_uses_its_default_argument() {
     );
 
     assert_eq!(
-        completion_locale(&root, &locales(&["de", "en", "fr"])).as_deref(),
+        TranslationCache::default()
+            .completion_locale(&root, &locales(&["de", "en", "fr"]))
+            .as_deref(),
         Some("fr"),
         "the env unwrap applies to both lookups — `fallback_locale` is env-wrapped \
          in a stock Laravel skeleton too"
@@ -5478,7 +5505,7 @@ fn no_candidates_resolves_to_no_locale() {
     let (_tmp, root) = root_with_app_config("    'locale' => 'en',");
 
     assert_eq!(
-        completion_locale(&root, &[]),
+        TranslationCache::default().completion_locale(&root, &[]),
         None,
         "a project with no locale directories has nothing to preview, whatever its \
          config says"
