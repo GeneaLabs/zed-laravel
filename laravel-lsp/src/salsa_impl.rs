@@ -10045,6 +10045,26 @@ impl SalsaActor {
         // refuses to evict, and nothing here touches them.
         self.files.remove(path);
         self.invalidate_file_caches(path);
+
+        // The three deferred indexes are readers too, and neither of the lines
+        // above reaches them: they answer `find_references` and the code lenses
+        // out of their own maps, refreshed lazily from whatever `mark_dirty`
+        // queued. A query run WHILE the buffer was open drains that queue, so
+        // the index is left holding the buffer's literals with the flag already
+        // cleared — a `view('…')` the discarded buffer introduced would keep
+        // answering find-references forever, pointing at a file that never
+        // contained it.
+        //
+        // Re-queueing is what `handle_update_file` does for any other change of
+        // a path's text, and this is one: the text just went from the buffer's
+        // back to disk's. It is NOT eviction — the drain runs
+        // `remove_literal_entries` + `insert_file`, which deliberately keeps
+        // the resolved magic-member entries that only a warm or save pass can
+        // rebuild, and which are the whole reason `did_close` refuses
+        // `RemoveFile`.
+        self.symbol_index.mark_dirty(path);
+        self.class_hierarchy_index.mark_dirty(path);
+        self.component_usage_index.mark_dirty(path);
     }
 
     /// Handle a Blade loop-blocks query. Memoized via Salsa + actor LRU.

@@ -506,3 +506,106 @@ async fn closing_a_document_stops_every_reader_serving_the_discarded_text() {
         "the discarded buffer's text must not survive its document, got {names:?}",
     );
 }
+
+// ---- the inverted index is a reader too ----------------------------------
+
+/// The files the inverted symbol index reports as referencing view `name`.
+async fn view_reference_files(backend: &LaravelLanguageServer, name: &str) -> HashSet<PathBuf> {
+    backend
+        .salsa
+        .find_references(
+            laravel_lsp::salsa_impl::SymbolRefData::View(name.to_string()),
+            false,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|loc| loc.file_path)
+        .collect()
+}
+
+/// `find_references` does not read `files[path]`; it answers from
+/// `symbol_index`, refreshed lazily from the paths `mark_dirty` queued. A
+/// query run while the buffer is open DRAINS that queue, so the index ends up
+/// holding the buffer's literals with the dirty flag cleared — and dropping
+/// the Salsa input on close cannot reach it. The view name the discarded
+/// buffer introduced then keeps answering find-references and code lenses
+/// forever, pointing at a file that never contained it.
+///
+/// The release therefore re-queues the path on the three deferred indexes,
+/// exactly as `handle_update_file` does for any other text change. Queueing is
+/// not eviction: the drain runs `remove_literal_entries` + `insert_file`, which
+/// deliberately preserves the resolved magic-member entries `did_close` exists
+/// to protect.
+#[tokio::test]
+async fn closing_a_document_stops_the_index_reporting_the_discarded_views() {
+    let dir = TempDir::new().unwrap();
+    let backend = backend_for(dir.path()).await;
+    let class = write_file(
+        dir.path(),
+        "app/Livewire/Counter.php",
+        SAVED_CLASS_RENDERING,
+    );
+
+    let uri = open_buffer(&backend, &class, DISCARDED_BUFFER_RENDERING).await;
+
+    // Drain the dirty queue WHILE the buffer is open — a find-references or a
+    // code lens during the edit session. Without this the release would look
+    // correct for the wrong reason: the still-queued path would be refreshed
+    // on the first post-close query whether or not the release re-queued it.
+    assert!(
+        view_reference_files(&backend, "livewire.from-buffer")
+            .await
+            .contains(&class),
+        "precondition: a query during the edit indexes the buffer's literals",
+    );
+
+    close_document(&backend, uri).await;
+
+    let phantom = view_reference_files(&backend, "livewire.from-buffer").await;
+    assert!(
+        phantom.is_empty(),
+        "the discarded buffer's view reference must stop answering, got {phantom:?}",
+    );
+    assert!(
+        view_reference_files(&backend, "livewire.from-disk")
+            .await
+            .contains(&class),
+        "and the file on disk must answer in its place",
+    );
+}
+
+/// The other half of the same edge: re-queueing must not cost the resolved
+/// magic-member entries, which no re-parse can restore. The drain runs
+/// `remove_literal_entries` + `insert_file`, never `remove_file`, so the two
+/// requirements coexist — but only a test that actually FORCES the drain after
+/// the close can say so.
+#[tokio::test]
+async fn the_index_requeue_on_close_keeps_resolved_magic_members() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let backend = backend_for(root).await;
+    write_file(root, "composer.json", COMPOSER);
+
+    let post = write_file(root, "app/Models/Post.php", POST);
+    seed(&backend, &post, POST).await;
+    let before = member_names(&backend, &post).await;
+    assert!(
+        before.contains("headline"),
+        "precondition: Post has resolved magic-member entries",
+    );
+
+    let uri = open_buffer(&backend, &post, POST).await;
+    close_document(&backend, uri).await;
+
+    // Force the deferred drain the release just queued. A destructive refresh
+    // would zero the entries here, where the sibling test above would still
+    // pass — it never makes the drain run.
+    let _ = view_reference_files(&backend, "no.such.view").await;
+
+    assert_eq!(
+        member_names(&backend, &post).await,
+        before,
+        "re-queueing the path must not zero what only warm/save can rebuild",
+    );
+}
