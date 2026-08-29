@@ -550,17 +550,17 @@ async fn config_completion_redacts_only_the_dotenv_sourced_sensitive_values() {
     );
 }
 
-/// `config/app.php` rendered the way the completion detail renders it — with
-/// the platform's own separator. Windows displays `config\app.php`, which is
-/// correct for Windows, so the expectation has to be built rather than typed:
-/// a literal `config/app.php` reddens the whole matrix job on a path-display
-/// difference that has nothing to do with redaction.
-fn config_app_display() -> String {
-    std::path::Path::new("config")
-        .join("app.php")
-        .display()
-        .to_string()
-}
+/// The project-relative label `config_source_label` renders beside a config
+/// value, spelled with a forward slash on **every** platform.
+///
+/// Typed as a literal on purpose. The label is user-visible text, and
+/// `config_source_label` normalizes separators precisely so it does not change
+/// shape with the host OS. An expectation built with `Path::join(...).display()`
+/// would mirror that production logic instead of pinning it: were the
+/// normalization dropped, the built expectation would pick up the native
+/// separator too and the test would stay green on the one platform — Windows —
+/// where the regression is visible.
+const CONFIG_APP_LABEL: &str = "config/app.php";
 
 /// End-to-end through the real handler, so the render sites are covered too:
 /// `completion_detail` and `config_documentation` both receive the redacted
@@ -577,7 +577,7 @@ async fn the_config_completion_response_carries_no_dotenv_secret() {
     let password = item(&items, "app.password", "config completion");
     assert_eq!(
         password.detail.as_deref(),
-        Some(format!("{REDACTED_ENV_VALUE} ({})", config_app_display()).as_str())
+        Some(format!("{REDACTED_ENV_VALUE} ({CONFIG_APP_LABEL})").as_str())
     );
     assert!(
         documentation_markdown(password, "config completion").contains(REDACTED_ENV_VALUE),
@@ -588,7 +588,7 @@ async fn the_config_completion_response_carries_no_dotenv_secret() {
     let name = item(&items, "app.name", "config completion");
     assert_eq!(
         name.detail.as_deref(),
-        Some(format!("{PLAIN_VALUE} ({})", config_app_display()).as_str())
+        Some(format!("{PLAIN_VALUE} ({CONFIG_APP_LABEL})").as_str())
     );
 }
 
