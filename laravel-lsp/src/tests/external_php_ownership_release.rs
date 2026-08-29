@@ -17,17 +17,28 @@
 //! the eviction question have to stay separate. Both halves of that claim are
 //! pinned here — the downgrade happens, and nothing else does.
 //!
-//! These drive the **real** `did_close` notification handler on the
-//! `LspService::new` harness (the seam `watched_files_magic.rs` uses), not the
-//! `SalsaHandle` method underneath it: a unit test of the release would prove
-//! nothing about whether close calls it.
+//! The release is also counted, not flagged. tower-lsp runs notification
+//! handlers concurrently, so a reopened buffer's `didOpen` can reach the Salsa
+//! actor before the `didClose` it followed at the client — and a release that
+//! fired there would strip a LIVE buffer's ownership, which is the same defect
+//! reached from the other side. `did_open` counts its buffer in and `did_close`
+//! counts it out, so the pair settles the same way whichever order it arrives
+//! in.
+//!
+//! These drive the **real** `did_open` and `did_close` notification handlers on
+//! the `LspService::new` harness (the seam `watched_files_magic.rs` uses), not
+//! the `SalsaHandle` methods underneath them: a unit test of either edge would
+//! prove nothing about whether the handlers call it.
 
 use crate::LaravelLanguageServer;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
-use tower_lsp::lsp_types::{DidCloseTextDocumentParams, TextDocumentIdentifier, Url};
+use tower_lsp::lsp_types::{
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, TextDocumentIdentifier,
+    TextDocumentItem, Url,
+};
 use tower_lsp::{LanguageServer, LspService};
 
 const COMPOSER: &str = r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#;
@@ -46,22 +57,37 @@ fn write_file(root: &Path, rel: &str, src: &str) -> PathBuf {
     path
 }
 
-/// Install `content` as the live editor buffer for `path` — `self.documents`
-/// plus the Salsa input, which is both halves of what `did_open` does with a
-/// buffer, and the pair `did_close` has to undo.
+/// Drive the real `textDocument/didOpen` handler for `path` with `content` as
+/// the buffer — the acquire `did_close` has to undo.
+///
+/// Driving the handler rather than re-spelling its Salsa calls here is the
+/// point: a helper that pushed the buffer itself would keep passing after
+/// `did_open` stopped counting its buffer in, and the ownership count is half
+/// of what these tests exist to pin.
 async fn open_buffer(backend: &LaravelLanguageServer, path: &Path, content: &str) -> Url {
     let uri = Url::from_file_path(path).unwrap();
     backend
-        .documents
-        .write()
-        .await
-        .insert(uri.clone(), (content.to_string(), 1));
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "php".to_string(),
+                version: 1,
+                text: content.to_string(),
+            },
+        })
+        .await;
+    uri
+}
+
+/// Install `content` as `path`'s Salsa text with NO open document — what a
+/// `didChangeWatchedFiles` push does. It takes the same `PushedByClient`
+/// stamp any client push does, but no buffer is counted in behind it.
+async fn push_without_open(backend: &LaravelLanguageServer, path: &Path, content: &str) {
     backend
         .salsa
         .update_file(path.to_path_buf(), 1, content.to_string())
         .await
-        .expect("the buffer reaches Salsa, exactly as did_open pushes it");
-    uri
+        .expect("the watcher's own read reaches Salsa");
 }
 
 /// Drive the real `textDocument/didClose` handler for `uri`.
@@ -82,6 +108,13 @@ const SAVED_CLASS: &str = "<?php\n\nnamespace App\\Livewire;\n\nuse Livewire\\Co
 /// the whole test: with disk and buffer agreeing, both a released and an
 /// unreleased path answer identically and the assertions below prove nothing.
 const DISCARDED_BUFFER: &str = "<?php\n\nnamespace App\\Livewire;\n\nuse Livewire\\Component;\n\nclass Counter extends Component\n{\n    public int $count = 0;\n\n    public function decrement(): void\n    {\n        $this->count--;\n    }\n}\n";
+
+/// A third spelling of the same class, for the reopen in the race tests. Three
+/// distinct method names keep the three states apart: `increment` is on disk,
+/// `decrement` was the buffer that closed, `multiply` is the buffer that is
+/// open now. Reusing one buffer constant for both opens could not tell "the
+/// reopened buffer answers" from "the first push's text was never replaced".
+const REOPENED_BUFFER: &str = "<?php\n\nnamespace App\\Livewire;\n\nuse Livewire\\Component;\n\nclass Counter extends Component\n{\n    public int $count = 0;\n\n    public function multiply(): void\n    {\n        $this->count *= 2;\n    }\n}\n";
 
 /// Write the v3 component pair and return `(class, blade)`.
 fn write_v3_component(root: &Path) -> (PathBuf, PathBuf) {
@@ -172,6 +205,124 @@ async fn closing_one_document_leaves_another_buffers_ownership_intact() {
             .await
             .is_none(),
         "and disk must not be read back over it",
+    );
+}
+
+// ---- the release must not outrun a reopen -------------------------------
+
+/// A close must not release a path that a LATER open has already claimed.
+///
+/// tower-lsp drives up to four notification handlers concurrently, so the
+/// `didOpen` of a reopened buffer — a revert, a tab restored, Zed's
+/// multibuffer lifecycle — can reach the Salsa actor before the `didClose`
+/// that preceded it at the client. Calling the handlers in that order IS that
+/// interleaving: the actor sees the reopen's messages first and the close
+/// last.
+///
+/// Releasing there is not a stale answer, it is a write: an unowned path sends
+/// the loader's next read into `set_text` on the shared `SourceFile` every
+/// per-file query reads, so a `$this->member` hover in the Blade view would
+/// revert the PHP buffer's text to disk.
+#[tokio::test]
+async fn a_reopen_that_overtakes_its_close_keeps_the_buffers_ownership() {
+    let dir = TempDir::new().unwrap();
+    let backend = backend_for(dir.path()).await;
+    let (class, blade) = write_v3_component(dir.path());
+
+    let closing = open_buffer(&backend, &class, DISCARDED_BUFFER).await;
+    // The reopen's didOpen wins the race to the actor...
+    open_buffer(&backend, &class, REOPENED_BUFFER).await;
+    // ...and the close it should have followed arrives late.
+    close_document(&backend, closing).await;
+
+    assert!(
+        backend
+            .locate_in_backing_class_files(&blade, "multiply")
+            .await
+            .is_some(),
+        "the reopened buffer is live and still owns the path — the late close \
+         belongs to a buffer that no longer exists",
+    );
+    assert!(
+        backend
+            .locate_in_backing_class_files(&blade, "increment")
+            .await
+            .is_none(),
+        "disk must not be read back over the live buffer",
+    );
+    assert!(
+        backend
+            .locate_in_backing_class_files(&blade, "decrement")
+            .await
+            .is_none(),
+        "and the closed buffer's own text is gone — the reopen replaced it",
+    );
+}
+
+/// The count must not strand ownership: the reopened buffer's own close still
+/// hands the path back. Without this, refusing the late close above could be
+/// spelled as never releasing at all.
+#[tokio::test]
+async fn the_reopened_buffer_releases_when_it_closes_in_turn() {
+    let dir = TempDir::new().unwrap();
+    let backend = backend_for(dir.path()).await;
+    let (class, blade) = write_v3_component(dir.path());
+
+    let closing = open_buffer(&backend, &class, DISCARDED_BUFFER).await;
+    let reopened = open_buffer(&backend, &class, REOPENED_BUFFER).await;
+    close_document(&backend, closing).await;
+
+    close_document(&backend, reopened).await;
+
+    let (path, loc) = backend
+        .locate_in_backing_class_files(&blade, "increment")
+        .await
+        .expect("with the last buffer gone, the SAVED method must resolve again");
+    assert_eq!(path, class, "resolution reaches the standalone class");
+    assert_eq!(loc.line, 10, "the saved declaration's line");
+    assert!(
+        backend
+            .locate_in_backing_class_files(&blade, "multiply")
+            .await
+            .is_none(),
+        "the reopened buffer's method must stop resolving once it closes too",
+    );
+}
+
+/// A `didChangeWatchedFiles` push stamps ownership with no open buffer behind
+/// it, so a close for that path finds nothing counted in. It must still hand
+/// the path back: an absent count is zero, and the original defect — text
+/// nothing holds, served forever — is what zero has to fall toward.
+#[tokio::test]
+async fn a_close_releases_a_path_no_open_ever_counted() {
+    let dir = TempDir::new().unwrap();
+    let backend = backend_for(dir.path()).await;
+    let (class, blade) = write_v3_component(dir.path());
+
+    push_without_open(&backend, &class, DISCARDED_BUFFER).await;
+    assert!(
+        backend
+            .locate_in_backing_class_files(&blade, "decrement")
+            .await
+            .is_some(),
+        "seed: the push owns the path, exactly as a buffer's would",
+    );
+
+    close_document(&backend, Url::from_file_path(&class).unwrap()).await;
+
+    assert!(
+        backend
+            .locate_in_backing_class_files(&blade, "increment")
+            .await
+            .is_some(),
+        "the uncounted push is still handed back on close — disk answers again",
+    );
+    assert!(
+        backend
+            .locate_in_backing_class_files(&blade, "decrement")
+            .await
+            .is_none(),
+        "and its text stops answering",
     );
 }
 
