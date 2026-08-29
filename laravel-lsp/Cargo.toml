@@ -55,6 +55,14 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "mysql", "postgres", "sql
 tiberius = { version = "0.12", default-features = false, features = ["tokio", "rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
+# RFC 3986 URL parsing for credential redaction. `mask_url_credentials` has to
+# know where a URL's authority ends before it can tell a password's `@` from a
+# path's, and a hand-rolled scan cannot: `mysql://host:3306/db@x` and
+# `postgres://user:p/ss@host/db` are the same shape to a scanner and different
+# URLs to a parser (issue #355). Already compiled transitively (sqlx parses its
+# connection strings with it), so this direct dep adds no new crate to the build.
+url = "2.5"
+
 # Tree-sitter parsers
 # Using latest version to match the Blade grammar from GitHub
 tree-sitter = "0.26"

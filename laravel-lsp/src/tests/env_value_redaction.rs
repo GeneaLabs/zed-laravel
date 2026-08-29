@@ -2,15 +2,20 @@
 //!
 //! #342 closed the *process*-environment leak. The project's own `.env` is a
 //! milder but real second source: a Laravel `.env` routinely holds `APP_KEY`,
-//! `DB_PASSWORD`, `MAIL_PASSWORD` and third-party tokens, and three
-//! client-rendered surfaces echoed them — env completion, `.env` hover, and
-//! `config('…')` completion.
+//! `DB_PASSWORD`, `MAIL_PASSWORD` and third-party tokens, and four
+//! client-rendered surfaces echoed them — env completion, `config('…')`
+//! completion, hover over an `env('KEY')` call in PHP (`hover_for_env`), and
+//! hover over the declaration itself in a `.env` buffer
+//! (`hover_for_env_declaration`). The two hovers are separate handlers for
+//! opposite directions, not one surface rendered twice; the second is driven
+//! through the real `hover` entry point in `env_key_navigation`, whose
+//! `sensitive_values_are_redacted_in_the_env_buffer_card` carries its
+//! redaction assertions. The first three are covered here.
 //!
-//! A fourth was found in review: the server log. It consults the same predicate
-//! and is covered next to the code that logs, in `database::tests` — these
-//! three are the client-rendered ones.
+//! One more was found in review: the server log. It consults the same
+//! predicate and is covered next to the code that logs, in `database::tests`.
 //!
-//! There was a fifth when #344 shipped: the warm-start disk cache, which wrote
+//! And there was one more again when #344 shipped: the warm-start disk cache, which wrote
 //! a redacted copy of every `.env` variable to `cache.json`. Issue #356 deleted
 //! that cache outright — nothing ever read the map back, so it was a file of
 //! `.env` names with no consumer — and its two tests went with it. What
@@ -19,7 +24,7 @@
 //! cleartext are still on disk, and the version check is still the only thing
 //! stopping a later build from serving them.
 //!
-//! All three now consult the same two gates: `is_sensitive_env_name`, which
+//! All of them now consult the same two gates: `is_sensitive_env_name`, which
 //! reads the variable's **name**, and `mask_url_credentials`, which reads the
 //! value's **shape**. The second exists because the first cannot see
 //! `DATABASE_URL=mysql://user:pass@host/db` — a name matching no sensitive
@@ -27,9 +32,12 @@
 //! password sits inside the value. These tests drive the real entry points —
 //! `completion()`, `hover_for_env` and `get_all_config_keys` — with two
 //! different matched keyword categories (`DB_PASSWORD` and `API_TOKEN`) plus
-//! the URL shape crossing every one of them, so a surface that re-implemented
-//! either check locally and drifted is caught by observed behaviour rather than
-//! by reading the diff.
+//! all three routes through the shape gate crossing every one of them, each
+//! taking a different arm inside `mask_url_credentials`: a credential in the
+//! authority (`DATABASE_URL`), a value with no authority at all (`JDBC_URL`),
+//! and a credential hidden *past* the authority (`CALLBACK_URL`). So a surface
+//! that re-implemented either check locally and drifted is caught by observed
+//! behaviour rather than by reading the diff.
 //!
 //! Leak assertions run over the **whole serialized response**, not the fields
 //! this change touches: `insertText`, `label`, `sortText` and friends are just
@@ -76,10 +84,72 @@ const PLAIN_VALUE: &str = "Example";
 /// reads `'url' => env('DATABASE_URL')` and the value carries the password
 /// inside itself. Caught by shape, not by name.
 const URL_NAME: &str = "DATABASE_URL";
-const URL_SECRET: &str = "url-hunter2-issue-344";
+/// Carries an unencoded `@`, the shape issue #355 fixed: `database::userinfo`
+/// interpolates a `.env` password into a connection URL verbatim, so a
+/// developer who types one gets this value on every masked surface — the ones
+/// enumerated in the module doc above, plus the server log covered in
+/// `database::tests`. Named there rather than counted here: #356 deleted the
+/// warm-start disk cache and a count would have gone stale silently, which is
+/// exactly what it did.
+const URL_SECRET: &str = "url-hunter2@tail-355";
+/// The half of `URL_SECRET` that survived the old first-`@` parse. Asserted on
+/// its own because every whole-secret check passes vacuously on a *partially*
+/// masked value — `sail:***@tail-355@host` contains no `URL_SECRET`.
+const URL_SECRET_TAIL: &str = "tail-355";
+
+/// The name gate's blind spot again, one layer deeper. `JDBC_URL` splits to
+/// `JDBC` / `URL` and matches no sensitive segment, exactly like
+/// `DATABASE_URL` — but a `jdbc:` value also defeats the *shape* gate's parse:
+/// `url` reads the opaque path, never parses userinfo, and reports no password
+/// however many the value holds. So both gates fell open at once and the
+/// password reached every surface in the clear.
+///
+/// Kept as its own variable rather than folded into `URL_NAME` because the two
+/// travel different routes through `mask_url_credentials` — an authority-
+/// bearing parse and an authority-less one — and one fixture cannot exercise
+/// both arms.
+const JDBC_NAME: &str = "JDBC_URL";
+const JDBC_SECRET: &str = "jdbc-hunter2@tail-358";
+/// `JDBC_SECRET`'s surviving half, for the same reason as `URL_SECRET_TAIL`.
+const JDBC_SECRET_TAIL: &str = "tail-358";
+
+/// The third route, and the one both gates missed at once. `CALLBACK_URL`
+/// splits to `CALLBACK` / `URL` and matches no sensitive segment; the value
+/// then *parses cleanly and carries an authority*, so the shape gate's
+/// no-password arm returned it untouched — while the credential sat one layer
+/// down, in the query. `Url::password` answers about the authority it parsed
+/// and nothing else, which is why the arm rescans its own tail.
+///
+/// Its own variable rather than another `DATABASE_URL` spelling, for the same
+/// reason `JDBC_NAME` is: the three travel different arms, and one fixture
+/// cannot exercise more than one of them.
+const NESTED_NAME: &str = "CALLBACK_URL";
+const NESTED_SECRET: &str = "nested-hunter2@tail-358b";
+/// `NESTED_SECRET`'s surviving half, for the same reason as `URL_SECRET_TAIL`.
+const NESTED_SECRET_TAIL: &str = "tail-358b";
 
 fn url_value() -> String {
     format!("mysql://sail:{URL_SECRET}@db.internal.example:3306/laravel")
+}
+
+fn jdbc_value() -> String {
+    format!("jdbc:mysql://sail:{JDBC_SECRET}@db.internal.example:3306/laravel")
+}
+
+/// The masked form of [`jdbc_value`]. Host, port and database survive here too.
+fn jdbc_masked() -> String {
+    "jdbc:mysql://sail:***@db.internal.example:3306/laravel".to_string()
+}
+
+fn nested_value() -> String {
+    format!("https://app.example.com/cb?next=mysql://sail:{NESTED_SECRET}@db.internal.example:3306/laravel")
+}
+
+/// The masked form of [`nested_value`]. The outer URL is untouched and the
+/// inner one keeps its host, port and database — the rescan masks the
+/// credential, it does not blank the tail.
+fn nested_masked() -> String {
+    "https://app.example.com/cb?next=mysql://sail:***@db.internal.example:3306/laravel".to_string()
 }
 
 /// What every surface must render instead: masked, not dropped. The host, port
@@ -100,8 +170,10 @@ const PLANTED_MIDDLEWARE: &str = "planted-issue-356";
 /// The project `.env` every test registers with Salsa.
 fn dotenv() -> String {
     format!(
-        "{PLAIN_NAME}={PLAIN_VALUE}\n{PASSWORD_NAME}={PASSWORD_VALUE}\n{TOKEN_NAME}={TOKEN_VALUE}\n{URL_NAME}={}\n# {COMMENTED_NAME}={COMMENTED_VALUE}\n",
-        url_value()
+        "{PLAIN_NAME}={PLAIN_VALUE}\n{PASSWORD_NAME}={PASSWORD_VALUE}\n{TOKEN_NAME}={TOKEN_VALUE}\n{URL_NAME}={}\n{JDBC_NAME}={}\n{NESTED_NAME}={}\n# {COMMENTED_NAME}={COMMENTED_VALUE}\n",
+        url_value(),
+        jdbc_value(),
+        nested_value()
     )
 }
 
@@ -205,7 +277,17 @@ fn assert_no_secret_leak(
 ) -> Vec<CompletionItem> {
     let (items, json) = dissect(response);
     let haystack = searchable(&json);
-    for secret in [PASSWORD_VALUE, TOKEN_VALUE, COMMENTED_VALUE, URL_SECRET] {
+    for secret in [
+        PASSWORD_VALUE,
+        TOKEN_VALUE,
+        COMMENTED_VALUE,
+        URL_SECRET,
+        URL_SECRET_TAIL,
+        JDBC_SECRET,
+        JDBC_SECRET_TAIL,
+        NESTED_SECRET,
+        NESTED_SECRET_TAIL,
+    ] {
         assert!(
             !haystack.contains(secret),
             "{context}: {secret} leaked into the completion response: {json}"
@@ -218,14 +300,26 @@ fn assert_no_secret_leak(
 /// green suite exercises it: the escaping only hides a needle when there is a
 /// leak to hide, so deleting the strip leaves every test here passing and
 /// silently narrows the search to the plain-text fields. This pins it at its
-/// own definition instead, over the same four needles the helper searches.
+/// own definition instead, over every needle the helper searches — the list is
+/// duplicated rather than counted, because a count is what goes stale when one
+/// side gains a needle and the other does not.
 ///
 /// The first assertion is what keeps the second honest — it fails if a needle
 /// ever loses its ASCII punctuation, at which point the escaping no longer
 /// transforms it and this test would prove nothing about that row.
 #[test]
 fn the_leak_search_still_finds_a_needle_the_panel_spells_with_escapes() {
-    for secret in [PASSWORD_VALUE, TOKEN_VALUE, COMMENTED_VALUE, URL_SECRET] {
+    for secret in [
+        PASSWORD_VALUE,
+        TOKEN_VALUE,
+        COMMENTED_VALUE,
+        URL_SECRET,
+        URL_SECRET_TAIL,
+        JDBC_SECRET,
+        JDBC_SECRET_TAIL,
+        NESTED_SECRET,
+        NESTED_SECRET_TAIL,
+    ] {
         let escaped = laravel_lsp::markdown_safety::escape_inline(secret);
         assert!(
             !escaped.contains(secret),
@@ -319,6 +413,36 @@ async fn env_completion_redacts_every_matched_category_and_leaves_the_rest_alone
         documentation_markdown(url, "env completion"),
         expected_panel(URL_NAME, &url_masked()),
         "{URL_NAME}: the panel must show the masked URL, not the credential"
+    );
+
+    // The same shape gate, on a value whose parse reports no authority. The
+    // name clears the gate exactly as `DATABASE_URL` does, so this is the only
+    // check standing between a JDBC password and the completion panel.
+    let jdbc = item(&items, JDBC_NAME, "env completion");
+    assert_eq!(
+        jdbc.detail.as_deref(),
+        Some(format!("{} (from .env)", jdbc_masked()).as_str()),
+        "{JDBC_NAME}: the detail line must show the URL with its password masked"
+    );
+    assert_eq!(
+        documentation_markdown(jdbc, "env completion"),
+        expected_panel(JDBC_NAME, &jdbc_masked()),
+        "{JDBC_NAME}: the panel must show the masked URL, not the credential"
+    );
+
+    // The same shape gate again, on a value whose parse reports an authority
+    // *and* no password while a credential sits past that authority. The
+    // no-password arm used to hand this back untouched.
+    let nested = item(&items, NESTED_NAME, "env completion");
+    assert_eq!(
+        nested.detail.as_deref(),
+        Some(format!("{} (from .env)", nested_masked()).as_str()),
+        "{NESTED_NAME}: the detail line must show the URL with its password masked"
+    );
+    assert_eq!(
+        documentation_markdown(nested, "env completion"),
+        expected_panel(NESTED_NAME, &nested_masked()),
+        "{NESTED_NAME}: the panel must show the masked URL, not the credential"
     );
 
     // Positive control: the unmatched variable is byte-for-byte what it was.
@@ -479,21 +603,37 @@ async fn hover_redacts_every_matched_category() {
 #[tokio::test]
 async fn hover_masks_a_credential_carried_inside_the_value() {
     let (_dir, _root, server) = project(&dotenv()).await;
-    let markdown = server.hover_for_env(URL_NAME).await;
 
-    assert!(
-        !markdown.contains(URL_SECRET),
-        "the password inside {URL_NAME} leaked into the hover markdown: {markdown}"
-    );
-    assert!(
-        markdown.contains(&format!("```\n{}\n```", url_masked())),
-        "the masked URL must still render as a code block: {markdown}"
-    );
-    assert!(
-        !markdown.contains(REDACTED_ENV_VALUE),
-        "the shape gate masks, it does not fall back to the name gate's \
-         whole-value redaction: {markdown}"
-    );
+    // All three routes through the shape gate: a credential in the authority,
+    // a value with no authority whose password `url` never looks for, and a
+    // credential hidden past an authority that reports none of its own.
+    for (name, masked, secrets) in [
+        (URL_NAME, url_masked(), [URL_SECRET, URL_SECRET_TAIL]),
+        (JDBC_NAME, jdbc_masked(), [JDBC_SECRET, JDBC_SECRET_TAIL]),
+        (
+            NESTED_NAME,
+            nested_masked(),
+            [NESTED_SECRET, NESTED_SECRET_TAIL],
+        ),
+    ] {
+        let markdown = server.hover_for_env(name).await;
+
+        for secret in secrets {
+            assert!(
+                !markdown.contains(secret),
+                "the password inside {name} leaked into the hover markdown: {markdown}"
+            );
+        }
+        assert!(
+            markdown.contains(&format!("```\n{masked}\n```")),
+            "the masked URL must still render as a code block: {markdown}"
+        );
+        assert!(
+            !markdown.contains(REDACTED_ENV_VALUE),
+            "the shape gate masks, it does not fall back to the name gate's \
+             whole-value redaction: {markdown}"
+        );
+    }
 }
 
 /// Positive control and regression guard: an unmatched variable still renders
