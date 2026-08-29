@@ -551,7 +551,7 @@ fn index_clear_empties() {
 }
 
 #[test]
-fn render_source_files_returns_every_contributing_file() {
+fn render_entries_carry_every_contributing_file() {
     let mut idx = ViewVarIndex::new();
     let controller = PathBuf::from("/proj/UserController.php");
     let page = PathBuf::from("/proj/Filament/UserPage.php");
@@ -568,12 +568,17 @@ fn render_source_files_returns_every_contributing_file() {
         &[render("other.view", &[("x", "App\\X")])],
     );
 
-    let mut sources = idx.render_source_files("users.show");
+    let entries = idx.render_entries();
+    let mut sources: Vec<PathBuf> = entries
+        .iter()
+        .filter(|(view, _)| view == "users.show")
+        .map(|(_, path)| path.clone())
+        .collect();
     sources.sort();
     let mut expected = vec![controller, page];
     expected.sort();
     assert_eq!(sources, expected);
-    assert!(idx.render_source_files("missing.view").is_empty());
+    assert!(!entries.iter().any(|(view, _)| view == "missing.view"));
 }
 
 #[test]
@@ -2070,7 +2075,7 @@ fn namespace_dir_inside_a_view_root_keeps_both_names() {
 }
 
 #[test]
-fn render_source_files_are_sorted_for_deterministic_first_match() {
+fn render_entries_are_sorted_for_deterministic_first_match() {
     let mut idx = ViewVarIndex::new();
     for name in ["zeta", "alpha", "midway"] {
         idx.insert_file(
@@ -2078,8 +2083,46 @@ fn render_source_files_are_sorted_for_deterministic_first_match() {
             &[render("users.show", &[("user", "App\\Models\\User")])],
         );
     }
-    let files = idx.render_source_files("users.show");
-    let mut sorted = files.clone();
+    let entries = idx.render_entries();
+    let mut sorted = entries.clone();
     sorted.sort();
-    assert_eq!(files, sorted, "HashMap order must not leak to callers");
+    assert_eq!(entries, sorted, "HashMap order must not leak to callers");
+}
+
+#[test]
+fn generation_advances_on_every_mutation_and_holds_otherwise() {
+    let mut idx = ViewVarIndex::new();
+    assert_eq!(idx.generation(), 0, "a fresh index is generation 0");
+
+    idx.insert_file(
+        PathBuf::from("/proj/UserController.php"),
+        &[render("users.show", &[("user", "App\\Models\\User")])],
+    );
+    let after_insert = idx.generation();
+    assert_ne!(after_insert, 0, "insert_file must advance the generation");
+
+    // A read is not a mutation: the Salsa push is skipped on an unchanged
+    // generation, so a read that bumped it would invalidate the memo per call.
+    let _ = idx.render_entries();
+    let _ = idx.var_types("users.show", "user");
+    assert_eq!(idx.generation(), after_insert, "reads must not advance it");
+
+    idx.remove_file(Path::new("/proj/UserController.php"));
+    let after_remove = idx.generation();
+    assert_ne!(
+        after_remove, after_insert,
+        "remove_file must advance the generation"
+    );
+
+    // Removing a file that contributed nothing changes no state, so it must
+    // not advance either — otherwise every no-op eviction costs a re-push.
+    idx.remove_file(Path::new("/proj/NeverIndexed.php"));
+    assert_eq!(
+        idx.generation(),
+        after_remove,
+        "a no-op remove must not advance it"
+    );
+
+    idx.clear();
+    assert_ne!(idx.generation(), after_remove, "clear must advance it");
 }

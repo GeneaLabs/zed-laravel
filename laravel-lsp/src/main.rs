@@ -2168,6 +2168,11 @@ struct LaravelLanguageServer {
     /// `std::sync::RwLock` for the same blocking-closure reason as
     /// `magic_deps`.
     view_vars: Arc<std::sync::RwLock<laravel_lsp::view_var_index::ViewVarIndex>>,
+    /// The `ViewVarIndex` generation last pushed to the Salsa actor's render
+    /// index. Guards against re-pushing an unchanged snapshot, which would bump
+    /// the Salsa revision and invalidate the backing-class memo on every
+    /// keystroke (#339, item 7).
+    pushed_render_generation: Arc<std::sync::atomic::AtomicU64>,
 
     /// Handle for the debounced magic-cache re-save. Incremental refreshes
     /// mutate the in-memory indexes; without re-persisting them the next
@@ -4700,6 +4705,7 @@ impl LaravelLanguageServer {
             view_vars: Arc::new(std::sync::RwLock::new(
                 laravel_lsp::view_var_index::ViewVarIndex::new(),
             )),
+            pushed_render_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             magic_cache_save_handle: Arc::new(RwLock::new(None)),
             vendor_open_magic_lru: Arc::new(std::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(VENDOR_OPEN_MAGIC_LRU_CAP).unwrap(),
@@ -13068,40 +13074,51 @@ impl LaravelLanguageServer {
         self.view_path_to_livewire_class_path(root, blade_path)
     }
 
-    /// Every `.php` file backing `blade_path`'s rendered content — the union
-    /// of two independent sources:
-    ///   1. The project-wide render index's contributors for the file's
-    ///      namespaced view name (a Filament-style `$view`-property page, or
-    ///      any controller `view(...)` call site).
-    ///   2. The conventionally-resolved Livewire component class, when
+    /// Resolve every PHP class backing `blade_path`'s rendered content, via
+    /// the memoized Salsa queries in
+    /// [`laravel_lsp::salsa_impl::blade_backing_class_files`] and
+    /// [`laravel_lsp::salsa_impl::blade_backing_class_sources`] (#339, item 7).
+    ///
+    /// This method's only job is supplying those queries' inputs:
+    ///   1. the template's Laravel view name, whose render-index contributors
+    ///      are a Filament-style `$view`-property page or any controller
+    ///      `view(...)` call site;
+    ///   2. the conventionally-resolved Livewire component class, when
     ///      `blade_path` is a Livewire view — so goto/hover `$this->member`
     ///      and `wire:` fallbacks work for plain Livewire components too, not
-    ///      just Filament pages.
+    ///      just Filament pages;
+    ///   3. the live editor buffer for the template itself, for the inline
+    ///      `new class extends Component` (Livewire v4 SFC / class-based Volt)
+    ///      and functional-Volt shapes, whose members live in the template's
+    ///      own front matter and so have no standalone `.php` source.
     ///
     /// Resolution for (2) goes through `livewire_name_for_path` +
     /// `resolve_component` (the reverse-then-forward resolver), not
-    /// `find_livewire_component_php`'s file heuristics — a V4 SFC or Volt
-    /// component's class lives inline in the `.blade.php` itself, which has
-    /// no separate `.php` source for `component_member_locator` to parse, so
-    /// those legitimately contribute nothing here.
+    /// `find_livewire_component_php`'s file heuristics.
     ///
-    /// Deduped; only paths that exist on disk and end in a plain `.php`
-    /// extension (not `.blade.php`) are kept.
-    async fn blade_backing_class_files(&self, blade_path: &Path) -> Vec<PathBuf> {
-        let mut out: Vec<PathBuf> = Vec::new();
+    /// The render-index snapshot is pushed first, but only when
+    /// `ViewVarIndex`'s generation has moved — an unchanged index leaves the
+    /// Salsa memo intact, which is the whole point of the conversion: what was
+    /// an O(entire index) sweep plus an uncached read-and-parse *per keystroke*
+    /// now recomputes only when the index or a backing file's content changes.
+    async fn blade_backing_class_resolution(
+        &self,
+        blade_path: &Path,
+    ) -> laravel_lsp::salsa_impl::BladeBackingResolutionData {
+        if let Some((generation, entries)) = self.pending_render_index_snapshot() {
+            if self.salsa.set_render_index(entries).await.is_ok() {
+                self.pushed_render_generation
+                    .store(generation, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
 
         let view_paths = match self.cached_config.read().await.as_ref() {
             Some(config) => config.view_paths.clone(),
             None => Vec::new(),
         };
-        if let Some(view_name) =
-            laravel_lsp::view_var_index::view_name_for_path(blade_path, &view_paths)
-        {
-            if let Ok(idx) = self.view_vars.read() {
-                out.extend(idx.render_source_files(&view_name));
-            }
-        }
+        let view_name = laravel_lsp::view_var_index::view_name_for_path(blade_path, &view_paths);
 
+        let mut livewire_paths: Vec<PathBuf> = Vec::new();
         if let Some((lw_config, lw_version)) = self.get_cached_livewire().await {
             if let Some(name) = laravel_lsp::livewire_resolver::livewire_name_for_path(
                 blade_path, &lw_config, lw_version,
@@ -13109,67 +13126,67 @@ impl LaravelLanguageServer {
                 if let Some(component) =
                     laravel_lsp::livewire_resolver::resolve_component(&name, &lw_config, lw_version)
                 {
-                    out.extend(component.paths);
+                    livewire_paths = component.paths;
                 }
             }
         }
 
-        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        out.retain(|p| {
-            let is_plain_php = p.extension().and_then(|e| e.to_str()) == Some("php")
-                && !p.to_string_lossy().ends_with(".blade.php");
-            is_plain_php && p.is_file() && seen.insert(p.clone())
-        });
-        out
-    }
-
-    /// Locate `member` (a property or method name) in whichever `.php`
-    /// file(s) back `blade_path` (see [`Self::blade_backing_class_files`]).
-    /// Returns the first hit's file plus its declaration position.
-    /// Every `(path, source)` pair whose PHP class backs `blade_path` — the
-    /// plain-`.php` backing files ([`Self::blade_backing_class_files`]), plus
-    /// the blade file ITSELF when it declares an inline
-    /// `new class extends Component` (a Livewire v4 single-file component or
-    /// a class-based Volt component). Those two shapes have no standalone
-    /// `.php` source: the class lives in the template's own front matter, so
-    /// the template is the source to parse and member positions land in the
-    /// `.blade.php` itself. The live editor buffer wins over disk for it.
-    async fn blade_backing_class_sources(&self, blade_path: &Path) -> Vec<(PathBuf, String)> {
-        let mut out: Vec<(PathBuf, String)> = Vec::new();
-        for class_path in self.blade_backing_class_files(blade_path).await {
-            if let Ok(source) = std::fs::read_to_string(&class_path) {
-                out.push((class_path, source));
-            }
-        }
-        let live = match Url::from_file_path(blade_path) {
+        let live_blade_text = match Url::from_file_path(blade_path) {
             Ok(url) => self
                 .documents
                 .read()
                 .await
                 .get(&url)
-                .map(|(c, _)| c.clone()),
+                .map(|(content, _)| content.clone()),
             Err(()) => None,
         };
-        let blade_content = match live {
-            Some(content) => Some(content),
-            None => std::fs::read_to_string(blade_path).ok(),
-        };
-        if let Some(content) = blade_content {
-            // A FUNCTIONAL Volt file declares no class at all, so
-            // `detect_inline_livewire_class` is false for it — but its
-            // `state([...])` keys and top-level closure assignments ARE the
-            // component's members, and `component_member_locator` reads them.
-            // Both inline shapes therefore hand the template itself to the
-            // locator (#339, item 3).
-            if laravel_lsp::php_class::detect_inline_livewire_class(&content)
-                || laravel_lsp::livewire_resolver::source_contains_volt_signature(&content)
-            {
-                out.push((blade_path.to_path_buf(), content));
-            }
-        }
-        out
+
+        self.salsa
+            .blade_backing_class_resolution(
+                blade_path.to_path_buf(),
+                view_name,
+                livewire_paths,
+                live_blade_text,
+            )
+            .await
+            .unwrap_or_default()
     }
 
+    /// The render-index snapshot still owed to the Salsa actor, or `None` when
+    /// the actor already holds the current generation.
+    ///
+    /// Reading `generation()` under the same lock that builds the snapshot is
+    /// what makes the pair consistent: a snapshot can never be stamped with a
+    /// generation it doesn't match.
+    ///
+    /// Generation 0 is the never-mutated index, which is empty — and the actor
+    /// synthesizes an empty render index for a resolution that arrives before
+    /// any snapshot. So the initial `0 == 0` skip is not a missed push: both
+    /// sides already agree there are no render sites.
+    fn pending_render_index_snapshot(&self) -> Option<(u64, Vec<(String, PathBuf)>)> {
+        let index = self.view_vars.read().ok()?;
+        let generation = index.generation();
+        if self
+            .pushed_render_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == generation
+        {
+            return None;
+        }
+        Some((generation, index.render_entries()))
+    }
+
+    /// Every `(path, source)` pair whose PHP class backs `blade_path`.
+    /// See [`Self::blade_backing_class_resolution`].
+    async fn blade_backing_class_sources(&self, blade_path: &Path) -> Vec<(PathBuf, String)> {
+        self.blade_backing_class_resolution(blade_path)
+            .await
+            .sources
+    }
+
+    /// Locate `member` (a property or method name) in whichever `.php`
+    /// file(s) back `blade_path` (see [`Self::blade_backing_class_resolution`]).
+    /// Returns the first hit's file plus its declaration position.
     async fn locate_in_backing_class_files(
         &self,
         blade_path: &Path,
@@ -18328,6 +18345,7 @@ return [
             route_decl_cache: self.route_decl_cache.clone(),
             magic_deps: self.magic_deps.clone(),
             view_vars: self.view_vars.clone(),
+            pushed_render_generation: self.pushed_render_generation.clone(),
             magic_cache_save_handle: self.magic_cache_save_handle.clone(),
             vendor_open_magic_lru: self.vendor_open_magic_lru.clone(),
             inertia_default_ext: self.inertia_default_ext.clone(),

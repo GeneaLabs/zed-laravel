@@ -674,3 +674,136 @@ async fn functional_volt_hover_card_names_the_component() {
         "the card names the component: {card}"
     );
 }
+
+// ─── Backing-class resolution is memoized, and content-tracked (#339, item 7) ─
+//
+// `blade_backing_class_sources` used to re-scan the whole render index and
+// re-read every backing class from disk on EVERY keystroke inside a `wire:`
+// value. These two tests drive the real lookup handler and read the Salsa
+// database's own body-execution counters, because the return value is
+// identical whether the answer was memoized or recomputed.
+
+/// A stock Livewire v3 component: a class under `app/Livewire`, and its view
+/// under `resources/views/livewire`. The class is a STANDALONE `.php` file, so
+/// the backing-class query has real file content to track.
+fn write_v3_component(root: &Path) -> (PathBuf, PathBuf) {
+    let class_dir = root.join("app/Livewire");
+    fs::create_dir_all(&class_dir).unwrap();
+    let class = class_dir.join("Counter.php");
+    fs::write(
+        &class,
+        "<?php\n\nnamespace App\\Livewire;\n\nuse Livewire\\Component;\n\nclass Counter extends Component\n{\n    public int $count = 0;\n\n    public function increment(): void\n    {\n        $this->count++;\n    }\n}\n",
+    )
+    .unwrap();
+
+    let view_dir = root.join("resources/views/livewire");
+    fs::create_dir_all(&view_dir).unwrap();
+    let blade = view_dir.join("counter.blade.php");
+    fs::write(
+        &blade,
+        "<div><button wire:click=\"increment\">+</button></div>\n",
+    )
+    .unwrap();
+
+    (class, blade)
+}
+
+#[tokio::test]
+async fn repeating_a_lookup_serves_the_backing_class_from_the_memo() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let (class, blade) = write_v3_component(dir.path());
+    *backend.cached_config.write().await =
+        Some(std::sync::Arc::new(config_with_view_root(dir.path())));
+
+    // Both hot inputs live: an OPEN document (so the live-buffer path runs on
+    // every lookup) and a non-empty render index (so the render-index query is
+    // actually consulted). Without either, the counters below would be
+    // vacuously equal.
+    open_document(&backend, &blade, &fs::read_to_string(&blade).unwrap()).await;
+    backend.view_vars.write().unwrap().insert_file(
+        dir.path()
+            .join("app/Http/Controllers/CounterController.php"),
+        &[laravel_lsp::view_var_index::ViewRender {
+            view_name: "livewire.counter".to_string(),
+            vars: std::collections::HashMap::new(),
+        }],
+    );
+
+    let first = backend
+        .locate_in_backing_class_files(&blade, "increment")
+        .await
+        .expect("the component class backs its own view");
+    assert_eq!(first.0, class, "resolution must reach the standalone class");
+
+    let after_first = backend.salsa.query_run_counts().await.unwrap();
+    assert!(
+        after_first.render_source_files > 0 && after_first.blade_backing_class_sources > 0,
+        "both queries must have run at least once, or the deltas below prove nothing",
+    );
+    let second = backend
+        .locate_in_backing_class_files(&blade, "increment")
+        .await
+        .expect("the second lookup resolves too");
+    let after_second = backend.salsa.query_run_counts().await.unwrap();
+
+    assert_eq!(first, second, "both lookups land on the same declaration");
+    assert_eq!(
+        after_second.blade_backing_class_sources, after_first.blade_backing_class_sources,
+        "a repeat lookup with nothing edited must not re-read the backing class",
+    );
+    assert_eq!(
+        after_second.render_source_files, after_first.render_source_files,
+        "nor re-scan the render index",
+    );
+}
+
+#[tokio::test]
+async fn editing_the_backing_class_on_disk_invalidates_the_cached_source() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let (class, blade) = write_v3_component(dir.path());
+
+    let before = backend
+        .locate_in_backing_class_files(&blade, "increment")
+        .await
+        .expect("the original method resolves");
+    assert_eq!(before.1.line, 10, "the original declaration line");
+
+    // Rewrite the BACKING CLASS — the blade file is untouched. A cache keyed on
+    // the template alone would keep serving the stale source and resolve
+    // `decrement` to nothing.
+    //
+    // The re-read is gated on mtime, whose resolution is only one second on
+    // some filesystems; push the timestamp forward explicitly rather than
+    // sleeping, so the test is neither slow nor flaky.
+    fs::write(
+        &class,
+        "<?php\n\nnamespace App\\Livewire;\n\nuse Livewire\\Component;\n\nclass Counter extends Component\n{\n    public int $count = 0;\n\n    public function decrement(): void\n    {\n        $this->count--;\n    }\n}\n",
+    )
+    .unwrap();
+    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&class)
+        .unwrap()
+        .set_modified(bumped)
+        .unwrap();
+
+    assert!(
+        backend
+            .locate_in_backing_class_files(&blade, "increment")
+            .await
+            .is_none(),
+        "the removed method must stop resolving",
+    );
+    let after = backend
+        .locate_in_backing_class_files(&blade, "decrement")
+        .await
+        .expect("the newly added method must resolve");
+    assert_eq!(after.0, class);
+    assert_eq!(
+        after.1.line, 10,
+        "the replacement method sits where the old one did",
+    );
+}

@@ -175,6 +175,7 @@ The LSP uses a dedicated thread for Salsa incremental computation to avoid lifet
 | Project Files | `ProjectFiles` | `ViewReferenceLocationData` | Reference finding across project |
 | Service Providers | `ServiceProviderFile` | `MiddlewareRegistrationData`, `BindingRegistrationData` | Middleware/binding lookups |
 | Env Variables | `EnvFile` | `EnvVariableData` | Environment variable lookups |
+| Render Index | `RenderIndex` | `BladeBackingResolutionData` | Blade backing-class resolution (which PHP class backs a template) |
 | Translations | `LangFile`, `LangDir` | `ResolvedTranslationData` | Translation key resolution + locale discovery |
 
 ### Important Conventions
