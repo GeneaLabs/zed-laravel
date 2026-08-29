@@ -167,6 +167,25 @@ fn dissect(response: Option<CompletionResponse>) -> (Vec<CompletionItem>, String
     }
 }
 
+/// The serialized response, with backslashes stripped so a search for a secret
+/// keeps the "any field" reach the assertion below claims.
+///
+/// The documentation panel's summary arrives markdown-escaped
+/// (`markdown_safety::escape_inline`, applied at the `.env` completion site),
+/// and every needle here carries hyphens — `hunter2-issue-344` spells
+/// `hunter2\-issue\-344` in that field. `detail` is not escaped, so a value
+/// reaching it still matches raw and this is not what catches a wholesale
+/// redaction failure; it is what stops `summary` becoming a field the search
+/// silently stopped covering.
+///
+/// A file-local copy of the sibling in `env_completion_system_leak.rs`, which
+/// is the same shape: these test modules are self-contained by convention (the
+/// `dissect` above is duplicated the same way), and there is no shared
+/// test-support module to hang it on.
+fn searchable(json: &str) -> String {
+    json.replace('\\', "")
+}
+
 /// No secret survives anywhere in the serialized response — any field, any
 /// item. Returns the items so callers can add positive assertions.
 fn assert_no_secret_leak(
@@ -174,13 +193,39 @@ fn assert_no_secret_leak(
     context: &str,
 ) -> Vec<CompletionItem> {
     let (items, json) = dissect(response);
+    let haystack = searchable(&json);
     for secret in [PASSWORD_VALUE, TOKEN_VALUE, COMMENTED_VALUE, URL_SECRET] {
         assert!(
-            !json.contains(secret),
+            !haystack.contains(secret),
             "{context}: {secret} leaked into the completion response: {json}"
         );
     }
     items
+}
+
+/// `searchable` is load-bearing for `assert_no_secret_leak`, and nothing in the
+/// green suite exercises it: the escaping only hides a needle when there is a
+/// leak to hide, so deleting the strip leaves every test here passing and
+/// silently narrows the search to the plain-text fields. This pins it at its
+/// own definition instead, over the same four needles the helper searches.
+///
+/// The first assertion is what keeps the second honest — it fails if a needle
+/// ever loses its ASCII punctuation, at which point the escaping no longer
+/// transforms it and this test would prove nothing about that row.
+#[test]
+fn the_leak_search_still_finds_a_needle_the_panel_spells_with_escapes() {
+    for secret in [PASSWORD_VALUE, TOKEN_VALUE, COMMENTED_VALUE, URL_SECRET] {
+        let escaped = laravel_lsp::markdown_safety::escape_inline(secret);
+        assert!(
+            !escaped.contains(secret),
+            "this fixture is only meaningful while the escaping transforms the \
+             needle; {secret} now survives escape_inline unchanged: {escaped}"
+        );
+        assert!(
+            searchable(&escaped).contains(secret),
+            "the leak search must see through the panel's escaping: {escaped}"
+        );
+    }
 }
 
 fn item<'a>(items: &'a [CompletionItem], label: &str, context: &str) -> &'a CompletionItem {

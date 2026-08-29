@@ -193,6 +193,26 @@ fn dissect(response: Option<CompletionResponse>) -> (Vec<CompletionItem>, String
     }
 }
 
+/// The serialized response, with backslashes stripped so a search for a secret
+/// keeps the "any field" reach every leak assertion here claims.
+///
+/// The documentation panel's summary arrives markdown-escaped
+/// (`markdown_safety::escape_inline`), and a value carrying ASCII punctuation
+/// spells `s3cr3t\-value\-set…` there — no longer the raw needle. `label` and
+/// `detail` are not escaped, so a value reaching either still matches raw and
+/// this is not what discriminates a restored `std::env::vars()` loop; it is
+/// what stops `summary` becoming a field the search silently stopped covering.
+/// Stripping makes the search blind to the escaping rather than defeated by it,
+/// and can only ever match more.
+///
+/// Named rather than inlined because the reasoning is the thing that has to
+/// reach every call site. Spelled out at one of this file's two leak searches
+/// and not the other, it left that other one hunting a needle the panel no
+/// longer spells.
+fn searchable(json: &str) -> String {
+    json.replace('\\', "")
+}
+
 /// Assert the process variable left no trace — by value, in any field of any
 /// item, which no relabelling can dodge — and that no item is derived from its
 /// name either. Returns the items so callers can make positive assertions.
@@ -201,18 +221,8 @@ fn assert_no_process_var_leak(
     context: &str,
 ) -> Vec<CompletionItem> {
     let (items, json) = dissect(response);
-    // Backslashes stripped before the search, so the check keeps the "any
-    // field" reach its own docs claim. The documentation panel's summary now
-    // arrives markdown-escaped, and a value carrying punctuation spells
-    // `s3cr3t\-value\-set…` there — no longer the raw needle. Restoring the
-    // deleted `std::env::vars()` loop would still be caught by `label` and
-    // `detail`, which are plain text, so this is not what discriminates that
-    // mutation; it is what stops the summary field becoming a blind spot the
-    // assertion silently stopped covering. Stripping makes the search blind to
-    // the escaping instead of defeated by it, and can only ever match more.
-    let unescaped = json.replace('\\', "");
     assert!(
-        !unescaped.contains(SECRET_VALUE),
+        !searchable(&json).contains(SECRET_VALUE),
         "{context}: the process variable's value leaked into the completion response: {json}"
     );
     assert!(
@@ -220,6 +230,29 @@ fn assert_no_process_var_leak(
         "{context}: an item was derived from the process variable {SECRET_NAME}"
     );
     items
+}
+
+/// `searchable` is load-bearing for every leak assertion in this file, and
+/// nothing in the green suite exercises it: the escaping only hides a needle
+/// when there is a leak to hide, so deleting the strip leaves all of these
+/// tests passing and silently narrows their reach to the plain-text fields.
+/// This pins it at its own definition instead.
+///
+/// The first assertion is what keeps the second honest — it fails if
+/// `SECRET_VALUE` ever loses its ASCII punctuation, at which point the escaping
+/// no longer transforms the needle and the rest of this test proves nothing.
+#[test]
+fn the_leak_search_still_finds_a_needle_the_panel_spells_with_escapes() {
+    let escaped = laravel_lsp::markdown_safety::escape_inline(SECRET_VALUE);
+    assert!(
+        !escaped.contains(SECRET_VALUE),
+        "this fixture is only meaningful while the escaping transforms the \
+         needle; {SECRET_VALUE} now survives escape_inline unchanged: {escaped}"
+    );
+    assert!(
+        searchable(&escaped).contains(SECRET_VALUE),
+        "the leak search must see through the panel's escaping: {escaped}"
+    );
 }
 
 /// The documentation panel's markdown, or a failure naming what arrived instead.
@@ -476,7 +509,7 @@ async fn dotenv_declaration_shadowing_a_process_var_still_completes_from_the_fil
 
     let (items, json) = dissect(complete_at_end_of_line(&server, uri, &line).await);
     assert!(
-        !json.contains(SECRET_VALUE),
+        !searchable(&json).contains(SECRET_VALUE),
         "the process value must not surface even when the .env declares the same name: {json}"
     );
 
