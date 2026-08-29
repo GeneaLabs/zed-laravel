@@ -19,8 +19,7 @@ use walkdir::WalkDir;
 
 // Use the library crate for all modules
 use laravel_lsp::cache_manager::{
-    BindingEntry, CacheManager, CachedEnvVars, CachedLaravelConfig, MiddlewareEntry, RescanType,
-    ScanResult,
+    BindingEntry, CacheManager, CachedLaravelConfig, MiddlewareEntry, RescanType, ScanResult,
 };
 use laravel_lsp::command_index::{build_command_index, CommandIndex};
 use laravel_lsp::completion_format::CompletionDoc;
@@ -6505,14 +6504,13 @@ impl LaravelLanguageServer {
                 *self.initialized_root.write().await = Some(actual_root);
             }
 
-            // 2-4: Register middleware/bindings/env with Salsa in background
+            // 2-3: Register middleware/bindings with Salsa in background
             // These are needed for goto but not for basic diagnostics
             let middleware_count = cache.get_all_middleware().len();
             let binding_count = cache.get_all_bindings().len();
-            let env_count = cache.get_env_vars().map(|e| e.variables.len()).unwrap_or(0);
             info!(
-                "📦 Queuing {} middleware, {} bindings, {} env vars for background registration",
-                middleware_count, binding_count, env_count
+                "📦 Queuing {} middleware, {} bindings for background registration",
+                middleware_count, binding_count
             );
 
             // Spawn background registration (doesn't block initialize)
@@ -6544,7 +6542,6 @@ impl LaravelLanguageServer {
                     )
                 })
                 .collect();
-            let env_vars = cache.get_env_vars().map(|e| e.variables.clone());
             let cached_config_for_salsa = cache.get_laravel_config().map(|c| LaravelConfigData {
                 root: c.root.clone(),
                 view_paths: c.view_paths.clone(),
@@ -6564,9 +6561,6 @@ impl LaravelLanguageServer {
                 // Register with Salsa in background for incremental updates
                 if let Some(config) = cached_config_for_salsa {
                     let _ = salsa.register_cached_config(config).await;
-                }
-                if let Some(vars) = env_vars {
-                    let _ = salsa.register_cached_env_vars(vars).await;
                 }
                 let _ = salsa
                     .register_cached_middleware_batch(middleware_entries)
@@ -7954,7 +7948,7 @@ impl LaravelLanguageServer {
         self.revalidate_open_documents().await;
     }
 
-    /// Populate cache with all data from Salsa (config, env, middleware, bindings)
+    /// Populate cache with all data from Salsa (config, middleware, bindings)
     async fn populate_cache_from_salsa(&self) {
         // Fetch the authoritative Laravel config from Salsa once, up front. This
         // is called after the vendor/app rescans have registered the service
@@ -8000,38 +7994,7 @@ impl LaravelLanguageServer {
             cache.set_laravel_config(cached_config);
         }
 
-        // 2. Cache env variables
-        if let Ok(env_vars) = self.salsa.get_all_parsed_env_vars().await {
-            let mut variables = std::collections::HashMap::new();
-            for var in &env_vars {
-                // A secret-bearing name is cached by name with an empty value
-                // (issue #344): the plaintext never reaches the cache file,
-                // which is world-readable-ish, long-lived, and outside the
-                // project the developer thinks they are protecting. The key is
-                // kept rather than dropped so a warm start still knows the
-                // variable exists and can offer it — the surfaces redact by
-                // name, so it renders identically to a live parse.
-                //
-                // No `is_commented` filter, matching the loop's existing
-                // behaviour: a commented-out `# DB_PASSWORD=hunter2` is cached
-                // too, so it must be redacted here as well.
-                //
-                // An unmatched name is still not written raw: `DATABASE_URL`
-                // matches no segment and carries the password inside its value,
-                // so it goes to disk with the credential masked. The plaintext
-                // must not reach this file under either gate.
-                let value = if laravel_lsp::completion_display::is_sensitive_env_name(&var.name) {
-                    String::new()
-                } else {
-                    laravel_lsp::completion_display::mask_url_credentials(&var.value).into_owned()
-                };
-                variables.insert(var.name.clone(), value);
-            }
-            debug!("Caching {} env variables", variables.len());
-            cache.set_env_vars(CachedEnvVars { variables });
-        }
-
-        // 3. Cache middleware
+        // 2. Cache middleware
         if let Ok(all_mw) = self.salsa.get_all_parsed_middleware().await {
             let mut vendor_scan = ScanResult::default();
             for mw in &all_mw {
@@ -8052,7 +8015,7 @@ impl LaravelLanguageServer {
             cache.set_vendor_scan(vendor_scan);
         }
 
-        // 4. Cache bindings
+        // 3. Cache bindings
         if let Ok(all_bindings) = self.salsa.get_all_parsed_bindings().await {
             let mut app_scan = ScanResult::default();
             for binding in &all_bindings {
