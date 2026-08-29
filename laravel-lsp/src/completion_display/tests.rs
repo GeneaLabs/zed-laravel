@@ -735,3 +735,160 @@ fn a_password_whose_leading_run_parses_as_a_port_still_fails_open() {
         "jdbc:mysql://user:***@host/db"
     );
 }
+
+/// The third member of the "parser did not find a password" family: a value
+/// whose outer URL parses, carries an authority, and hides a credential
+/// *past* that authority.
+///
+/// [`url::Url::password`] answers about the authority it parsed and nothing
+/// else. `https://ok/cb?next=mysql://user:secret@host/db` has an authority
+/// (`ok`), no password in it, and a live credential in its query — so routing
+/// on "has an authority" alone handed it back in the clear, which was a
+/// regression against the greedy scan this function replaced. `CALLBACK_URL`,
+/// `WEBHOOK_URL` and `NEXT_URL` match no [`SENSITIVE_ENV_SEGMENTS`] keyword,
+/// so nothing else stops such a value reaching a display surface.
+///
+/// The membership assertions are what make this a test about the *arm* rather
+/// than about the strings: each fixture must parse, must report an authority,
+/// and must report no password — the exact three conditions that used to end
+/// in `Cow::Borrowed`.
+#[test]
+fn a_credential_past_the_authority_is_found_by_the_tail_rescan() {
+    for (value, expected) in [
+        // A nested URL in the query — an OAuth `redirect_uri`, a webhook
+        // forwarding target.
+        (
+            "https://ok.example.com/cb?next=mysql://user:secret@host/db",
+            "https://ok.example.com/cb?next=mysql://user:***@host/db",
+        ),
+        // In the path, and in the fragment.
+        (
+            "https://ok/mysql://user:secret@host/db",
+            "https://ok/mysql://user:***@host/db",
+        ),
+        (
+            "https://ok/x#mysql://user:secret@host/db",
+            "https://ok/x#mysql://user:***@host/db",
+        ),
+        // The `@`-bearing password issue #355 is about, one layer in. The
+        // rescan reaches the fallback, which prefers the authority's last `@`,
+        // so the tail does not survive here either.
+        (
+            "https://ok/cb?next=postgres://user:p@ssword@host/db",
+            "https://ok/cb?next=postgres://user:***@host/db",
+        ),
+        // A `;`-delimited endpoint list, where only the second entry
+        // authenticates.
+        (
+            "https://a/b;mysql://user:secret@host/db",
+            "https://a/b;mysql://user:***@host/db",
+        ),
+        // The inner value is itself authority-less, so the rescan's own
+        // `jdbc:` arm has to fire inside the tail.
+        (
+            "https://ok/x?u=jdbc:mysql://user:secret@host/db",
+            "https://ok/x?u=jdbc:mysql://user:***@host/db",
+        ),
+    ] {
+        let parsed = url::Url::parse(value)
+            .unwrap_or_else(|e| panic!("{value:?} must parse, or it is in the rejected arm: {e}"));
+        assert!(
+            parsed.has_authority(),
+            "{value:?} is in this test only because the outer parse reports an authority"
+        );
+        assert!(
+            parsed.password().is_none(),
+            "{value:?} must report no password — the outer authority has none, and \
+             that silence is the whole defect"
+        );
+        assert_eq!(
+            mask_url_credentials(value),
+            expected,
+            "{value:?} hides its credential past the authority; the tail rescan \
+             has to find it"
+        );
+    }
+}
+
+/// The price of the rescan, pinned so it stays a known trade.
+///
+/// A credential-*free* nested URL whose inner half carries both a `:` and a
+/// later `@` is over-masked, because the scan inside the tail cannot tell a
+/// path's `@` from a credential separator. Identical in kind to the
+/// over-masking the rejected-parse and authority-less arms already do, and the
+/// alternative is the leak the test above closes.
+///
+/// The second half is the discriminating one: a tail with no second `://`
+/// never reaches the rescan, so every ordinary URL is byte-for-byte unchanged.
+#[test]
+fn a_credential_free_nested_url_is_over_masked_by_the_tail_rescan() {
+    for (value, expected) in [
+        (
+            "https://ok/mysql://host:3306/db@x",
+            "https://ok/mysql://host:***@x",
+        ),
+        (
+            "https://ok/x?u=jdbc:mysql://host:3306/db@x",
+            "https://ok/x?u=jdbc:mysql://host:***@x",
+        ),
+    ] {
+        assert_eq!(
+            mask_url_credentials(value),
+            expected,
+            "{value:?} carries no credential, but its nested URL has a `:` and a \
+             later `@` — over-masking, not a leak"
+        );
+    }
+
+    for value in [
+        // No second `://` in the tail: the rescan returns borrowed and the
+        // outer value is handed back untouched. This is every ordinary
+        // `DATABASE_URL`, so it is the path that must not move.
+        "mysql://host:3306/db@x",
+        "https://example.com/webhook?notify=ops@example.com",
+        "https://host/path@literal",
+        // A nested URL with no `:` in its credential position is left alone
+        // by the scan, so the rescan changes nothing here either.
+        "https://ok/x?u=https://other.example.com/p@th",
+    ] {
+        assert!(
+            matches!(mask_url_credentials(value), std::borrow::Cow::Borrowed(v) if v == value),
+            "{value:?} must still come back borrowed and unchanged"
+        );
+    }
+}
+
+/// The rescan recurses, so its bound is a safety property rather than a
+/// stylistic one: a `.env` value is arbitrary text off disk, and an unbounded
+/// recursion over one is a stack overflow in the language server.
+///
+/// The bound is two frames, and it is structural. The tail starts at the first
+/// `/`, `?` or `#` in the authority scan, so it *begins* with one of those
+/// characters — and no such string parses as an absolute URL, so the recursive
+/// call can only reach the fallback arm, which does not recurse. Asserted here
+/// against the parser rather than argued, because it is `url`'s behaviour and
+/// not this module's that makes it true.
+#[test]
+fn the_tail_rescan_cannot_recurse_past_one_level() {
+    for tail_start in ['/', '?', '#'] {
+        for tail in [
+            format!("{tail_start}db"),
+            format!("{tail_start}x?u=mysql://user:p@h/db"),
+            tail_start.to_string(),
+        ] {
+            assert!(
+                url::Url::parse(&tail).is_err(),
+                "{tail:?} must not parse as an absolute URL, or the rescan gains a \
+                 third frame and its depth stops being bounded"
+            );
+        }
+    }
+
+    // And the same bound observed end to end, on an input far past any depth a
+    // stack would survive if the recursion followed the nesting.
+    let deep = format!("https://a{}/user:secret@h/db", "/https://b".repeat(5_000));
+    assert!(
+        !mask_url_credentials(&deep).contains("secret"),
+        "a deeply nested value must still be masked, without recursing per level"
+    );
+}

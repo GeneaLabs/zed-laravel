@@ -1004,7 +1004,8 @@ async fn sensitive_values_are_redacted_in_the_env_buffer_card() {
     let (server, dir) = server_with(
         &[(
             ".env",
-            "DB_PASSWORD=hunter2\nDATABASE_URL=mysql://root:hunter2@localhost/app\n",
+            "DB_PASSWORD=hunter2\nDATABASE_URL=mysql://root:hunter2@localhost/app\n\
+             CALLBACK_URL=https://app.example.com/cb?next=mysql://root:hunter3@localhost/app\n",
         )],
         &[],
     )
@@ -1033,5 +1034,21 @@ async fn sensitive_values_are_redacted_in_the_env_buffer_card() {
     assert!(
         by_shape.contains("mysql://"),
         "masking must keep the rest of the URL readable: {by_shape:?}"
+    );
+
+    // The shape gate's third arm, on this surface too: the outer URL parses
+    // and carries an authority reporting no password, while the credential
+    // sits past it in the query. `CALLBACK_URL` clears the name gate, so this
+    // card is one of the four places that value would have been printed.
+    let past_authority = hover_at(&server, &env, position(2, 2))
+        .await
+        .expect("CALLBACK_URL must still render a card");
+    assert!(
+        !past_authority.contains("hunter3"),
+        "a credential past the authority must not reach the card: {past_authority:?}"
+    );
+    assert!(
+        past_authority.contains("https://app.example.com/cb?next=mysql://root:***@localhost/app"),
+        "the outer URL and the inner host must both survive the mask: {past_authority:?}"
     );
 }

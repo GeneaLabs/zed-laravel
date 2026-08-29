@@ -33,12 +33,21 @@ use url::Url;
 /// What every *client-rendered* surface prints in place of a sensitive `.env`
 /// value.
 ///
-/// One constant rather than a per-site literal: the three surfaces that used to
-/// echo dotenv values (env completion, `.env` hover and `config('…')`
-/// completion) are meant to be indistinguishable to a reader, and a second
-/// spelling is how they drift apart (issue #344). A fourth, the warm-start disk
-/// cache, was one of them until issue #356 deleted the cache outright — nothing
-/// ever read its map back.
+/// One constant rather than a per-site literal: the client-rendered surfaces
+/// that echo dotenv values are meant to be indistinguishable to a reader, and a
+/// second spelling is how they drift apart (issue #344). They are named rather
+/// than counted, because a count is what goes stale when one is added or
+/// deleted:
+///
+/// - env completion (`completion`),
+/// - `config('…')` completion, via `env_display_value`,
+/// - hover over an `env('KEY')` call in PHP (`hover_for_env`),
+/// - hover over the declaration itself in a `.env` buffer
+///   (`hover_for_env_declaration`) — a separate handler for the reverse
+///   direction, not a second render site of the one above.
+///
+/// The warm-start disk cache was a fifth until issue #356 deleted the cache
+/// outright — nothing ever read its map back.
 ///
 /// The server log is the one masked surface that does *not* use this string.
 /// It renders `(set)` — see `database::mask_env_value_for_log` — because a log
@@ -118,18 +127,22 @@ pub fn is_sensitive_env_name(name: &str) -> bool {
 ///   `/`, `?` or `#`). A raw `/`, `?` or `#` inside userinfo would have ended
 ///   the authority in the parser too, so that window always holds the `@`;
 /// - the parse reports **no password, and the value has an authority** — the
-///   only shape returned untouched. That is the *rule*, not a list of the
-///   shapes it admits: [`Url::password`] gates on [`Url::has_authority`], so an
-///   authority is exactly the condition under which the parser read a userinfo
-///   component. Only then is its silence evidence that no password was there.
-///   (`mysql://host:3306/db@x` is a host, a port and a path `@`;
-///   `https://example.com/webhook` has no userinfo at all; `mysql://user:@host/db`
-///   carries a `:` with nothing after it, which [`url`] reports identically to
-///   no password — the one place this function is *less* eager than `main`'s
-///   scan, which rewrote it to `mysql://user:***@host/db`. Those are examples
-///   of the rule and not a definition of it — earlier revisions of this comment
-///   listed members instead of stating the rule, and each rewrite added the one
-///   the last had missed while the arm below stayed hidden entirely.);
+///   authority is acquitted, and nothing else is. [`Url::password`] gates on
+///   [`Url::has_authority`], so this is the one arm where the parser really did
+///   read a userinfo component — but it read *that* authority's, and its
+///   silence is evidence about that component alone. A credential can sit past
+///   the authority entirely, in a path, query or fragment that spells a second
+///   URL (`https://ok/cb?next=mysql://user:p@ss@host/db`, an `ES_HOSTS`-style
+///   endpoint list), and no property of the outer parse says otherwise. So the
+///   whole rule is re-run over the tail past the authority, and the value comes
+///   back borrowed only when that finds nothing either. (`mysql://host:3306/db@x`
+///   is a host, a port and a path `@`; `https://example.com/webhook` has no
+///   userinfo at all; `mysql://user:@host/db` carries a `:` with nothing after
+///   it, which [`url`] reports identically to no password — the one place this
+///   function is *less* eager than `main`'s scan, which rewrote it to
+///   `mysql://user:***@host/db`. Those are examples, not a definition: three
+///   revisions of this comment listed members instead of stating the rule, and
+///   each rewrite added the one the last had missed.);
 /// - **everything else** — the parse fails, or it succeeds with no authority.
 ///   Both are parses that never looked at a userinfo component, so the scan is
 ///   all that is left. It prefers the last `@` in the authority window and
@@ -161,6 +174,13 @@ pub fn is_sensitive_env_name(name: &str) -> bool {
 /// — `mysql://host:70000/db@x` mangles identically — and a mangled display beats
 /// a printed password.
 ///
+/// The tail rescan on the authority arm buys into the same trade, on the same
+/// terms. A credential-free nested URL whose inner half carries both a `:` and
+/// a later `@` is over-masked: `https://ok/mysql://host:3306/db@x` renders as
+/// `https://ok/mysql://host:***@x`. The outer URL is untouched either way, and
+/// a value with no second `://` in its tail never reaches the rescan at all —
+/// which is every ordinary `DATABASE_URL`, so the common path is unchanged.
+///
 /// **One shape still fails open**: a password holding a raw `/`, `?` or `#`
 /// whose leading run happens to parse as a port, as in
 /// `mysql://user:12/34@host/db`. The parser reads `user` as the host and `12`
@@ -186,8 +206,8 @@ pub fn is_sensitive_env_name(name: &str) -> bool {
 ///
 /// Lives here rather than in `database`, where it started life as
 /// `mask_url_password`: it is now the second half of the redaction policy the
-/// three display surfaces and the server log share, and a second copy is how the
-/// two spellings drift apart.
+/// client-rendered surfaces enumerated on [`REDACTED_ENV_VALUE`] and the server
+/// log share, and a second copy is how the two spellings drift apart.
 pub fn mask_url_credentials(value: &str) -> Cow<'_, str> {
     let Some(scheme_end) = value.find("://") else {
         return Cow::Borrowed(value);
@@ -203,10 +223,30 @@ pub fn mask_url_credentials(value: &str) -> Cow<'_, str> {
     // Offsets are relative to `creds_start` on every arm.
     let at_offset = match Url::parse(value) {
         Ok(parsed) if parsed.password().is_some() => authority_at(),
-        // The only arm whose silence is evidence. `Url::password` gates on
-        // `has_authority`, so an authority is exactly the condition under
-        // which the parser read a userinfo component at all.
-        Ok(parsed) if parsed.has_authority() => return Cow::Borrowed(value),
+        // An authority, and no password in it. `Url::password` gates on
+        // `has_authority`, so this is the one arm where the parser did read a
+        // userinfo component — but it read *this* authority's, and a value can
+        // carry a credential past it (`https://ok/cb?next=mysql://u:p@h/db`).
+        // So the silence acquits the authority and nothing else: re-run the
+        // whole rule over the tail, and keep the value borrowed only if that
+        // finds nothing either.
+        //
+        // Terminates at depth 2. The tail begins at the first `/`, `?` or `#`,
+        // so it begins *with* one of them, and no such string parses as an
+        // absolute URL — the recursive call can only reach the fallback arm
+        // below, which does not recurse. Pinned by
+        // `the_tail_rescan_cannot_recurse_past_one_level`.
+        Ok(parsed) if parsed.has_authority() => {
+            return match mask_url_credentials(&value[authority_end..]) {
+                Cow::Borrowed(_) => Cow::Borrowed(value),
+                Cow::Owned(masked_tail) => {
+                    let mut spliced = String::with_capacity(value.len() + 3);
+                    spliced.push_str(&value[..authority_end]);
+                    spliced.push_str(&masked_tail);
+                    Cow::Owned(spliced)
+                }
+            };
+        }
         // Rejected, or accepted with no authority: either way the parser never
         // looked where a credential lives, so the scan has to.
         _ => authority_at().or_else(|| value[creds_start..].find('@')),
