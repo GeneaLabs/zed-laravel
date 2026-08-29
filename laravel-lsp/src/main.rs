@@ -28000,13 +28000,26 @@ impl LanguageServer for LaravelLanguageServer {
                     documentation: Some(
                         CompletionDoc::new()
                             .header(&v.name)
-                            .summary(if sensitive {
+                            // Escaped, because `summary` is markdown-bearing by
+                            // contract and so leaves the escaping to whoever
+                            // fills it — unlike `header`, which the renderer
+                            // escapes for every caller. A `.env` value has no
+                            // charset restriction any more than a key does, so
+                            // an unescaped one renders a live link (or an image
+                            // the client fetches unprompted) in the panel.
+                            //
+                            // Applied to the whole expression rather than to the
+                            // untrusted arm alone: every arm here is plain text
+                            // meant to render as itself, and escaping the field
+                            // instead of one branch of it means a fourth arm
+                            // added later cannot reopen this.
+                            .summary(laravel_lsp::markdown_safety::escape_inline(&if sensitive {
                                 laravel_lsp::completion_display::REDACTED_ENV_VALUE.to_string()
                             } else if v.value.is_empty() {
                                 "(empty)".to_string()
                             } else {
                                 shown.to_string()
-                            })
+                            }))
                             .section(format!("Source: {}", source_file))
                             .into_documentation(),
                     ),

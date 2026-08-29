@@ -201,8 +201,18 @@ fn assert_no_process_var_leak(
     context: &str,
 ) -> Vec<CompletionItem> {
     let (items, json) = dissect(response);
+    // Backslashes stripped before the search, so the check keeps the "any
+    // field" reach its own docs claim. The documentation panel's summary now
+    // arrives markdown-escaped, and a value carrying punctuation spells
+    // `s3cr3t\-value\-set…` there — no longer the raw needle. Restoring the
+    // deleted `std::env::vars()` loop would still be caught by `label` and
+    // `detail`, which are plain text, so this is not what discriminates that
+    // mutation; it is what stops the summary field becoming a blind spot the
+    // assertion silently stopped covering. Stripping makes the search blind to
+    // the escaping instead of defeated by it, and can only ever match more.
+    let unescaped = json.replace('\\', "");
     assert!(
-        !json.contains(SECRET_VALUE),
+        !unescaped.contains(SECRET_VALUE),
         "{context}: the process variable's value leaked into the completion response: {json}"
     );
     assert!(
@@ -229,15 +239,21 @@ fn documentation_markdown(item: &CompletionItem, context: &str) -> String {
 /// the bolded header, the value as the summary, `Source: <file>` as the trailing
 /// section. Asserted whole rather than by substring, so dropping any one of the
 /// three builder calls fails — not only the `.section(...)` this fix is about.
-/// The header arrives markdown-escaped (`markdown_safety::escape_inline`),
-/// because a `.env` key has no charset and the panel is rendered as markdown.
+/// Both the name and the value arrive markdown-escaped
+/// (`markdown_safety::escape_inline`), because neither a `.env` key nor a
+/// `.env` value has a charset and the panel is rendered as markdown — the
+/// header escaped by `CompletionDoc::render` for every caller, the summary by
+/// the call site, whose field is markdown-bearing by contract.
+///
 /// Building the expectation with the same helper is not circular: the escaping
-/// itself is pinned by `markdown_safety`'s own literal-expectation tests and by
-/// the link/image fixtures in `env_key_navigation.rs`. What *this* helper
-/// asserts is the panel's structure and its redaction, and those must not
-/// become unreadable to spell an underscore.
+/// itself is pinned by `markdown_safety`'s own literal-expectation tests, by
+/// the link/image fixtures in `env_key_navigation.rs`, and by
+/// `env_value_redaction`'s `a_value_spelling_a_markdown_link_renders_inert_in_the_panel`.
+/// What *this* helper asserts is the panel's structure and its redaction, and
+/// those must not become unreadable to spell an underscore.
 fn expected_documentation(name: &str, value: &str, source_file: &str) -> String {
     let name = laravel_lsp::markdown_safety::escape_inline(name);
+    let value = laravel_lsp::markdown_safety::escape_inline(value);
     format!("**{name}**\n\n{value}\n\nSource: {source_file}")
 }
 

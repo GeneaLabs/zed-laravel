@@ -101,7 +101,8 @@ impl CompletionDoc {
     /// legitimately carries emphasis and inline code, so [`render`](Self::render)
     /// must not escape this field. A call site putting *untrusted* text here
     /// (rather than in [`code`](Self::code), which is fence-safe) owns the
-    /// escaping itself.
+    /// escaping itself — as `completion`'s `.env` branch does, passing a
+    /// variable's value through [`crate::markdown_safety::escape_inline`].
     pub fn summary(mut self, summary: impl Into<String>) -> Self {
         let s = summary.into();
         if !s.is_empty() {

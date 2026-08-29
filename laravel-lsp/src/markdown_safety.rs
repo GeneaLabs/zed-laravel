@@ -22,6 +22,18 @@
 //! happen to be known-unsafe today. The invariant is "text this renderer was
 //! handed renders as itself", and a renderer is the only place that can hold
 //! it for callers that do not exist yet.
+//!
+//! The guarantee is per-field, not per-renderer, and it covers exactly two
+//! fields: the bold header ([`escape_inline`]) and the code block
+//! ([`fenced_block`]). Every other field — `detail`, `description`, `lines`,
+//! `tags`, `source_link` and `trailer` on a hover card, `summary` and
+//! `sections` on a completion panel — is rendered verbatim on purpose,
+//! because each exists to carry markdown its caller wrote (PHPDoc prose, a
+//! `[label](file:line)` link, an italic `*(commented out)*` note).
+//!
+//! So a call site putting *untrusted* text in one of those owns the escaping
+//! and calls [`escape_inline`] itself. The `.env` branch of `completion` is
+//! the one that does today: it puts a variable's value in `summary`.
 
 use std::borrow::Cow;
 
