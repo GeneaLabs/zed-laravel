@@ -15,7 +15,9 @@ fn renders_full_panel_in_intelephense_order() {
         .section("@return $this");
 
     let rendered = doc.render();
-    let expected = "**Illuminate\\Database\\Eloquent\\Builder::with**\n\n\
+    // Header escaping (`markdown_safety::escape_inline`) backslashes the
+    // FQN separators on the wire; the rendered line is unchanged.
+    let expected = "**Illuminate\\\\Database\\\\Eloquent\\\\Builder\\:\\:with**\n\n\
                     Begin querying a model with eager loading.\n\n\
                     ```php\n\
                     <?php\n\
@@ -34,13 +36,13 @@ fn skips_absent_parts_without_blank_lines() {
         .header("users.email")
         .summary("varchar(255), nullable");
 
-    assert_eq!(doc.render(), "**users.email**\n\nvarchar(255), nullable");
+    assert_eq!(doc.render(), "**users\\.email**\n\nvarchar(255), nullable");
 }
 
 #[test]
 fn header_only_renders_just_header() {
     let doc = CompletionDoc::new().header("app.name");
-    assert_eq!(doc.render(), "**app.name**");
+    assert_eq!(doc.render(), "**app\\.name**");
 }
 
 #[test]

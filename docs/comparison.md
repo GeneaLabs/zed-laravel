@@ -58,7 +58,7 @@ Neither approach wins outright. The boundary worth spelling out is where static 
 | Views / Blade | Completion, hover, diagnostics, links, "create missing view" quick fix | Same + rename + find-references + directive autocomplete, bracket expansion, closing-tag nav, outline |
 | Translations | Key / locale / param completion, hover | Same + rename + find-references |
 | Config | Completion, hover, diagnostics, links | Same + rename + find-references |
-| Env vars | Completion, hover, diagnostics, links, Vite quick fix | Same + rename + find-references |
+| Env vars | Completion, hover, diagnostics, links, Vite quick fix | Same + rename + find-references + hover / go-to-consumers on the declaration inside `.env*` |
 | Middleware | Completion, hover, diagnostics, links | Same + rename + find-references |
 | Container bindings | Completion, hover, diagnostics, links | Same (`app()` / `resolve()`) |
 | Assets | Completion, diagnostics, links | `asset()` / `vite()` links only |

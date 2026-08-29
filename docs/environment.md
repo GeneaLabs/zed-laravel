@@ -140,10 +140,12 @@ Zed has already classified this way" — not an ownership claim:
   cannot register, override, or take over a language, and it does not try to.
 - **The `.env` features are gated on the filename, never on Zed's
   classification.** The server checks that a file is named `.env` or
-  `.env.<something>` before it does anything env-specific, and hover,
-  go-to-definition, find-references and rename only ever run on `.php` and
-  `.blade.php`. Open a real `.sh` script and this extension contributes
-  nothing to it — no hover, no go-to-definition, no diagnostics.
+  `.env.<something>` before it does anything env-specific. Inside such a
+  buffer, hover and go-to-definition act on the key declaration under the
+  cursor; find-references and rename still only ever run on `.php` and
+  `.blade.php`. Every other file reaches those handlers through the
+  `.php`/`.blade.php` test alone, so opening a real `.sh` script gets nothing
+  from this extension — no hover, no go-to-definition, no diagnostics.
 - **`Shell Script` is the only route to your `.env` files.** Zed ships no
   `env` language, and classifies every env file as Shell Script: bare `.env`
   via the bash grammar's `path_suffixes`, and the `.env.*` variants via Zed's

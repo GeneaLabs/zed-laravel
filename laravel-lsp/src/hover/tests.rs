@@ -16,7 +16,10 @@ fn render_header_only() {
         header: Some("App\\Models\\User"),
         ..Default::default()
     });
-    assert_eq!(out, "**App\\Models\\User**");
+    // `render` escapes the header (see `markdown_safety`), so the FQN's
+    // separators arrive backslashed. CommonMark renders `\\` as one `\`,
+    // so the card still reads `App\Models\User` on screen.
+    assert_eq!(out, "**App\\\\Models\\\\User**");
 }
 
 #[test]
@@ -76,7 +79,7 @@ fn render_full_section_set_in_order() {
         source_link: Some("[app/Foo.php:10](file:///abs/Foo.php#L10)"),
         trailer: None,
     });
-    let expected = "**App\\Foo::bar**\n\
+    let expected = "**App\\\\Foo\\:\\:bar**\n\
                     \n\
                     Some detail line\n\
                     \n\
@@ -106,7 +109,7 @@ fn render_skips_absent_sections() {
         source_link: Some("[app/Foo.php](file:///abs/Foo.php)"),
         ..Default::default()
     });
-    let expected = "**App\\Foo**\n\n[app/Foo.php](file:///abs/Foo.php)";
+    let expected = "**App\\\\Foo**\n\n[app/Foo.php](file:///abs/Foo.php)";
     assert_eq!(out, expected);
 }
 
@@ -127,7 +130,7 @@ fn render_empty_tags_slice_omits_section() {
         tags: &tags,
         ..Default::default()
     });
-    assert_eq!(out, "**App\\Foo**");
+    assert_eq!(out, "**App\\\\Foo**");
 }
 
 #[test]

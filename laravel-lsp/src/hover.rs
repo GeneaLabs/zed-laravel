@@ -20,20 +20,25 @@
 //! Sections, rendered in order with `\n\n` separators (paragraph breaks in
 //! markdown). Each section is omitted entirely when absent:
 //!
-//! 1. **Bold header** — typically a fully-qualified class name. Wrap-free
-//!    text; [`render`] adds the `**…**` markdown.
+//! 1. **Bold header** — typically a fully-qualified class name. Plain text,
+//!    never markdown: [`render`] adds the `**…**` and backslash-escapes the
+//!    text inside it ([`crate::markdown_safety`]), because `.env` keys reach
+//!    this field with no charset restriction.
 //! 2. **Detail line** — short inline markdown beneath the header
 //!    (e.g. `` `GET /uri` → `Controller@show` ``).
 //! 3. **Description** — a paragraph of prose (PHPDoc summary, etc.).
 //! 4. **Code block** — fenced code with language hint. PHP-tagged blocks get
 //!    the `<?php` opener prepended so Zed's `tree-sitter-php` grammar can
-//!    parse them (the standard grammar variant requires the opening tag).
+//!    parse them (the standard grammar variant requires the opening tag). The
+//!    fence outgrows any backtick run in the content
+//!    ([`crate::markdown_safety`]), so a value cannot close it early.
 //! 5. **Tag lines** — one italic line per PHPDoc tag (`@param`, `@return`).
 //! 6. **Source link** — markdown link to the source location, rendered
 //!    verbatim (no prefix, no extra backticks; caller builds the link).
 //! 7. **Trailer** — italic note like `*(file not found)*`.
 
 use crate::livewire_resolver::extract_blade_variable_at_cursor;
+use crate::markdown_safety;
 use crate::salsa_impl::{ParsedPatternsData, PatternAtPosition};
 use std::path::Path;
 
@@ -98,11 +103,16 @@ pub fn find_hover_target(
 #[derive(Debug, Default, Clone)]
 pub struct HoverContent<'a> {
     /// Bold header — typically a fully-qualified class name
-    /// (e.g. `App\Livewire\Counter`). `**…**` wrapping is added by render.
+    /// (e.g. `App\Livewire\Counter`). Plain text: `**…**` wrapping *and*
+    /// markdown escaping are added by [`render`], so a caller may pass
+    /// arbitrary text (a `.env` key) without it acting as markdown.
     pub header: Option<&'a str>,
-    /// Detail line under the header. Free-form inline markdown.
+    /// Detail line under the header. Free-form inline markdown — rendered
+    /// verbatim, so a caller with untrusted text must escape it or use
+    /// [`code`](Self::code), which is fence-safe.
     pub detail: Option<&'a str>,
-    /// Free-form description paragraph (e.g. PHPDoc summary).
+    /// Free-form description paragraph (e.g. PHPDoc summary). Markdown-bearing
+    /// on the same terms as [`detail`](Self::detail).
     pub description: Option<&'a str>,
     /// Fenced code block with language hint.
     pub code: Option<CodeBlock<'a>>,
@@ -147,7 +157,10 @@ pub fn render(content: &HoverContent<'_>) -> String {
     let mut sections: Vec<String> = Vec::new();
 
     if let Some(h) = content.header {
-        sections.push(format!("**{}**", h));
+        // Escaped, not interpolated raw: `header` is the one field documented
+        // as plain text, and `.env` keys reach it (`hover_for_env_declaration`)
+        // with no charset restriction whatsoever.
+        sections.push(format!("**{}**", markdown_safety::escape_inline(h)));
     }
     if let Some(d) = content.detail {
         sections.push(d.to_string());
@@ -156,9 +169,14 @@ pub fn render(content: &HoverContent<'_>) -> String {
         sections.push(d.to_string());
     }
     if let Some(code) = &content.code {
+        // Both arms negotiate the fence length against their own content: a
+        // `.env` value carrying three backticks would otherwise close a fixed
+        // fence early and render the rest as markdown.
         let block = match code.language {
-            CodeLanguage::Php => format!("```php\n<?php\n{}\n```", code.content),
-            CodeLanguage::Plain => format!("```\n{}\n```", code.content),
+            CodeLanguage::Php => {
+                markdown_safety::fenced_block("php", &format!("<?php\n{}", code.content))
+            }
+            CodeLanguage::Plain => markdown_safety::fenced_block("", code.content),
         };
         sections.push(block);
     }
