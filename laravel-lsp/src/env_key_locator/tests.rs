@@ -309,6 +309,52 @@ fn the_two_enumerations_never_return_the_same_line() {
     assert_eq!(commented[0].1.line, 0);
 }
 
+// ── `commented_declaration_body` — the one "what is commented" rule ──
+
+#[test]
+fn commented_body_strips_the_whole_marker_run_and_its_whitespace() {
+    // The rule Salsa's `parse_env_source`, the declaration parser and the
+    // commented enumeration all classify with. `##` is a marker run, not a key
+    // character, and the body starts after the whitespace that follows it.
+    assert_eq!(
+        commented_declaration_body("# APP_NAME=x"),
+        Some("APP_NAME=x")
+    );
+    assert_eq!(
+        commented_declaration_body("##APP_NAME=x"),
+        Some("APP_NAME=x")
+    );
+    assert_eq!(
+        commented_declaration_body("   #\t APP_NAME=x"),
+        Some("APP_NAME=x")
+    );
+    assert_eq!(commented_declaration_body("#"), Some(""));
+}
+
+#[test]
+fn commented_body_declines_lines_that_are_not_comments() {
+    // A `#` anywhere but the first non-blank column is an inline comment or
+    // part of a value — neither makes the line a commented declaration.
+    assert_eq!(commented_declaration_body("APP_NAME=x"), None);
+    assert_eq!(commented_declaration_body("APP_NAME=x # note"), None);
+    assert_eq!(commented_declaration_body("APP_NAME=#value"), None);
+    assert_eq!(commented_declaration_body(""), None);
+    assert_eq!(commented_declaration_body("   "), None);
+}
+
+#[test]
+fn the_commented_body_is_always_a_suffix_of_its_line() {
+    // What makes `line.len() - body.len()` the body's column, which is how the
+    // commented enumeration shifts its positions back onto the whole line.
+    for line in ["# APP_NAME=x", "##APP_NAME=x", "   #  APP_NAME=x", "#"] {
+        let body = commented_declaration_body(line).expect("a comment");
+        assert!(
+            line.ends_with(body),
+            "{line:?} must end with its body {body:?}"
+        );
+    }
+}
+
 // ── `is_env_file_name` — the gate every env feature classifies with ──
 
 #[test]
