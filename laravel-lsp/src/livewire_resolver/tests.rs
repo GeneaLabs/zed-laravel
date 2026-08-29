@@ -915,3 +915,40 @@ fn an_absolute_component_name_cannot_escape_the_class_path() {
         "an un-namespaced absolute name must not resolve outside the class path"
     );
 }
+
+#[test]
+fn absolute_parent_segments_cannot_escape_via_the_v4_branch() {
+    // The V4 SFC/MFC/Volt branch runs BEFORE the class branch and builds its
+    // search directory with `parents_to_path`, which uses `PathBuf::push` —
+    // and an ABSOLUTE segment replaces the whole path. So gating only the
+    // class branch left the first branch wide open: the parent segments of a
+    // dotted name could name any directory on disk.
+    let proj = tempfile::Builder::new().prefix("zzproj").tempdir().unwrap();
+    let ext = tempfile::Builder::new().prefix("zzext").tempdir().unwrap();
+    let root = proj.path();
+    fs::create_dir_all(root.join("resources/views/livewire")).unwrap();
+
+    // A real V4 SFC sitting entirely outside the project root.
+    let outside = ext.path().join("resources/views/livewire");
+    let decoy = outside.join(format!("{}secret.blade.php", naming::LIVEWIRE_EMOJI));
+    write(
+        &decoy,
+        "<?php new class extends Component {}; ?><div></div>",
+    );
+
+    let cfg = config_for(root);
+    let name = format!("{}.secret", outside.display());
+
+    assert!(
+        decoy.is_file(),
+        "precondition: the decoy resolves if the guard is absent"
+    );
+    assert!(
+        !name.contains(char::is_whitespace),
+        "precondition: the probe name is a single component name"
+    );
+    assert!(
+        resolve_component(&name, &cfg, LivewireVersion::V4).is_none(),
+        "absolute parent segments must not re-root the V4 component search"
+    );
+}

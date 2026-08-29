@@ -9110,8 +9110,20 @@ impl LaravelLanguageServer {
         // wins.
         let registrars = self.module_livewire_registrars.read().await.clone();
         let module_dirs = self.module_dirs_for(root).await;
-        let mut provider_files: Vec<PathBuf> =
-            laravel_lsp::config::module_provider_files(&module_dirs);
+        // Carry each provider's OWNING MODULE from the discovery that found
+        // it, rather than re-deriving ownership from a path prefix later. A
+        // `modules.paths` glob such as `app/*` expands to include
+        // `app/Providers`, so a prefix match would call an APP provider a
+        // module provider and gate its registrations against `app/Providers`
+        // — silently dropping the ordinary
+        // `loadLivewireComponentsFrom(__DIR__.'/../Livewire')`. Provenance is
+        // known here and exact; the prefix match was a guess.
+        let mut provider_files: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+        for module_dir in module_dirs.iter() {
+            for p in laravel_lsp::config::module_provider_files(std::slice::from_ref(module_dir)) {
+                provider_files.push((p, Some(module_dir.clone())));
+            }
+        }
         let app_providers = root.join("app/Providers");
         if app_providers.is_dir() {
             for entry in WalkDir::new(&app_providers)
@@ -9121,25 +9133,23 @@ impl LaravelLanguageServer {
             {
                 let p = entry.path();
                 if p.is_file() && p.extension().is_some_and(|ext| ext == "php") {
-                    provider_files.push(p.to_path_buf());
+                    provider_files.push((p.to_path_buf(), None));
                 }
             }
         }
 
-        for provider_path in provider_files {
+        for (provider_path, module_dir) in provider_files {
             let Ok(provider_source) = std::fs::read_to_string(&provider_path) else {
                 continue;
             };
             // A module provider's registrations are contained by its own
             // module directory (a symlinked composer path repo resolves
             // outside the root); an app provider's by the root.
-            let module_dir = laravel_lsp::config::owning_module(&module_dirs, &provider_path)
-                .map(|(_rank, dir)| dir);
             for (prefix, reg) in laravel_lsp::livewire_namespaces::extract_livewire_namespaces(
                 &provider_source,
                 &provider_path,
                 root,
-                module_dir,
+                module_dir.as_deref(),
                 &registrars,
             ) {
                 config.class_namespaces.insert(prefix, reg);
@@ -24003,6 +24013,15 @@ impl LanguageServer for LaravelLanguageServer {
         // resolves, so a stale one is a wrong answer, not just an old one.
         if providers_changed {
             self.invalidate_vendor_translation_namespaces().await;
+            // The Livewire class-namespace map is built from these same
+            // providers, and its registrations are gated on the class
+            // DIRECTORY existing. A provider added or changed on disk —
+            // `artisan module:make-livewire` creating the first component
+            // (and `Livewire/` with it), a `git pull`, a branch switch —
+            // otherwise left the map stale until the user edited a provider
+            // in the editor or restarted the server: a registration that
+            // failed the gate at index time stayed failed forever.
+            *self.cached_livewire.write().await = None;
         }
 
         // A Command class changed on disk — rebuild the Artisan command index so

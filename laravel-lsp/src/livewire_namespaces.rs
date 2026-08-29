@@ -22,6 +22,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use tracing::warn;
+
 use crate::parser::parse_php;
 use crate::vendor_translations::{
     argument_value, is_this_receiver, resolve_path_arg, string_literal_text,
@@ -206,14 +208,14 @@ fn classify_registrar_call(
 ///   Livewire registration — silently, with no diagnostic — while
 ///   [`crate::config::expand_module_dirs`] deliberately admits exactly that
 ///   layout. Gating against the owning module keeps it working:
-///   [`crate::path_containment::path_within_root_registration`] canonicalizes
+///   [`crate::path_containment::canonical_within_root_registration`] canonicalizes
 ///   both sides, so the module's real target contains its own registrations.
 /// - The gate gets STRICTER for a module provider, not looser: a
 ///   registration reaching into a sibling module or into bare `app/` is
 ///   inside the root but outside its own module, and is dropped.
 ///
 /// **Fail-closed**, via
-/// [`crate::path_containment::path_within_root_registration`]: an out-of-root
+/// [`crate::path_containment::canonical_within_root_registration`]: an out-of-root
 /// candidate is refused lexically without a disk probe, and a path whose real
 /// target cannot be PROVEN inside `gate_dir` yields no registration — a
 /// dangling under-root symlink, an unsearchable parent, or a path with
@@ -231,8 +233,23 @@ fn contained_class_path(
     paths: &PathContext,
 ) -> Option<PathBuf> {
     let resolved = resolve_path_arg(arg, bytes, paths.provider_dir, paths.root)?;
-    crate::path_containment::path_within_root_registration(&resolved, paths.gate_dir)
-        .then(|| resolved.canonicalize().unwrap_or(resolved))
+    // The guard returns the canonical path it verified — canonicalizing again
+    // here would re-resolve the symlink and could store a path it never saw.
+    let contained =
+        crate::path_containment::canonical_within_root_registration(&resolved, paths.gate_dir);
+    if contained.is_none() {
+        // A dropped registration is otherwise invisible: there is no Livewire
+        // "component not found" diagnostic, so the only symptom is goto,
+        // hover and completion quietly doing nothing. Name the path and the
+        // gate it failed — a module provider legitimately reaching a shared
+        // sibling directory looks identical to a mistake from the outside.
+        warn!(
+            path = %resolved.display(),
+            gate = %paths.gate_dir.display(),
+            "Livewire registration dropped: the class path is not contained by its gate directory"
+        );
+    }
+    contained
 }
 
 /// Order a call's arguments by the given parameter names: positional

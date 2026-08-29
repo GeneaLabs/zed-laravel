@@ -1177,6 +1177,26 @@ pub fn expand_module_dirs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
         let mut matched = 0usize;
         for dir in current {
             if dir != *root && seen.insert(dir.clone()) {
+                // A module directory whose real target sits outside the
+                // project is admitted on purpose — that is the composer
+                // path-repository layout this expansion exists to support.
+                // It is not, however, something to do SILENTLY: the
+                // directory becomes a containment gate, so everything under
+                // the symlink's target is in scope for indexing. Announce it
+                // so an accidental link (a stray `Modules/Shared ->
+                // ../../other-checkout`) is visible rather than inferred
+                // from surprising results.
+                if let (Ok(real_dir), Ok(real_root)) = (dir.canonicalize(), root.canonicalize()) {
+                    if !real_dir.starts_with(&real_root) {
+                        tracing::warn!(
+                            module = %dir.display(),
+                            resolves_to = %real_dir.display(),
+                            "modules.paths entry resolves OUTSIDE the project root — it is \
+                             admitted (composer path repositories legitimately link outward) \
+                             and becomes a containment gate for everything under it"
+                        );
+                    }
+                }
                 out.push(dir);
                 matched += 1;
             }
@@ -1211,13 +1231,19 @@ pub fn expand_module_dirs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
 /// Resolving either side would move the provider out from under its own
 /// module and lose the ownership this answers.
 ///
-/// One lookup, two callers, by design: the Livewire containment gate
-/// (`livewire_namespaces`) gates a registration against its *owning module*
-/// instead of the project root, and the Salsa registration merge
-/// (`salsa_impl::handle_get_laravel_config`) breaks an equal-priority tie by
-/// `modules.paths` rank. Both ask the same question — which module owns this
-/// provider file, and where does it sit in the configured order — so both
-/// read one answer rather than two path-prefix implementations that drift.
+/// Used by the Salsa registration merge
+/// (`salsa_impl::handle_get_laravel_config`) to break an equal-priority tie by
+/// `modules.paths` rank, where a prefix match is the only signal available:
+/// the merge sees a provider file, not the discovery that produced it.
+///
+/// The Livewire containment gate deliberately does NOT use this. A gate needs
+/// to know which module a provider *was discovered as belonging to*, and a
+/// prefix match only guesses at that: a `modules.paths` glob such as `app/*`
+/// expands to include `app/Providers`, so the guess labels an APP provider a
+/// module provider and gates its registrations against `app/Providers` —
+/// silently dropping the ordinary `__DIR__.'/../Livewire'`. That call site
+/// carries provenance down from `module_provider_files` instead. Prefer the
+/// same wherever the answer must be exact rather than indicative.
 pub fn owning_module<'a>(module_dirs: &'a [PathBuf], path: &Path) -> Option<(usize, &'a Path)> {
     let normalized = crate::route_discovery::normalize_path(path);
     module_dirs

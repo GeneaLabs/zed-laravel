@@ -103,22 +103,36 @@ pub fn dotted_to_namespace(s: &str) -> String {
 ///
 /// Splitting on `.` already destroys `..` (it becomes two empty segments), so
 /// the traversal that remains is a separator or an absolute/drive prefix. A
-/// segment is rejected when it is empty or contains `/`, `\\`, or `:`.
+/// segment is rejected when it is empty or contains `/`, `\\`, or `:`, and the
+/// check runs on the PascalCase-converted segments — the ones actually joined
+/// — because `kebab_to_pascal` collapses an all-dashes segment to nothing.
 /// Rejecting rather than sanitizing keeps this total: there is no "cleaned"
 /// name that silently resolves somewhere the author did not write.
 pub fn dotted_to_class_path(s: &str) -> Option<String> {
-    let segments = split_dotted(s);
+    // Check the segments that are actually JOINED, not the raw ones.
+    // `kebab_to_pascal` splits on `-` and maps every empty part to an empty
+    // string, so a segment of only dashes passes a raw check (non-empty, no
+    // separator) and collapses to `""` here — and an empty FIRST segment
+    // makes the join start with `/`, i.e. absolute, which is the exact shape
+    // this guard exists to refuse. `"-.foo"` was minting `"/Foo"`.
+    let segments: Vec<String> = split_dotted(s).into_iter().map(kebab_to_pascal).collect();
     if !segments.iter().all(|seg| is_safe_path_segment(seg)) {
         return None;
     }
-    Some(join_pascal_segments(s, '/'))
+    Some(segments.join("/"))
 }
 
 /// True if `s` is usable as exactly ONE path segment: non-empty, and free of
 /// any separator or prefix that `Path::join` would treat as re-rooting.
+///
+/// Public because component names become path components in two different
+/// shapes: [`dotted_to_class_path`] checks the PascalCase-CONVERTED segments
+/// it joins, while `livewire_resolver::resolve_component` checks the RAW
+/// segments, which it pushes verbatim as directory names and file stems.
+/// Both need the same answer to "is this one segment, or is it path syntax?"
 /// `\\` and `:` matter on Windows (`C:`, `\\\\server\\share`, NTFS streams) and are
 /// refused on every platform so behaviour does not diverge by host.
-fn is_safe_path_segment(s: &str) -> bool {
+pub fn is_safe_path_segment(s: &str) -> bool {
     !s.is_empty() && !s.contains(['/', '\\', ':'])
 }
 

@@ -301,3 +301,20 @@ fn dotted_to_class_path_still_accepts_ordinary_names() {
         Some("V2Widget")
     );
 }
+
+#[test]
+fn dotted_to_class_path_refuses_a_segment_that_collapses_to_nothing() {
+    // `kebab_to_pascal` splits on `-` and maps every empty part to `""`, so an
+    // all-dashes segment survives a check of the RAW segments (non-empty, no
+    // separator) and then vanishes from the join. An empty leading segment
+    // makes the result absolute, and `Path::join` discards its base — the very
+    // escape this guard exists to stop. `"-.foo"` minted `"/Foo"`, which the
+    // rename path turned into a class file written to `/Foo.php`.
+    assert_eq!(dotted_to_class_path("-"), None);
+    assert_eq!(dotted_to_class_path("-.foo"), None);
+    assert_eq!(dotted_to_class_path("--.foo"), None);
+    assert_eq!(dotted_to_class_path("-.etc.passwd"), None);
+    // A collapsing segment in the middle is refused too: it would double the
+    // separator rather than re-root, but it is still not a component name.
+    assert_eq!(dotted_to_class_path("foo.-.bar"), None);
+}

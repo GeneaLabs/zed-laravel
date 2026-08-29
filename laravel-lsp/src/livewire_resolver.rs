@@ -429,6 +429,19 @@ pub fn resolve_component(
     if leaf.is_empty() {
         return None;
     }
+    // Every segment becomes a path component: the parents through
+    // `parents_to_path` (which uses `PathBuf::push`, and an ABSOLUTE segment
+    // replaces the whole path), the leaf as a file stem. A name is discovered
+    // data — it comes from a `<livewire:…>` tag or an `@livewire('…')`
+    // literal — so one carrying its own path syntax must not become a path.
+    // This gate covers every branch below; the class branch is additionally
+    // gated by `dotted_to_class_path`, which checks the CONVERTED segments.
+    if !segments
+        .iter()
+        .all(|seg| crate::naming::is_safe_path_segment(seg))
+    {
+        return None;
+    }
     let parents = &segments[..segments.len() - 1];
     let sub = parents_to_path(parents);
 

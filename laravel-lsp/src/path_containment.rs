@@ -52,7 +52,7 @@
 //!   the root passes, and anything that escapes (or can't be canonicalized) is
 //!   refused. Used by `scan_dir` in `component_completion.rs` and the
 //!   `controllers_dir` walk in `main.rs`.
-//! - [`path_within_root_registration`] is the fail-closed guard for a path
+//! - [`canonical_within_root_registration`] is the fail-closed guard for a path
 //!   **minted from discovered provider source that will be READ downstream**
 //!   (issue #354 item 1). It is the missing combination of the two axes above:
 //!   it refuses an out-of-root candidate lexically, with no disk probe (#145),
@@ -66,7 +66,7 @@
 //!   sides canonicalize to the real target. Used by `contained_class_path` in
 //!   `livewire_namespaces.rs`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::route_discovery::normalize_path;
 
@@ -226,15 +226,24 @@ pub fn path_within_root_emit_safe(path: &Path, root: &Path) -> bool {
 /// read. [`path_within_root`] satisfies the second but fails the first.
 ///
 /// Gate against the provider's owning module rather than the project root and
-/// a symlinked composer path repository still passes: `canonical_containment`
-/// canonicalizes BOTH sides, so the module's real target contains its own
-/// registrations.
-pub fn path_within_root_registration(path: &Path, root: &Path) -> bool {
-    lexically_in_root(path, root) && canonical_containment(path, root).unwrap_or(false)
+/// a symlinked composer path repository still passes: both sides are
+/// canonicalized, so the module's real target contains its own registrations.
+///
+/// Returns the VERIFIED canonical path rather than a bool, so the caller
+/// stores exactly what was checked. Handing back a bool invited the caller to
+/// canonicalize a second time to obtain the value, and a symlink swapped
+/// between the two calls would store a path the guard never approved.
+pub fn canonical_within_root_registration(path: &Path, root: &Path) -> Option<PathBuf> {
+    if !lexically_in_root(path, root) {
+        return None;
+    }
+    let real_path = path.canonicalize().ok()?;
+    let real_root = root.canonicalize().ok()?;
+    real_path.starts_with(&real_root).then_some(real_path)
 }
 
 /// The lexical containment gate shared by [`path_within_root_lexical`],
-/// [`path_within_root_emit_safe`] and [`path_within_root_registration`]. True
+/// [`path_within_root_emit_safe`] and [`canonical_within_root_registration`]. True
 /// when `path`, with interior `..`/`.` collapsed by `normalize_path`, is a
 /// `starts_with` prefix-match of `root` —
 /// first against the root as given, then (only if that fails) against the root's
@@ -861,7 +870,7 @@ mod tests {
         let classes = root.path().join("src").join("Livewire");
         std::fs::create_dir_all(&classes).unwrap();
 
-        assert!(path_within_root_registration(&classes, root.path()));
+        assert!(canonical_within_root_registration(&classes, root.path()).is_some());
     }
 
     #[cfg(unix)]
@@ -893,7 +902,11 @@ mod tests {
         );
 
         assert!(
-            path_within_root_registration(&module_link.join("src").join("Livewire"), &module_link),
+            canonical_within_root_registration(
+                &module_link.join("src").join("Livewire"),
+                &module_link
+            )
+            .is_some(),
             "a symlinked path-repo module contains its own registrations"
         );
     }
@@ -927,7 +940,7 @@ mod tests {
             "precondition: the lexical guard admits it — the behaviour this guard corrects"
         );
         assert!(
-            !path_within_root_registration(&dangling, &root),
+            canonical_within_root_registration(&dangling, &root).is_none(),
             "a dangling under-root symlink is unverifiable and must be refused"
         );
     }
@@ -946,7 +959,7 @@ mod tests {
             "precondition: emit_safe admits a genuinely-absent path"
         );
         assert!(
-            !path_within_root_registration(&absent, root.path()),
+            canonical_within_root_registration(&absent, root.path()).is_none(),
             "an absent path proves nothing about where it will resolve — refuse it"
         );
     }
@@ -978,7 +991,7 @@ mod tests {
         );
 
         assert!(
-            !path_within_root_registration(&outside_link, &root),
+            canonical_within_root_registration(&outside_link, &root).is_none(),
             "an out-of-root candidate must be refused lexically, before any disk probe"
         );
     }
@@ -1008,7 +1021,7 @@ mod tests {
         );
 
         assert!(
-            !path_within_root_registration(&escaping, &root),
+            canonical_within_root_registration(&escaping, &root).is_none(),
             "an in-root symlink whose target escapes the gate dir must be refused"
         );
     }

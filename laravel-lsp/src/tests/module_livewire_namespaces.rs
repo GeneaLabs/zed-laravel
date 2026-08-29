@@ -323,3 +323,51 @@ class AppServiceProvider
         "an app provider reaching outside the root yields no registration"
     );
 }
+
+#[tokio::test]
+async fn an_app_provider_keeps_its_registration_when_modules_paths_covers_app_providers() {
+    // Regression: the gate used to re-derive a provider's owning module by
+    // PATH PREFIX. `modules.paths` patterns are user-written, and the
+    // settings doc itself offers `app/*/*` — so `app/*` is a shape people
+    // write. It expands to include `app/Providers`, which made an APP
+    // provider look like a module provider and gated its registrations
+    // against `app/Providers`. The result: the most ordinary registration
+    // there is — `__DIR__.'/../Livewire'`, i.e. `app/Livewire` — fell
+    // outside its own "module" and was dropped, silently, with no
+    // diagnostic and no log. Provenance now comes from the discovery that
+    // found the provider, so an app provider is never gated by a module.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(root.join("app/Providers")).unwrap();
+    fs::create_dir_all(root.join("app/Livewire")).unwrap();
+    fs::create_dir_all(root.join("app/Models")).unwrap();
+    fs::write(
+        root.join("app/Providers/AppServiceProvider.php"),
+        r#"<?php
+
+namespace App\Providers;
+
+use Livewire\Livewire;
+
+class AppServiceProvider
+{
+    public function boot(): void
+    {
+        Livewire::addNamespace('app-ui', 'App\\Livewire', __DIR__.'/../Livewire');
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // `app/*` sweeps `app/Providers` in as if it were a module.
+    let backend = backend_with_patterns(&root, vec!["app/*".to_string()]).await;
+    assert_eq!(
+        resolved_class_namespace(&backend, &root, "app-ui")
+            .await
+            .as_deref(),
+        Some("App\\Livewire"),
+        "an app provider is gated by the ROOT even when a modules.paths glob \
+         happens to cover app/Providers"
+    );
+}
