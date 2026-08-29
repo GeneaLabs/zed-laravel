@@ -39,6 +39,10 @@ use crate::route_discovery::normalize_path;
 // The lexical (non-fail-closed) entry point of the shared containment guard —
 // admits speculative candidates that don't exist on disk yet (issue #156).
 use crate::path_containment::path_within_root_lexical;
+// The two guards `ensure_external_php_source_loaded` splits across its
+// branches (issue #364): the emit-safe one for the client-owned path it
+// returns without reading, the registration one for the path it reads.
+use crate::path_containment::{canonical_within_root_registration, path_within_root_emit_safe};
 
 // ============================================================================
 // Database Definition
@@ -10027,13 +10031,48 @@ impl SalsaActor {
     /// is unreadable — which is also how a non-existent path and a directory
     /// (a Livewire v4 MFC's component dir) are dropped from backing-class
     /// resolution.
+    ///
+    /// **Containment (issue #364).** Every path reaching here is contained by
+    /// construction today — render-index candidates come from the project's
+    /// own directory walk, Livewire candidates from a resolver that gates each
+    /// segment through `naming::is_safe_path_segment` — but this function is a
+    /// read primitive whose result is *emitted* as a goto-definition target
+    /// (`handle_blade_backing_class_resolution` maps it into
+    /// `BladeBackingResolutionData::files`). A guard that lives only in the
+    /// callers is a guard a future caller can forget, which is how #294 and
+    /// both rounds of #348 happened. The guard therefore lives at the
+    /// primitive, and it is split across the two branches because they ask
+    /// different questions — see the comments on each.
     fn ensure_external_php_source_loaded(&mut self, path: &PathBuf) -> Option<SourceFile> {
+        // Root unknown: refuse before any state is read, mutated, or stat'd.
+        // Containment cannot be decided without a root, and this function's
+        // failure mode must be closed.
+        let root = self.config_root.clone()?;
+
         // Ownership is checked BEFORE the filesystem, so a client-pushed path
         // is served from Salsa whether or not it can be stat'd at this instant.
         // Ordering the stat first would drop an unsaved buffer out of
         // backing-class resolution whenever its file is momentarily absent —
         // a branch switch, a stash, an `artisan make:*` regeneration.
         if self.external_php_text.get(path) == Some(&ExternalPhpText::PushedByClient) {
+            // This branch reads no disk — but the path it hands back is emitted
+            // to the client as a location to open, so containment still has to
+            // hold. `path_within_root_emit_safe` is the guard shaped for that:
+            // its lexical pre-gate refuses an out-of-root candidate with no
+            // `stat` probe (#145), and its `None` arm admits a *genuinely
+            // absent* in-root path — precisely the unsaved-buffer case this
+            // branch exists to protect (#361) — while refusing a dangling
+            // under-root symlink and every non-`NotFound` lstat error.
+            //
+            // The fail-closed read guard below cannot serve this branch: it
+            // refuses anything it cannot canonicalize, which is exactly the
+            // momentarily-absent buffer, so using it here would reintroduce
+            // #361. The read branch keeps the full fail-closed guard; this is
+            // an addition to a branch that guard never covered, not a
+            // substitution for it.
+            if !path_within_root_emit_safe(path, &root) {
+                return None;
+            }
             if let Some(file) = self.files.get(path).copied() {
                 return Some(file);
             }
@@ -10043,7 +10082,21 @@ impl SalsaActor {
             // belt-and-braces arm, not a reachable steady state.
         }
 
-        let current_mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+        // The disk branch reads real bytes, so containment must be PROVEN.
+        // `canonical_within_root_registration` is documented for exactly this
+        // shape — a path minted from discovered source data and then read: it
+        // keeps the lexical pre-gate (no out-of-root existence oracle, #145)
+        // and fails closed on anything it cannot canonicalize, including a
+        // dangling under-root symlink (#134/#155).
+        //
+        // Both filesystem calls below go through `real`, the VERIFIED canonical
+        // path the guard returns. Re-deriving it from `path` would let a
+        // symlink swapped between guard and read hand back a target the guard
+        // never approved. `path` stays the key for `self.files` and
+        // `external_php_text`, so the callers' own lookups still resolve.
+        let real = canonical_within_root_registration(path, &root)?;
+
+        let current_mtime = std::fs::metadata(&real).ok()?.modified().ok()?;
 
         let needs_reload = match self.external_php_text.get(path) {
             Some(ExternalPhpText::LoadedFromDisk(prev_mtime)) => {
@@ -10054,7 +10107,7 @@ impl SalsaActor {
         };
 
         if needs_reload {
-            let text = std::fs::read_to_string(path).ok()?;
+            let text = std::fs::read_to_string(&real).ok()?;
             self.bump_text_revision(path);
             // This write replaces the text every per-file cache was populated
             // from. `pattern_cache` compares nothing on lookup — a hit is
@@ -11282,6 +11335,24 @@ impl SalsaActor {
     }
 
     /// Ensure a file is registered with Salsa (read from disk if needed)
+    ///
+    /// **No containment guard here, deliberately** (#364 sibling-site audit),
+    /// and the reason differs from [`Self::ensure_external_php_source_loaded`]
+    /// next door. Every call site passes the *request's own*
+    /// `textDocument.uri` — the document the client already has open and is
+    /// asking about (`handle_get_patterns`,
+    /// `handle_find_magic_member_references`, `hover_for_magic_member`,
+    /// `handle_resolve_facade_receiver_at`, `handle_magic_member_rename_data`).
+    /// That is not a path minted by joining project-derived text onto a
+    /// directory, so there is no traversal to fence: the client supplied the
+    /// path, holds the file open, and `did_open`/`did_change` already register
+    /// arbitrary client paths through `handle_update_file`. The text read here
+    /// is parsed for the answer and the path itself is never emitted as a new
+    /// navigation target.
+    ///
+    /// Gating it on the project root would also be a behaviour change, not a
+    /// hardening: a file legitimately open outside the workspace root would
+    /// stop answering hover and goto entirely.
     fn ensure_file_registered(&mut self, path: &PathBuf) {
         use std::collections::hash_map::Entry;
         // Use entry API to avoid double lookup

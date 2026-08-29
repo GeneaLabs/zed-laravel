@@ -5817,3 +5817,227 @@ fn is_plain_php_path_separates_classes_from_templates() {
     )));
     assert!(!is_plain_php_path(Path::new("/proj/composer.json")));
 }
+
+// ─── External-PHP loader containment (#364) ────────────────────────────
+//
+// `ensure_external_php_source_loaded` is a read primitive whose result is
+// emitted as a goto-definition target, so it carries its own containment
+// guard rather than trusting each caller to have sanitised the path. The
+// criteria for #364 ask for assertions on the actor's own `files` and
+// `external_php_text` maps — "returned `None`" alone does not prove the
+// rejected path left no cached entry behind for the ~8 other
+// `self.files.get(path)` sites in this module to serve. No `SalsaHandle`
+// message exposes those maps, so these tests build a `SalsaActor` directly
+// (see `SalsaActor::new`) and call the loader as `&mut self`.
+
+/// An actor with no thread behind it. The receiver is live but never polled —
+/// these tests call `&mut self` methods directly instead of sending requests.
+fn loader_test_actor(config_root: Option<PathBuf>) -> SalsaActor {
+    let (_tx, rx) = mpsc::channel(1);
+    let mut actor = SalsaActor::new(rx, Arc::new(OnceLock::new()), Arc::new(OnceLock::new()));
+    actor.config_root = config_root;
+    actor
+}
+
+/// A project root and a sibling directory outside it, under one tempdir.
+/// Returned alongside the `TempDir` so the caller keeps it alive.
+fn root_and_outside() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("project");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(root.join("app/Livewire")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    (dir, root, outside)
+}
+
+/// Precondition for every rejection test below: assert the path really does
+/// resolve outside the root, so a mis-built fixture can't pass vacuously.
+fn assert_outside_root(path: &Path, root: &Path) {
+    let real = path
+        .canonicalize()
+        .expect("the fixture target must exist on disk");
+    let real_root = root.canonicalize().expect("the project root must exist");
+    assert!(
+        !real.starts_with(&real_root),
+        "fixture is not actually out of root: {real:?} is under {real_root:?}"
+    );
+}
+
+#[test]
+fn loader_refuses_an_out_of_root_candidate_and_caches_nothing() {
+    let (_dir, root, outside) = root_and_outside();
+    let escapee = outside.join("Secret.php");
+    std::fs::write(&escapee, "<?php\nclass Secret { public $token = 'x'; }\n").unwrap();
+    assert_outside_root(&escapee, &root);
+
+    let mut actor = loader_test_actor(Some(root.clone()));
+
+    assert!(
+        actor.ensure_external_php_source_loaded(&escapee).is_none(),
+        "an out-of-root candidate must not load, even though it reads fine",
+    );
+    assert!(
+        !actor.files.contains_key(&escapee),
+        "a rejected path must not be left as a Salsa input for other sites to read",
+    );
+    assert!(
+        !actor.external_php_text.contains_key(&escapee),
+        "a rejected path must not be recorded as loaded",
+    );
+}
+
+#[test]
+fn loader_refuses_a_candidate_when_the_root_is_unknown() {
+    let (_dir, root, _outside) = root_and_outside();
+    let class = root.join("app/Livewire/Counter.php");
+    let source = "<?php\nclass Counter { public $count = 0; }\n";
+    std::fs::write(&class, source).unwrap();
+
+    // Root unknown: the short-circuit fires before anything is touched.
+    let mut actor = loader_test_actor(None);
+    assert!(
+        actor.ensure_external_php_source_loaded(&class).is_none(),
+        "with no project root there is nothing to contain against — fail closed",
+    );
+    assert!(actor.files.is_empty(), "no Salsa input may be created");
+    assert!(
+        actor.external_php_text.is_empty(),
+        "nothing may be recorded as loaded",
+    );
+
+    // The same path, same actor state, with the root known: it loads. That is
+    // what proves the `None` above came from the short-circuit and not from a
+    // coincidental read failure.
+    actor.config_root = Some(root);
+    let file = actor
+        .ensure_external_php_source_loaded(&class)
+        .expect("the very same path loads once the root is known");
+    assert_eq!(*file.text(&actor.db), source);
+}
+
+#[cfg(unix)]
+#[test]
+fn loader_refuses_an_under_root_symlink_that_escapes() {
+    let (_dir, root, outside) = root_and_outside();
+
+    // Distinguishable content, so a rejection can't be confused with an empty
+    // or unreadable target.
+    let secret_src = "<?php\nclass Counter { public $secret = 'escaped'; }\n";
+    let target = outside.join("Secret.php");
+    std::fs::write(&target, secret_src).unwrap();
+
+    let link = root.join("app/Livewire/Counter.php");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert_outside_root(&link, &root);
+
+    let mut actor = loader_test_actor(Some(root.clone()));
+    assert!(
+        actor.ensure_external_php_source_loaded(&link).is_none(),
+        "a path lexically under the root that resolves outside it must be refused",
+    );
+    assert!(!actor.files.contains_key(&link));
+    assert!(!actor.external_php_text.contains_key(&link));
+
+    // The contrast: the SAME bytes at a genuine in-root path load normally, so
+    // the rejection tracks containment, not a read that happened to fail.
+    let genuine = root.join("app/Livewire/Real.php");
+    std::fs::write(&genuine, secret_src).unwrap();
+    let file = actor
+        .ensure_external_php_source_loaded(&genuine)
+        .expect("an in-root file with identical content loads");
+    assert_eq!(*file.text(&actor.db), secret_src);
+}
+
+#[cfg(unix)]
+#[test]
+fn retargeting_a_symlink_out_of_root_cannot_disturb_the_cached_load() {
+    let (_dir, root, outside) = root_and_outside();
+
+    let good_src = "<?php\nclass Counter { public $from = 'in-root'; }\n";
+    let good = root.join("app/Livewire/Real.php");
+    std::fs::write(&good, good_src).unwrap();
+
+    let bad_src = "<?php\nclass Counter { public $from = 'escaped'; }\n";
+    let bad = outside.join("Secret.php");
+    std::fs::write(&bad, bad_src).unwrap();
+
+    let link = root.join("app/Livewire/Counter.php");
+    std::os::unix::fs::symlink(&good, &link).unwrap();
+
+    let mut actor = loader_test_actor(Some(root.clone()));
+    let file = actor
+        .ensure_external_php_source_loaded(&link)
+        .expect("an in-root symlink to an in-root target loads");
+    assert_eq!(*file.text(&actor.db), good_src);
+    let recorded = *actor
+        .external_php_text
+        .get(&link)
+        .expect("the load is recorded");
+
+    // Swap the link out from under the cached entry.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&bad, &link).unwrap();
+    assert_outside_root(&link, &root);
+
+    assert!(
+        actor.ensure_external_php_source_loaded(&link).is_none(),
+        "the retargeted link now escapes the root and must be refused",
+    );
+    assert_eq!(
+        *file.text(&actor.db),
+        good_src,
+        "the previously-cached text must survive the refused reload",
+    );
+    assert_eq!(
+        actor.external_php_text.get(&link),
+        Some(&recorded),
+        "the recorded mtime must survive the refused reload",
+    );
+}
+
+#[test]
+fn a_client_pushed_out_of_root_path_is_refused_even_when_cached() {
+    let (_dir, root, outside) = root_and_outside();
+    let escapee = outside.join("Secret.php");
+    std::fs::write(&escapee, "<?php\nclass Secret {}\n").unwrap();
+    assert_outside_root(&escapee, &root);
+
+    let mut actor = loader_test_actor(Some(root.clone()));
+
+    // Install it the way a client push does — this is the branch that returns
+    // without touching disk, and whose return value becomes a goto target.
+    let buffer = "<?php\nclass Secret { public $unsaved = true; }\n";
+    actor
+        .ensure_blade_source_registered(&escapee, Some(buffer.to_string()))
+        .expect("the push installs a Salsa input");
+    assert_eq!(
+        actor.external_php_text.get(&escapee),
+        Some(&ExternalPhpText::PushedByClient),
+        "precondition: the ownership fast path is what answers next",
+    );
+
+    assert!(
+        actor.ensure_external_php_source_loaded(&escapee).is_none(),
+        "client ownership is not a containment exemption — the path is emitted",
+    );
+}
+
+#[test]
+fn a_client_pushed_in_root_buffer_still_answers_while_its_file_is_absent() {
+    let (_dir, root, _outside) = root_and_outside();
+    // Never written to disk: this is the #361 case the emit-safe guard has to
+    // keep admitting.
+    let class = root.join("app/Livewire/Counter.php");
+    assert!(!class.exists(), "precondition: the file is absent on disk");
+
+    let mut actor = loader_test_actor(Some(root.clone()));
+    let buffer = "<?php\nclass Counter { public function unsaved() {} }\n";
+    actor
+        .ensure_blade_source_registered(&class, Some(buffer.to_string()))
+        .expect("the push installs a Salsa input");
+
+    let file = actor
+        .ensure_external_php_source_loaded(&class)
+        .expect("a genuinely-absent in-root buffer must still resolve");
+    assert_eq!(*file.text(&actor.db), buffer);
+}

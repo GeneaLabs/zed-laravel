@@ -75,6 +75,14 @@ async fn backend_for(root: &Path) -> LaravelLanguageServer {
     let backend = service.inner().clone();
     *backend.root_path.write().await = Some(root.to_path_buf());
     *backend.cached_config.write().await = Some(Arc::new(config_for(root)));
+    // The actor's own `config_root`, which the backing-class loader's
+    // containment guard reads (#364). Production registers it before the
+    // project walk; caching the config on the backend alone does not.
+    backend
+        .salsa
+        .register_config_files(root.to_path_buf(), None, None, None)
+        .await
+        .expect("actor registers the tempdir project root");
     backend
         .salsa
         .register_project_files(
