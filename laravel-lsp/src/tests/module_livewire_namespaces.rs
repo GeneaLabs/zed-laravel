@@ -94,18 +94,29 @@ async fn resolved_class_namespace(
 
 #[tokio::test]
 async fn later_module_livewire_namespace_wins_over_an_earlier_one() {
+    // Three modules listed Alpha, Gamma, Beta — so the winner (Beta) is
+    // neither the lexicographically first nor the last of the three. The
+    // previous two-module fixture used one `app/*/*` glob, which made
+    // configured order and path-sort order coincide: it passed under either
+    // rule and could not tell them apart (#354 item 3).
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();
-    registering_module(root, "Legal", "Alpha", "shared-ui");
-    registering_module(root, "Legal", "Beta", "shared-ui");
+    let order = ["Alpha", "Gamma", "Beta"];
+    for name in order {
+        registering_module(root, "Legal", name, "shared-ui");
+    }
 
-    let backend = backend_for(root).await;
+    let backend = backend_with_patterns(
+        root,
+        order.iter().map(|n| format!("app/Legal/{n}")).collect(),
+    )
+    .await;
     assert_eq!(
         resolved_class_namespace(&backend, root, "shared-ui")
             .await
             .as_deref(),
         Some("App\\Legal\\Beta\\Livewire"),
-        "the later module (higher modules.paths precedence) wins"
+        "the last module in modules.paths order wins — not the last by path sort"
     );
 }
 

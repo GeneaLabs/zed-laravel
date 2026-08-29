@@ -4824,6 +4824,10 @@ impl LaravelLanguageServer {
             .salsa
             .set_translation_provider_extras(module_providers)
             .await;
+        // The Salsa-side registration merge breaks an equal-priority tie by
+        // `modules.paths` rank, which only this order carries — a module
+        // provider's PATH sorts lexicographically, which is a different rule.
+        let _ = self.salsa.set_module_dirs(expanded.to_vec()).await;
         expanded
     }
 
