@@ -437,3 +437,72 @@ async fn closing_a_document_keeps_its_resolved_magic_members() {
         "the closed file's magic-dependency contribution must survive too",
     );
 }
+
+// ---- the text the release leaves behind ----------------------------------
+
+/// The same class again, distinguished by the view name its `render()` returns
+/// rather than by a method name: `handle_get_patterns` reports `view(...)`
+/// call sites, so a view name is what makes the two texts tell apart through
+/// the pattern path rather than the backing-class path.
+const SAVED_CLASS_RENDERING: &str = "<?php\n\nnamespace App\\Livewire;\n\nuse Livewire\\Component;\n\nclass Counter extends Component\n{\n    public function render()\n    {\n        return view('livewire.from-disk');\n    }\n}\n";
+
+const DISCARDED_BUFFER_RENDERING: &str = "<?php\n\nnamespace App\\Livewire;\n\nuse Livewire\\Component;\n\nclass Counter extends Component\n{\n    public function render()\n    {\n        return view('livewire.from-buffer');\n    }\n}\n";
+
+/// The view names `get_patterns` currently reports for `path`.
+async fn pattern_view_names(backend: &LaravelLanguageServer, path: &Path) -> HashSet<String> {
+    backend
+        .salsa
+        .get_patterns(path.to_path_buf())
+        .await
+        .unwrap()
+        .map(|data| data.views.iter().map(|v| v.name.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Releasing ownership un-blocks the LOADER, but the loader is not the only
+/// reader of the text a discarded buffer installed. `handle_get_patterns`,
+/// `handle_get_document_symbols`, `handle_get_loop_blocks` and
+/// `handle_get_php_assignments` all read `files[path]` directly, and the
+/// pattern cache is checked with no version comparison at all — so a
+/// buffer-derived entry there is served until something else evicts it.
+/// Find-references answering out of that entry names a symbol that exists in
+/// no file at all.
+///
+/// The release therefore drops the text it hands back, not merely the claim
+/// on it: every reader re-derives from disk on its next question. Still lazy —
+/// nothing is read at close time.
+#[tokio::test]
+async fn closing_a_document_stops_every_reader_serving_the_discarded_text() {
+    let dir = TempDir::new().unwrap();
+    let backend = backend_for(dir.path()).await;
+    let class = write_file(
+        dir.path(),
+        "app/Livewire/Counter.php",
+        SAVED_CLASS_RENDERING,
+    );
+
+    let uri = open_buffer(&backend, &class, DISCARDED_BUFFER_RENDERING).await;
+
+    // Populate the pattern cache from the buffer, exactly as a diagnostics or
+    // find-references pass would while the document is open.
+    assert!(
+        pattern_view_names(&backend, &class)
+            .await
+            .contains("livewire.from-buffer"),
+        "precondition: the open buffer's text is what the pattern path reports",
+    );
+
+    // Changes discarded, document closed. Nothing is written to disk, so no
+    // `didChangeWatchedFiles` arrives to correct anything.
+    close_document(&backend, uri).await;
+
+    let names = pattern_view_names(&backend, &class).await;
+    assert!(
+        names.contains("livewire.from-disk"),
+        "after the close every reader must see the file on disk, got {names:?}",
+    );
+    assert!(
+        !names.contains("livewire.from-buffer"),
+        "the discarded buffer's text must not survive its document, got {names:?}",
+    );
+}

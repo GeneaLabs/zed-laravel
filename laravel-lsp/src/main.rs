@@ -24176,8 +24176,18 @@ impl LanguageServer for LaravelLanguageServer {
         // loader would go on serving text that exists neither on disk nor in
         // any buffer. Releasing ownership is the matching edge to that
         // acquire: once the path's LAST buffer closes it downgrades to
-        // unowned and the next resolution re-reads disk. It evicts NOTHING,
-        // which is what makes it compatible with the paragraph above.
+        // unowned and the next resolution re-reads disk.
+        //
+        // The release drops that path's Salsa text and its per-file caches
+        // along with the claim, because the loader is not the only reader of
+        // what a buffer installed — `handle_get_patterns` and the three
+        // per-file cache queries read `files[path]` directly, and the pattern
+        // cache is served with no version check. Dropping the input makes them
+        // all re-derive from disk on their next question, still lazily: nothing
+        // is read here. It evicts NOTHING ELSE — the symbol index, the reverse
+        // component-usage index, the class-hierarchy index and the resolved
+        // magic-member entries all stand, which is what makes this compatible
+        // with the paragraph above.
         //
         // "Last buffer" is not pedantry. This notification and the `didOpen`
         // of a buffer that reopens the same path — a revert, an editor

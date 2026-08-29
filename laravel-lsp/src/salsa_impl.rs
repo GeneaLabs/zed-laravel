@@ -10022,6 +10022,29 @@ impl SalsaActor {
             self.external_php_open_buffers.remove(path);
         }
         self.external_php_text.remove(path);
+
+        // Drop the TEXT that stamp was protecting, not merely the claim on it.
+        // Releasing ownership alone un-blocks the LOADER, and the loader is not
+        // the only reader: `handle_get_patterns`, `handle_get_document_symbols`,
+        // `handle_get_loop_blocks` and `handle_get_php_assignments` all read
+        // `files[path]` directly, and `pattern_cache` is checked with NO version
+        // comparison — so an entry derived from the discarded buffer is served
+        // forever rather than merely once. Find-references answering out of it
+        // names a symbol that exists in no file at all.
+        //
+        // Removing the input restores the same "nobody installed text here"
+        // state the line above restores for ownership, for every reader at
+        // once: `ensure_file_registered` finds the slot vacant and reads disk,
+        // and `ensure_external_php_source_loaded` reloads through its own
+        // containment guard. This stays LAZY — nothing is read at close time;
+        // the re-read lands on whichever query asks first.
+        //
+        // Deliberately NOT `RemoveFile`: the symbol index, the reverse
+        // component-usage index, the class-hierarchy index and the resolved
+        // magic-member entries are all left standing. Those are what `did_close`
+        // refuses to evict, and nothing here touches them.
+        self.files.remove(path);
+        self.invalidate_file_caches(path);
     }
 
     /// Handle a Blade loop-blocks query. Memoized via Salsa + actor LRU.
