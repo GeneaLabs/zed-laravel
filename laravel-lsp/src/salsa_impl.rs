@@ -3560,8 +3560,9 @@ struct ProviderMacro {
 /// ## Coverage boundaries (be honest about the caps)
 ///
 /// - **Which files**: every file registered as a [`ServiceProviderFile`] Salsa
-///   input — app providers (priority 2), framework providers (0), and package
-///   providers (1), the last two discovered by the vendor scan
+///   input — app providers (priority 3), module providers (2, from the
+///   `modules.paths` globs), package providers (1), and framework providers
+///   (0), the last two discovered by the vendor scan
 ///   (`rescan_vendor_providers`). Priority merging happens in
 ///   [`SalsaActor::build_macro_registry`], not here.
 /// - **Which calls**: only a STATIC `Receiver::macro(...)` / `Receiver::mixin(...)`

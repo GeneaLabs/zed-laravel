@@ -1332,18 +1332,31 @@ mod env_parsing {
 
 mod priority_merging {
 
-    /// Test that priority ordering is documented and followed
-    /// Priority: app (2) > package (1) > framework (0)
+    /// The service-provider tier scale, as a readable anchor:
+    /// app (3) > module (2) > package (1) > framework (0).
+    ///
+    /// This is a documentation test — the constants are local, so it records
+    /// the order rather than observing it. The order is *enforced* against the
+    /// real merge elsewhere: `module_view_namespaces` and
+    /// `module_livewire_namespaces` pin app-over-module and module-vs-module
+    /// with discriminating fixtures, and the former's
+    /// `every_registry_breaks_an_equal_priority_tie_the_same_way` pins the
+    /// shared tie-break across all five registries. Keep the numbers here in
+    /// step with `register_service_provider_files_with_salsa`.
     #[test]
     fn test_priority_ordering_constants() {
-        // Document the expected priority values
         const FRAMEWORK_PRIORITY: u8 = 0;
         const PACKAGE_PRIORITY: u8 = 1;
-        const APP_PRIORITY: u8 = 2;
+        const MODULE_PRIORITY: u8 = 2;
+        const APP_PRIORITY: u8 = 3;
 
         const _: () = assert!(
-            APP_PRIORITY > PACKAGE_PRIORITY,
-            "App should have higher priority than package"
+            APP_PRIORITY > MODULE_PRIORITY,
+            "App should have higher priority than module"
+        );
+        const _: () = assert!(
+            MODULE_PRIORITY > PACKAGE_PRIORITY,
+            "Module should have higher priority than package"
         );
         const _: () = assert!(
             PACKAGE_PRIORITY > FRAMEWORK_PRIORITY,
