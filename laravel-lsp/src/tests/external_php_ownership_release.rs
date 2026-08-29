@@ -47,6 +47,17 @@ async fn backend_for(root: &Path) -> LaravelLanguageServer {
     let (service, _socket) = LspService::new(LaravelLanguageServer::new);
     let backend = service.inner().clone();
     *backend.root_path.write().await = Some(root.to_path_buf());
+    // The actor keeps its OWN root, and the backing-class loader's containment
+    // guard reads it (#364). Production always sets the two together — via
+    // `register_config_with_salsa` or the cached-config request — so a fixture
+    // that sets only `root_path` is under-registering, and every load below
+    // would fail closed for want of a root rather than for the reason the test
+    // is about.
+    backend
+        .salsa
+        .register_config_files(root.to_path_buf(), None, None, None)
+        .await
+        .expect("actor registers the tempdir project root");
     backend
 }
 

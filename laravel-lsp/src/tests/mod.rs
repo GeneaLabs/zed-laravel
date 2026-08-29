@@ -28,6 +28,7 @@ mod env_key_navigation;
 mod env_source_registration_gate;
 mod env_value_redaction;
 mod expected_path_diagnostic_containment;
+mod external_php_loader_containment;
 mod external_php_ownership_release;
 mod factory_goto_def_handler;
 mod flux_component_context;

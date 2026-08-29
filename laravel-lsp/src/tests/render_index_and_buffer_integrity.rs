@@ -23,9 +23,18 @@ fn write(path: &Path, contents: &str) -> PathBuf {
 }
 
 /// A handle whose project is `root`, with `resources/views` registered as the
-/// view root so the Blade files below land in the actor's view-file list.
+/// view root so the Blade files below land in the actor's view-file list, and
+/// `root` registered as the config root.
 async fn handle_for(root: &Path) -> SalsaHandle {
     let handle = laravel_lsp::salsa_impl::SalsaActor::spawn();
+    // Registers the actor's `config_root`, which the backing-class loader's
+    // containment guard needs before it will read anything (#364). Production
+    // always sets it first — either here or via `RegisterCachedConfig` — so a
+    // fixture that skips it is under-registering, not exercising a real state.
+    handle
+        .register_config_files(root.to_path_buf(), None, None, None)
+        .await
+        .expect("actor registers the tempdir project root");
     handle
         .register_project_files(
             root.to_path_buf(),
