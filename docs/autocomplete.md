@@ -173,6 +173,7 @@ Inside a `wire:*="…"` value, completion offers the backing component's members
 ```
 
 - **Action bindings** (`wire:click`, `wire:submit`, any DOM-event directive) offer public, non-static **methods** — excluding the lifecycle surface (`mount`, `boot`, `booted`, `hydrate`, `dehydrate`, `rendering`, `rendered`, `exception`) and the per-property `updatedFoo`/`updatingFoo` hook families. Dotted values are rejected for actions.
+- **Loading targets** (`wire:target`) name either kind, so both methods and properties are offered in one list. The value is a comma-separated list, and the entry under the cursor is the one resolved.
 - **Data bindings** (`wire:model` with any modifiers, `wire:show`, `wire:text`) offer public, non-static **properties**. Dotted paths complete segment by segment: each leading segment resolves to its declared class, and that class's properties are offered — at any depth while the types stay resolvable.
 - Values that are already a JS expression (`$wire.count++`, `open = true`) get no member completion, so nothing conflicts with Alpine.
 

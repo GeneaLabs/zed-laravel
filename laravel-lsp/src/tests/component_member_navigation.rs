@@ -435,6 +435,64 @@ async fn wire_target_navigates_the_entry_under_the_cursor() {
     );
 }
 
+/// `wire:target` also names a PROPERTY when it pairs with `wire:model`'s
+/// loading state, which is the form item 5's kind filter could silently
+/// break: classify `target` as a method and this reference resolves to
+/// nothing. `$query` is declared as a property and nothing else, so only the
+/// unfiltered classification can answer it.
+const WIRE_TARGET_PROPERTY: &str = r#"<?php
+
+use Livewire\Component;
+
+new class extends Component {
+    public function save(): void
+    {
+    }
+
+    public $query = '';
+};
+?>
+
+<div>
+    <input wire:model.live="query">
+    <span wire:target="query" wire:loading>Searching…</span>
+</div>
+"#;
+
+#[tokio::test]
+async fn wire_target_resolves_a_loading_state_property() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let blade = write_blade(
+        dir.path(),
+        "resources/views/loading.blade.php",
+        WIRE_TARGET_PROPERTY,
+    );
+    let uri = open_document(&backend, &blade, WIRE_TARGET_PROPERTY).await;
+
+    let target_line = 15;
+    let text = WIRE_TARGET_PROPERTY
+        .lines()
+        .nth(target_line as usize)
+        .unwrap();
+    let character = text.find("query\"").unwrap() as u32;
+    let response = backend
+        .wire_attribute_goto_definition(
+            &uri,
+            Position {
+                line: target_line,
+                character,
+            },
+        )
+        .await
+        .expect("wire:target resolves a property, not only an action");
+    assert_eq!(
+        goto_line(&response),
+        9,
+        "the target is the `public $query` declaration"
+    );
+}
+
 #[tokio::test]
 async fn hover_card_for_a_binding_ignores_the_same_named_method() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -549,11 +607,20 @@ async fn a_named_backing_class_still_shows_its_fqcn() {
     );
 }
 
+/// The card's class name has to come from the text the user is looking at.
+///
+/// **The divergence is the whole test.** Disk keeps `OldName`; the editor's
+/// unsaved buffer renames the class to `NewName`, and only the buffer is
+/// pushed into Salsa — so a card reading the live source says `NewName` and a
+/// card re-reading the path off disk says `OldName`. Without that split the
+/// assertion passes either way, which is exactly how the first version of
+/// this test went green with the fix reverted.
 #[tokio::test]
 async fn the_hover_card_reads_the_live_buffer_not_the_saved_file() {
     let dir = tempfile::TempDir::new().unwrap();
     let backend = backend_with_root(dir.path()).await;
     let saved = "<?php\n\nnamespace App\\Livewire;\n\nclass OldName extends Component\n{\n    public function increment(): void {}\n}\n";
+    let buffer = "<?php\n\nnamespace App\\Livewire;\n\nclass NewName extends Component\n{\n    public function increment(): void {}\n}\n";
     let class_path = dir.path().join("app/Livewire/Counter.php");
     fs::create_dir_all(class_path.parent().unwrap()).unwrap();
     fs::write(&class_path, saved).unwrap();
@@ -572,13 +639,26 @@ async fn the_hover_card_reads_the_live_buffer_not_the_saved_file() {
         }],
     );
 
+    // The rename exists only in the editor. `did_open`/`did_change` push the
+    // buffer to both places, so the test does too.
+    open_document(&backend, &class_path, buffer).await;
+    backend
+        .salsa
+        .update_file(class_path.clone(), 2, buffer.to_string())
+        .await
+        .expect("the editor's buffer reaches Salsa");
+
     let card = backend
         .this_member_hover_card(&blade, "increment")
         .await
         .expect("the backing class declares increment()");
     assert!(
-        card.contains("OldName"),
-        "sanity: the saved file names OldName: {card}"
+        card.contains(&rendered("App\\Livewire\\NewName::increment()")),
+        "the card must name the class in the live buffer: {card}"
+    );
+    assert!(
+        !card.contains("OldName"),
+        "the last-saved class name must not reach the card: {card}"
     );
 }
 
@@ -837,5 +917,139 @@ async fn editing_the_backing_class_on_disk_invalidates_the_cached_source() {
     assert_eq!(
         after.1.line, 10,
         "the replacement method sits where the old one did",
+    );
+}
+
+// ---- items 6 and 8, through their real handler ---------------------------
+//
+// Both fixes were pinned by unit tests over `locate_member` and
+// `is_template_local_binding` alone. A unit test of a predicate proves nothing
+// about whether the handler consults it, and `blade_variable_goto_definition`
+// is the only consumer either one has — so it is what these drive.
+
+/// Wire a Blade template to an external backing class, the way the hover-card
+/// tests do: the config supplies the view root, and the render index says this
+/// `.php` renders that view.
+async fn backend_rendering(
+    root: &Path,
+    view_name: &str,
+    class_rel: &str,
+    class_source: &str,
+) -> (LaravelLanguageServer, PathBuf) {
+    let backend = backend_with_root(root).await;
+    let class_path = root.join(class_rel);
+    fs::create_dir_all(class_path.parent().unwrap()).unwrap();
+    fs::write(&class_path, class_source).unwrap();
+    *backend.cached_config.write().await = Some(std::sync::Arc::new(config_with_view_root(root)));
+    backend.view_vars.write().unwrap().insert_file(
+        class_path.clone(),
+        &[laravel_lsp::view_var_index::ViewRender {
+            view_name: view_name.to_string(),
+            vars: Default::default(),
+        }],
+    );
+    (backend, class_path)
+}
+
+/// `@props(['color' => 'blue'])` binds the KEY. The value `blue`, and any
+/// unrelated quoted text sharing the line, are not bindings — so `$blue` and
+/// `$literal` must still navigate to the backing class while `$color` is
+/// correctly shadowed.
+const PROPS_LINE: &str = r#"@props(['color' => 'blue']) <div title="literal">
+{{ $color }}
+{{ $blue }}
+{{ $literal }}
+</div>
+"#;
+
+const PROPS_BACKING_CLASS: &str = r#"<?php
+
+namespace App\Livewire;
+
+class Card extends Component
+{
+    public $color = '';
+    public $blue = '';
+    public $literal = '';
+}
+"#;
+
+#[tokio::test]
+async fn props_goto_binds_the_key_and_leaves_the_value_navigable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (backend, _class) = backend_rendering(
+        dir.path(),
+        "card",
+        "app/Livewire/Card.php",
+        PROPS_BACKING_CLASS,
+    )
+    .await;
+    let blade = write_blade(dir.path(), "resources/views/card.blade.php", PROPS_LINE);
+    let uri = open_document(&backend, &blade, PROPS_LINE).await;
+
+    let goto = |line: u32, character: u32| {
+        backend.blade_variable_goto_definition(&uri, Position { line, character })
+    };
+
+    assert!(
+        goto(1, 6).await.is_none(),
+        "`color` is the @props KEY, so it is template-local and shadows the class"
+    );
+
+    let blue = goto(2, 6)
+        .await
+        .expect("`blue` is a default VALUE, not a binding — it still navigates");
+    assert_eq!(
+        goto_line(&blue),
+        7,
+        "goto lands on `public $blue` in the backing class"
+    );
+
+    let literal = goto(3, 6)
+        .await
+        .expect("unrelated quoted text on the @props line binds nothing");
+    assert_eq!(
+        goto_line(&literal),
+        8,
+        "goto lands on `public $literal` in the backing class"
+    );
+}
+
+/// The candidate declared FIRST in the file sits one level deeper in the tree
+/// than the one declared second, so a queue-based traversal reports the
+/// shallow class and a true document-order sort reports the trait. Goto is a
+/// location question over the whole file, which is why the trait wins here
+/// even though completion (a surface question) excludes it.
+const DOCUMENT_ORDER_CLASS: &str =
+    "<?php\ntrait Helper {\n    public $dup = 1;\n}\nclass Card extends Component { public $dup = 2; }\n";
+
+#[tokio::test]
+async fn goto_takes_the_first_declaration_in_document_order() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (backend, _class) = backend_rendering(
+        dir.path(),
+        "card",
+        "app/Livewire/Card.php",
+        DOCUMENT_ORDER_CLASS,
+    )
+    .await;
+    let source = "{{ $dup }}\n";
+    let blade = write_blade(dir.path(), "resources/views/card.blade.php", source);
+    let uri = open_document(&backend, &blade, source).await;
+
+    let response = backend
+        .blade_variable_goto_definition(
+            &uri,
+            Position {
+                line: 0,
+                character: 6,
+            },
+        )
+        .await
+        .expect("`$dup` is declared in the backing class file");
+    assert_eq!(
+        goto_line(&response),
+        2,
+        "the trait's `$dup` is declared first, on line 2; the class's is line 4"
     );
 }

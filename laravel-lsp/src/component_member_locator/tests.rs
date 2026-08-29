@@ -321,6 +321,26 @@ fn completion_excludes_members_of_every_other_top_level_declaration() {
     );
 }
 
+/// The sibling of the test above, with the names COLLIDING. Distinct names
+/// prove a leak by its presence; identical names can only be told apart by
+/// what came back, so the foreign class declares the same members at a
+/// different type. A leak shows up as the wrong type or a duplicate entry —
+/// neither of which a distinct-name fixture can produce.
+#[test]
+fn completion_keeps_the_owning_class_when_a_stranger_shares_its_member_names() {
+    let source = "<?php\nclass Component1 {\n    public string $shared = 'owned';\n    public function shared() {}\n}\n\nclass Unrelated {\n    public int $shared = 2;\n    public function shared() {}\n}\n";
+    assert_eq!(
+        public_property_types(source),
+        vec![("shared".to_string(), "string".to_string())],
+        "the owning class's `string $shared`, not the stranger's `int $shared`"
+    );
+    assert_eq!(
+        public_action_method_names(source),
+        vec!["shared"],
+        "one entry — the stranger's same-named method must not double it up"
+    );
+}
+
 #[test]
 fn completion_excludes_a_trait_declared_beside_the_component() {
     let source = "<?php\nclass C {\n    public $owned = 1;\n}\n\ntrait Helper {\n    public $fromTrait = 2;\n    public function helperAction() {}\n}\n";
@@ -503,6 +523,55 @@ fn a_used_same_file_traits_member_is_locatable() {
     );
     let action = locate_member(USED_TRAIT, "bumpFromTrait").expect("the trait's method is found");
     assert_eq!(action.line, 5, "`bumpFromTrait()` is declared on line 5");
+}
+
+/// Two traits that `use` each other. PHP fatals on this at runtime, but the
+/// state is reachable as a mid-edit buffer and this walk runs on the request
+/// path — an unguarded worklist would loop forever and take every LSP feature
+/// down with it. The visited set is what stops that, and nothing else in the
+/// tree constructs a cycle to hold it in place.
+///
+/// Each member appearing exactly once is the second half of the assertion: a
+/// guard that terminated by some other means (a depth cap, say) would still
+/// re-visit a trait on the way there.
+#[test]
+fn a_mutual_trait_use_cycle_terminates() {
+    let source = r#"<?php
+trait Ping
+{
+    use Pong;
+
+    public $fromPing = 1;
+}
+
+trait Pong
+{
+    use Ping;
+
+    public $fromPong = 2;
+}
+
+class Counter extends Component
+{
+    use Ping;
+
+    public $own = 3;
+}
+"#;
+    let mut properties: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    properties.sort();
+    assert_eq!(
+        properties,
+        vec![
+            "fromPing".to_string(),
+            "fromPong".to_string(),
+            "own".to_string()
+        ],
+        "the cycle is walked once through and each member lands exactly once"
+    );
 }
 
 /// A `use` naming a trait declared in another file resolves to nothing — the

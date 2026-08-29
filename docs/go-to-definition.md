@@ -122,7 +122,7 @@ Two escape hatches cover what the heuristic can't infer — a directive that tak
 
 Names with dedicated handling (`@component`, `@livewire`, `@feature`, `@includeFirst`, `@extends`, `@include`, `@includeIf`, `@each`, `@includeWhen`, `@includeUnless`) ignore both lists — their own resolution always wins. See [Configuration](configuration.md).
 
-**Component members in Blade** — inside a template backed by a component class (a Livewire component in any format, a class-based Volt component, or a Filament `$view`-property page), `$this->member`, bare `$variable` references, and `wire:` attribute values all jump to the member's declaration in the backing class. For a Livewire v4 single-file component or a class-based Volt component the class lives in the template's own front matter, so the jump lands inside the `.blade.php` itself:
+**Component members in Blade** — inside a template backed by a Livewire component in any format — class-based or functional Volt included — or by a Filament `$view`-property page, `$this->member`, bare `$variable` references, and `wire:` attribute values all jump to the member's declaration in the backing class. For a Livewire v4 single-file component, a class-based Volt component, or a functional Volt file (`state([...])` keys are the properties, top-level `$name = fn () => …` assignments the actions), the member lives in the template's own front matter, so the jump lands inside the `.blade.php` itself:
 
 ```blade
 <button wire:click="enterEditMode">Edit</button>

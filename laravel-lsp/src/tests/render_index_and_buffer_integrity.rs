@@ -265,6 +265,117 @@ async fn reloading_a_changed_backing_class_drops_its_cached_patterns() {
     );
 }
 
+/// The guard is not allowed to depend on a filesystem call succeeding. When
+/// the buffer is pushed while its file is momentarily absent — a branch
+/// switch, a stash, an `artisan make:*` regeneration — a stamp built from
+/// `fs::metadata` records nothing, and "nothing recorded" reads downstream as
+/// "never loaded, read disk unconditionally": the clobber the stamp exists to
+/// prevent, re-armed by its own failure path.
+#[tokio::test]
+async fn a_buffer_pushed_while_its_file_is_missing_is_not_clobbered() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let blade = write(
+        &root.join("resources/views/livewire/counter.blade.php"),
+        "<div>{{ $count }}</div>\n",
+    );
+    let class = root.join("app/Livewire/Counter.php");
+    fs::create_dir_all(class.parent().unwrap()).unwrap();
+    let handle = handle_for(root).await;
+
+    // The editor pushes its buffer while the path does not exist on disk, so
+    // any `fs::metadata(&class)` inside the push fails.
+    let buffer = "<?php\nclass Counter\n{\n    public function unsaved(): void {}\n}\n";
+    handle
+        .update_file(class.clone(), 7, buffer.to_string())
+        .await
+        .unwrap();
+
+    // The file comes back, with different content — the regenerated or
+    // checked-out version the user has NOT accepted into their buffer.
+    write(
+        &class,
+        "<?php\nclass Counter\n{\n    public function regenerated(): void {}\n}\n",
+    );
+
+    let resolved = handle
+        .blade_backing_class_resolution(
+            blade,
+            Some("livewire.counter".to_string()),
+            vec![class.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let source = resolved
+        .sources
+        .iter()
+        .find(|(path, _)| path == &class)
+        .map(|(_, source)| source.clone())
+        .expect("the backing class resolves from the pushed buffer");
+    assert_eq!(
+        source, buffer,
+        "a push that could not stat its file still owns the text"
+    );
+}
+
+/// The same rule under the trigger that does not need a failed `metadata()`
+/// at all: the file changes on disk while the buffer is open and dirty. An
+/// mtime comparison says "reload"; ownership says the pusher's text stands
+/// until the pusher replaces it.
+#[tokio::test]
+async fn a_disk_change_under_a_dirty_buffer_does_not_reload() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let class = write(
+        &root.join("app/Livewire/Counter.php"),
+        "<?php\nclass Counter\n{\n    public function saved(): void {}\n}\n",
+    );
+    let blade = write(
+        &root.join("resources/views/livewire/counter.blade.php"),
+        "<div>{{ $count }}</div>\n",
+    );
+    let handle = handle_for(root).await;
+
+    let buffer = "<?php\nclass Counter\n{\n    public function unsaved(): void {}\n}\n";
+    handle
+        .update_file(class.clone(), 7, buffer.to_string())
+        .await
+        .unwrap();
+
+    // Disk moves on underneath the dirty buffer. The sleep gives the mtime
+    // room to advance on filesystems with coarse timestamps, so the test
+    // exercises the mtime-differs branch rather than an accidental tie.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(
+        &class,
+        "<?php\nclass Counter\n{\n    public function checked_out(): void {}\n}\n",
+    )
+    .unwrap();
+
+    let resolved = handle
+        .blade_backing_class_resolution(
+            blade,
+            Some("livewire.counter".to_string()),
+            vec![class.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let source = resolved
+        .sources
+        .iter()
+        .find(|(path, _)| path == &class)
+        .map(|(_, source)| source.clone())
+        .expect("the backing class resolves");
+    assert_eq!(
+        source, buffer,
+        "an advancing mtime must not evict the editor's unsaved text"
+    );
+}
+
 // === 3. the render index never goes backwards =============================
 
 /// Two tasks snapshot generations 1 and 2 and reach the actor in either order.

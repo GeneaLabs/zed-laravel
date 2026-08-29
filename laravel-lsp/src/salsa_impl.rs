@@ -8677,6 +8677,28 @@ pub enum FileListOp {
     Remove,
 }
 
+/// Where the text currently installed in `files[path]` came from, and
+/// therefore who is responsible for replacing it.
+///
+/// The backing-class loader ([`SalsaActor::ensure_external_php_source_loaded`])
+/// reads a file from disk whenever a Blade template resolves `$this->member`,
+/// which is a request-path read of a file somebody may be editing. The rule
+/// this enum encodes is the narrowest one that keeps that safe: **the loader
+/// only ever overwrites text it loaded itself.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalPhpText {
+    /// The loader read it from disk, at this mtime. It is the owner, so it
+    /// re-reads once the mtime advances.
+    LoadedFromDisk(std::time::SystemTime),
+    /// A client push installed it — `textDocument/didOpen`/`didChange` with an
+    /// editor buffer, or `workspace/didChangeWatchedFiles` with the watcher's
+    /// own fresh read. Both push again when their source changes, so the
+    /// pusher owns invalidation for this path and the loader must not read
+    /// disk over it: a live buffer would lose the user's unsaved edits, and a
+    /// watched file is already being kept current by the watcher.
+    PushedByClient,
+}
+
 /// The Salsa actor that owns the database and runs on a dedicated thread
 pub struct SalsaActor {
     db: LaravelDatabase,
@@ -8744,12 +8766,15 @@ pub struct SalsaActor {
     /// via the memoized Salsa query.
     document_symbols_cache:
         LruCache<PathBuf, (u64, Arc<Vec<crate::document_symbols::SymbolEntry>>)>,
-    /// Tracks the on-disk mtime of external PHP files registered as Salsa inputs —
-    /// Livewire component classes, and the backing classes of a Blade template
-    /// (#339, item 7). These files are not opened in the editor (no
-    /// `did_open`/`did_change` events), so we invalidate by comparing filesystem
-    /// mtime on each access.
-    external_php_mtimes: HashMap<PathBuf, std::time::SystemTime>,
+    /// Records where the text currently installed in `files[path]` came from,
+    /// for external PHP files registered as Salsa inputs — Livewire component
+    /// classes, and the backing classes of a Blade template (#339, item 7).
+    ///
+    /// [`SalsaActor::ensure_external_php_source_loaded`] reads this to decide
+    /// whether a disk re-read is due. An absent entry means "this actor never
+    /// installed text for that path", which is the only state that permits an
+    /// unconditional read.
+    external_php_text: HashMap<PathBuf, ExternalPhpText>,
     /// Monotonic version counter for external PHP SourceFiles (incremented per disk re-read).
     /// Monotonic stamp for the text currently installed in `files[path]`,
     /// bumped by EVERY writer, and the key the three per-file LRU caches
@@ -8955,7 +8980,7 @@ impl SalsaActor {
                 loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 document_symbols_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
-                external_php_mtimes: HashMap::with_capacity(64),
+                external_php_text: HashMap::with_capacity(64),
                 text_revision: 0,
                 file_text_revisions: HashMap::with_capacity(64),
                 // Config management
@@ -9100,7 +9125,7 @@ impl SalsaActor {
                     self.files.remove(&path);
                     self.invalidate_file_caches(&path);
                     self.file_text_revisions.remove(&path);
-                    self.external_php_mtimes.remove(&path);
+                    self.external_php_text.remove(&path);
                     // Drop from the inverted index too. Doing this
                     // synchronously (rather than via mark_dirty) is
                     // correct: there's no future state to refresh
@@ -9759,14 +9784,13 @@ impl SalsaActor {
         self.component_usage_index.mark_dirty(&path);
 
         self.bump_text_revision(&path);
-        // Stamp the file's current mtime as "already loaded". This text is
-        // authoritative — a live editor buffer, or a disk read the watcher
-        // just made — and without the stamp `ensure_external_php_source_loaded`
-        // would see no entry, decide a reload is due, and overwrite an unsaved
-        // buffer with the last-saved bytes the moment a Blade hover resolved
-        // its backing class. Same rule `did_change_watched_files` already
-        // applies from the other side: the buffer wins over disk.
-        self.mark_external_php_loaded(&path);
+        // Hand ownership of this path's text to the pusher. Without it
+        // `ensure_external_php_source_loaded` sees no entry, decides a reload
+        // is due, and overwrites an unsaved buffer with the last-saved bytes
+        // the moment a Blade hover resolves its backing class. Same rule
+        // `did_change_watched_files` already applies from the other side: the
+        // buffer wins over disk.
+        self.mark_pushed_by_client(&path);
 
         if let Some(file) = self.files.get(&path) {
             // Update existing file
@@ -9806,12 +9830,18 @@ impl SalsaActor {
         self.document_symbols_cache.pop(path);
     }
 
-    /// Record `path`'s current disk mtime as the one already reflected in
-    /// Salsa, so the backing-class loader treats it as up to date.
-    fn mark_external_php_loaded(&mut self, path: &Path) {
-        if let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) {
-            self.external_php_mtimes.insert(path.to_path_buf(), mtime);
-        }
+    /// Record that `path`'s Salsa text was installed by a client push, so the
+    /// backing-class loader never reads disk over it.
+    ///
+    /// Deliberately infallible. The predecessor stamped `path`'s disk mtime
+    /// and silently did nothing when `metadata()` failed — leaving a pushed
+    /// (possibly unsaved) buffer with no entry at all, which the loader reads
+    /// as "never loaded, read disk unconditionally": precisely the clobber the
+    /// stamp exists to prevent. Ownership is not a fact about the filesystem,
+    /// so it must not be recorded through a fallible filesystem call.
+    fn mark_pushed_by_client(&mut self, path: &Path) {
+        self.external_php_text
+            .insert(path.to_path_buf(), ExternalPhpText::PushedByClient);
     }
 
     /// Handle a Blade loop-blocks query. Memoized via Salsa + actor LRU.
@@ -9949,7 +9979,7 @@ impl SalsaActor {
                     self.bump_text_revision(path);
                     // The live buffer supersedes disk for this file too, so
                     // the loader must not read it back out from under us.
-                    self.mark_external_php_loaded(path);
+                    self.mark_pushed_by_client(path);
                     self.invalidate_file_caches(path);
                     file.set_text(&mut self.db).to(text);
                 }
@@ -9957,7 +9987,7 @@ impl SalsaActor {
             }
             None => {
                 self.bump_text_revision(path);
-                self.mark_external_php_loaded(path);
+                self.mark_pushed_by_client(path);
                 let file = SourceFile::new(&self.db, path.clone(), 0, text);
                 self.files.insert(path.clone(), file);
                 Some(file)
@@ -9970,17 +10000,40 @@ impl SalsaActor {
         resolve_livewire_member_type(&self.db, file, member.to_string())
     }
 
-    /// Register an external (editor-unopened) PHP file as a Salsa input,
-    /// reloading from disk whenever its mtime advances. Returns the cached
-    /// `SourceFile` handle, or `None` when the path is unreadable — which is
-    /// also how a non-existent path and a directory (a Livewire v4 MFC's
-    /// component dir) are dropped from backing-class resolution.
+    /// Register an external PHP file as a Salsa input, reloading it from disk
+    /// whenever its mtime advances — but only while this loader owns the
+    /// path's text. A path a client pushed (see [`ExternalPhpText`]) is served
+    /// from Salsa untouched, so an unsaved buffer is never overwritten with
+    /// its last-saved bytes.
+    ///
+    /// Returns the cached `SourceFile` handle, or `None` when an unowned path
+    /// is unreadable — which is also how a non-existent path and a directory
+    /// (a Livewire v4 MFC's component dir) are dropped from backing-class
+    /// resolution.
     fn ensure_external_php_source_loaded(&mut self, path: &PathBuf) -> Option<SourceFile> {
+        // Ownership is checked BEFORE the filesystem, so a client-pushed path
+        // is served from Salsa whether or not it can be stat'd at this instant.
+        // Ordering the stat first would drop an unsaved buffer out of
+        // backing-class resolution whenever its file is momentarily absent —
+        // a branch switch, a stash, an `artisan make:*` regeneration.
+        if self.external_php_text.get(path) == Some(&ExternalPhpText::PushedByClient) {
+            if let Some(file) = self.files.get(path).copied() {
+                return Some(file);
+            }
+            // Marked as pushed, yet the input is gone. Nothing is left to
+            // protect, so fall through and load from disk rather than answer
+            // `None`. `RemoveFile` clears both together, so this is a
+            // belt-and-braces arm, not a reachable steady state.
+        }
+
         let current_mtime = std::fs::metadata(path).ok()?.modified().ok()?;
 
-        let needs_reload = match self.external_php_mtimes.get(path) {
-            Some(prev_mtime) => *prev_mtime != current_mtime || !self.files.contains_key(path),
-            None => true,
+        let needs_reload = match self.external_php_text.get(path) {
+            Some(ExternalPhpText::LoadedFromDisk(prev_mtime)) => {
+                *prev_mtime != current_mtime || !self.files.contains_key(path)
+            }
+            // Either never loaded, or the pushed-but-vanished case above.
+            _ => true,
         };
 
         if needs_reload {
@@ -9998,7 +10051,8 @@ impl SalsaActor {
                 let file = SourceFile::new(&self.db, path.clone(), 0, text);
                 self.files.insert(path.clone(), file);
             }
-            self.external_php_mtimes.insert(path.clone(), current_mtime);
+            self.external_php_text
+                .insert(path.clone(), ExternalPhpText::LoadedFromDisk(current_mtime));
         }
 
         self.files.get(path).copied()

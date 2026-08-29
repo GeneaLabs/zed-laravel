@@ -22,7 +22,7 @@ $tz = config('app.timezone');
 {{-- ^^^^^ hover →  App\Models\User::$email, its PHPDoc summary, and the declaration --}}
 ```
 
-**Component members in Blade** — `$this->member` in a template backed by a component class (Livewire in any format, class-based Volt, a Filament `$view`-property page) gets a card with the member's kind, the backing class, the full declaration header, and a click-to-open link. Inside an anonymous partial (`<x-save-button />`), which has no backing class of its own, the card resolves against the nearest component that renders it. This card is emitted unconditionally in Blade: Intelephense cannot resolve `$this` inside a template's PHP context, so there is no PHP-tooling card to defer to.
+**Component members in Blade** — `$this->member` in a template backed by a Livewire component in any format — including a functional Volt file, which declares no class at all — or by a Filament `$view`-property page gets a card with the member's kind, the backing class, the full declaration header, and a click-to-open link. Inside an anonymous partial (`<x-save-button />`), which has no backing class of its own, the card resolves against the nearest component that renders it. This card is emitted unconditionally in Blade: Intelephense cannot resolve `$this` inside a template's PHP context, so there is no PHP-tooling card to defer to.
 
 ```blade
 {{ $this->getCalculatedEndDateForDisplay() }}
