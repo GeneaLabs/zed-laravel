@@ -53,6 +53,10 @@ pub struct ViewRender {
 pub struct ViewVarIndex {
     /// view name → (variable name → set of FQCN types).
     forward: HashMap<String, HashMap<String, HashSet<String>>>,
+    /// Bumped on every mutation. The Salsa render-index input is refreshed
+    /// only when this changes, so an unchanged index never invalidates the
+    /// memoized backing-class queries (#339, item 7).
+    generation: u64,
     /// file → the full render sites it contributed. Keeping whole renders
     /// (not just view names) gives `remove_file` per-file type provenance
     /// for a precise rebuild, and lets the incremental save flow (#80) diff
@@ -69,6 +73,7 @@ impl ViewVarIndex {
     /// contribution from the same file (evict-then-insert) so a re-parse of an
     /// edited controller doesn't leave stale types behind.
     pub fn insert_file(&mut self, path: PathBuf, renders: &[ViewRender]) {
+        self.generation = self.generation.wrapping_add(1);
         self.remove_file(&path);
         for render in renders {
             let view = self.forward.entry(render.view_name.clone()).or_default();
@@ -88,6 +93,7 @@ impl ViewVarIndex {
         let Some(renders) = self.by_file.remove(path) else {
             return;
         };
+        self.generation = self.generation.wrapping_add(1);
         let affected: HashSet<&str> = renders.iter().map(|r| r.view_name.as_str()).collect();
         for view in &affected {
             self.forward.remove(*view);
@@ -135,25 +141,33 @@ impl ViewVarIndex {
             .unwrap_or_default()
     }
 
-    /// Every file that currently contributes a render site for `view_name` —
-    /// the reverse of `by_file`'s per-file contribution. A Filament-style
-    /// `$view`-property page and any controller `view(...)` call site that
-    /// renders the same view both show up here, letting a Blade-goto/hover
-    /// fallback jump straight from the template into whichever class(es)
-    /// declare its variables.
-    pub fn render_source_files(&self, view_name: &str) -> Vec<PathBuf> {
-        let mut files: Vec<PathBuf> = self
+    /// The whole index flattened to `(view name, contributing file)` pairs —
+    /// the reverse of `by_file`'s per-file contribution, as the Salsa
+    /// [`crate::salsa_impl::RenderIndex`] input consumes it.
+    ///
+    /// A Filament-style `$view`-property page and any controller `view(...)`
+    /// call site that renders the same view both appear here, which is what
+    /// lets a Blade goto/hover fallback jump straight from the template into
+    /// whichever class(es) declare its variables. Per-view lookup is the
+    /// memoized `salsa_impl::render_source_files` query — this index no longer
+    /// answers that question itself, so nothing can reach the O(entire index)
+    /// scan it used to run per keystroke (#339, item 7).
+    ///
+    /// Sorted and deduped: `salsa_impl::render_source_files` takes the FIRST
+    /// hit over its slice of these entries, and `by_file` is a `HashMap`.
+    pub fn render_entries(&self) -> Vec<(String, PathBuf)> {
+        let mut entries: Vec<(String, PathBuf)> = self
             .by_file
             .iter()
-            .filter(|(_, renders)| renders.iter().any(|r| r.view_name == view_name))
-            .map(|(path, _)| path.clone())
+            .flat_map(|(path, renders)| {
+                renders
+                    .iter()
+                    .map(move |render| (render.view_name.clone(), path.clone()))
+            })
             .collect();
-        // Sorted for the same reason `vars_for_view` sorts: `by_file` is a
-        // HashMap, and `locate_in_backing_class_files` takes the FIRST hit
-        // over this list — unsorted, a member declared by two contributing
-        // classes would flap between targets run to run.
-        files.sort();
-        files
+        entries.sort();
+        entries.dedup();
+        entries
     }
 
     /// Every variable `view_name` has a render site for, as `(name, sorted
@@ -179,8 +193,15 @@ impl ViewVarIndex {
 
     /// Clear everything — called at the start of a warm rebuild.
     pub fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         self.forward.clear();
         self.by_file.clear();
+    }
+
+    /// A change counter, bumped by every mutation. Callers use it to skip
+    /// re-pushing an unchanged snapshot (#339, item 7).
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn is_empty(&self) -> bool {

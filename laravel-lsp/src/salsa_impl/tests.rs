@@ -5553,3 +5553,267 @@ fn config_string_literal_reads_an_empty_literal() {
          directory name"
     );
 }
+
+// ─── Blade backing-class resolution, memoized (issue #339, item 7) ───────
+
+/// A render index holding `(view name, rendering file)` pairs.
+fn render_index(db: &LaravelDatabase, entries: &[(&str, &str)]) -> RenderIndex {
+    RenderIndex::new(
+        db,
+        1,
+        entries
+            .iter()
+            .map(|(view, path)| (view.to_string(), PathBuf::from(path)))
+            .collect(),
+    )
+}
+
+#[test]
+fn render_source_files_returns_every_contributor_sorted() {
+    let db = LaravelDatabase::default();
+    let index = render_index(
+        &db,
+        &[
+            ("users.show", "/proj/zeta/Controller.php"),
+            ("users.show", "/proj/alpha/Page.php"),
+            ("other.view", "/proj/Other.php"),
+        ],
+    );
+
+    assert_eq!(
+        render_source_files(&db, index, "users.show".to_string()),
+        vec![
+            PathBuf::from("/proj/alpha/Page.php"),
+            PathBuf::from("/proj/zeta/Controller.php"),
+        ],
+        "contributors come back in lexicographic path order, not index order",
+    );
+    assert!(render_source_files(&db, index, "missing.view".to_string()).is_empty());
+}
+
+#[test]
+fn render_source_files_is_memoized_until_the_index_changes() {
+    let mut db = LaravelDatabase::default();
+    let index = render_index(&db, &[("users.show", "/proj/UserController.php")]);
+
+    let before = db
+        .query_run_counts()
+        .render_source_files
+        .load(Ordering::Relaxed);
+    let first = render_source_files(&db, index, "users.show".to_string());
+    let second = render_source_files(&db, index, "users.show".to_string());
+    assert_eq!(first, second);
+    assert_eq!(
+        db.query_run_counts()
+            .render_source_files
+            .load(Ordering::Relaxed)
+            - before,
+        1,
+        "a second lookup over an unchanged index must be served from the memo",
+    );
+
+    index.set_entries(&mut db).to(vec![
+        (
+            "users.show".to_string(),
+            PathBuf::from("/proj/UserController.php"),
+        ),
+        (
+            "users.show".to_string(),
+            PathBuf::from("/proj/Filament/UserPage.php"),
+        ),
+    ]);
+    let third = render_source_files(&db, index, "users.show".to_string());
+    assert_eq!(
+        third,
+        vec![
+            PathBuf::from("/proj/Filament/UserPage.php"),
+            PathBuf::from("/proj/UserController.php"),
+        ],
+        "a changed index must recompute, not serve the old contributor list",
+    );
+    assert_eq!(
+        db.query_run_counts()
+            .render_source_files
+            .load(Ordering::Relaxed)
+            - before,
+        2,
+    );
+}
+
+#[test]
+fn blade_backing_class_files_puts_render_sites_before_the_livewire_convention() {
+    let db = LaravelDatabase::default();
+    let index = render_index(&db, &[("livewire.counter", "/proj/app/Filament/Page.php")]);
+
+    let files = blade_backing_class_files(
+        &db,
+        index,
+        Some("livewire.counter".to_string()),
+        vec![PathBuf::from("/proj/app/Livewire/Counter.php")],
+    );
+
+    assert_eq!(
+        files,
+        vec![
+            PathBuf::from("/proj/app/Filament/Page.php"),
+            PathBuf::from("/proj/app/Livewire/Counter.php"),
+        ],
+        "the direct render site outranks the conventionally-resolved class",
+    );
+}
+
+#[test]
+fn blade_backing_class_files_drops_templates_and_duplicates() {
+    let db = LaravelDatabase::default();
+    let index = render_index(
+        &db,
+        &[
+            ("livewire.counter", "/proj/app/Livewire/Counter.php"),
+            ("livewire.counter", "/proj/resources/views/x.blade.php"),
+            ("livewire.counter", "/proj/resources/views/x.blade"),
+        ],
+    );
+
+    let files = blade_backing_class_files(
+        &db,
+        index,
+        Some("livewire.counter".to_string()),
+        vec![
+            // Already contributed by the render index — must not appear twice.
+            PathBuf::from("/proj/app/Livewire/Counter.php"),
+            // A v4 MFC component directory: no `.php` extension.
+            PathBuf::from("/proj/resources/views/components/counter"),
+        ],
+    );
+
+    assert_eq!(
+        files,
+        vec![PathBuf::from("/proj/app/Livewire/Counter.php")],
+        "only plain `.php` paths survive, and each appears once",
+    );
+}
+
+#[test]
+fn blade_backing_class_files_without_a_view_name_uses_only_the_livewire_paths() {
+    let db = LaravelDatabase::default();
+    let index = render_index(&db, &[("users.show", "/proj/UserController.php")]);
+
+    assert_eq!(
+        blade_backing_class_files(
+            &db,
+            index,
+            None,
+            vec![PathBuf::from("/proj/app/Livewire/Counter.php")],
+        ),
+        vec![PathBuf::from("/proj/app/Livewire/Counter.php")],
+        "a template outside every view root contributes no render sites",
+    );
+}
+
+#[test]
+fn blade_backing_class_sources_reads_each_file_and_appends_an_inline_component() {
+    let db = LaravelDatabase::default();
+    let class = SourceFile::new(
+        &db,
+        PathBuf::from("/proj/app/Livewire/Counter.php"),
+        0,
+        "<?php class Counter extends Component { public $count = 0; }".to_string(),
+    );
+    let inline = SourceFile::new(
+        &db,
+        PathBuf::from("/proj/resources/views/livewire/counter.blade.php"),
+        0,
+        "<?php new class extends Component { public $tally = 0; }; ?>\n<div></div>".to_string(),
+    );
+
+    let sources = blade_backing_class_sources(&db, vec![class], Some(inline));
+
+    assert_eq!(sources.len(), 2);
+    assert_eq!(
+        sources[0].0,
+        PathBuf::from("/proj/app/Livewire/Counter.php")
+    );
+    assert!(sources[0].1.contains("public $count"));
+    assert_eq!(
+        sources[1].0,
+        PathBuf::from("/proj/resources/views/livewire/counter.blade.php"),
+        "the template itself is appended AFTER the standalone classes",
+    );
+}
+
+#[test]
+fn blade_backing_class_sources_skips_a_template_with_no_inline_component() {
+    let db = LaravelDatabase::default();
+    let plain = SourceFile::new(
+        &db,
+        PathBuf::from("/proj/resources/views/partial.blade.php"),
+        0,
+        "<div>{{ $name }}</div>".to_string(),
+    );
+
+    assert!(
+        blade_backing_class_sources(&db, Vec::new(), Some(plain)).is_empty(),
+        "a template with neither an inline class nor a Volt signature contributes nothing",
+    );
+}
+
+#[test]
+fn blade_backing_class_sources_invalidates_when_a_backing_class_is_edited() {
+    let mut db = LaravelDatabase::default();
+    let class = SourceFile::new(
+        &db,
+        PathBuf::from("/proj/app/Livewire/Counter.php"),
+        0,
+        "<?php class Counter { public $count = 0; }".to_string(),
+    );
+
+    let before = db
+        .query_run_counts()
+        .blade_backing_class_sources
+        .load(Ordering::Relaxed);
+    let first = blade_backing_class_sources(&db, vec![class], None);
+    assert!(first[0].1.contains("public $count"));
+
+    // Same inputs: served from the memo.
+    let _ = blade_backing_class_sources(&db, vec![class], None);
+    assert_eq!(
+        db.query_run_counts()
+            .blade_backing_class_sources
+            .load(Ordering::Relaxed)
+            - before,
+        1,
+        "an unchanged backing class must not be re-read",
+    );
+
+    // The BACKING CLASS changes — not the blade file. The memo must drop.
+    class
+        .set_text(&mut db)
+        .to("<?php class Counter { public $tally = 0; }".to_string());
+    let after = blade_backing_class_sources(&db, vec![class], None);
+    assert!(
+        after[0].1.contains("public $tally"),
+        "editing the backing class must invalidate the cached source, got {:?}",
+        after[0].1,
+    );
+    assert_eq!(
+        db.query_run_counts()
+            .blade_backing_class_sources
+            .load(Ordering::Relaxed)
+            - before,
+        2,
+    );
+}
+
+#[test]
+fn is_plain_php_path_separates_classes_from_templates() {
+    assert!(is_plain_php_path(Path::new(
+        "/proj/app/Livewire/Counter.php"
+    )));
+    assert!(!is_plain_php_path(Path::new(
+        "/proj/resources/views/counter.blade.php"
+    )));
+    assert!(!is_plain_php_path(Path::new(
+        "/proj/resources/views/counter"
+    )));
+    assert!(!is_plain_php_path(Path::new("/proj/composer.json")));
+}

@@ -249,3 +249,339 @@ new class extends Component {
     assert_eq!(loc.kind, MemberKind::Property);
     assert_eq!(loc.line, 5);
 }
+
+// ---- true document order + declaration scoping (issue #339, item 6) -------
+
+#[test]
+fn locate_member_returns_the_first_declaration_in_document_order() {
+    let source = "<?php\nclass A { public $dup = 1; }\n\nclass B { public $dup = 2; }\n";
+    let loc = locate_member(source, "dup").expect("both classes declare $dup");
+    assert_eq!(
+        loc.line, 1,
+        "the FIRST declaration wins, not the last-visited one"
+    );
+}
+
+#[test]
+fn a_deeply_nested_earlier_candidate_beats_a_shallow_later_one() {
+    // The trait's `$dup` sits one level deeper in the tree than the class's,
+    // and comes first in the document. A breadth-first or reverse-DFS walk
+    // returns the shallow/later one; true `(line, column)` order returns the
+    // trait's.
+    let source = "<?php\ntrait T {\n    public $dup = 1;\n}\nclass C { public $dup = 2; }\n";
+    let loc = locate_member(source, "dup").expect("both declare $dup");
+    assert_eq!(
+        loc.line, 2,
+        "the trait's declaration is earlier in the file"
+    );
+}
+
+#[test]
+fn member_summary_describes_the_same_declaration_goto_lands_on() {
+    let source = "<?php\nclass A { public int $dup = 1; }\n\nclass B { public string $dup = 2; }\n";
+    assert_eq!(
+        member_declaration_summary(source, "dup").as_deref(),
+        Some("public int $dup"),
+        "the summary follows the same document-order pick as locate_member"
+    );
+}
+
+#[test]
+fn kind_filter_keeps_a_property_reference_off_a_same_named_method() {
+    let source = "<?php\nclass C {\n    public $save = 1;\n    public function save() {}\n}\n";
+    let as_property = locate_member_of_kind(source, "save", Some(MemberKind::Property))
+        .expect("the property is declared");
+    assert_eq!(as_property.line, 2);
+    let as_method = locate_member_of_kind(source, "save", Some(MemberKind::Method))
+        .expect("the method is declared");
+    assert_eq!(as_method.line, 3);
+}
+
+#[test]
+fn kind_filter_returns_nothing_when_only_the_other_kind_exists() {
+    let source = "<?php\nclass C {\n    public function save() {}\n}\n";
+    assert!(
+        locate_member_of_kind(source, "save", Some(MemberKind::Property)).is_none(),
+        "a wire:model binding must not resolve to a method"
+    );
+}
+
+#[test]
+fn completion_excludes_members_of_every_other_top_level_declaration() {
+    let source = "<?php\nclass Component1 {\n    public $owned = 1;\n    public function act() {}\n}\n\nclass Unrelated {\n    public $foreign = 2;\n    public function stranger() {}\n}\n";
+    let props: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(props, vec!["owned"], "only the component's own properties");
+    assert_eq!(
+        public_action_method_names(source),
+        vec!["act"],
+        "only the component's own actions"
+    );
+}
+
+/// The sibling of the test above, with the names COLLIDING. Distinct names
+/// prove a leak by its presence; identical names can only be told apart by
+/// what came back, so the foreign class declares the same members at a
+/// different type. A leak shows up as the wrong type or a duplicate entry —
+/// neither of which a distinct-name fixture can produce.
+#[test]
+fn completion_keeps_the_owning_class_when_a_stranger_shares_its_member_names() {
+    let source = "<?php\nclass Component1 {\n    public string $shared = 'owned';\n    public function shared() {}\n}\n\nclass Unrelated {\n    public int $shared = 2;\n    public function shared() {}\n}\n";
+    assert_eq!(
+        public_property_types(source),
+        vec![("shared".to_string(), "string".to_string())],
+        "the owning class's `string $shared`, not the stranger's `int $shared`"
+    );
+    assert_eq!(
+        public_action_method_names(source),
+        vec!["shared"],
+        "one entry — the stranger's same-named method must not double it up"
+    );
+}
+
+#[test]
+fn completion_excludes_a_trait_declared_beside_the_component() {
+    let source = "<?php\nclass C {\n    public $owned = 1;\n}\n\ntrait Helper {\n    public $fromTrait = 2;\n    public function helperAction() {}\n}\n";
+    let props: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(props, vec!["owned"]);
+    assert!(
+        public_action_method_names(source).is_empty(),
+        "a trait the class never `use`s is not on $this, so it stays excluded"
+    );
+}
+
+#[test]
+fn an_inline_anonymous_component_class_owns_the_members() {
+    let source = "<?php\ntrait Helper {\n    public $fromTrait = 1;\n}\n\nnew class extends Component {\n    public $owned = 2;\n};\n";
+    let props: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(
+        props,
+        vec!["owned"],
+        "the anonymous class is the component even with a trait above it"
+    );
+}
+
+/// A class declaring BOTH kinds under one name: the summary must describe the
+/// kind asked for, not whichever declaration the parser reaches first. The
+/// method is declared first, so an unfiltered call answers with it — which is
+/// what makes these two assertions discriminate.
+const SUMMARY_KIND_CLASH: &str = r#"<?php
+class Counter
+{
+    public function save(): void
+    {
+    }
+
+    public string $save = '';
+}
+"#;
+
+#[test]
+fn declaration_summary_of_kind_describes_the_requested_kind() {
+    assert_eq!(
+        member_declaration_summary_of_kind(SUMMARY_KIND_CLASH, "save", Some(MemberKind::Property))
+            .as_deref(),
+        Some("public string $save"),
+    );
+    assert_eq!(
+        member_declaration_summary_of_kind(SUMMARY_KIND_CLASH, "save", Some(MemberKind::Method))
+            .as_deref(),
+        Some("public function save(): void"),
+    );
+}
+
+#[test]
+fn an_unfiltered_summary_still_answers_in_document_order() {
+    assert_eq!(
+        member_declaration_summary(SUMMARY_KIND_CLASH, "save").as_deref(),
+        Some("public function save(): void"),
+        "no filter means first-in-document-order, which is the method here",
+    );
+}
+
+#[test]
+fn declaration_summary_of_a_kind_the_class_lacks_is_none() {
+    let source = "<?php\nclass Counter\n{\n    public function save(): void {}\n}\n";
+    assert!(
+        member_declaration_summary_of_kind(source, "save", Some(MemberKind::Property)).is_none()
+    );
+}
+
+/// Item 6 scoped the member surface to the component's own declaration. A
+/// trait the component actually `use`s is on `$this` at runtime, so scoping it
+/// away traded a false positive for a false negative.
+const USED_TRAIT: &str = r#"<?php
+trait HasCounter
+{
+    public $fromTrait = 1;
+
+    public function bumpFromTrait(): void
+    {
+    }
+}
+
+trait Unrelated
+{
+    public $fromUnrelated = 1;
+
+    public function bumpFromUnrelated(): void
+    {
+    }
+}
+
+class Counter extends Component
+{
+    use HasCounter;
+
+    public $own = 1;
+}
+"#;
+
+#[test]
+fn a_used_same_file_trait_contributes_its_members() {
+    let properties: Vec<String> = public_property_types(USED_TRAIT)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(properties.contains(&"own".to_string()));
+    assert!(
+        properties.contains(&"fromTrait".to_string()),
+        "`use HasCounter` puts $fromTrait on $this: {properties:?}"
+    );
+
+    let actions = public_action_method_names(USED_TRAIT);
+    assert!(
+        actions.contains(&"bumpFromTrait".to_string()),
+        "`use HasCounter` puts bumpFromTrait() on $this: {actions:?}"
+    );
+}
+
+#[test]
+fn an_unused_same_file_trait_contributes_nothing() {
+    let properties: Vec<String> = public_property_types(USED_TRAIT)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        !properties.contains(&"fromUnrelated".to_string()),
+        "a trait the class never `use`s is not on $this: {properties:?}"
+    );
+    assert!(
+        !public_action_method_names(USED_TRAIT).contains(&"bumpFromUnrelated".to_string()),
+        "a trait the class never `use`s is not on $this"
+    );
+}
+
+#[test]
+fn a_trait_used_by_a_used_trait_contributes_its_members() {
+    let source = r#"<?php
+trait Inner
+{
+    public $deep = 1;
+}
+
+trait Outer
+{
+    use Inner;
+
+    public $middle = 1;
+}
+
+class Counter extends Component
+{
+    use Outer;
+}
+"#;
+    let properties: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(properties.contains(&"middle".to_string()), "{properties:?}");
+    assert!(
+        properties.contains(&"deep".to_string()),
+        "a trait's own `use` clauses count too: {properties:?}"
+    );
+}
+
+/// Goto over a used same-file trait, which `docs/go-to-definition.md` now
+/// states outright. The walk searches the whole file, so this holds for the
+/// same reason completion holds — but the docs claim it, so a test pins it.
+#[test]
+fn a_used_same_file_traits_member_is_locatable() {
+    let property = locate_member(USED_TRAIT, "fromTrait").expect("the trait's property is found");
+    assert_eq!(
+        property.line, 3,
+        "`public $fromTrait` is declared on line 3"
+    );
+    let action = locate_member(USED_TRAIT, "bumpFromTrait").expect("the trait's method is found");
+    assert_eq!(action.line, 5, "`bumpFromTrait()` is declared on line 5");
+}
+
+/// Two traits that `use` each other. PHP fatals on this at runtime, but the
+/// state is reachable as a mid-edit buffer and this walk runs on the request
+/// path — an unguarded worklist would loop forever and take every LSP feature
+/// down with it. The visited set is what stops that, and nothing else in the
+/// tree constructs a cycle to hold it in place.
+///
+/// Each member appearing exactly once is the second half of the assertion: a
+/// guard that terminated by some other means (a depth cap, say) would still
+/// re-visit a trait on the way there.
+#[test]
+fn a_mutual_trait_use_cycle_terminates() {
+    let source = r#"<?php
+trait Ping
+{
+    use Pong;
+
+    public $fromPing = 1;
+}
+
+trait Pong
+{
+    use Ping;
+
+    public $fromPong = 2;
+}
+
+class Counter extends Component
+{
+    use Ping;
+
+    public $own = 3;
+}
+"#;
+    let mut properties: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    properties.sort();
+    assert_eq!(
+        properties,
+        vec![
+            "fromPing".to_string(),
+            "fromPong".to_string(),
+            "own".to_string()
+        ],
+        "the cycle is walked once through and each member lands exactly once"
+    );
+}
+
+/// A `use` naming a trait declared in another file resolves to nothing — the
+/// documented cross-file limitation, unchanged by the same-file fix.
+#[test]
+fn a_use_of_an_absent_trait_is_ignored() {
+    let source = "<?php\nclass Counter extends Component\n{\n    use \\App\\Traits\\Absent;\n\n    public $own = 1;\n}\n";
+    let properties: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(properties, vec!["own".to_string()]);
+}

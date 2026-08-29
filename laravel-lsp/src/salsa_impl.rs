@@ -15,6 +15,7 @@ use salsa::Setter;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -43,22 +44,66 @@ use crate::path_containment::path_within_root_lexical;
 // Database Definition
 // ============================================================================
 
+/// Body-execution counters for the memoized backing-class queries (#339,
+/// item 7). Incremented inside a query's BODY, so the count answers the one
+/// question a return value cannot: was this served from the memo, or recomputed?
+///
+/// Per-database rather than a process-wide static, so a test measuring one
+/// database is not perturbed by whatever the Salsa actor thread is doing in
+/// another test. Shared across clones of the database, which is what Salsa's
+/// own snapshotting produces.
+#[derive(Debug, Default)]
+pub struct QueryRunCounts {
+    /// Body runs of [`render_source_files`].
+    pub render_source_files: AtomicUsize,
+    /// Body runs of [`blade_backing_class_sources`].
+    pub blade_backing_class_sources: AtomicUsize,
+}
+
+impl QueryRunCounts {
+    /// A plain snapshot of the counters, for transfer across the actor's
+    /// async boundary.
+    pub fn snapshot(&self) -> QueryRunCountsData {
+        QueryRunCountsData {
+            render_source_files: self.render_source_files.load(Ordering::Relaxed),
+            blade_backing_class_sources: self.blade_backing_class_sources.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Data transfer type for [`QueryRunCounts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryRunCountsData {
+    pub render_source_files: usize,
+    pub blade_backing_class_sources: usize,
+}
+
 /// The Salsa database trait for Laravel LSP
 #[salsa::db]
-pub trait Db: salsa::Database {}
+pub trait Db: salsa::Database {
+    /// This database's query body-execution counters. See [`QueryRunCounts`].
+    fn query_run_counts(&self) -> &QueryRunCounts;
+}
 
 /// The concrete database implementation
 #[salsa::db]
 #[derive(Default, Clone)]
 pub struct LaravelDatabase {
     storage: salsa::Storage<Self>,
+    /// Shared with every clone of this database, so a snapshot's query runs
+    /// are counted against the same totals.
+    run_counts: Arc<QueryRunCounts>,
 }
 
 #[salsa::db]
 impl salsa::Database for LaravelDatabase {}
 
 #[salsa::db]
-impl Db for LaravelDatabase {}
+impl Db for LaravelDatabase {
+    fn query_run_counts(&self) -> &QueryRunCounts {
+        &self.run_counts
+    }
+}
 
 // ============================================================================
 // Input Types - Source data provided to the system
@@ -119,6 +164,24 @@ pub struct ProjectFiles {
     /// PHP files in routes/
     #[returns(ref)]
     pub route_files: Vec<PathBuf>,
+}
+
+/// The project-wide render index: every `(view name, rendering file)` pair
+/// the controller / Livewire scan has observed.
+///
+/// The flattened reverse of `ViewVarIndex::by_file`. Holding it as a Salsa
+/// input is what turns backing-class resolution from an O(entire index) linear
+/// sweep *per keystroke* into a memoized lookup that only recomputes when the
+/// index itself changes (issue #339, item 7).
+#[salsa::input]
+pub struct RenderIndex {
+    /// Version incremented when the index contents change
+    #[returns(copy)]
+    pub version: i32,
+
+    /// `(view name, file that renders it)`, one entry per render site
+    #[returns(ref)]
+    pub entries: Vec<(String, PathBuf)>,
 }
 
 /// Represents a service provider file with priority
@@ -1373,6 +1436,123 @@ pub fn parse_blade_loop_blocks(
 pub fn parse_blade_php_assignments(db: &dyn Db, file: SourceFile) -> Vec<(String, String)> {
     let text = file.text(db);
     crate::blade_php_block::extract_php_block_assignments(text)
+}
+
+// ============================================================================
+// Blade backing-class resolution (issue #339, item 7)
+// ============================================================================
+
+/// Whether `path` is a plain `.php` file rather than a `.blade.php` template.
+///
+/// A Blade template has no standalone class for `component_member_locator` to
+/// parse — its inline `new class extends Component` (or Volt front matter) is
+/// handled separately, by [`blade_backing_class_sources`]'s `inline` arm.
+pub fn is_plain_php_path(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("php")
+        && !path.to_string_lossy().ends_with(".blade.php")
+}
+
+/// Every file that renders `view_name`, sorted lexicographically by path.
+///
+/// The sort is load-bearing, not cosmetic: [`blade_backing_class_files`]'s
+/// consumers take the FIRST hit over this list, so an unsorted result would
+/// flap between two contributing classes that both declare the same member.
+///
+/// Memoized: only re-runs when the [`RenderIndex`] input changes.
+#[salsa::tracked(returns(clone))]
+pub fn render_source_files(db: &dyn Db, index: RenderIndex, view_name: String) -> Vec<PathBuf> {
+    db.query_run_counts()
+        .render_source_files
+        .fetch_add(1, Ordering::Relaxed);
+    let mut files: Vec<PathBuf> = index
+        .entries(db)
+        .iter()
+        .filter(|(view, _)| *view == view_name)
+        .map(|(_, path)| path.clone())
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// The plain-`.php` files backing a Blade template's rendered content — the
+/// union of two independent sources, in precedence order:
+///   1. the render index's contributors for `view_name` (a Filament-style
+///      `$view`-property page, or any controller `view(...)` call site);
+///   2. `livewire_paths`, the conventionally-resolved Livewire component class
+///      for a Blade file that lives under Livewire's view path.
+///
+/// (1) comes first so a direct render site outranks the Livewire convention.
+/// A partial that has NEITHER resolves through the component that rendered it,
+/// one level up — but that walk lives in `Backend::blade_backing_class_
+/// resolution` (#339, item 1), which calls this query per candidate rather than
+/// climbing inside it, so a direct render site is always tried before any
+/// ancestor.
+///
+/// Deduped, and restricted to plain `.php` paths. Existence is NOT checked
+/// here: this query is pure, and the actor drops paths it cannot read when it
+/// loads them as Salsa inputs.
+///
+/// Memoized: only re-runs when the [`RenderIndex`], the view name, or the
+/// resolved Livewire paths change.
+#[salsa::tracked(returns(clone))]
+pub fn blade_backing_class_files(
+    db: &dyn Db,
+    index: RenderIndex,
+    view_name: Option<String>,
+    livewire_paths: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(view) = view_name {
+        out.extend(render_source_files(db, index, view));
+    }
+    out.extend(livewire_paths);
+
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    out.retain(|p| is_plain_php_path(p) && seen.insert(p.clone()));
+    out
+}
+
+/// Every `(path, source)` pair whose PHP class backs a Blade template: the
+/// plain-`.php` backing files of [`blade_backing_class_files`], plus the Blade
+/// file ITSELF (`inline`) when it declares an inline
+/// `new class extends Component` (a Livewire v4 single-file component or a
+/// class-based Volt component) or carries a functional Volt signature. Those
+/// shapes have no standalone `.php` source — the members live in the
+/// template's own front matter.
+///
+/// Memoized against each backing file's CONTENT, not merely its path: `files`
+/// are [`SourceFile`] inputs, so editing a backing class invalidates this
+/// query and the next call recomputes rather than serving a stale source.
+#[salsa::tracked(returns(clone))]
+pub fn blade_backing_class_sources(
+    db: &dyn Db,
+    files: Vec<SourceFile>,
+    inline: Option<SourceFile>,
+) -> Vec<(PathBuf, String)> {
+    db.query_run_counts()
+        .blade_backing_class_sources
+        .fetch_add(1, Ordering::Relaxed);
+    let mut out: Vec<(PathBuf, String)> = files
+        .iter()
+        .map(|file| (file.path(db).clone(), file.text(db).clone()))
+        .collect();
+
+    if let Some(blade) = inline {
+        let text = blade.text(db);
+        // A FUNCTIONAL Volt file declares no class at all, so
+        // `detect_inline_livewire_class` is false for it — but its
+        // `state([...])` keys and top-level closure assignments ARE the
+        // component's members, and `component_member_locator` reads them.
+        // Both inline shapes therefore hand the template itself to the
+        // locator (#339, item 3).
+        if crate::php_class::detect_inline_livewire_class(text)
+            || crate::livewire_resolver::source_contains_volt_signature(text)
+        {
+            out.push((blade.path(db).clone(), text.clone()));
+        }
+    }
+    out
 }
 
 /// Extract the document-symbol tree for a file (route file, Blade template,
@@ -6226,6 +6406,24 @@ pub struct FacadeReceiverTarget {
 }
 
 /// Requests that can be sent to the Salsa actor
+/// The answer to one backing-class resolution for a Blade template (#339,
+/// item 7): the plain-`.php` files that back it, and each of those files'
+/// current source, plus the template itself when it declares its component
+/// inline.
+///
+/// Both halves come from the same pair of memoized queries in one actor
+/// round-trip, so a caller that needs only the paths (the item 1 up-walk, which
+/// calls this once per ancestor) never pays for a second request that would
+/// recompute the same lookup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BladeBackingResolutionData {
+    /// Backing `.php` paths that exist and could be read, in precedence order.
+    pub files: Vec<PathBuf>,
+    /// `(path, source)` for each entry of `files`, plus the Blade template
+    /// itself when it carries an inline component class.
+    pub sources: Vec<(PathBuf, String)>,
+}
+
 pub enum SalsaRequest {
     /// Update or create a file in the database
     UpdateFile {
@@ -6317,6 +6515,38 @@ pub enum SalsaRequest {
         reply: oneshot::Sender<Option<LaravelConfigData>>,
     },
 
+    // === Blade backing-class resolution (#339, item 7) ===
+    /// Read the actor database's query body-execution counters. Exists so a
+    /// test driving the real LSP handler can prove the memo was hit, which a
+    /// return value alone cannot show.
+    QueryRunCounts {
+        reply: oneshot::Sender<QueryRunCountsData>,
+    },
+    /// Replace the render-index snapshot the backing-class queries read.
+    /// Bumps the Salsa revision, so only send this when the index has actually
+    /// changed — see `Backend::pending_render_index_snapshot`.
+    SetRenderIndex {
+        /// `ViewVarIndex::generation()` this snapshot was taken at. The actor
+        /// drops a snapshot older than the one it holds, so two concurrent
+        /// pushes cannot leave it serving the loser's data.
+        generation: u64,
+        entries: Vec<(String, PathBuf)>,
+        reply: oneshot::Sender<()>,
+    },
+    /// Resolve the PHP class(es) backing a Blade template, memoized against
+    /// the render index and each backing file's content.
+    BladeBackingClassResolution {
+        blade_path: PathBuf,
+        /// The template's own Laravel view name, when it has one.
+        view_name: Option<String>,
+        /// Livewire-convention class paths the caller already resolved.
+        livewire_paths: Vec<PathBuf>,
+        /// The live editor buffer for `blade_path`, when the document is open.
+        /// `None` falls back to the file on disk.
+        live_blade_text: Option<String>,
+        reply: oneshot::Sender<BladeBackingResolutionData>,
+    },
+
     // === Reference Finding ===
     /// Register project files for reference finding
     /// Scans directories and registers all PHP/Blade files
@@ -6332,6 +6562,19 @@ pub enum SalsaRequest {
     FindViewReferences {
         view_name: String,
         reply: oneshot::Sender<Vec<ViewReferenceLocationData>>,
+    },
+    /// Every Blade template that RENDERS one of these components — the reverse
+    /// edge the item-1 up-walk climbs (#339). `component_names` are matched
+    /// against `<x-…>` tags (`ParsedPatternsData::components`) and
+    /// `livewire_names` against `<livewire:…>` tags
+    /// (`ParsedPatternsData::livewire_refs`), because a partial is used through
+    /// either syntax and indexing only the first would leave the other silent.
+    ///
+    /// Replies with the rendering `.blade.php` paths, sorted and deduped.
+    FilesRenderingComponent {
+        component_names: Vec<String>,
+        livewire_names: Vec<String>,
+        reply: oneshot::Sender<Vec<PathBuf>>,
     },
     /// Find all references to a classified symbol across the project.
     /// Iterates `ProjectFiles` and filters parser-classified patterns by name —
@@ -6915,6 +7158,64 @@ impl SalsaHandle {
 
     /// Resolve a `$this->X` member access in a Livewire component PHP file.
     /// Auto-registers the file as a Salsa input on first access, invalidates on mtime change.
+    /// Read the actor database's query body-execution counters.
+    pub async fn query_run_counts(&self) -> Result<QueryRunCountsData, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::QueryRunCounts { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Push a render-index snapshot into the actor. Invalidates the memoized
+    /// backing-class queries, so send it only when the index has changed.
+    pub async fn set_render_index(
+        &self,
+        generation: u64,
+        entries: Vec<(String, PathBuf)>,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SetRenderIndex {
+                generation,
+                entries,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Resolve the PHP class(es) backing `blade_path`. See
+    /// [`BladeBackingResolutionData`].
+    pub async fn blade_backing_class_resolution(
+        &self,
+        blade_path: PathBuf,
+        view_name: Option<String>,
+        livewire_paths: Vec<PathBuf>,
+        live_blade_text: Option<String>,
+    ) -> Result<BladeBackingResolutionData, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::BladeBackingClassResolution {
+                blade_path,
+                view_name,
+                livewire_paths,
+                live_blade_text,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
     pub async fn resolve_livewire_member(
         &self,
         path: PathBuf,
@@ -7113,6 +7414,29 @@ impl SalsaHandle {
         self.sender
             .send(SalsaRequest::FindViewReferences {
                 view_name,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Every Blade template that renders one of `component_names` (as
+    /// `<x-…>`) or `livewire_names` (as `<livewire:…>`), sorted and deduped.
+    /// Backs the item-1 up-walk from a partial to the component that rendered
+    /// it (#339).
+    pub async fn files_rendering_component(
+        &self,
+        component_names: Vec<String>,
+        livewire_names: Vec<String>,
+    ) -> Result<Vec<PathBuf>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::FilesRenderingComponent {
+                component_names,
+                livewire_names,
                 reply: reply_tx,
             })
             .await
@@ -8353,6 +8677,28 @@ pub enum FileListOp {
     Remove,
 }
 
+/// Where the text currently installed in `files[path]` came from, and
+/// therefore who is responsible for replacing it.
+///
+/// The backing-class loader ([`SalsaActor::ensure_external_php_source_loaded`])
+/// reads a file from disk whenever a Blade template resolves `$this->member`,
+/// which is a request-path read of a file somebody may be editing. The rule
+/// this enum encodes is the narrowest one that keeps that safe: **the loader
+/// only ever overwrites text it loaded itself.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalPhpText {
+    /// The loader read it from disk, at this mtime. It is the owner, so it
+    /// re-reads once the mtime advances.
+    LoadedFromDisk(std::time::SystemTime),
+    /// A client push installed it — `textDocument/didOpen`/`didChange` with an
+    /// editor buffer, or `workspace/didChangeWatchedFiles` with the watcher's
+    /// own fresh read. Both push again when their source changes, so the
+    /// pusher owns invalidation for this path and the loader must not read
+    /// disk over it: a live buffer would lose the user's unsaved edits, and a
+    /// watched file is already being kept current by the watcher.
+    PushedByClient,
+}
+
 /// The Salsa actor that owns the database and runs on a dedicated thread
 pub struct SalsaActor {
     db: LaravelDatabase,
@@ -8407,23 +8753,44 @@ pub struct SalsaActor {
     /// tokio runtime, so a blocking read is the correct (and only
     /// available) primitive here.
     documents: Arc<OnceLock<Arc<RwLock<HashMap<Url, (String, i32)>>>>>,
-    /// LRU cache of parsed Blade loop blocks, keyed by file path + version.
-    /// Salsa already memoizes the underlying query, but caching the Arc avoids
-    /// re-walking the query graph on every diagnostic / completion request.
-    loop_blocks_cache: LruCache<PathBuf, (i32, Arc<Vec<crate::blade_loops::BladeLoopBlock>>)>,
-    /// LRU cache of parsed `@php ... @endphp` block assignments, keyed by file path + version.
-    php_assignments_cache: LruCache<PathBuf, (i32, Arc<Vec<(String, String)>>)>,
-    /// LRU cache of document-symbol trees keyed by file path. Stores file
-    /// version alongside the cached Arc so a version mismatch triggers a
-    /// recompute via the memoized Salsa query.
+    /// LRU cache of parsed Blade loop blocks, keyed by file path + text
+    /// revision ([`SalsaActor::text_revision`]). Salsa already memoizes the
+    /// underlying query, but caching the Arc avoids re-walking the query graph
+    /// on every diagnostic / completion request.
+    loop_blocks_cache: LruCache<PathBuf, (u64, Arc<Vec<crate::blade_loops::BladeLoopBlock>>)>,
+    /// LRU cache of parsed `@php ... @endphp` block assignments, keyed by file
+    /// path + text revision.
+    php_assignments_cache: LruCache<PathBuf, (u64, Arc<Vec<(String, String)>>)>,
+    /// LRU cache of document-symbol trees keyed by file path. Stores the text
+    /// revision alongside the cached Arc so a mismatch triggers a recompute
+    /// via the memoized Salsa query.
     document_symbols_cache:
-        LruCache<PathBuf, (i32, Arc<Vec<crate::document_symbols::SymbolEntry>>)>,
-    /// Tracks the on-disk mtime of Livewire component PHP files registered as Salsa inputs.
-    /// These files are not opened in the editor (no `did_open`/`did_change` events), so we
-    /// invalidate by comparing filesystem mtime on each access.
-    livewire_mtimes: HashMap<PathBuf, std::time::SystemTime>,
-    /// Monotonic version counter for Livewire component SourceFiles (incremented per disk re-read).
-    livewire_version_counter: i32,
+        LruCache<PathBuf, (u64, Arc<Vec<crate::document_symbols::SymbolEntry>>)>,
+    /// Records where the text currently installed in `files[path]` came from,
+    /// for external PHP files registered as Salsa inputs — Livewire component
+    /// classes, and the backing classes of a Blade template (#339, item 7).
+    ///
+    /// [`SalsaActor::ensure_external_php_source_loaded`] reads this to decide
+    /// whether a disk re-read is due. An absent entry means "this actor never
+    /// installed text for that path", which is the only state that permits an
+    /// unconditional read.
+    external_php_text: HashMap<PathBuf, ExternalPhpText>,
+    /// Monotonic version counter for external PHP SourceFiles (incremented per disk re-read).
+    /// Monotonic stamp for the text currently installed in `files[path]`,
+    /// bumped by EVERY writer, and the key the three per-file LRU caches
+    /// below compare on.
+    ///
+    /// `SourceFile::version` cannot serve that purpose: `handle_update_file`
+    /// stamps the LSP document version onto it while the backing-class loader
+    /// stamped a counter of its own, so two independent sequences — both
+    /// starting near zero, both climbing — wrote one field. Where they
+    /// collided, a cache hit returned blocks parsed from the other writer's
+    /// text: same number, different source. One counter, one namespace, no
+    /// collision possible.
+    text_revision: u64,
+    /// Per-file view of [`Self::text_revision`]. Absent means "never written
+    /// through a bumping site", which reads as revision 0.
+    file_text_revisions: HashMap<PathBuf, u64>,
 
     // === Config Management ===
     /// Project root path
@@ -8444,6 +8811,13 @@ pub struct SalsaActor {
     registration_baselines: HashMap<PathBuf, ProviderRegistrationsData>,
 
     // === Reference Finding ===
+    /// The render index as a Salsa input, created on first use (#339, item 7).
+    render_index: Option<RenderIndex>,
+    /// Monotonic version for the render-index input.
+    render_index_version: i32,
+    /// The `ViewVarIndex` generation the installed render index was built from.
+    /// Guards `handle_set_render_index` against an out-of-order push.
+    render_index_generation: u64,
     /// Project files input for reference finding
     project_files: Option<ProjectFiles>,
     /// Version counter for project files
@@ -8486,6 +8860,13 @@ pub struct SalsaActor {
     /// `BuildSymbolIndex` message; kept fresh thereafter via the
     /// `mark_dirty` / `take_dirty` pattern (see `symbol_index.rs`).
     symbol_index: crate::symbol_index::SymbolIndex,
+
+    /// Reverse "which Blade files render component X" index, over the same
+    /// `ParsedPatternsData` the pattern cache already holds. Kept fresh with
+    /// the same deferred `mark_dirty` / drain shape as `symbol_index`; see
+    /// `component_usage_index.rs` for why the ancestor walk cannot afford the
+    /// linear scan it replaces.
+    component_usage_index: crate::component_usage_index::ComponentUsageIndex,
 
     /// Project-wide class-hierarchy + member index. Populated at warming from
     /// the same parse that feeds the pattern cache; powers structural code
@@ -8599,8 +8980,9 @@ impl SalsaActor {
                 loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 document_symbols_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
-                livewire_mtimes: HashMap::with_capacity(64),
-                livewire_version_counter: 0,
+                external_php_text: HashMap::with_capacity(64),
+                text_revision: 0,
+                file_text_revisions: HashMap::with_capacity(64),
                 // Config management
                 config_root: None,
                 config_files: HashMap::with_capacity(4),
@@ -8608,6 +8990,9 @@ impl SalsaActor {
                 config_cache: None,
                 registration_baselines: HashMap::new(),
                 // Reference finding
+                render_index: None,
+                render_index_version: 0,
+                render_index_generation: 0,
                 project_files: None,
                 project_files_version: 0,
                 controller_files: Vec::new(),
@@ -8618,6 +9003,7 @@ impl SalsaActor {
                 source_files: Vec::new(),
                 project_root_paths: ProjectRootPaths::default(),
                 symbol_index: crate::symbol_index::SymbolIndex::default(),
+                component_usage_index: crate::component_usage_index::ComponentUsageIndex::default(),
                 class_hierarchy_index: crate::class_hierarchy_index::ClassHierarchyIndex::default(),
                 class_files_snapshot: None,
                 // Service provider registry
@@ -8701,6 +9087,32 @@ impl SalsaActor {
                     let result = self.handle_get_document_symbols(&path);
                     let _ = reply.send(result);
                 }
+                SalsaRequest::QueryRunCounts { reply } => {
+                    let _ = reply.send(self.db.query_run_counts().snapshot());
+                }
+                SalsaRequest::SetRenderIndex {
+                    generation,
+                    entries,
+                    reply,
+                } => {
+                    self.handle_set_render_index(generation, entries);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::BladeBackingClassResolution {
+                    blade_path,
+                    view_name,
+                    livewire_paths,
+                    live_blade_text,
+                    reply,
+                } => {
+                    let result = self.handle_blade_backing_class_resolution(
+                        &blade_path,
+                        view_name,
+                        livewire_paths,
+                        live_blade_text,
+                    );
+                    let _ = reply.send(result);
+                }
                 SalsaRequest::ResolveLivewireMember {
                     path,
                     member,
@@ -8711,15 +9123,15 @@ impl SalsaActor {
                 }
                 SalsaRequest::RemoveFile { path, reply } => {
                     self.files.remove(&path);
-                    self.pattern_cache.remove(&path);
-                    self.loop_blocks_cache.pop(&path);
-                    self.php_assignments_cache.pop(&path);
-                    self.document_symbols_cache.pop(&path);
+                    self.invalidate_file_caches(&path);
+                    self.file_text_revisions.remove(&path);
+                    self.external_php_text.remove(&path);
                     // Drop from the inverted index too. Doing this
                     // synchronously (rather than via mark_dirty) is
                     // correct: there's no future state to refresh
                     // to — the file is gone.
                     self.symbol_index.remove_file(&path);
+                    self.component_usage_index.remove_file(&path);
                     if self.class_hierarchy_index.contains_file(&path) {
                         self.class_hierarchy_index.remove_file(&path);
                         self.class_files_snapshot = None; // hierarchy changed
@@ -8759,6 +9171,13 @@ impl SalsaActor {
                     // hierarchy node, or cached parse can survive the rebuild.
                     self.pattern_cache.clear();
                     self.symbol_index.clear();
+                    // Re-queued rather than merely cleared: the view files
+                    // still exist, and an emptied index that nothing refills
+                    // would answer every ancestor walk with silence.
+                    self.component_usage_index.clear();
+                    for path in &self.view_files.clone() {
+                        self.component_usage_index.mark_dirty(path);
+                    }
                     self.class_hierarchy_index.clear();
                     self.loop_blocks_cache.clear();
                     self.php_assignments_cache.clear();
@@ -8812,6 +9231,15 @@ impl SalsaActor {
                 }
                 SalsaRequest::FindViewReferences { view_name, reply } => {
                     let result = self.handle_find_view_references(&view_name);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::FilesRenderingComponent {
+                    component_names,
+                    livewire_names,
+                    reply,
+                } => {
+                    let result =
+                        self.handle_files_rendering_component(&component_names, &livewire_names);
                     let _ = reply.send(result);
                 }
                 SalsaRequest::FindReferences {
@@ -9342,10 +9770,7 @@ impl SalsaActor {
     /// Handle file update - create or update the SourceFile
     fn handle_update_file(&mut self, path: PathBuf, version: i32, text: String) {
         // Invalidate caches for this file - will be recomputed on next request
-        self.pattern_cache.remove(&path);
-        self.loop_blocks_cache.pop(&path);
-        self.php_assignments_cache.pop(&path);
-        self.document_symbols_cache.pop(&path);
+        self.invalidate_file_caches(&path);
         // Mark for re-indexing on next find-references query. We don't
         // re-index eagerly here because (a) most file edits are
         // followed by more edits before any query runs, and (b) the
@@ -9353,6 +9778,19 @@ impl SalsaActor {
         // via get_patterns anyway. Lazy refresh amortizes both costs.
         self.symbol_index.mark_dirty(&path);
         self.class_hierarchy_index.mark_dirty(&path);
+        // A Blade edit can add or delete an `<x-…>` / `<livewire:…>` tag, so
+        // the reverse usage index has to re-read this file before its next
+        // answer (no-op for non-Blade paths).
+        self.component_usage_index.mark_dirty(&path);
+
+        self.bump_text_revision(&path);
+        // Hand ownership of this path's text to the pusher. Without it
+        // `ensure_external_php_source_loaded` sees no entry, decides a reload
+        // is due, and overwrites an unsaved buffer with the last-saved bytes
+        // the moment a Blade hover resolves its backing class. Same rule
+        // `did_change_watched_files` already applies from the other side: the
+        // buffer wins over disk.
+        self.mark_pushed_by_client(&path);
 
         if let Some(file) = self.files.get(&path) {
             // Update existing file
@@ -9365,15 +9803,56 @@ impl SalsaActor {
         }
     }
 
+    /// Stamp a new revision for `path`'s text and return it. Every write into
+    /// `self.files` calls this; see [`SalsaActor::text_revision`] for why the
+    /// caches cannot key on `SourceFile::version` instead.
+    fn bump_text_revision(&mut self, path: &Path) -> u64 {
+        self.text_revision = self.text_revision.wrapping_add(1);
+        self.file_text_revisions
+            .insert(path.to_path_buf(), self.text_revision);
+        self.text_revision
+    }
+
+    /// The revision of the text currently installed for `path`. Zero for a
+    /// file no bumping writer has touched.
+    fn text_revision_of(&self, path: &Path) -> u64 {
+        self.file_text_revisions.get(path).copied().unwrap_or(0)
+    }
+
+    /// Drop every per-file actor cache entry for `path`. Called by every
+    /// writer of `files[path]`'s text — `pattern_cache` in particular is
+    /// checked without any version comparison, so a stale entry there is
+    /// served forever rather than merely once.
+    fn invalidate_file_caches(&mut self, path: &Path) {
+        self.pattern_cache.remove(path);
+        self.loop_blocks_cache.pop(path);
+        self.php_assignments_cache.pop(path);
+        self.document_symbols_cache.pop(path);
+    }
+
+    /// Record that `path`'s Salsa text was installed by a client push, so the
+    /// backing-class loader never reads disk over it.
+    ///
+    /// Deliberately infallible. The predecessor stamped `path`'s disk mtime
+    /// and silently did nothing when `metadata()` failed — leaving a pushed
+    /// (possibly unsaved) buffer with no entry at all, which the loader reads
+    /// as "never loaded, read disk unconditionally": precisely the clobber the
+    /// stamp exists to prevent. Ownership is not a fact about the filesystem,
+    /// so it must not be recorded through a fallible filesystem call.
+    fn mark_pushed_by_client(&mut self, path: &Path) {
+        self.external_php_text
+            .insert(path.to_path_buf(), ExternalPhpText::PushedByClient);
+    }
+
     /// Handle a Blade loop-blocks query. Memoized via Salsa + actor LRU.
     fn handle_get_loop_blocks(
         &mut self,
         path: &PathBuf,
     ) -> Option<Arc<Vec<crate::blade_loops::BladeLoopBlock>>> {
         let file = self.files.get(path)?;
-        let version = file.version(&self.db);
+        let version = self.text_revision_of(path);
 
-        // Cache hit on matching version
+        // Cache hit on matching revision
         if let Some((cached_version, cached)) = self.loop_blocks_cache.get(path) {
             if *cached_version == version {
                 return Some(Arc::clone(cached));
@@ -9390,34 +9869,190 @@ impl SalsaActor {
 
     /// Handle resolving a `$this->X` member access in a Livewire component PHP file.
     /// Auto-registers the file in Salsa, invalidates on mtime change.
+    /// Replace the render-index snapshot, unless it is older than the one
+    /// already held.
+    ///
+    /// Every call bumps the Salsa revision, which invalidates the
+    /// backing-class memo — so the caller must not push a snapshot the actor
+    /// already holds. `Backend::pending_render_index_snapshot` is that gate,
+    /// and skipping there saves the round-trip as well as the write.
+    ///
+    /// **The generation check is what makes concurrent pushes safe.** Two
+    /// tasks can snapshot generations 5 and 6 and then reach this actor in
+    /// either order, because each awaits a channel round-trip in between. The
+    /// caller's own gate cannot fix that — it only advances a counter, while
+    /// the data that ends up installed is decided here. So ordering is the
+    /// actor's problem, and the actor solves it by refusing to go backwards:
+    /// the winner is always the newest generation, whatever order they arrive
+    /// in. `>=` rather than `>` because an equal generation carries identical
+    /// entries, and re-installing them would drop the memo for nothing.
+    fn handle_set_render_index(&mut self, generation: u64, entries: Vec<(String, PathBuf)>) {
+        if self.render_index.is_some() && generation <= self.render_index_generation {
+            return;
+        }
+        self.render_index_generation = generation;
+        self.render_index_version = self.render_index_version.wrapping_add(1);
+        match self.render_index {
+            Some(index) => {
+                index
+                    .set_version(&mut self.db)
+                    .to(self.render_index_version);
+                index.set_entries(&mut self.db).to(entries);
+            }
+            None => {
+                self.render_index = Some(RenderIndex::new(
+                    &self.db,
+                    self.render_index_version,
+                    entries,
+                ));
+            }
+        }
+    }
+
+    /// The render-index input, created empty on first use so a resolution that
+    /// runs before any snapshot arrives still answers (with no contributors)
+    /// instead of failing.
+    fn render_index_input(&mut self) -> RenderIndex {
+        match self.render_index {
+            Some(index) => index,
+            None => {
+                let index = RenderIndex::new(&self.db, self.render_index_version, Vec::new());
+                self.render_index = Some(index);
+                index
+            }
+        }
+    }
+
+    /// Resolve the PHP class(es) backing a Blade template (#339, item 7).
+    ///
+    /// The two memoized queries do the work; this handler only supplies their
+    /// inputs. That split is deliberate: registering a `SourceFile` reads the
+    /// filesystem, and a tracked query must stay pure.
+    fn handle_blade_backing_class_resolution(
+        &mut self,
+        blade_path: &PathBuf,
+        view_name: Option<String>,
+        livewire_paths: Vec<PathBuf>,
+        live_blade_text: Option<String>,
+    ) -> BladeBackingResolutionData {
+        let index = self.render_index_input();
+        let candidates = blade_backing_class_files(&self.db, index, view_name, livewire_paths);
+
+        // Existence filtering happens HERE, not in the query: a candidate that
+        // cannot be read as a Salsa input (absent file, or an MFC component
+        // directory) contributes nothing and is dropped, exactly as the old
+        // `is_file()` guard dropped it.
+        let inputs: Vec<SourceFile> = candidates
+            .iter()
+            .filter_map(|path| self.ensure_external_php_source_loaded(path))
+            .collect();
+        let files: Vec<PathBuf> = inputs
+            .iter()
+            .map(|file| file.path(&self.db).clone())
+            .collect();
+
+        let inline = self.ensure_blade_source_registered(blade_path, live_blade_text);
+        let sources = blade_backing_class_sources(&self.db, inputs, inline);
+        BladeBackingResolutionData { files, sources }
+    }
+
+    /// Register the Blade template itself as a Salsa input so the inline
+    /// SFC / Volt arm of [`blade_backing_class_sources`] reads it through the
+    /// same memoized path as the backing classes.
+    ///
+    /// `live_text` (the open editor buffer) wins over disk, because the
+    /// `did_change` → Salsa hop is debounced and an inline component's members
+    /// must resolve against what the user is typing right now, not what landed
+    /// 250 ms ago. The text is only written when it actually differs, so a
+    /// resolution on an unedited buffer leaves the memo intact.
+    fn ensure_blade_source_registered(
+        &mut self,
+        path: &PathBuf,
+        live_text: Option<String>,
+    ) -> Option<SourceFile> {
+        let Some(text) = live_text else {
+            return self.ensure_external_php_source_loaded(path);
+        };
+        match self.files.get(path).copied() {
+            Some(file) => {
+                if *file.text(&self.db) != text {
+                    self.bump_text_revision(path);
+                    // The live buffer supersedes disk for this file too, so
+                    // the loader must not read it back out from under us.
+                    self.mark_pushed_by_client(path);
+                    self.invalidate_file_caches(path);
+                    file.set_text(&mut self.db).to(text);
+                }
+                Some(file)
+            }
+            None => {
+                self.bump_text_revision(path);
+                self.mark_pushed_by_client(path);
+                let file = SourceFile::new(&self.db, path.clone(), 0, text);
+                self.files.insert(path.clone(), file);
+                Some(file)
+            }
+        }
+    }
+
     fn handle_resolve_livewire_member(&mut self, path: &PathBuf, member: &str) -> Option<String> {
-        let file = self.ensure_livewire_source_loaded(path)?;
+        let file = self.ensure_external_php_source_loaded(path)?;
         resolve_livewire_member_type(&self.db, file, member.to_string())
     }
 
-    /// Register an external component PHP file as a Salsa input, reloading from
-    /// disk whenever its mtime advances. Returns the cached `SourceFile` handle.
-    fn ensure_livewire_source_loaded(&mut self, path: &PathBuf) -> Option<SourceFile> {
+    /// Register an external PHP file as a Salsa input, reloading it from disk
+    /// whenever its mtime advances — but only while this loader owns the
+    /// path's text. A path a client pushed (see [`ExternalPhpText`]) is served
+    /// from Salsa untouched, so an unsaved buffer is never overwritten with
+    /// its last-saved bytes.
+    ///
+    /// Returns the cached `SourceFile` handle, or `None` when an unowned path
+    /// is unreadable — which is also how a non-existent path and a directory
+    /// (a Livewire v4 MFC's component dir) are dropped from backing-class
+    /// resolution.
+    fn ensure_external_php_source_loaded(&mut self, path: &PathBuf) -> Option<SourceFile> {
+        // Ownership is checked BEFORE the filesystem, so a client-pushed path
+        // is served from Salsa whether or not it can be stat'd at this instant.
+        // Ordering the stat first would drop an unsaved buffer out of
+        // backing-class resolution whenever its file is momentarily absent —
+        // a branch switch, a stash, an `artisan make:*` regeneration.
+        if self.external_php_text.get(path) == Some(&ExternalPhpText::PushedByClient) {
+            if let Some(file) = self.files.get(path).copied() {
+                return Some(file);
+            }
+            // Marked as pushed, yet the input is gone. Nothing is left to
+            // protect, so fall through and load from disk rather than answer
+            // `None`. `RemoveFile` clears both together, so this is a
+            // belt-and-braces arm, not a reachable steady state.
+        }
+
         let current_mtime = std::fs::metadata(path).ok()?.modified().ok()?;
 
-        let needs_reload = match self.livewire_mtimes.get(path) {
-            Some(prev_mtime) => *prev_mtime != current_mtime || !self.files.contains_key(path),
-            None => true,
+        let needs_reload = match self.external_php_text.get(path) {
+            Some(ExternalPhpText::LoadedFromDisk(prev_mtime)) => {
+                *prev_mtime != current_mtime || !self.files.contains_key(path)
+            }
+            // Either never loaded, or the pushed-but-vanished case above.
+            _ => true,
         };
 
         if needs_reload {
             let text = std::fs::read_to_string(path).ok()?;
-            self.livewire_version_counter = self.livewire_version_counter.wrapping_add(1);
-            let version = self.livewire_version_counter;
+            self.bump_text_revision(path);
+            // This write replaces the text every per-file cache was populated
+            // from. `pattern_cache` compares nothing on lookup — a hit is
+            // assumed current — so an entry left behind here would answer
+            // goto and completion out of the previous text indefinitely.
+            self.invalidate_file_caches(path);
 
             if let Some(existing) = self.files.get(path) {
-                existing.set_version(&mut self.db).to(version);
                 existing.set_text(&mut self.db).to(text);
             } else {
-                let file = SourceFile::new(&self.db, path.clone(), version, text);
+                let file = SourceFile::new(&self.db, path.clone(), 0, text);
                 self.files.insert(path.clone(), file);
             }
-            self.livewire_mtimes.insert(path.clone(), current_mtime);
+            self.external_php_text
+                .insert(path.clone(), ExternalPhpText::LoadedFromDisk(current_mtime));
         }
 
         self.files.get(path).copied()
@@ -9426,7 +10061,7 @@ impl SalsaActor {
     /// Handle a Blade @php-assignments query. Memoized via Salsa + actor LRU.
     fn handle_get_php_assignments(&mut self, path: &PathBuf) -> Option<Arc<Vec<(String, String)>>> {
         let file = self.files.get(path)?;
-        let version = file.version(&self.db);
+        let version = self.text_revision_of(path);
 
         if let Some((cached_version, cached)) = self.php_assignments_cache.get(path) {
             if *cached_version == version {
@@ -9447,7 +10082,7 @@ impl SalsaActor {
         path: &PathBuf,
     ) -> Option<Arc<Vec<crate::document_symbols::SymbolEntry>>> {
         let file = self.files.get(path)?;
-        let version = file.version(&self.db);
+        let version = self.text_revision_of(path);
 
         if let Some((cached_version, cached)) = self.document_symbols_cache.get(path) {
             if *cached_version == version {
@@ -10366,11 +11001,15 @@ impl SalsaActor {
         match op {
             FileListOp::Add => {
                 if !list.contains(&path) {
-                    list.push(path);
+                    list.push(path.clone());
                 }
+                // Invariant 3 of `component_usage_index`: every `view_files`
+                // mutation queues or drops the path, or the walk cannot see it.
+                self.component_usage_index.mark_dirty(&path);
             }
             FileListOp::Remove => {
                 list.retain(|p| p != &path);
+                self.component_usage_index.remove_file(&path);
             }
         }
         Some(category.label())
@@ -10393,6 +11032,8 @@ impl SalsaActor {
         // Clear existing file lists
         self.controller_files.clear();
         self.view_files.clear();
+        // Rebuilt below as the walk re-discovers each view file.
+        self.component_usage_index.clear();
         self.livewire_files.clear();
         self.route_files.clear();
         self.vendor_files.clear();
@@ -10454,6 +11095,7 @@ impl SalsaActor {
                         if let Some(file_name) = entry.path().file_name() {
                             if file_name.to_string_lossy().ends_with(".blade.php") {
                                 let path = entry.path().to_path_buf();
+                                self.component_usage_index.mark_dirty(&path);
                                 self.view_files.push(path);
                                 // Salsa input deferred to first cache miss.
                             }
@@ -10630,6 +11272,57 @@ impl SalsaActor {
             if let Ok(text) = std::fs::read_to_string(path) {
                 let file = SourceFile::new(&self.db, path.clone(), 0, text);
                 entry.insert(file);
+            }
+        }
+    }
+
+    /// The Blade templates that render any of `component_names` (`<x-…>`) or
+    /// `livewire_names` (`<livewire:…>`) — one step UP the usage graph, for the
+    /// item-1 walk from an anonymous partial to the Livewire component that
+    /// rendered it (#339).
+    ///
+    /// Both tag families are read, from the per-file `ParsedPatternsData` the
+    /// parse pass already produced: `<x-save-button>` lands in `components` and
+    /// `<livewire:save-button>` in `livewire_refs`, and a partial is reachable
+    /// through either. Matching is on the parser-classified NAME, never on raw
+    /// text, exactly as [`Self::handle_find_view_references`] matches its
+    /// directives.
+    ///
+    /// Only `.blade.php` files are returned. A plain `.php` parent (a class
+    /// rendering a tag from a heredoc) is not a rendering ancestor for this
+    /// purpose: the `$this` inside the partial belongs to the component whose
+    /// TEMPLATE contains the tag, and that template is what the walk needs.
+    ///
+    /// Sorted and deduped, because the walk takes the first match and an
+    /// unsorted result would flap between two parents that both qualify.
+    fn handle_files_rendering_component(
+        &mut self,
+        component_names: &[String],
+        livewire_names: &[String],
+    ) -> Vec<PathBuf> {
+        if component_names.is_empty() && livewire_names.is_empty() {
+            return Vec::new();
+        }
+        self.refresh_component_usage_index();
+        self.component_usage_index
+            .find(component_names, livewire_names)
+    }
+
+    /// Fold every queued Blade file into the reverse component-usage index.
+    ///
+    /// Empty on the hot path, which is the entire point: only project
+    /// registration, an edit, or a watcher event queues anything, so an
+    /// ancestor walk visiting a hundred nodes drains once and then answers
+    /// each of the hundred lookups out of a `HashMap`. The drain itself reads
+    /// through `handle_get_patterns`, so a warmed file costs a cache hit
+    /// rather than a parse.
+    fn refresh_component_usage_index(&mut self) {
+        for path in self.component_usage_index.take_pending() {
+            match self.handle_get_patterns(&path) {
+                Some(patterns) => self.component_usage_index.insert_file(&path, &patterns),
+                // Unreadable now — drop whatever it contributed before rather
+                // than serving entries for a file we can no longer confirm.
+                None => self.component_usage_index.remove_file(&path),
             }
         }
     }

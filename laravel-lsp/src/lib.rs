@@ -61,6 +61,7 @@ pub mod completion_format;
 pub mod component_completion;
 pub mod component_declaration_locator;
 pub mod component_member_locator;
+pub mod component_usage_index;
 pub mod composer_autoload;
 pub mod config;
 pub mod config_key_locator;
@@ -146,6 +147,7 @@ pub mod member_resolver;
 
 // Controller/Volt → Blade view-variable type inference (magic members in Blade)
 pub mod view_var_index;
+pub mod volt_functional;
 
 // M1 single-parse capture: compile a file's own-source resolution context at
 // parse so the magic-member resolve passes never re-read/re-parse it.

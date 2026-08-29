@@ -452,6 +452,20 @@ pub fn read_line_from_file(path: &std::path::Path, line: u32) -> Option<String> 
 /// header — gives the reader a fully-resolved type they don't see at the
 /// cursor (`<livewire:counter>` → `App\Livewire\Counter`).
 pub fn extract_class_fqn(path: &std::path::Path) -> Option<String> {
+    extract_class_fqn_from_source(&std::fs::read_to_string(path).ok()?)
+}
+
+/// [`extract_class_fqn`] over source text already in hand.
+///
+/// The disk-reading form disagrees with any caller holding the LIVE editor
+/// buffer: an unsaved rename shows the old class name until the file is
+/// saved. Callers that already have the source pass it here instead.
+///
+/// Returns `None` for a file that declares no NAMED class — an anonymous
+/// `new class extends Component` (a Livewire SFC or class-based Volt front
+/// matter) or a functional Volt file. The regex requires `class` at the start
+/// of a line, which `new class extends …` never satisfies.
+pub fn extract_class_fqn_from_source(content: &str) -> Option<String> {
     use lazy_static::lazy_static;
     use regex::Regex;
     lazy_static! {
@@ -462,14 +476,13 @@ pub fn extract_class_fqn(path: &std::path::Path) -> Option<String> {
         )
         .unwrap();
     }
-    let content = std::fs::read_to_string(path).ok()?;
     let class_name = CLASS_NAME_RE
-        .captures(&content)?
+        .captures(content)?
         .get(1)?
         .as_str()
         .to_string();
     let namespace = NS_RE
-        .captures(&content)
+        .captures(content)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str());
     Some(match namespace {
