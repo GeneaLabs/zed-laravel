@@ -226,9 +226,7 @@ fn owning_declaration<'tree>(root: Node<'tree>) -> Node<'tree> {
             // `new class extends Component { … }` — the front-matter shape
             // of a Livewire SFC and a class-based Volt component.
             "anonymous_class" => Some((true, n)),
-            "trait_declaration" | "enum_declaration" | "interface_declaration" => {
-                Some((false, n))
-            }
+            "trait_declaration" | "enum_declaration" | "interface_declaration" => Some((false, n)),
             _ => None,
         };
         if let Some((is_class, node)) = candidate {

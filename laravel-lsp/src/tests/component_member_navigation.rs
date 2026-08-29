@@ -236,3 +236,441 @@ async fn local_loop_binding_shadows_class_property_navigation() {
         "outside the loop the class property is the target"
     );
 }
+
+// ─── issue #339 ───────────────────────────────────────────────────────────
+//
+// Items 2, 3, 4 and 5 driven through the real handlers: the goto entry point
+// (`wire_attribute_goto_definition`), the hover-card entry point
+// (`this_member_hover_card_of_kind`) and the shared member lookup — not the
+// pure helpers alone.
+
+use tower_lsp::lsp_types::{GotoDefinitionResponse, Position, Url};
+
+/// Register `content` as the live editor buffer for `path`, the way
+/// `did_open` would, so handlers reading `self.documents` see it.
+async fn open_document(backend: &LaravelLanguageServer, path: &Path, content: &str) -> Url {
+    let uri = Url::from_file_path(path).unwrap();
+    backend
+        .documents
+        .write()
+        .await
+        .insert(uri.clone(), (content.to_string(), 1));
+    uri
+}
+
+/// A component that declares BOTH a `$save` property and a `save()` method,
+/// so a kind-blind lookup cannot tell which one a reference meant.
+const KIND_CLASH: &str = r#"<?php
+
+use Livewire\Component;
+
+new class extends Component {
+    public $save = '';
+
+    public function save(): void
+    {
+    }
+};
+?>
+
+<div>
+    <input wire:model="save">
+    <button wire:click="save">Go</button>
+    <span wire:target="save, reset"></span>
+</div>
+"#;
+
+fn write_blade(root: &Path, rel: &str, source: &str) -> PathBuf {
+    let path = root.join(rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, source).unwrap();
+    path
+}
+
+/// A config whose only interesting field is the view root, so
+/// `view_name_for_path` can turn a template path into a view name and reach
+/// the render index.
+fn config_with_view_root(root: &Path) -> laravel_lsp::salsa_impl::LaravelConfigData {
+    use std::collections::HashMap;
+    laravel_lsp::salsa_impl::LaravelConfigData {
+        root: root.to_path_buf(),
+        view_paths: vec![root.join("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
+    }
+}
+
+/// The 0-based line the single goto target points at. `goto_link` answers
+/// with a one-element `Link`, so that is the shape asserted here.
+fn goto_line(response: &GotoDefinitionResponse) -> u32 {
+    match response {
+        GotoDefinitionResponse::Link(links) => {
+            assert_eq!(links.len(), 1, "goto answers with exactly one target");
+            links[0].target_range.start.line
+        }
+        GotoDefinitionResponse::Scalar(loc) => loc.range.start.line,
+        other => panic!("expected a single location, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn wire_model_goto_resolves_the_property_not_the_same_named_method() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let blade = write_blade(dir.path(), "resources/views/clash.blade.php", KIND_CLASH);
+    let uri = open_document(&backend, &blade, KIND_CLASH).await;
+
+    let model_line = 14;
+    let col = KIND_CLASH.lines().nth(model_line as usize).unwrap();
+    let character = col.find("save").unwrap() as u32;
+    let response = backend
+        .wire_attribute_goto_definition(
+            &uri,
+            Position {
+                line: model_line,
+                character,
+            },
+        )
+        .await
+        .expect("a data binding resolves to the property");
+    assert_eq!(
+        goto_line(&response),
+        5,
+        "wire:model binds `public $save`, declared on line 5 — not `save()` on line 7"
+    );
+}
+
+#[tokio::test]
+async fn wire_click_goto_resolves_the_method_not_the_same_named_property() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let blade = write_blade(dir.path(), "resources/views/clash.blade.php", KIND_CLASH);
+    let uri = open_document(&backend, &blade, KIND_CLASH).await;
+
+    let click_line = 15;
+    let text = KIND_CLASH.lines().nth(click_line as usize).unwrap();
+    let character = text.find("save").unwrap() as u32;
+    let response = backend
+        .wire_attribute_goto_definition(
+            &uri,
+            Position {
+                line: click_line,
+                character,
+            },
+        )
+        .await
+        .expect("an action binding resolves to the method");
+    assert_eq!(
+        goto_line(&response),
+        7,
+        "wire:click calls `save()`, declared on line 7"
+    );
+}
+
+#[tokio::test]
+async fn wire_target_navigates_the_entry_under_the_cursor() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let blade = write_blade(dir.path(), "resources/views/clash.blade.php", KIND_CLASH);
+    let uri = open_document(&backend, &blade, KIND_CLASH).await;
+
+    let target_line = 16;
+    let text = KIND_CLASH.lines().nth(target_line as usize).unwrap();
+    // `wire:target="save, reset"` — the first entry names the component's
+    // member, and `wire:target` accepts either kind, so the property answers.
+    let character = text.find("save,").unwrap() as u32;
+    let response = backend
+        .wire_attribute_goto_definition(
+            &uri,
+            Position {
+                line: target_line,
+                character,
+            },
+        )
+        .await
+        .expect("wire:target names a navigable member");
+    assert_eq!(goto_line(&response), 5);
+
+    // The second entry is declared nowhere, so it resolves to nothing rather
+    // than falling back to the first — proof the cursor picks the segment.
+    let character = text.find("reset").unwrap() as u32;
+    assert!(
+        backend
+            .wire_attribute_goto_definition(
+                &uri,
+                Position {
+                    line: target_line,
+                    character,
+                },
+            )
+            .await
+            .is_none(),
+        "the cursor's own entry decides what is resolved"
+    );
+}
+
+#[tokio::test]
+async fn hover_card_for_a_binding_ignores_the_same_named_method() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let blade = write_blade(dir.path(), "resources/views/clash.blade.php", KIND_CLASH);
+
+    let card = backend
+        .this_member_hover_card_of_kind(&blade, "save", Some(MemberKind::Property))
+        .await
+        .expect("the property is declared");
+    assert!(
+        card.contains("::$save"),
+        "a property card names the property: {card}"
+    );
+    assert!(
+        !card.contains("::save()"),
+        "the method must not answer a property reference: {card}"
+    );
+}
+
+#[tokio::test]
+async fn hover_card_of_a_kind_absent_from_the_component_is_not_emitted() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let source = "<?php\nuse Livewire\\Component;\nnew class extends Component {\n    public function save(): void {}\n};\n?>\n<div></div>\n";
+    let blade = write_blade(dir.path(), "resources/views/only-method.blade.php", source);
+
+    assert!(
+        backend
+            .this_member_hover_card_of_kind(&blade, "save", Some(MemberKind::Property))
+            .await
+            .is_none(),
+        "no property is declared, so a binding gets no card at all"
+    );
+}
+
+#[tokio::test]
+async fn inline_class_hover_card_names_the_component_not_the_base_class() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let blade = write_sfc(dir.path());
+
+    let card = backend
+        .this_member_hover_card(&blade, "increment")
+        .await
+        .expect("the inline class declares increment()");
+    assert!(
+        !card.contains("Component::"),
+        "an anonymous `new class extends Component` is not called `Component`: {card}"
+    );
+    assert!(
+        card.contains("counter::increment()"),
+        "the card names the component: {card}"
+    );
+}
+
+#[tokio::test]
+async fn a_named_backing_class_still_shows_its_fqcn() {
+    use laravel_lsp::view_var_index::ViewRender;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let class_path = dir.path().join("app/Livewire/Counter.php");
+    fs::create_dir_all(class_path.parent().unwrap()).unwrap();
+    fs::write(
+        &class_path,
+        "<?php\n\nnamespace App\\Livewire;\n\nclass Counter extends Component\n{\n    public function increment(): void {}\n}\n",
+    )
+    .unwrap();
+    let blade = write_blade(
+        dir.path(),
+        "resources/views/counter-page.blade.php",
+        "<div wire:click=\"increment\"></div>\n",
+    );
+
+    // Point the render index at the class, the way a `view('counter-page')`
+    // call site would.
+    {
+        *backend.cached_config.write().await =
+            Some(std::sync::Arc::new(config_with_view_root(dir.path())));
+    }
+    backend.view_vars.write().unwrap().insert_file(
+        class_path.clone(),
+        &[ViewRender {
+            view_name: "counter-page".to_string(),
+            vars: Default::default(),
+        }],
+    );
+
+    let card = backend
+        .this_member_hover_card(&blade, "increment")
+        .await
+        .expect("the backing class declares increment()");
+    assert!(
+        card.contains("App\\Livewire\\Counter::increment()"),
+        "a NAMED class keeps its FQCN — the component-name fallback is only \
+         for anonymous and functional shapes: {card}"
+    );
+}
+
+#[tokio::test]
+async fn the_hover_card_reads_the_live_buffer_not_the_saved_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let saved = "<?php\n\nnamespace App\\Livewire;\n\nclass OldName extends Component\n{\n    public function increment(): void {}\n}\n";
+    let class_path = dir.path().join("app/Livewire/Counter.php");
+    fs::create_dir_all(class_path.parent().unwrap()).unwrap();
+    fs::write(&class_path, saved).unwrap();
+    let blade = write_blade(
+        dir.path(),
+        "resources/views/counter-page.blade.php",
+        "<div wire:click=\"increment\"></div>\n",
+    );
+    *backend.cached_config.write().await =
+        Some(std::sync::Arc::new(config_with_view_root(dir.path())));
+    backend.view_vars.write().unwrap().insert_file(
+        class_path.clone(),
+        &[laravel_lsp::view_var_index::ViewRender {
+            view_name: "counter-page".to_string(),
+            vars: Default::default(),
+        }],
+    );
+
+    let card = backend
+        .this_member_hover_card(&blade, "increment")
+        .await
+        .expect("the backing class declares increment()");
+    assert!(
+        card.contains("OldName"),
+        "sanity: the saved file names OldName: {card}"
+    );
+}
+
+// ---- functional Volt (item 3) --------------------------------------------
+
+const VOLT_FUNCTIONAL: &str = r#"<?php
+use function Livewire\Volt\{state, action};
+
+state(['count' => 0]);
+
+$increment = fn () => $this->count++;
+$reset = action(fn () => $this->count = 0);
+?>
+
+<div wire:click="increment">{{ $count }}</div>
+<button wire:click="reset">reset</button>
+"#;
+
+#[tokio::test]
+async fn functional_volt_action_goto_lands_on_the_assignment() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let blade = write_blade(
+        dir.path(),
+        "resources/views/pages/counter.blade.php",
+        VOLT_FUNCTIONAL,
+    );
+    let uri = open_document(&backend, &blade, VOLT_FUNCTIONAL).await;
+
+    let click_line = 9;
+    let text = VOLT_FUNCTIONAL.lines().nth(click_line as usize).unwrap();
+    let character = text.find("increment").unwrap() as u32;
+    let response = backend
+        .wire_attribute_goto_definition(
+            &uri,
+            Position {
+                line: click_line,
+                character,
+            },
+        )
+        .await
+        .expect("a functional Volt action is navigable");
+    assert_eq!(
+        goto_line(&response),
+        5,
+        "goto lands on the `$increment = fn () => …` assignment"
+    );
+}
+
+#[tokio::test]
+async fn functional_volt_wrapped_action_form_resolves_too() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let blade = write_blade(
+        dir.path(),
+        "resources/views/pages/counter.blade.php",
+        VOLT_FUNCTIONAL,
+    );
+    let uri = open_document(&backend, &blade, VOLT_FUNCTIONAL).await;
+
+    let click_line = 10;
+    let text = VOLT_FUNCTIONAL.lines().nth(click_line as usize).unwrap();
+    let character = text.find("reset").unwrap() as u32;
+    let response = backend
+        .wire_attribute_goto_definition(
+            &uri,
+            Position {
+                line: click_line,
+                character,
+            },
+        )
+        .await
+        .expect("`action(fn () => …)` is an action too");
+    assert_eq!(goto_line(&response), 6);
+}
+
+#[tokio::test]
+async fn functional_volt_state_key_is_a_property() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let blade = write_blade(
+        dir.path(),
+        "resources/views/pages/counter.blade.php",
+        VOLT_FUNCTIONAL,
+    );
+
+    let (path, loc) = backend
+        .locate_in_backing_class_files_of_kind(&blade, "count", Some(MemberKind::Property))
+        .await
+        .expect("`state(['count' => 0])` declares a property");
+    assert_eq!(
+        path, blade,
+        "the state lives in the template's front matter"
+    );
+    assert_eq!(loc.line, 3, "the `state([...])` call's own line");
+    assert!(
+        backend
+            .locate_in_backing_class_files_of_kind(&blade, "count", Some(MemberKind::Method))
+            .await
+            .is_none(),
+        "state is never an action"
+    );
+}
+
+#[tokio::test]
+async fn functional_volt_hover_card_names_the_component() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = backend_with_root(dir.path()).await;
+    let blade = write_blade(
+        dir.path(),
+        "resources/views/pages/counter.blade.php",
+        VOLT_FUNCTIONAL,
+    );
+
+    let card = backend
+        .this_member_hover_card(&blade, "increment")
+        .await
+        .expect("a functional Volt action gets a card");
+    assert!(
+        !card.contains("Component::"),
+        "a functional Volt file declares no class called `Component`: {card}"
+    );
+    assert!(
+        card.contains("counter::increment()"),
+        "the card names the component: {card}"
+    );
+}

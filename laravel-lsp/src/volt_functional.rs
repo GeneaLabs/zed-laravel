@@ -200,11 +200,12 @@ fn collect_closure_member(assign: Node, bytes: &[u8], out: &mut Vec<(String, Mem
         "arrow_function" | "anonymous_function" | "anonymous_function_creation_expression" => {
             MemberKind::Method
         }
-        "function_call_expression" => match call_name(right, bytes).as_deref().and_then(wrapper_kind)
-        {
-            Some(k) => k,
-            None => return,
-        },
+        "function_call_expression" => {
+            match call_name(right, bytes).as_deref().and_then(wrapper_kind) {
+                Some(k) => k,
+                None => return,
+            }
+        }
         _ => return,
     };
     let Ok(text) = left.utf8_text(bytes) else {

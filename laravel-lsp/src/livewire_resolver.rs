@@ -1184,11 +1184,7 @@ fn entry_key_name(entry: &str) -> Option<String> {
     let first = inner_chars.next()?;
     (first.is_ascii_alphabetic() || first == '_')
         .then(|| inner.to_string())
-        .filter(|_| {
-            inner
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
+        .filter(|_| inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 /// The byte offset of a top-level `=>` in `entry`, skipping quoted runs and

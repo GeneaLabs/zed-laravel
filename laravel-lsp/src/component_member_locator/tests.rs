@@ -270,7 +270,10 @@ fn a_deeply_nested_earlier_candidate_beats_a_shallow_later_one() {
     // trait's.
     let source = "<?php\ntrait T {\n    public $dup = 1;\n}\nclass C { public $dup = 2; }\n";
     let loc = locate_member(source, "dup").expect("both declare $dup");
-    assert_eq!(loc.line, 2, "the trait's declaration is earlier in the file");
+    assert_eq!(
+        loc.line, 2,
+        "the trait's declaration is earlier in the file"
+    );
 }
 
 #[test]

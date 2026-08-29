@@ -11575,12 +11575,17 @@ impl LaravelLanguageServer {
             line_text,
             position.character,
         )?;
-        let member = match &target {
-            WireTarget::Method(m) => m,
-            WireTarget::Property(p) => p,
+        use laravel_lsp::component_member_locator::MemberKind;
+        // The attribute decides which declaration kind may answer. A
+        // `wire:target` names either an action or a `wire:model` property, so
+        // it alone accepts both (#339, items 4 and 5).
+        let (member, want) = match &target {
+            WireTarget::Method(m) => (m, Some(MemberKind::Method)),
+            WireTarget::Property(p) => (p, Some(MemberKind::Property)),
+            WireTarget::Member(m) => (m, None),
         };
         let (class_path, loc) = self
-            .locate_in_backing_class_files(&file_path, member)
+            .locate_in_backing_class_files_of_kind(&file_path, member, want)
             .await?;
         Self::goto_link(&class_path, loc.line, loc.start_column, loc.end_column)
     }
@@ -13150,7 +13155,15 @@ impl LaravelLanguageServer {
             None => std::fs::read_to_string(blade_path).ok(),
         };
         if let Some(content) = blade_content {
-            if laravel_lsp::php_class::detect_inline_livewire_class(&content) {
+            // A FUNCTIONAL Volt file declares no class at all, so
+            // `detect_inline_livewire_class` is false for it — but its
+            // `state([...])` keys and top-level closure assignments ARE the
+            // component's members, and `component_member_locator` reads them.
+            // Both inline shapes therefore hand the template itself to the
+            // locator (#339, item 3).
+            if laravel_lsp::php_class::detect_inline_livewire_class(&content)
+                || laravel_lsp::livewire_resolver::source_contains_volt_signature(&content)
+            {
                 out.push((blade_path.to_path_buf(), content));
             }
         }
@@ -13165,8 +13178,27 @@ impl LaravelLanguageServer {
         PathBuf,
         laravel_lsp::component_member_locator::MemberLocation,
     )> {
+        self.locate_in_backing_class_files_of_kind(blade_path, member, None)
+            .await
+    }
+
+    /// [`Self::locate_in_backing_class_files`], restricted to the declaration
+    /// kind the REFERENCE demands (#339, item 5). `wire:model="save"` binds a
+    /// property, so passing `Some(MemberKind::Property)` keeps it off a
+    /// same-named `save()` method. `None` accepts either kind, for references
+    /// that carry none of their own.
+    async fn locate_in_backing_class_files_of_kind(
+        &self,
+        blade_path: &Path,
+        member: &str,
+        want: Option<laravel_lsp::component_member_locator::MemberKind>,
+    ) -> Option<(
+        PathBuf,
+        laravel_lsp::component_member_locator::MemberLocation,
+    )> {
         for (class_path, source) in self.blade_backing_class_sources(blade_path).await {
-            if let Some(loc) = laravel_lsp::component_member_locator::locate_member(&source, member)
+            if let Some(loc) =
+                laravel_lsp::component_member_locator::locate_member_of_kind(&source, member, want)
             {
                 return Some((class_path, loc));
             }
@@ -20231,6 +20263,33 @@ return [
         Self::goto_link(&decl_file, line, start, end)
     }
 
+    /// The name to head a hover card with when the source declares no NAMED
+    /// class — an inline `new class extends Component` (Livewire SFC or
+    /// class-based Volt) or a functional Volt file. The resolved Livewire
+    /// component name when the file is one, else the template's own stem.
+    ///
+    /// Never the literal `"Component"`: that string is the name of the base
+    /// class the anonymous class extends, not of the component, and printing
+    /// it made every SFC card read `Component::increment()` (#339, item 2).
+    async fn component_display_name(&self, path: &Path) -> String {
+        if let Some((lw_config, lw_version)) = self.get_cached_livewire().await {
+            if let Some(name) =
+                laravel_lsp::livewire_resolver::livewire_name_for_path(path, &lw_config, lw_version)
+            {
+                return name;
+            }
+        }
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| {
+                n.strip_suffix(".blade.php")
+                    .or_else(|| n.strip_suffix(".php"))
+                    .unwrap_or(n)
+                    .to_string()
+            })
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
     /// Hover card for `$this->member` in a Blade template whose backing
     /// class is known (a Filament `$view`-property page, a Livewire
     /// component, an inline SFC/Volt class): header `ClassName::member()` /
@@ -20242,16 +20301,36 @@ return [
     /// PHP-tooling card to defer to. `None` when no backing class declares
     /// `member`.
     async fn this_member_hover_card(&self, blade_path: &Path, member: &str) -> Option<String> {
+        self.this_member_hover_card_of_kind(blade_path, member, None)
+            .await
+    }
+
+    /// [`Self::this_member_hover_card`], restricted to the declaration kind
+    /// the reference demands — the hover half of the same kind filter goto
+    /// applies (#339, item 5), so `wire:model="save"` shows no card for a
+    /// `save()` method.
+    async fn this_member_hover_card_of_kind(
+        &self,
+        blade_path: &Path,
+        member: &str,
+        want: Option<laravel_lsp::component_member_locator::MemberKind>,
+    ) -> Option<String> {
         use laravel_lsp::component_member_locator::MemberKind;
         use laravel_lsp::hover;
 
         let sources = self.blade_backing_class_sources(blade_path).await;
         let (class_path, source, loc) = sources.iter().find_map(|(path, source)| {
-            laravel_lsp::component_member_locator::locate_member(source, member)
+            laravel_lsp::component_member_locator::locate_member_of_kind(source, member, want)
                 .map(|loc| (path, source, loc))
         })?;
-        let class_name = laravel_lsp::php_class::extract_class_fqn(class_path)
-            .unwrap_or_else(|| "Component".to_string());
+        // Read the FQCN out of the source already in hand, not off disk: for
+        // the blade file itself that source is the live editor buffer, and a
+        // disk read would show a stale class name for an unsaved edit
+        // (#339, item 2).
+        let class_name = match laravel_lsp::php_class::extract_class_fqn_from_source(source) {
+            Some(fqn) => fqn,
+            None => self.component_display_name(class_path).await,
+        };
         let header = match loc.kind {
             MemberKind::Method => format!("{class_name}::{member}()"),
             MemberKind::Property => format!("{class_name}::${member}"),
@@ -26008,43 +26087,50 @@ impl LanguageServer for LaravelLanguageServer {
                         let mut seen_members = std::collections::HashSet::new();
                         for (_, class_source) in self.blade_backing_class_sources(&blade_path).await
                         {
-                            match wire_kind {
-                                laravel_lsp::livewire_resolver::WireValueKind::Property => {
-                                    for (name, php_type) in
-                                        laravel_lsp::component_member_locator::public_property_types(
-                                            &class_source,
-                                        )
+                            use laravel_lsp::livewire_resolver::WireValueKind;
+                            // `wire:target` names an action OR a property, so
+                            // it offers both surfaces (#339, items 4 and 5).
+                            let wants_properties = matches!(
+                                wire_kind,
+                                WireValueKind::Property | WireValueKind::Member
+                            );
+                            let wants_methods =
+                                matches!(wire_kind, WireValueKind::Method | WireValueKind::Member);
+                            if wants_properties {
+                                for (name, php_type) in
+                                    laravel_lsp::component_member_locator::public_property_types(
+                                        &class_source,
+                                    )
+                                {
+                                    if name.starts_with(&typed_prefix)
+                                        && seen_members.insert(name.clone())
                                     {
-                                        if name.starts_with(&typed_prefix)
-                                            && seen_members.insert(name.clone())
-                                        {
-                                            items.push(CompletionItem {
-                                                label: name,
-                                                kind: Some(CompletionItemKind::FIELD),
-                                                detail: Some(php_type),
-                                                ..Default::default()
-                                            });
-                                        }
+                                        items.push(CompletionItem {
+                                            label: name,
+                                            kind: Some(CompletionItemKind::FIELD),
+                                            detail: Some(php_type),
+                                            ..Default::default()
+                                        });
                                     }
                                 }
-                                laravel_lsp::livewire_resolver::WireValueKind::Method => {
-                                    for name in
-                                        laravel_lsp::component_member_locator::public_action_method_names(
-                                            &class_source,
-                                        )
+                            }
+                            if wants_methods {
+                                for name in
+                                    laravel_lsp::component_member_locator::public_action_method_names(
+                                        &class_source,
+                                    )
+                                {
+                                    if name.starts_with(&typed_prefix)
+                                        && seen_members.insert(name.clone())
                                     {
-                                        if name.starts_with(&typed_prefix)
-                                            && seen_members.insert(name.clone())
-                                        {
-                                            items.push(CompletionItem {
-                                                label: name,
+                                        items.push(CompletionItem {
+                                            label: name,
                                                 kind: Some(CompletionItemKind::METHOD),
-                                                detail: Some("Livewire action".to_string()),
-                                                ..Default::default()
-                                            });
-                                        }
-                                    }
+                                            detail: Some("Livewire action".to_string()),
+                                        ..Default::default()
+                                    });
                                 }
+                            }
                             }
                         }
                         if !items.is_empty() {
