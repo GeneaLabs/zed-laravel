@@ -346,13 +346,6 @@ fn an_unencoded_at_in_the_password_does_not_end_the_credentials_early() {
         // The no-username Redis form, which starts its credentials with the
         // `:` the mask keys on.
         ("redis://:p@ss@redis:6379", "redis://:***@redis:6379"),
-        // The libpq socket URL `build_postgres_candidates` generates: the
-        // authority ends immediately after the `@`, and the socket path lives
-        // in the query string.
-        (
-            "postgres://user:p@ss@/laravel?host=/var/run/postgresql",
-            "postgres://user:***@/laravel?host=/var/run/postgresql",
-        ),
         // An `@` in the query must not be mistaken for the separator and drag
         // the real credentials into the "host" half.
         (
@@ -379,7 +372,20 @@ fn an_unencoded_at_in_the_password_does_not_end_the_credentials_early() {
         // The two ordinary shapes, which were already correct and stay so.
         ("mysql://user:pass@host/db", "mysql://user:***@host/db"),
         ("redis://:pass@host:6379", "redis://:***@host:6379"),
+        // Multibyte user *and* password. Every offset this function splices at
+        // comes from an ASCII `find`/`rfind`, so a slice boundary can never
+        // land inside a codepoint — asserted rather than argued.
+        (
+            "postgres://usér:p@sswörd@host/db",
+            "postgres://usér:***@host/db",
+        ),
     ] {
+        assert!(
+            matches!(url::Url::parse(value), Ok(parsed) if parsed.password().is_some()),
+            "{value:?} belongs to this test only while the parser accepts it and \
+             reports a password — if that stops being true it has moved to the \
+             fallback arm, and this test is no longer covering what it says"
+        );
         assert_eq!(
             mask_url_credentials(value),
             expected,
@@ -389,10 +395,12 @@ fn an_unencoded_at_in_the_password_does_not_end_the_credentials_early() {
 }
 
 /// Fail-open, and borrowed while it is at it: a value carrying no credential to
-/// hide is returned untouched rather than blanked. Two populations land here —
-/// values with no `://` at all, which never reach the parser, and values the
-/// parser accepts while reporting no password. (A value the parser *rejects* is
-/// a third case entirely, and it gets masked; see
+/// hide is returned untouched rather than blanked. Two populations are pinned
+/// here — values with no `://` at all, which never reach the parser, and values
+/// the parser accepts while reporting no password. (A value the parser
+/// *rejects* is a third case: it goes to the fallback scan, which masks it when
+/// it finds an `@` with a `:` before it, and otherwise returns it borrowed like
+/// everything here. `mysql://host:70000/db` takes that second route. See
 /// `a_value_the_url_parser_rejects_is_still_masked_by_the_fallback_scan`.)
 ///
 /// `Cow::Borrowed` is asserted rather than just string equality because it is
@@ -421,6 +429,15 @@ fn a_value_carrying_no_credential_is_returned_untouched() {
         // A path `@` with no port colon anywhere to hint at credentials — the
         // only `@` in the value follows the first `/`.
         "https://host/path@literal",
+        // Userinfo carrying a `:` with nothing after it. `url` reports this
+        // exactly as it reports no password at all, so it takes the same arm.
+        // No secret is disclosed, but `main`'s scan did rewrite it to
+        // `mysql://user:***@host/db` — pinned because the doc comment on
+        // `mask_url_credentials` now names it.
+        "mysql://user:@host/db",
+        // A parser rejection that carries no `@` for the fallback to find, so
+        // it lands here rather than being masked.
+        "mysql://host:70000/db",
     ] {
         assert!(
             matches!(mask_url_credentials(value), std::borrow::Cow::Borrowed(v) if v == value),
@@ -481,8 +498,8 @@ fn a_value_the_url_parser_rejects_is_still_masked_by_the_fallback_scan() {
     }
 }
 
-/// The premise the fallback rests on: the shapes a greedy scan mangles never
-/// reach it.
+/// What keeps the shapes a greedy scan mangles away from the fallback: a
+/// successful parse, and nothing else.
 ///
 /// `mysql://host:3306/db@x` is host, port and a path holding an `@`. The
 /// fallback would read the `@` as a credential separator and print
@@ -493,8 +510,17 @@ fn a_value_the_url_parser_rejects_is_still_masked_by_the_fallback_scan() {
 /// Asserted here rather than inferred from the borrowed-and-unchanged fixture
 /// above, because that test would stay green if the value reached the fallback
 /// and the fallback happened to leave it alone for some other reason.
+///
+/// The protection is exactly that conditional, and the second half of this test
+/// pins the other side of it. Give the same credential-free shape a port the
+/// parser refuses — a typo, or a port past `u16::MAX` — and it *does* reach the
+/// fallback, whose unbounded `find('@')` walks into the path and prints a `***`
+/// password on a value that never had one. That is over-masking rather than a
+/// leak, and it is the price of the `or_else` that masks
+/// `postgres://user:p/ss@host/db`, so the behaviour stays. What must not stay is
+/// the impression that these shapes can never get there.
 #[test]
-fn the_shapes_the_fallback_would_mangle_never_reach_it() {
+fn a_successful_parse_is_the_only_thing_keeping_the_fallback_off_these_shapes() {
     for value in [
         "mysql://host:3306/db@x",
         "mysql://host:3306/db@extra",
@@ -507,6 +533,25 @@ fn the_shapes_the_fallback_would_mangle_never_reach_it() {
         assert!(
             parsed.password().is_none(),
             "{value:?} carries no credentials, so the parse must report no password"
+        );
+    }
+
+    // The same shapes with a port the parser refuses. The parse fails for a
+    // reason that has nothing to do with credentials, and the fallback masks
+    // the path's `@` anyway.
+    for (value, expected) in [
+        ("mysql://host:70000/db@extra", "mysql://host:***@extra"),
+        ("mysql://host:port/db@extra", "mysql://host:***@extra"),
+    ] {
+        assert!(
+            url::Url::parse(value).is_err(),
+            "{value:?} is in this half only because the parser rejects it"
+        );
+        assert_eq!(
+            mask_url_credentials(value),
+            expected,
+            "{value:?} carries no credential, but an unparseable port sends it to \
+             the fallback, which masks the path's `@` — over-masking, not a leak"
         );
     }
 }
@@ -529,6 +574,11 @@ fn a_password_whose_leading_run_parses_as_a_port_still_fails_open() {
         // An empty port is valid too, so a password *starting* with `/` lands
         // in the same place.
         "mysql://user:/ss@host/db",
+        // `?` and `#` end the authority for the parser exactly as `/` does, so
+        // the residue is all three characters the doc comment names, not only
+        // the one it gives an example of.
+        "mysql://user:12?34@host/db",
+        "mysql://user:12#34@host/db",
     ] {
         assert!(
             matches!(mask_url_credentials(value), std::borrow::Cow::Borrowed(v) if v == value),

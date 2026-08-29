@@ -69,7 +69,10 @@ const PLAIN_VALUE: &str = "Example";
 const URL_NAME: &str = "DATABASE_URL";
 /// Carries an unencoded `@`, the shape issue #355 fixed: `database::userinfo`
 /// interpolates a `.env` password into a connection URL verbatim, so a
-/// developer who types one gets this value across all five surfaces.
+/// developer who types one gets this value on every masked surface — the three
+/// client-rendered ones covered here, plus the server log covered in
+/// `database::tests`. Four, not the five there were when #344 shipped: #356
+/// deleted the warm-start disk cache, as the module doc above records.
 const URL_SECRET: &str = "url-hunter2@tail-355";
 /// The half of `URL_SECRET` that survived the old first-`@` parse. Asserted on
 /// its own because every whole-secret check passes vacuously on a *partially*

@@ -117,9 +117,13 @@ pub fn is_sensitive_env_name(name: &str) -> bool {
 ///   it ends at the last `@` in the authority (the run from `://` to the first
 ///   `/`, `?` or `#`). A raw `/`, `?` or `#` inside userinfo would have ended
 ///   the authority in the parser too, so that window always holds the `@`;
-/// - the parse succeeds and reports **no password** — what looks like
-///   credentials is `host:port`, and every `@` after it is path, query or
-///   fragment. Untouched;
+/// - the parse succeeds and reports **no password** — either what looks like
+///   credentials is `host:port` and every `@` after it is path, query or
+///   fragment, or the userinfo carries a `:` with nothing after it
+///   (`mysql://user:@host/db`), which [`url`] reports identically to no
+///   password at all. Untouched on both counts — neither shape holds a secret,
+///   though the second is the one place this function is *less* eager than
+///   `main`'s scan, which rewrote it to `mysql://user:***@host/db`;
 /// - the parse **fails** — the value is not a URL any parser accepts, so the
 ///   scan is all that is left. It prefers the last `@` in the authority and
 ///   falls back to the first `@` anywhere, which is `main`'s original rule.
@@ -130,15 +134,25 @@ pub fn is_sensitive_env_name(name: &str) -> bool {
 /// a password spliced in raw by `database::userinfo`. Preferring the authority's
 /// last `@` there is what keeps an `@`-bearing password out of that log line.
 ///
-/// **One shape still fails open**, narrower than the scan-only version it
-/// replaces: a password holding a raw `/`, `?` or `#` whose leading run happens
-/// to parse as a port, as in `mysql://user:12/34@host/db`. The parser reads
-/// `user` as the host and `12` as its port, exactly as it reads
-/// `mysql://host:3306/db@x`, because per RFC 3986 that *is* what the two strings
-/// say — a password must percent-encode all four characters, and `database::userinfo`
-/// not doing so is a connection-string defect rather than a display one. Every
-/// other `/`, `?` or `#` password (`postgres://user:p/ss@host/db` and friends)
-/// is rejected by the parse and masked by the fallback.
+/// **One shape still fails open**: a password holding a raw `/`, `?` or `#`
+/// whose leading run happens to parse as a port, as in
+/// `mysql://user:12/34@host/db`. The parser reads `user` as the host and `12`
+/// as its port, exactly as it reads `mysql://host:3306/db@x`, because per RFC
+/// 3986 that *is* what the two strings say — a password must percent-encode all
+/// four characters, and `database::userinfo` not doing so is a
+/// connection-string defect rather than a display one. Every other `/`, `?` or
+/// `#` password (`postgres://user:p/ss@host/db` and friends) is rejected by the
+/// parse and masked by the fallback.
+///
+/// **Name the baseline, because the residue is narrower than one predecessor
+/// and not the other.** It is narrower than the authority-bounded scan this
+/// arm replaces, which failed open on *every* `/`, `?` or `#` password. It is
+/// **not** narrower than `main`'s greedy first-`@` scan, which masked
+/// `mysql://user:12/34@host/db` correctly. That scan bought the difference by
+/// rewriting `mysql://host:3306/db@x` into `mysql://host:***@x` — host, port
+/// and database thrown away — and by leaving an `@`-bearing password's tail
+/// on screen (issue #355). Both of those classes are closed here, so this is a
+/// net gain over `main` rather than a strict subset of it.
 ///
 /// Lives here rather than in `database`, where it started life as
 /// `mask_url_password`: it is now the second half of the redaction policy the
