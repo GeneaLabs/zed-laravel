@@ -3741,8 +3741,9 @@ struct ProviderMacro {
 /// ## Coverage boundaries (be honest about the caps)
 ///
 /// - **Which files**: every file registered as a [`ServiceProviderFile`] Salsa
-///   input — app providers (priority 2), framework providers (0), and package
-///   providers (1), the last two discovered by the vendor scan
+///   input — app providers (priority 3), module providers (2, from the
+///   `modules.paths` globs), package providers (1), and framework providers
+///   (0), the last two discovered by the vendor scan
 ///   (`rescan_vendor_providers`). Priority merging happens in
 ///   [`SalsaActor::build_macro_registry`], not here.
 /// - **Which calls**: only a STATIC `Receiver::macro(...)` / `Receiver::mixin(...)`
@@ -5565,8 +5566,10 @@ pub fn component_candidate_paths(
     // Windows and a wasted `stat` on POSIX. Namespaced forms resolve via the
     // PSR-4 `componentNamespace` block below instead, so skip them here.
     if !name.contains(':') {
-        candidates
-            .push(crate::component_declaration_locator::conventional_class_file_path(name, config));
+        // A name that can't form a safe relative path yields no candidate.
+        candidates.extend(
+            crate::component_declaration_locator::conventional_class_file_path(name, config),
+        );
     }
 
     // Explicit class-backed registration: Blade::component('tag', Class::class)
@@ -6892,6 +6895,13 @@ pub enum SalsaRequest {
         files: Vec<PathBuf>,
         reply: oneshot::Sender<()>,
     },
+    /// Replace the configured module directories, in `modules.paths`
+    /// glob-match order. The registration merge reads their order as the
+    /// equal-priority tie-break rank.
+    SetModuleDirs {
+        dirs: Vec<PathBuf>,
+        reply: oneshot::Sender<()>,
+    },
     /// How many times the translation cache has touched disk
     LangDiskReads { reply: oneshot::Sender<usize> },
 
@@ -6900,7 +6910,7 @@ pub enum SalsaRequest {
     RegisterServiceProviderSource {
         path: PathBuf,
         text: String,
-        priority: u8, // 0=framework, 1=package, 2=app
+        priority: u8, // 0=framework, 1=package, 2=module, 3=app
         root_path: PathBuf,
         reply: oneshot::Sender<()>,
     },
@@ -8286,6 +8296,23 @@ impl SalsaHandle {
             .map_err(|_| "Salsa actor dropped reply channel")
     }
 
+    /// Hand the actor the configured module directories in `modules.paths`
+    /// order, so the registration merge can break an equal-priority tie by
+    /// module rank instead of by provider path.
+    pub async fn set_module_dirs(&self, dirs: Vec<PathBuf>) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SetModuleDirs {
+                dirs,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
     /// Drop everything derived from service providers after one changed.
     pub async fn invalidate_translation_providers(&self) -> Result<(), &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -8855,6 +8882,11 @@ pub struct SalsaActor {
     // === Salsa-based Service Provider Tracking (New) ===
     /// Service provider files registered with Salsa for incremental parsing
     salsa_sp_files: HashMap<PathBuf, ServiceProviderFile>,
+
+    /// Configured module directories in `modules.paths` glob-match order —
+    /// the rank the registration merge breaks equal-priority ties on. Empty
+    /// when the modular-monolith feature is off.
+    module_dirs: Vec<PathBuf>,
     /// Version counter for service provider files
     salsa_sp_version: i32,
     /// Project root for service provider resolution
@@ -8871,6 +8903,13 @@ const PATTERN_CACHE_INITIAL_CAPACITY: usize = 1024;
 /// covers files that appear afterwards without forcing an immediate rehash
 /// (a `composer update`, new app files created mid-session).
 const PATTERN_CACHE_CAPACITY_PADDING: usize = 1000;
+
+/// One provider registration's standing in the merge performed by
+/// [`SalsaActor::handle_get_laravel_config`]: its tier priority
+/// (`0=framework, 1=package, 2=module, 3=app`) and, for a module provider,
+/// its 1-based rank in `modules.paths` order (`0` = not a module provider).
+/// Ordered as a plain tuple, which IS the documented rule.
+type MergeRank = (u8, usize);
 
 impl SalsaActor {
     /// Spawn the actor on a dedicated thread and return a handle for communication
@@ -8956,6 +8995,7 @@ impl SalsaActor {
                 translations: TranslationCache::default(),
                 // Salsa-based service provider tracking
                 salsa_sp_files: HashMap::with_capacity(32),
+                module_dirs: Vec::new(),
                 salsa_sp_version: 0,
                 salsa_sp_root: None,
             };
@@ -9584,6 +9624,13 @@ impl SalsaActor {
                 }
                 SalsaRequest::SetTranslationProviderExtras { files, reply } => {
                     self.translations.set_extra_provider_files(files);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::SetModuleDirs { dirs, reply } => {
+                    // The merge tie-break reads these, and the merged config
+                    // is memoized — a changed module list has to invalidate it.
+                    self.module_dirs = dirs;
+                    self.config_cache = None;
                     let _ = reply.send(());
                 }
                 SalsaRequest::LangDiskReads { reply } => {
@@ -10707,85 +10754,91 @@ impl SalsaActor {
             livewire_config,
         );
 
-        // Collect view namespaces from all parsed service providers.
-        // Both maps carry (priority, value) while merging — app > module >
-        // package > framework, last-wins on ties — and drop the priority
-        // once the winner is settled.
-        let mut view_namespaces: HashMap<String, (u8, PathBuf)> = HashMap::new();
-        let mut component_namespaces: HashMap<String, (u8, String)> = HashMap::new();
-        let mut anonymous_component_paths: HashMap<String, PathBuf> = HashMap::new();
-        let mut anonymous_component_namespaces: HashMap<String, String> = HashMap::new();
-        // tag → (priority, class file); higher priority (app > package >
-        // framework) wins since sp-file iteration order is arbitrary.
-        let mut class_component_files: HashMap<String, (u8, PathBuf)> = HashMap::new();
+        // THE MERGE RULE, for all five registries below: the highest
+        // [`MergeRank`] wins — tier priority first (the app boots last, so
+        // app > module > package > framework), then `modules.paths` rank, and
+        // a full tie goes to the later provider in the deterministic
+        // lexicographic order (last-wins). Every map carries its winner's
+        // rank while merging and drops it once the winner is settled; none of
+        // them restates the rule locally.
+        let mut view_namespaces: HashMap<String, (MergeRank, PathBuf)> = HashMap::new();
+        let mut component_namespaces: HashMap<String, (MergeRank, String)> = HashMap::new();
+        let mut anonymous_component_paths: HashMap<String, (MergeRank, PathBuf)> = HashMap::new();
+        let mut anonymous_component_namespaces: HashMap<String, (MergeRank, String)> =
+            HashMap::new();
+        let mut class_component_files: HashMap<String, (MergeRank, PathBuf)> = HashMap::new();
+
+        /// Does `candidate` take the key from the current holder? The single
+        /// comparison every merge below routes through, so the five registries
+        /// cannot drift into five rules again (#354 item 4).
+        fn wins(existing: Option<&MergeRank>, candidate: MergeRank) -> bool {
+            existing.is_none_or(|held| candidate >= *held)
+        }
 
         if let Some(sp_root) = self.salsa_sp_root.as_ref() {
             // Lexicographic provider order (`sorted_sp_files`) so the
-            // first-wins / priority tiebreaks below are deterministic (#255).
+            // last-wins tie-break below is deterministic (#255).
             for sp_file in self.sorted_sp_files() {
+                // `modules.paths` rank of the module that owns this provider,
+                // read through the one shared ownership lookup — a module's
+                // provider path sorts lexicographically, which is NOT the
+                // configured order the docs promise (#354 item 3).
+                let module_rank =
+                    crate::config::owning_module(&self.module_dirs, sp_file.path(&self.db))
+                        .map_or(0, |(rank, _)| rank);
                 let parsed = parse_service_provider_source(&self.db, sp_file, sp_root.clone());
 
-                // Collect view namespaces. Higher priority wins (the app
-                // boots last, so app > module > package); on EQUAL priority
-                // the later provider in the deterministic lexicographic
-                // order wins — matching the documented last-registered-wins
-                // rule and the translation-namespace merge.
                 for vn in parsed.view_namespaces(&self.db) {
                     let ns = vn.namespace(&self.db).namespace(&self.db).clone();
-                    let prio = vn.priority(&self.db);
+                    let rank = (vn.priority(&self.db), module_rank);
                     if let Some(path) = vn.view_path(&self.db).clone() {
-                        match view_namespaces.get(&ns) {
-                            Some((existing_prio, _)) if *existing_prio > prio => {}
-                            _ => {
-                                view_namespaces.insert(ns, (prio, path));
-                            }
+                        if wins(view_namespaces.get(&ns).map(|(r, _)| r), rank) {
+                            view_namespaces.insert(ns, (rank, path));
                         }
                     }
                 }
 
-                // Collect component namespaces — same precedence rule as the
-                // view namespaces above.
                 for cn in parsed.component_namespaces(&self.db) {
                     let prefix = cn.prefix(&self.db).namespace(&self.db).clone();
-                    let prio = cn.priority(&self.db);
-                    let php_ns = cn.php_namespace(&self.db).clone();
-                    match component_namespaces.get(&prefix) {
-                        Some((existing_prio, _)) if *existing_prio > prio => {}
-                        _ => {
-                            component_namespaces.insert(prefix, (prio, php_ns));
-                        }
+                    let rank = (cn.priority(&self.db), module_rank);
+                    if wins(component_namespaces.get(&prefix).map(|(r, _)| r), rank) {
+                        component_namespaces
+                            .insert(prefix, (rank, cn.php_namespace(&self.db).clone()));
                     }
                 }
 
-                // Collect anonymous component paths (Blade::anonymousComponentPath)
+                // Blade::anonymousComponentPath
                 for acp in parsed.anonymous_component_paths(&self.db) {
                     let prefix = acp.prefix(&self.db).namespace(&self.db).clone();
-                    let directory = acp.directory(&self.db).clone();
-                    anonymous_component_paths.entry(prefix).or_insert(directory);
+                    let rank = (acp.priority(&self.db), module_rank);
+                    if wins(anonymous_component_paths.get(&prefix).map(|(r, _)| r), rank) {
+                        anonymous_component_paths
+                            .insert(prefix, (rank, acp.directory(&self.db).clone()));
+                    }
                 }
 
-                // Collect anonymous component namespaces (Blade::anonymousComponentNamespace)
+                // Blade::anonymousComponentNamespace
                 for acn in parsed.anonymous_component_namespaces(&self.db) {
                     let prefix = acn.prefix(&self.db).namespace(&self.db).clone();
-                    let directory = acn.directory(&self.db).clone();
-                    anonymous_component_namespaces
-                        .entry(prefix)
-                        .or_insert(directory);
+                    let rank = (acn.priority(&self.db), module_rank);
+                    if wins(
+                        anonymous_component_namespaces.get(&prefix).map(|(r, _)| r),
+                        rank,
+                    ) {
+                        anonymous_component_namespaces
+                            .insert(prefix, (rank, acn.directory(&self.db).clone()));
+                    }
                 }
 
-                // Collect class-backed component registrations
-                // (Blade::component('tag', Class::class), either form/order)
+                // Blade::component('tag', Class::class), either form/order
                 for bc in parsed.blade_components(&self.db) {
                     let Some(file) = bc.file_path(&self.db).clone() else {
                         continue;
                     };
                     let tag = bc.tag_name(&self.db).name(&self.db).clone();
-                    let prio = bc.priority(&self.db);
-                    match class_component_files.get(&tag) {
-                        Some((existing_prio, _)) if *existing_prio >= prio => {}
-                        _ => {
-                            class_component_files.insert(tag, (prio, file));
-                        }
+                    let rank = (bc.priority(&self.db), module_rank);
+                    if wins(class_component_files.get(&tag).map(|(r, _)| r), rank) {
+                        class_component_files.insert(tag, (rank, file));
                     }
                 }
             }
@@ -10797,19 +10850,19 @@ impl SalsaActor {
             if let Some(path) = &data.view_path {
                 view_namespaces
                     .entry(ns.clone())
-                    .or_insert_with(|| (0, path.clone()));
+                    .or_insert_with(|| ((0, 0), path.clone()));
             }
         }
         for (prefix, data) in &self.sp_component_namespaces {
             component_namespaces
                 .entry(prefix.clone())
-                .or_insert_with(|| (0, data.php_namespace.clone()));
+                .or_insert_with(|| ((0, 0), data.php_namespace.clone()));
         }
         for (tag, data) in &self.sp_blade_components {
             if let Some(file) = &data.file_path {
                 class_component_files
                     .entry(tag.clone())
-                    .or_insert_with(|| (data.priority, file.clone()));
+                    .or_insert_with(|| ((data.priority, 0), file.clone()));
             }
         }
 
@@ -10822,7 +10875,7 @@ impl SalsaActor {
         // arrives transitively (Flux, Filament, MaryUI); the loader
         // self-gates on the config files existing.
         for (ns, dir) in crate::config::livewire_component_namespaces(&root) {
-            anonymous_component_paths.entry(ns).or_insert(dir);
+            anonymous_component_paths.entry(ns).or_insert(((0, 0), dir));
         }
 
         // Convert to data transfer type
@@ -10837,19 +10890,25 @@ impl SalsaActor {
             has_livewire: config_ref.has_livewire(&self.db),
             view_namespaces: view_namespaces
                 .into_iter()
-                .map(|(ns, (_prio, path))| (ns, path))
+                .map(|(ns, (_rank, path))| (ns, path))
                 .collect(),
             component_namespaces: component_namespaces
                 .into_iter()
-                .map(|(prefix, (_prio, php_ns))| (prefix, php_ns))
+                .map(|(prefix, (_rank, php_ns))| (prefix, php_ns))
                 .collect(),
-            anonymous_component_paths,
-            anonymous_component_namespaces,
+            anonymous_component_paths: anonymous_component_paths
+                .into_iter()
+                .map(|(prefix, (_rank, dir))| (prefix, dir))
+                .collect(),
+            anonymous_component_namespaces: anonymous_component_namespaces
+                .into_iter()
+                .map(|(prefix, (_rank, dir))| (prefix, dir))
+                .collect(),
             component_aliases,
             icon_aliases,
             class_component_files: class_component_files
                 .into_iter()
-                .map(|(tag, (_prio, file))| (tag, file))
+                .map(|(tag, (_rank, file))| (tag, file))
                 .collect(),
         };
 
@@ -11973,7 +12032,8 @@ impl SalsaActor {
 
     /// Build the macro registry — `(receiver_fqcn, macro_name)` → registration —
     /// by merging every Salsa-parsed service provider's `macros`, highest
-    /// priority winning on key collision (framework=0 < package=1 < app=2). Built
+    /// priority winning on key collision (framework=0 < package=1 < module=2 <
+    /// app=3). Built
     /// fresh each call from the tracked-query outputs (mirrors
     /// [`Self::build_facade_alias_snapshot`]); macros number in the dozens-to-
     /// hundreds, with no cache to invalidate on a provider edit.
@@ -12674,7 +12734,7 @@ impl SalsaActor {
                 file_path: class_file.map(PathBuf::from),
                 source_file: source_file.map(PathBuf::from),
                 source_line: Some(line as usize),
-                priority: 2, // Cache entries have highest priority (app level)
+                priority: 3, // Cache entries are app tier — the highest
             },
         );
     }
@@ -12706,7 +12766,7 @@ impl SalsaActor {
                 binding_type: bt,
                 source_file: source_file.map(PathBuf::from),
                 source_line: Some(line as usize),
-                priority: 2, // Cache entries have highest priority (app level)
+                priority: 3, // Cache entries are app tier — the highest
             },
         );
     }

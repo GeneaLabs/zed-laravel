@@ -1363,8 +1363,11 @@ fn resolve_helper_receiver(
 ///   guessing among equals.
 /// - **no implementer** → `None`.
 ///
-/// Package priority follows the project-wide convention (App=2 > Package=1 >
-/// Framework=0): a project's own implementation of a framework contract wins
+/// Package priority here is its own two-value scale read off the resolved
+/// file path (in-project = 2, under `vendor/` = 0) — not the four-tier
+/// service-provider scale (`0=framework, 1=package, 2=module, 3=app`), which
+/// a bare class file carries no way to determine. Higher wins either way: a
+/// project's own implementation of a framework contract wins
 /// over the vendor default. The priority is read from the resolved file path
 /// (`vendor/` segment ⇒ Framework/Package, otherwise App) since the
 /// [`ClassFileResolver`] seam carries file paths, not parsed package metadata.
@@ -1396,10 +1399,13 @@ fn resolve_interface_concrete(
     }
 }
 
-/// Package priority of an implementing class for disambiguation: App=2 (the
-/// project's own code) outranks vendor code=0. Derived from the resolved file
-/// path — a `vendor/` segment marks framework/package code. An unresolvable
-/// file (not in the index) is treated as lowest priority.
+/// Package priority of an implementing class for disambiguation, on this
+/// function's own two-value scale: in-project code scores 2 and outranks
+/// vendor code at 0. (It is not the four-tier service-provider scale —
+/// `0=framework, 1=package, 2=module, 3=app` — which a resolved class file
+/// carries no way to determine.) Derived from the resolved file path: a
+/// `vendor/` segment marks framework/package code. An unresolvable file (not
+/// in the index) is treated as lowest priority.
 fn impl_priority(fqcn: &str, resolver: &impl ClassFileResolver) -> u8 {
     match resolver.class_file(fqcn) {
         Some(path) => {

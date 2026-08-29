@@ -66,8 +66,12 @@ Everything goes in your Zed `settings.json`. Zed settings are JSONC, so the inli
         //     module < app), so on a namespace conflict an app/Providers
         //     registration always wins — the app boots last — and between
         //     two modules the later (higher glob-match precedence) one
-        //     wins. Paths a provider registers are containment-checked:
-        //     a registration pointing outside the project is dropped.
+        //     wins. Paths a provider registers are containment-checked
+        //     against the MODULE that registers them, so a registration
+        //     reaching into another module or outside the project is
+        //     dropped — while a module symlinked in from a composer path
+        //     repository keeps working. An app/Providers registration is
+        //     checked against the project root.
         // All of it is parsed statically (tree-sitter) — no project PHP is
         // ever executed. Two operational notes: changing "paths" MID-SESSION
         // re-resolves everything except the file watchers — restart the

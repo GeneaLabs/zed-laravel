@@ -1332,18 +1332,31 @@ mod env_parsing {
 
 mod priority_merging {
 
-    /// Test that priority ordering is documented and followed
-    /// Priority: app (2) > package (1) > framework (0)
+    /// The service-provider tier scale, as a readable anchor:
+    /// app (3) > module (2) > package (1) > framework (0).
+    ///
+    /// This is a documentation test — the constants are local, so it records
+    /// the order rather than observing it. The order is *enforced* against the
+    /// real merge elsewhere: `module_view_namespaces` and
+    /// `module_livewire_namespaces` pin app-over-module and module-vs-module
+    /// with discriminating fixtures, and the former's
+    /// `every_registry_breaks_an_equal_priority_tie_the_same_way` pins the
+    /// shared tie-break across all five registries. Keep the numbers here in
+    /// step with `register_service_provider_files_with_salsa`.
     #[test]
     fn test_priority_ordering_constants() {
-        // Document the expected priority values
         const FRAMEWORK_PRIORITY: u8 = 0;
         const PACKAGE_PRIORITY: u8 = 1;
-        const APP_PRIORITY: u8 = 2;
+        const MODULE_PRIORITY: u8 = 2;
+        const APP_PRIORITY: u8 = 3;
 
         const _: () = assert!(
-            APP_PRIORITY > PACKAGE_PRIORITY,
-            "App should have higher priority than package"
+            APP_PRIORITY > MODULE_PRIORITY,
+            "App should have higher priority than module"
+        );
+        const _: () = assert!(
+            MODULE_PRIORITY > PACKAGE_PRIORITY,
+            "Module should have higher priority than package"
         );
         const _: () = assert!(
             PACKAGE_PRIORITY > FRAMEWORK_PRIORITY,
@@ -1370,12 +1383,26 @@ mod priority_merging {
         assert!(env_priority(".env.local") > env_priority(".env.example"));
     }
 
-    /// Test that service provider locations map to correct priorities
+    /// The path-classifiable half of the tier scale: app (3) > package (1) >
+    /// framework (0), keyed the way `register_service_provider_files_with_salsa`
+    /// keys them.
+    ///
+    /// Module providers (2) are deliberately absent: no path substring
+    /// identifies one. They are discovered from the `modules.paths` globs plus
+    /// each module's composer `extra.laravel.providers`, via
+    /// `config::module_provider_files` — so a `contains("modules/")` branch here
+    /// would encode a rule the real classifier does not implement.
+    ///
+    /// Like `test_priority_ordering_constants` above, this is a documentation
+    /// test — the mapping is local, so it records the classification rather than
+    /// observing it. The module tier is enforced against the real merge by
+    /// `module_view_namespaces` and `module_livewire_namespaces`. Keep the
+    /// numbers here in step with `register_service_provider_files_with_salsa`.
     #[test]
     fn test_service_provider_priority_by_location() {
         fn provider_priority(path: &str) -> u8 {
             if path.contains("app/Providers") {
-                2 // App providers
+                3 // App providers
             } else if path.contains("vendor") && !path.contains("laravel/framework") {
                 1 // Package providers
             } else {
@@ -1383,7 +1410,7 @@ mod priority_merging {
             }
         }
 
-        assert_eq!(provider_priority("app/Providers/AppServiceProvider.php"), 2);
+        assert_eq!(provider_priority("app/Providers/AppServiceProvider.php"), 3);
         assert_eq!(
             provider_priority("vendor/some-package/src/ServiceProvider.php"),
             1

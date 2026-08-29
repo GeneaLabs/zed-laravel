@@ -1497,7 +1497,11 @@ fn psr4_entries_escaping_the_module_resolve_nothing() {
 
     for psr4_dir in [
         outside.to_string_lossy().to_string(), // absolute
-        "../../outside".to_string(),           // traversal
+        // Four levels: `{n}` -> `Legal` -> `app` -> `proj` -> the temp dir,
+        // so the candidate lands ON the decoy written above. `../../outside`
+        // normalized to `proj/app/outside`, which holds nothing — the
+        // assertion then passed with or without the containment gate.
+        "../../../../outside".to_string(), // traversal
     ] {
         let module = tmp
             .path()
@@ -1585,5 +1589,114 @@ fn expand_module_dirs_follows_a_symlinked_module_directory() {
         dirs,
         vec![modules.join("Ui")],
         "a symlinked module expands (configured paths are trusted)"
+    );
+}
+
+// ============================================================================
+// owning_module — the shared module-ownership + `modules.paths` rank lookup
+// ============================================================================
+
+#[test]
+fn owning_module_ranks_by_configured_order_not_by_name() {
+    // The rank is the module's position in `modules.paths`, so it must be
+    // readable off a list whose order is neither alphabetical nor its
+    // reverse — the property both the containment gate and the merge
+    // tie-break depend on.
+    let root = Path::new("/proj");
+    let dirs = vec![
+        root.join("app/Legal/Alpha"),
+        root.join("app/Legal/Gamma"),
+        root.join("app/Legal/Beta"),
+    ];
+
+    for (name, rank) in [("Alpha", 1), ("Gamma", 2), ("Beta", 3)] {
+        let provider = root.join(format!("app/Legal/{name}/app/Providers/Registrar.php"));
+        assert_eq!(
+            owning_module(&dirs, &provider),
+            Some((rank, root.join(format!("app/Legal/{name}")).as_path())),
+            "{name} is owned by its own module at configured rank {rank}"
+        );
+    }
+}
+
+#[test]
+fn owning_module_is_none_outside_every_module() {
+    let root = Path::new("/proj");
+    let dirs = vec![root.join("app/Legal/Alpha")];
+
+    assert_eq!(
+        owning_module(&dirs, &root.join("app/Providers/AppServiceProvider.php")),
+        None,
+        "an app provider has no owning module — the caller falls back to the root"
+    );
+    assert_eq!(
+        owning_module(&[], &root.join("app/Legal/Alpha/app/Providers/X.php")),
+        None,
+        "no configured modules, no ownership"
+    );
+}
+
+#[test]
+fn owning_module_prefers_the_innermost_module_on_nesting() {
+    // A module nested inside another is booted by its own composer.json, so
+    // it owns its files — the longest match wins regardless of rank order.
+    let root = Path::new("/proj");
+    // The outer module is listed FIRST so that both modules match the inner
+    // file and only the longest-match rule can pick the inner one — a
+    // first-match implementation returns the outer module here.
+    let dirs = vec![
+        root.join("app/Legal/Suite"),
+        root.join("app/Legal/Suite/packages/Billing"),
+    ];
+
+    assert_eq!(
+        owning_module(
+            &dirs,
+            &root.join("app/Legal/Suite/packages/Billing/src/Provider.php")
+        ),
+        Some((2, root.join("app/Legal/Suite/packages/Billing").as_path())),
+        "the inner module owns its own file even though the outer one is listed first"
+    );
+    assert_eq!(
+        owning_module(&dirs, &root.join("app/Legal/Suite/src/Provider.php")),
+        Some((1, root.join("app/Legal/Suite").as_path())),
+        "a file only the outer module contains stays with the outer module"
+    );
+}
+
+#[test]
+fn owning_module_does_not_match_a_sibling_sharing_a_name_prefix() {
+    // `Path::starts_with` is component-wise, so this is a pin against a
+    // future string-prefix rewrite: `.../Contract` must not own
+    // `.../ContractSupport/…`.
+    let root = Path::new("/proj");
+    let dirs = vec![root.join("app/Legal/Contract")];
+
+    assert_eq!(
+        owning_module(
+            &dirs,
+            &root.join("app/Legal/ContractSupport/app/Providers/X.php")
+        ),
+        None,
+        "a name-prefix sibling is a different module"
+    );
+}
+
+#[test]
+fn owning_module_collapses_traversal_before_matching() {
+    // The gate reads ownership off provider paths that may still carry
+    // `..`/`.`; a raw component compare would call an escaping path in-module.
+    let root = Path::new("/proj");
+    let dirs = vec![root.join("app/Legal/Alpha")];
+
+    assert_eq!(
+        owning_module(&dirs, &root.join("app/Legal/Alpha/../Beta/src/X.php")),
+        None,
+        "a path that walks out of the module is not owned by it"
+    );
+    assert_eq!(
+        owning_module(&dirs, &root.join("app/Legal/./Alpha/src/X.php")),
+        Some((1, root.join("app/Legal/Alpha").as_path())),
+        "a `.` segment is noise, not an escape"
     );
 }
