@@ -114,7 +114,9 @@ async fn hover_card_carries_kind_class_and_signature() {
         .await
         .expect("member exists, so a card must be emitted");
     assert!(
-        card.contains("::increment()"),
+        // The header is markdown-escaped by `hover::render`, so the `::`
+        // and the parens arrive backslashed; the rendered line is unchanged.
+        card.contains(r"\:\:increment\(\)"),
         "header names the member as a method: {card}"
     );
     assert!(
@@ -126,7 +128,7 @@ async fn hover_card_carries_kind_class_and_signature() {
         .this_member_hover_card(&blade, "count")
         .await
         .expect("property card");
-    assert!(card.contains("::$count"), "property header: {card}");
+    assert!(card.contains(r"\:\:\$count"), "property header: {card}");
     assert!(
         card.contains("public int $count"),
         "card carries the declared type: {card}"

@@ -92,6 +92,7 @@ pub mod migration_index;
 // Public API is re-exported as `laravel_introspector::ModelMetadata`.
 pub mod magic_dependency_index;
 pub mod magic_disk_cache;
+pub mod markdown_safety;
 pub mod naming;
 pub mod parser;
 pub mod path_containment;

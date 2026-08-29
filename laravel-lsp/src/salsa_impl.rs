@@ -1699,13 +1699,14 @@ pub fn parse_env_source<'db>(db: &'db dyn Db, file: EnvFile) -> Vec<ParsedEnvVar
             continue;
         }
 
-        // Check if line is commented
-        let is_commented = line.trim_start().starts_with('#');
-        let working_line = if is_commented {
-            line.trim_start().trim_start_matches('#').trim_start()
-        } else {
-            line
-        };
+        // Check if line is commented — through the one rule every reader of
+        // `.env` text classifies with, so Salsa's view of "commented" and the
+        // buffer-local view the LSP handlers hit-test with cannot disagree.
+        let (is_commented, working_line) =
+            match crate::env_key_locator::commented_declaration_body(line) {
+                Some(body) => (true, body),
+                None => (false, line),
+            };
 
         // Parse VAR=value format
         if let Some((name_part, value_part)) = working_line.split_once('=') {
@@ -5880,25 +5881,6 @@ impl crate::member_resolver::ClassFileResolver for ContainerAwareResolver<'_> {
     }
 }
 
-/// Environment variable data for transfer across async boundaries
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct EnvVariableData {
-    /// The variable name (e.g., "APP_NAME")
-    pub name: String,
-    /// The value (e.g., "Laravel")
-    pub value: String,
-    /// Which file this was defined in
-    pub file_path: PathBuf,
-    /// Line number where defined (0-based)
-    pub line: usize,
-    /// Column where the variable name starts (0-based)
-    pub column: usize,
-    /// Column where the value starts (after the =)
-    pub value_column: usize,
-    /// Whether this variable is commented out
-    pub is_commented: bool,
-}
-
 /// Package view namespace data for transfer across async boundaries
 /// From: $this->loadViewsFrom(__DIR__.'/../resources/views', 'courier')
 #[derive(Debug, Clone, serde::Serialize)]
@@ -6818,20 +6800,6 @@ pub enum SalsaRequest {
         reply: oneshot::Sender<Vec<ComponentNamespaceData>>,
     },
 
-    // === Environment Variable Management ===
-    /// Register environment variables from the env cache
-    RegisterEnvVariables {
-        variables: std::collections::HashMap<String, EnvVariableData>,
-        reply: oneshot::Sender<()>,
-    },
-    /// Get an environment variable by name
-    GetEnvVariable {
-        name: String,
-        reply: oneshot::Sender<Option<EnvVariableData>>,
-    },
-    /// Get all environment variable names (for autocomplete)
-    GetEnvVariableNames { reply: oneshot::Sender<Vec<String>> },
-
     // === Salsa-based Environment Variable Management (New) ===
     /// Register a raw .env file for Salsa to parse
     RegisterEnvSource {
@@ -6989,12 +6957,6 @@ pub enum SalsaRequest {
     /// clippy::large_enum_variant).
     RegisterCachedConfig {
         config: Box<LaravelConfigData>,
-        reply: oneshot::Sender<()>,
-    },
-
-    /// Register env variables from disk cache (bypasses parsing)
-    RegisterCachedEnvVars {
-        variables: std::collections::HashMap<String, String>,
         reply: oneshot::Sender<()>,
     },
 
@@ -8091,56 +8053,6 @@ impl SalsaHandle {
             .map_err(|_| "Salsa actor dropped reply channel")
     }
 
-    // === Environment Variable Methods ===
-
-    /// Register environment variables from the env cache
-    pub async fn register_env_variables(
-        &self,
-        variables: std::collections::HashMap<String, EnvVariableData>,
-    ) -> Result<(), &'static str> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(SalsaRequest::RegisterEnvVariables {
-                variables,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| "Salsa actor disconnected")?;
-        reply_rx
-            .await
-            .map_err(|_| "Salsa actor dropped reply channel")
-    }
-
-    /// Get an environment variable by name
-    pub async fn get_env_variable(
-        &self,
-        name: String,
-    ) -> Result<Option<EnvVariableData>, &'static str> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(SalsaRequest::GetEnvVariable {
-                name,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| "Salsa actor disconnected")?;
-        reply_rx
-            .await
-            .map_err(|_| "Salsa actor dropped reply channel")
-    }
-
-    /// Get all environment variable names (for autocomplete)
-    pub async fn get_env_variable_names(&self) -> Result<Vec<String>, &'static str> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(SalsaRequest::GetEnvVariableNames { reply: reply_tx })
-            .await
-            .map_err(|_| "Salsa actor disconnected")?;
-        reply_rx
-            .await
-            .map_err(|_| "Salsa actor dropped reply channel")
-    }
-
     // === Salsa-based Environment Variable Methods (New - Phase 1) ===
 
     /// Register a raw .env file for Salsa to parse
@@ -8638,24 +8550,6 @@ impl SalsaHandle {
             .await
             .map_err(|_| "Salsa actor dropped reply channel")
     }
-
-    /// Register env variables from disk cache (bypasses parsing)
-    pub async fn register_cached_env_vars(
-        &self,
-        variables: std::collections::HashMap<String, String>,
-    ) -> Result<(), &'static str> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(SalsaRequest::RegisterCachedEnvVars {
-                variables,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| "Salsa actor disconnected")?;
-        reply_rx
-            .await
-            .map_err(|_| "Salsa actor dropped reply channel")
-    }
 }
 
 /// Absolute root directories captured at `register_project_files` time.
@@ -8916,10 +8810,6 @@ pub struct SalsaActor {
     /// Cached component namespace registrations from Blade::componentNamespace() calls
     sp_component_namespaces: HashMap<String, ComponentNamespaceData>,
 
-    // === Environment Variables ===
-    /// Cached environment variables
-    env_variables: HashMap<String, EnvVariableData>,
-
     // === Salsa-based Environment Variable Tracking (New) ===
     /// Env files registered with Salsa for incremental parsing
     salsa_env_files: HashMap<PathBuf, EnvFile>,
@@ -9024,8 +8914,6 @@ impl SalsaActor {
                 sp_view_namespaces: HashMap::new(),
                 sp_blade_components: HashMap::new(),
                 sp_component_namespaces: HashMap::new(),
-                // Environment variables
-                env_variables: HashMap::new(),
                 // Salsa-based env tracking
                 salsa_env_files: HashMap::with_capacity(4),
                 salsa_env_version: 0,
@@ -9559,20 +9447,6 @@ impl SalsaActor {
                     let _ = reply.send(result);
                 }
 
-                // === Environment Variable Handlers ===
-                SalsaRequest::RegisterEnvVariables { variables, reply } => {
-                    self.handle_register_env_variables(variables);
-                    let _ = reply.send(());
-                }
-                SalsaRequest::GetEnvVariable { name, reply } => {
-                    let result = self.handle_get_env_variable(&name);
-                    let _ = reply.send(result);
-                }
-                SalsaRequest::GetEnvVariableNames { reply } => {
-                    let result = self.handle_get_env_variable_names();
-                    let _ = reply.send(result);
-                }
-
                 // === Salsa-based Environment Variable Handlers (New) ===
                 SalsaRequest::RegisterEnvSource {
                     path,
@@ -9765,26 +9639,6 @@ impl SalsaActor {
                     self.config_root = Some(config.root.clone());
                     self.config_cache = Some((self.config_version, *config));
                     tracing::info!("📋 Registered cached Laravel config");
-                    let _ = reply.send(());
-                }
-                SalsaRequest::RegisterCachedEnvVars { variables, reply } => {
-                    // Set env vars directly from cache
-                    let count = variables.len();
-                    for (name, value) in variables {
-                        self.env_variables.insert(
-                            name.clone(),
-                            EnvVariableData {
-                                name,
-                                value,
-                                file_path: PathBuf::from(".env"), // Placeholder
-                                line: 0,
-                                column: 0,
-                                value_column: 0,
-                                is_commented: false,
-                            },
-                        );
-                    }
-                    tracing::debug!("Registered {} cached env variables", count);
                     let _ = reply.send(());
                 }
 
@@ -12333,23 +12187,6 @@ impl SalsaActor {
         merged.into_values().collect()
     }
 
-    // === Environment Variable Handlers ===
-
-    /// Handle env variables registration
-    fn handle_register_env_variables(&mut self, variables: HashMap<String, EnvVariableData>) {
-        self.env_variables = variables;
-    }
-
-    /// Handle get env variable by name
-    fn handle_get_env_variable(&self, name: &str) -> Option<EnvVariableData> {
-        self.env_variables.get(name).cloned()
-    }
-
-    /// Handle get all env variable names
-    fn handle_get_env_variable_names(&self) -> Vec<String> {
-        self.env_variables.keys().cloned().collect()
-    }
-
     // === Salsa-based Environment Variable Handlers (New) ===
 
     /// Handle registering a raw env file for Salsa to parse
@@ -12431,6 +12268,28 @@ impl SalsaActor {
         self.translations.invalidate_config(path);
     }
 
+    /// Whether `candidate` replaces `current` as the merged declaration of a
+    /// key. The one rule both env merges below resolve ties with.
+    ///
+    /// The file-priority ladder decides first: `.env` (2) outranks
+    /// `.env.local` (1) outranks `.env.example` (0). Every declaration *inside*
+    /// one file carries that file's priority and so always ties, and there an
+    /// active declaration outranks a commented one — `# KEY=old` above
+    /// `KEY=new` is one declaration and one comment, not two candidates, and
+    /// keeping the first line seen let the comment answer for the key. Beyond
+    /// that the first line seen still wins.
+    ///
+    /// A commented declaration in a higher-priority file still outranks an
+    /// active one below it: commenting a key out in `.env` is how a project
+    /// turns it off, and the ladder is what gives `.env` the last word.
+    fn env_var_supersedes(candidate: &ParsedEnvVarData, current: &ParsedEnvVarData) -> bool {
+        match candidate.priority.cmp(&current.priority) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => current.is_commented && !candidate.is_commented,
+            std::cmp::Ordering::Less => false,
+        }
+    }
+
     /// Handle getting a parsed env variable by name from Salsa
     fn handle_get_parsed_env_var(&self, name: &str) -> Option<ParsedEnvVarData> {
         // Find the variable with the highest priority
@@ -12452,7 +12311,7 @@ impl SalsaActor {
                     };
                     // Keep the one with highest priority
                     match &best {
-                        Some(existing) if existing.priority >= data.priority => {}
+                        Some(existing) if !Self::env_var_supersedes(&data, existing) => {}
                         _ => best = Some(data),
                     }
                 }
@@ -12485,7 +12344,7 @@ impl SalsaActor {
                 };
 
                 match merged.get(&name) {
-                    Some(existing) if existing.priority >= data.priority => {}
+                    Some(existing) if !Self::env_var_supersedes(&data, existing) => {}
                     _ => {
                         merged.insert(name, data);
                     }

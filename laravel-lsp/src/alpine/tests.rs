@@ -169,7 +169,13 @@ fn matching_events_filters_by_prefix() {
 #[test]
 fn directive_card_has_name_summary_and_docs_link() {
     let card = directive_card("x-data").expect("x-data has a card");
-    assert!(card.contains("x-data"), "card shows the directive name");
+    // The header is escaped by `render` (`markdown_safety`), so the
+    // hyphen arrives backslashed. Asserting the escaped form keeps the
+    // test honest about what the card actually carries.
+    assert!(
+        card.contains("x\\-data"),
+        "card shows the directive name: {card}"
+    );
     assert!(
         card.contains("reactive data"),
         "card shows the synopsis: {card}"
@@ -400,7 +406,7 @@ fn hover_on_directive_name() {
     let line = "<div x-data=\"{}\">";
     let at = line.find("data").unwrap() as u32; // cursor on the directive
     let card = hover_at(line, at).expect("hover over x-data");
-    assert!(card.contains("x-data"));
+    assert!(card.contains("x\\-data"), "hover over x-data: {card}");
 }
 
 #[test]
@@ -409,7 +415,7 @@ fn hover_on_event_argument_resolves_to_x_on() {
     let line = "<button x-on:click=\"go()\">";
     let at = line.find("click").unwrap() as u32;
     let card = hover_at(line, at).expect("hover over x-on:click");
-    assert!(card.contains("x-on"), "resolves to x-on: {card}");
+    assert!(card.contains("x\\-on"), "resolves to x-on: {card}");
 }
 
 #[test]
@@ -417,7 +423,7 @@ fn hover_on_at_event_shorthand_resolves_to_x_on() {
     let line = "<button @click=\"go()\">";
     let at = line.find("click").unwrap() as u32;
     let card = hover_at(line, at).expect("hover over @click");
-    assert!(card.contains("x-on"), "@event maps to x-on: {card}");
+    assert!(card.contains("x\\-on"), "@event maps to x-on: {card}");
 }
 
 #[test]
@@ -425,7 +431,7 @@ fn hover_on_colon_bind_shorthand_resolves_to_x_bind() {
     let line = "<img :src=\"url\">";
     let at = line.find("src").unwrap() as u32;
     let card = hover_at(line, at).expect("hover over :src");
-    assert!(card.contains("x-bind"), ":attr maps to x-bind: {card}");
+    assert!(card.contains("x\\-bind"), ":attr maps to x-bind: {card}");
 }
 
 #[test]
