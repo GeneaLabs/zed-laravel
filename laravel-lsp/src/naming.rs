@@ -87,13 +87,39 @@ pub fn dotted_to_namespace(s: &str) -> String {
     join_pascal_segments(s, '\\')
 }
 
-/// Convert a dotted component name to a forward-slash file path with each
-/// segment in PascalCase.
+/// Convert a dotted component name to a forward-slash **relative** file path
+/// with each segment in PascalCase.
 ///
-/// `"admin.user-list"` → `"Admin/UserList"`. The caller appends `.php` or
-/// joins with a root directory.
-pub fn dotted_to_class_path(s: &str) -> String {
-    join_pascal_segments(s, '/')
+/// `"admin.user-list"` → `Some("Admin/UserList")`.
+///
+/// Returns `None` when any segment is not a valid single path segment, so the
+/// result is always safe to hand to `Path::join`. Every caller joins this onto
+/// a trusted base directory, and `Path::join` REPLACES the base when the
+/// right-hand side is absolute — so `"/etc/passwd"` reaching this function
+/// unchecked made `class_path.join(..)` resolve to `/etc/passwd`, escaping the
+/// registered directory entirely. The component name is discovered data (it
+/// comes from a `<livewire:…>` tag or an `@livewire('…')` literal), so it is
+/// exactly the kind of input that must not be able to name a path.
+///
+/// Splitting on `.` already destroys `..` (it becomes two empty segments), so
+/// the traversal that remains is a separator or an absolute/drive prefix. A
+/// segment is rejected when it is empty or contains `/`, `\\`, or `:`.
+/// Rejecting rather than sanitizing keeps this total: there is no "cleaned"
+/// name that silently resolves somewhere the author did not write.
+pub fn dotted_to_class_path(s: &str) -> Option<String> {
+    let segments = split_dotted(s);
+    if !segments.iter().all(|seg| is_safe_path_segment(seg)) {
+        return None;
+    }
+    Some(join_pascal_segments(s, '/'))
+}
+
+/// True if `s` is usable as exactly ONE path segment: non-empty, and free of
+/// any separator or prefix that `Path::join` would treat as re-rooting.
+/// `\\` and `:` matter on Windows (`C:`, `\\\\server\\share`, NTFS streams) and are
+/// refused on every platform so behaviour does not diverge by host.
+fn is_safe_path_segment(s: &str) -> bool {
+    !s.is_empty() && !s.contains(['/', '\\', ':'])
 }
 
 fn join_pascal_segments(s: &str, sep: char) -> String {

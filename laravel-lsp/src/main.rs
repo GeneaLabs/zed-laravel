@@ -25160,11 +25160,16 @@ impl LanguageServer for LaravelLanguageServer {
                             trimmed_new,
                             &config,
                         );
-                    if &target_class != current_class {
-                        file_renames.push(laravel_lsp::rename::FileRename {
-                            old_path: current_class.clone(),
-                            new_path: target_class.clone(),
-                        });
+                    // `None` when the new name can't form a safe relative
+                    // path — refuse to move the file rather than compute an
+                    // arbitrary destination for it.
+                    if let Some(target_class) = target_class.as_ref() {
+                        if target_class != current_class {
+                            file_renames.push(laravel_lsp::rename::FileRename {
+                                old_path: current_class.clone(),
+                                new_path: target_class.clone(),
+                            });
+                        }
                     }
 
                     // Class name rewrite — fires whenever the leaf Pascal-
@@ -25186,10 +25191,12 @@ impl LanguageServer for LaravelLanguageServer {
 
                     // Namespace rewrite — only when the file moved into a
                     // different conventional namespace.
-                    if let Some(root) = root_path.as_ref() {
+                    if let (Some(root), Some(target_class)) =
+                        (root_path.as_ref(), target_class.as_ref())
+                    {
                         let new_namespace =
                             laravel_lsp::component_declaration_locator::conventional_namespace_for(
-                                &target_class,
+                                target_class,
                                 root,
                             );
                         if let Some(span) = &current.namespace_declaration {

@@ -866,3 +866,52 @@ fn namespaced_component_resolution_with_negative_controls() {
         "true negative: a missing component under the valid namespace stays missing"
     );
 }
+
+#[test]
+fn an_absolute_component_name_cannot_escape_the_class_path() {
+    // Regression: `bare` is discovered data — whatever follows `::` in a
+    // `<livewire:…>` tag or an `@livewire('…')` literal. Because
+    // `Path::join` replaces the base on an absolute right-hand side, an
+    // absolute name resolved to a file completely outside the registered
+    // class directory and was handed back as a goto-definition target.
+    // A dot-free temp prefix matters: `TempDir::new()` names its directory
+    // `.tmpXXXX`, and splitting the name on `.` would mangle the probe path
+    // before it could escape — making this test pass for the wrong reason.
+    let tmp = tempfile::Builder::new().prefix("zz").tempdir().unwrap();
+    let root = tmp.path();
+    let mut cfg = config_for(root);
+
+    // A decoy outside every configured location.
+    let outside = tmp.path().join("outside");
+    let decoy = outside.join("Secret.php");
+    write(&decoy, "<?php // not yours");
+
+    cfg.class_namespaces.insert(
+        "ui".to_string(),
+        crate::livewire_namespaces::LivewireClassNamespace {
+            class_namespace: "App\\UiKit\\Livewire".to_string(),
+            class_path: root.join("app/UiKit/Livewire"),
+        },
+    );
+
+    let absolute = outside.join("Secret");
+    let absolute = absolute.to_string_lossy();
+
+    assert!(
+        decoy.is_file(),
+        "precondition: the decoy exists, so only the guard can refuse it"
+    );
+    assert!(
+        !absolute.contains('.'),
+        "precondition: the probe name must be dot-free, or `split_dotted` mangles \
+         it and this test passes without exercising the guard at all"
+    );
+    assert!(
+        resolve_component(&format!("ui::{absolute}"), &cfg, LivewireVersion::V3).is_none(),
+        "a namespaced absolute name must not resolve outside the class path"
+    );
+    assert!(
+        resolve_component(&absolute, &cfg, LivewireVersion::V3).is_none(),
+        "an un-namespaced absolute name must not resolve outside the class path"
+    );
+}

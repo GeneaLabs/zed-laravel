@@ -5385,8 +5385,10 @@ pub fn component_candidate_paths(
     // Windows and a wasted `stat` on POSIX. Namespaced forms resolve via the
     // PSR-4 `componentNamespace` block below instead, so skip them here.
     if !name.contains(':') {
-        candidates
-            .push(crate::component_declaration_locator::conventional_class_file_path(name, config));
+        // A name that can't form a safe relative path yields no candidate.
+        candidates.extend(
+            crate::component_declaration_locator::conventional_class_file_path(name, config),
+        );
     }
 
     // Explicit class-backed registration: Blade::component('tag', Class::class)

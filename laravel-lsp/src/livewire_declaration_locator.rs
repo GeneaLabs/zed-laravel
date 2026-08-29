@@ -292,7 +292,7 @@ fn compute_v3_class_targets(
     let _old_class = current.first()?;
     let new_class = config
         .class_path
-        .join(naming::dotted_to_class_path(new_name))
+        .join(naming::dotted_to_class_path(new_name)?)
         .with_extension("php");
     let mut out = vec![new_class];
 

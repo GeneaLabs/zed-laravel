@@ -693,7 +693,7 @@ fn try_namespaced_class(
 ) -> Option<LivewireComponent> {
     let class_file = reg
         .class_path
-        .join(naming::dotted_to_class_path(bare))
+        .join(naming::dotted_to_class_path(bare)?)
         .with_extension("php");
     if !class_file.is_file() {
         return None;
@@ -707,7 +707,7 @@ fn try_namespaced_class(
 fn try_v3_class(bare: &str, config: &LivewireConfig) -> Option<LivewireComponent> {
     let class_path = config
         .class_path
-        .join(naming::dotted_to_class_path(bare))
+        .join(naming::dotted_to_class_path(bare)?)
         .with_extension("php");
     if !class_path.is_file() {
         return None;

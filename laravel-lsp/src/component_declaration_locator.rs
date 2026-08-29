@@ -137,12 +137,10 @@ pub fn locate_component(name: &str, config: &LaravelConfigData) -> Option<Compon
         .into_iter()
         .find(|p| p.is_file());
 
-    let class_file_path = conventional_class_file_path(name, config);
-    let class_file = if class_file_path.is_file() {
-        Some(class_file_path)
-    } else {
-        None
-    };
+    // `None` when the name can't form a safe relative path — the candidate
+    // simply doesn't exist, same as a miss on disk.
+    let class_file = conventional_class_file_path(name, config)
+        .filter(|class_file_path| class_file_path.is_file());
 
     if blade_file.is_none() && class_file.is_none() {
         return None;
@@ -173,12 +171,21 @@ pub fn locate_component(name: &str, config: &LaravelConfigData) -> Option<Compon
 /// The conventional PHP class file path for a tag name, regardless of
 /// whether the file actually exists. Used both to look up an existing file
 /// and to compute the target path for a rename.
-pub fn conventional_class_file_path(name: &str, config: &LaravelConfigData) -> PathBuf {
-    config
-        .root
-        .join("app/View/Components")
-        .join(naming::dotted_to_class_path(name))
-        .with_extension("php")
+///
+/// `None` when the tag name can't form a safe relative path (see
+/// [`naming::dotted_to_class_path`]) — a name carrying its own separator or
+/// an absolute prefix would otherwise make `Path::join` discard the
+/// `app/View/Components` base and name a file anywhere on disk. Both callers
+/// fail closed on `None`: the lookup reports no candidate, and the rename
+/// declines to move the file rather than inventing a destination.
+pub fn conventional_class_file_path(name: &str, config: &LaravelConfigData) -> Option<PathBuf> {
+    Some(
+        config
+            .root
+            .join("app/View/Components")
+            .join(naming::dotted_to_class_path(name)?)
+            .with_extension("php"),
+    )
 }
 
 /// The conventional PHP namespace for a class file at the given path, given

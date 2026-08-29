@@ -84,19 +84,22 @@ fn dotted_to_namespace_nested() {
 
 #[test]
 fn dotted_to_class_path_single() {
-    assert_eq!(dotted_to_class_path("counter"), "Counter");
+    assert_eq!(dotted_to_class_path("counter").as_deref(), Some("Counter"));
 }
 
 #[test]
 fn dotted_to_class_path_nested() {
-    assert_eq!(dotted_to_class_path("admin.user-list"), "Admin/UserList");
+    assert_eq!(
+        dotted_to_class_path("admin.user-list").as_deref(),
+        Some("Admin/UserList")
+    );
 }
 
 #[test]
 fn dotted_to_class_path_deep() {
     assert_eq!(
-        dotted_to_class_path("admin.users.show-profile"),
-        "Admin/Users/ShowProfile"
+        dotted_to_class_path("admin.users.show-profile").as_deref(),
+        Some("Admin/Users/ShowProfile")
     );
 }
 
@@ -252,5 +255,49 @@ fn validate_dotted_rejects_invalid_characters() {
     assert_eq!(
         validate_dotted_name("users@profile", true),
         Err(DottedNameError::InvalidCharacter('@'))
+    );
+}
+
+#[test]
+fn dotted_to_class_path_refuses_an_absolute_name() {
+    // `Path::join` REPLACES the base when the right-hand side is absolute, so
+    // an absolute name made `class_path.join(..)` resolve to the name itself,
+    // escaping the registered directory entirely.
+    assert_eq!(dotted_to_class_path("/etc/passwd"), None);
+    assert_eq!(dotted_to_class_path("/tmp/Secret"), None);
+}
+
+#[test]
+fn dotted_to_class_path_refuses_separators_inside_a_segment() {
+    // A component name is dotted segments of kebab identifiers. Anything
+    // carrying its own separator is not a name, and must not become a path.
+    assert_eq!(dotted_to_class_path("admin/users"), None);
+    assert_eq!(dotted_to_class_path("admin.users/show"), None);
+    assert_eq!(dotted_to_class_path("admin\\users"), None);
+    assert_eq!(dotted_to_class_path("C:windows"), None);
+}
+
+#[test]
+fn dotted_to_class_path_refuses_an_empty_segment() {
+    // Splitting on `.` turns `..` into empty segments, so this is also what
+    // stops classic dot-dot traversal from surviving the conversion.
+    assert_eq!(dotted_to_class_path("admin..users"), None);
+    assert_eq!(dotted_to_class_path(".users"), None);
+    assert_eq!(dotted_to_class_path("users."), None);
+    assert_eq!(dotted_to_class_path(""), None);
+}
+
+#[test]
+fn dotted_to_class_path_still_accepts_ordinary_names() {
+    // The guard must not cost a legitimate name — including digits and the
+    // deep nesting Laravel conventions produce.
+    assert_eq!(dotted_to_class_path("counter").as_deref(), Some("Counter"));
+    assert_eq!(
+        dotted_to_class_path("admin.users.show-profile").as_deref(),
+        Some("Admin/Users/ShowProfile")
+    );
+    assert_eq!(
+        dotted_to_class_path("v2-widget").as_deref(),
+        Some("V2Widget")
     );
 }
