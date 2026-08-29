@@ -61,11 +61,6 @@ fn assert_outside_root(path: &Path, root: &Path) {
     );
 }
 
-/// The paths in a resolution result, as the client would receive them.
-fn resolved_paths(data: &laravel_lsp::salsa_impl::BladeBackingResolutionData) -> Vec<PathBuf> {
-    data.files.clone()
-}
-
 #[tokio::test]
 async fn an_out_of_root_backing_class_candidate_is_not_resolved() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -99,7 +94,7 @@ async fn an_out_of_root_backing_class_candidate_is_not_resolved() {
         .unwrap();
 
     assert!(
-        !resolved_paths(&resolved).contains(&escapee),
+        !resolved.files.contains(&escapee),
         "an out-of-root candidate must never surface as a goto target: {:?}",
         resolved.files,
     );
@@ -143,7 +138,7 @@ async fn an_under_root_symlink_escaping_the_root_is_not_resolved() {
         .await
         .unwrap();
     assert!(
-        !resolved_paths(&escaping).contains(&link),
+        !escaping.files.contains(&link),
         "a path lexically under the root whose target escapes it must be refused: {:?}",
         escaping.files,
     );
@@ -162,7 +157,7 @@ async fn an_under_root_symlink_escaping_the_root_is_not_resolved() {
         .await
         .unwrap();
     assert!(
-        resolved_paths(&contained).contains(&genuine),
+        contained.files.contains(&genuine),
         "the same content at an in-root path must still resolve: {:?}",
         contained.files,
     );
@@ -192,7 +187,7 @@ async fn an_in_root_backing_class_resolves_to_its_exact_disk_content() {
         .unwrap();
 
     assert!(
-        resolved_paths(&resolved).contains(&class),
+        resolved.files.contains(&class),
         "an in-root backing class must resolve: {:?}",
         resolved.files,
     );

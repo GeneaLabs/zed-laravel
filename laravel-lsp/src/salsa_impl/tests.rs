@@ -6041,3 +6041,168 @@ fn a_client_pushed_in_root_buffer_still_answers_while_its_file_is_absent() {
         .expect("a genuinely-absent in-root buffer must still resolve");
     assert_eq!(*file.text(&actor.db), buffer);
 }
+
+// ─── Module-gated containment (#364, review round 1) ───────────────────
+//
+// Gating this read against the project root alone dropped every backing
+// class inside a module symlinked in from a composer path repository — the
+// layout `config::expand_module_dirs` admits on purpose and
+// `livewire_namespaces::contained_class_path` gates against the owning
+// module precisely to keep working. The loader now makes the same choice.
+// These three tests pin the widening AND its limits: a module's own subtree
+// is reachable, everything else is still refused.
+
+/// A project with `Modules/Blog` symlinked to a package directory that lives
+/// outside the project root. Returns the tempdir, the root, the module dir,
+/// and the external package dir.
+#[cfg(unix)]
+fn symlinked_module_project() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("project");
+    let package = dir.path().join("packages/blog");
+    std::fs::create_dir_all(root.join("Modules")).unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+    std::fs::create_dir_all(package.join("src/Livewire")).unwrap();
+
+    let module = root.join("Modules/Blog");
+    std::os::unix::fs::symlink(&package, &module).unwrap();
+    (dir, root, module, package)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_backing_class_inside_a_symlinked_module_still_loads() {
+    let (_dir, root, module, package) = symlinked_module_project();
+
+    let source = "<?php\nclass Post { public $title = 'x'; }\n";
+    std::fs::write(package.join("src/Livewire/Post.php"), source).unwrap();
+    let class = module.join("src/Livewire/Post.php");
+
+    // Precondition: this really is out of root — the case a root-only gate
+    // refused, and the reason this test exists.
+    let real = class.canonicalize().unwrap();
+    assert!(
+        !real.starts_with(root.canonicalize().unwrap()),
+        "fixture must resolve outside the project root, got {real:?}",
+    );
+
+    let mut actor = loader_test_actor(Some(root));
+    actor.module_dirs = vec![module];
+
+    let file = actor
+        .ensure_external_php_source_loaded(&class)
+        .expect("a class inside a symlinked path-repository module must load");
+    assert_eq!(*file.text(&actor.db), source);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_escaping_its_own_module_is_still_refused() {
+    let (dir, root, module, _package) = symlinked_module_project();
+
+    // Neither in the module nor in the project: the escape the widened gate
+    // must still catch.
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let secret = elsewhere.join("Secret.php");
+    std::fs::write(&secret, "<?php\nclass Secret { public $token = 'x'; }\n").unwrap();
+
+    // A path that LOOKS like it belongs to the module, so `owning_module`
+    // elects the module as its gate — and the gate then refuses it.
+    let link = module.join("src/Livewire/Escape.php");
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+    let mut actor = loader_test_actor(Some(root));
+    actor.module_dirs = vec![module];
+
+    assert!(
+        actor.ensure_external_php_source_loaded(&link).is_none(),
+        "electing a module gate must not become a way out of it",
+    );
+    assert!(!actor.files.contains_key(&link));
+    assert!(!actor.external_php_text.contains_key(&link));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_module_path_reaching_back_into_the_app_is_refused() {
+    let (_dir, root, module, _package) = symlinked_module_project();
+
+    // Inside the project root, but outside the module that owns the candidate.
+    let app_file = root.join("app/Shared.php");
+    std::fs::write(&app_file, "<?php\nclass Shared {}\n").unwrap();
+
+    let link = module.join("src/Livewire/Shared.php");
+    std::os::unix::fs::symlink(&app_file, &link).unwrap();
+
+    let mut actor = loader_test_actor(Some(root));
+    actor.module_dirs = vec![module];
+
+    // Deliberately STRICTER than a root-only gate, matching the rule
+    // `livewire_namespaces::contained_class_path` already applies to the
+    // registrations that mint these paths: a module reaching into bare `app/`
+    // is inside the root and still outside its own module.
+    assert!(
+        actor.ensure_external_php_source_loaded(&link).is_none(),
+        "a module candidate must resolve inside its own module, not merely in-root",
+    );
+}
+
+#[test]
+fn a_traversing_path_cannot_elect_a_module_as_its_gate() {
+    // A REAL module directory, not a symlinked one: an interior `..` after a
+    // symlink is resolved by the OS against the link's target, which would
+    // send this path nowhere and let the test pass with no guard at all. On a
+    // real directory the escape lands on a real, readable file, so the
+    // assertion can only hold because the gate refused it.
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("project");
+    let module = root.join("Modules/Blog");
+    std::fs::create_dir_all(module.join("src/Livewire")).unwrap();
+
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let secret = outside.join("Secret.php");
+    std::fs::write(&secret, "<?php\nclass Secret { public $token = 'x'; }\n").unwrap();
+
+    // Textually prefixed by the module dir, and it resolves to a real file.
+    let traversing = module.join("../../../outside/Secret.php");
+    assert!(
+        traversing.canonicalize().is_ok(),
+        "precondition: the escape target must be readable, or the test is vacuous",
+    );
+
+    let mut actor = loader_test_actor(Some(root));
+    actor.module_dirs = vec![module];
+
+    // `owning_module` collapses `..` before its prefix test, so this never
+    // elects the module gate — and the root gate it falls back to refuses it.
+    assert!(
+        actor
+            .ensure_external_php_source_loaded(&traversing)
+            .is_none(),
+        "an interior-`..` escape must not borrow the module's gate",
+    );
+}
+
+#[test]
+fn without_modules_the_gate_is_the_project_root() {
+    // The common case: no `modules.paths`, so `owning_module` never matches
+    // and the gate is exactly the root. Pins that the widening costs nothing
+    // for a project without modules.
+    let (_dir, root, outside) = root_and_outside();
+    let escapee = outside.join("Secret.php");
+    std::fs::write(&escapee, "<?php\nclass Secret {}\n").unwrap();
+
+    let mut actor = loader_test_actor(Some(root.clone()));
+    assert!(actor.module_dirs.is_empty(), "precondition: no modules");
+    assert!(actor.ensure_external_php_source_loaded(&escapee).is_none());
+
+    let inside = root.join("app/Livewire/Counter.php");
+    let source = "<?php\nclass Counter {}\n";
+    std::fs::write(&inside, source).unwrap();
+    let file = actor
+        .ensure_external_php_source_loaded(&inside)
+        .expect("an in-root class still loads with no modules configured");
+    assert_eq!(*file.text(&actor.db), source);
+}

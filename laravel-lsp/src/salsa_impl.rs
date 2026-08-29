@@ -10042,12 +10042,38 @@ impl SalsaActor {
     /// callers is a guard a future caller can forget, which is how #294 and
     /// both rounds of #348 happened. The guard therefore lives at the
     /// primitive, and it is split across the two branches because they ask
-    /// different questions — see the comments on each.
+    /// different questions — see the comments on each. Both branches gate
+    /// against the candidate's owning module where it has one, so a module
+    /// symlinked in from a composer path repository keeps resolving.
     fn ensure_external_php_source_loaded(&mut self, path: &PathBuf) -> Option<SourceFile> {
         // Root unknown: refuse before any state is read, mutated, or stat'd.
         // Containment cannot be decided without a root, and this function's
         // failure mode must be closed.
         let root = self.config_root.clone()?;
+
+        // Gate against the candidate's OWNING MODULE where it has one, falling
+        // back to the project root — the same choice
+        // `livewire_namespaces::contained_class_path` makes for the
+        // registrations that MINT these paths, and the same
+        // `config::owning_module` lookup this file already uses for provider
+        // rank.
+        //
+        // `config::expand_module_dirs` admits a module directory whose real
+        // target sits outside the project ON PURPOSE: that is the composer
+        // path-repository layout. Gating this read against the root alone
+        // dropped every backing class inside such a module — silently, since
+        // there is no "component not found" diagnostic and the only symptom is
+        // goto and hover quietly doing nothing.
+        //
+        // The swap does not loosen the guard, and for a module path it
+        // TIGHTENS it: a candidate lexically under a module must canonicalize
+        // inside that module, so one reaching into a sibling module or into
+        // bare `app/` is refused even though it is inside the root.
+        // `owning_module` collapses `..` before its prefix test, so a
+        // traversing path cannot elect itself a laxer gate.
+        let gate = crate::config::owning_module(&self.module_dirs, path)
+            .map(|(_, dir)| dir.to_path_buf())
+            .unwrap_or(root);
 
         // Ownership is checked BEFORE the filesystem, so a client-pushed path
         // is served from Salsa whether or not it can be stat'd at this instant.
@@ -10070,7 +10096,7 @@ impl SalsaActor {
             // #361. The read branch keeps the full fail-closed guard; this is
             // an addition to a branch that guard never covered, not a
             // substitution for it.
-            if !path_within_root_emit_safe(path, &root) {
+            if !path_within_root_emit_safe(path, &gate) {
                 return None;
             }
             if let Some(file) = self.files.get(path).copied() {
@@ -10094,7 +10120,7 @@ impl SalsaActor {
         // symlink swapped between guard and read hand back a target the guard
         // never approved. `path` stays the key for `self.files` and
         // `external_php_text`, so the callers' own lookups still resolve.
-        let real = canonical_within_root_registration(path, &root)?;
+        let real = canonical_within_root_registration(path, &gate)?;
 
         let current_mtime = std::fs::metadata(&real).ok()?.modified().ok()?;
 
