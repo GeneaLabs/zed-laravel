@@ -1383,12 +1383,26 @@ mod priority_merging {
         assert!(env_priority(".env.local") > env_priority(".env.example"));
     }
 
-    /// Test that service provider locations map to correct priorities
+    /// The path-classifiable half of the tier scale: app (3) > package (1) >
+    /// framework (0), keyed the way `register_service_provider_files_with_salsa`
+    /// keys them.
+    ///
+    /// Module providers (2) are deliberately absent: no path substring
+    /// identifies one. They are discovered from the `modules.paths` globs plus
+    /// each module's composer `extra.laravel.providers`, via
+    /// `config::module_provider_files` — so a `contains("modules/")` branch here
+    /// would encode a rule the real classifier does not implement.
+    ///
+    /// Like `test_priority_ordering_constants` above, this is a documentation
+    /// test — the mapping is local, so it records the classification rather than
+    /// observing it. The module tier is enforced against the real merge by
+    /// `module_view_namespaces` and `module_livewire_namespaces`. Keep the
+    /// numbers here in step with `register_service_provider_files_with_salsa`.
     #[test]
     fn test_service_provider_priority_by_location() {
         fn provider_priority(path: &str) -> u8 {
             if path.contains("app/Providers") {
-                2 // App providers
+                3 // App providers
             } else if path.contains("vendor") && !path.contains("laravel/framework") {
                 1 // Package providers
             } else {
@@ -1396,7 +1410,7 @@ mod priority_merging {
             }
         }
 
-        assert_eq!(provider_priority("app/Providers/AppServiceProvider.php"), 2);
+        assert_eq!(provider_priority("app/Providers/AppServiceProvider.php"), 3);
         assert_eq!(
             provider_priority("vendor/some-package/src/ServiceProvider.php"),
             1
