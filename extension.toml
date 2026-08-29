@@ -25,10 +25,14 @@ name = "Laravel CE"
 #     `env_key_locator::is_env_file_name`, which matches `.env` exactly or a
 #     `.env.` variant prefix: the code lens (`collect_lens_items`), the
 #     inline-comment semantic tokens (`semantic_tokens_full`), env-key
-#     completion, and the ingestion step that admits an edited buffer as an
-#     env source at all. Every position request — hover, go-to-definition,
-#     find-references, rename — returns early unless the path ends in `.php`
-#     or `.blade.php`, so none of them reach a Shell Script buffer at all.
+#     completion, hover (`env_key_hover`) and go-to-definition
+#     (`env_key_definition`) on the key declaration under the cursor, and the
+#     ingestion step that admits an edited buffer as an env source at all.
+#     Find-references and rename are narrower still: they return early unless
+#     the path ends in `.php` or `.blade.php`, so they never run on a Shell
+#     Script buffer at all. A buffer Zed classifies as Shell Script but does
+#     not NAME `.env` or `.env.<suffix>` fails the gate and reaches no env
+#     feature.
 #
 # (c) Because of (a) and (b), attaching to "Shell Script" registers nothing,
 #     overrides nothing, and claims nothing. It is the only route to `.env*`
