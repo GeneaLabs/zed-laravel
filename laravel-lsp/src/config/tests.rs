@@ -1497,7 +1497,11 @@ fn psr4_entries_escaping_the_module_resolve_nothing() {
 
     for psr4_dir in [
         outside.to_string_lossy().to_string(), // absolute
-        "../../outside".to_string(),           // traversal
+        // Four levels: `{n}` -> `Legal` -> `app` -> `proj` -> the temp dir,
+        // so the candidate lands ON the decoy written above. `../../outside`
+        // normalized to `proj/app/outside`, which holds nothing — the
+        // assertion then passed with or without the containment gate.
+        "../../../../outside".to_string(), // traversal
     ] {
         let module = tmp
             .path()

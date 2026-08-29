@@ -6696,7 +6696,7 @@ pub enum SalsaRequest {
     RegisterServiceProviderSource {
         path: PathBuf,
         text: String,
-        priority: u8, // 0=framework, 1=package, 2=app
+        priority: u8, // 0=framework, 1=package, 2=module, 3=app
         root_path: PathBuf,
         reply: oneshot::Sender<()>,
     },
@@ -10364,7 +10364,8 @@ impl SalsaActor {
                     let prefix = cn.prefix(&self.db).namespace(&self.db).clone();
                     let rank = (cn.priority(&self.db), module_rank);
                     if wins(component_namespaces.get(&prefix).map(|(r, _)| r), rank) {
-                        component_namespaces.insert(prefix, (rank, cn.php_namespace(&self.db).clone()));
+                        component_namespaces
+                            .insert(prefix, (rank, cn.php_namespace(&self.db).clone()));
                     }
                 }
 
@@ -11535,7 +11536,8 @@ impl SalsaActor {
 
     /// Build the macro registry — `(receiver_fqcn, macro_name)` → registration —
     /// by merging every Salsa-parsed service provider's `macros`, highest
-    /// priority winning on key collision (framework=0 < package=1 < app=2). Built
+    /// priority winning on key collision (framework=0 < package=1 < module=2 <
+    /// app=3). Built
     /// fresh each call from the tracked-query outputs (mirrors
     /// [`Self::build_facade_alias_snapshot`]); macros number in the dozens-to-
     /// hundreds, with no cache to invalidate on a provider edit.
@@ -12231,7 +12233,7 @@ impl SalsaActor {
                 file_path: class_file.map(PathBuf::from),
                 source_file: source_file.map(PathBuf::from),
                 source_line: Some(line as usize),
-                priority: 2, // Cache entries have highest priority (app level)
+                priority: 3, // Cache entries are app tier — the highest
             },
         );
     }
@@ -12263,7 +12265,7 @@ impl SalsaActor {
                 binding_type: bt,
                 source_file: source_file.map(PathBuf::from),
                 source_line: Some(line as usize),
-                priority: 2, // Cache entries have highest priority (app level)
+                priority: 3, // Cache entries are app tier — the highest
             },
         );
     }

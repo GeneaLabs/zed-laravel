@@ -27,6 +27,16 @@ use crate::vendor_translations::{
     argument_value, is_this_receiver, resolve_path_arg, string_literal_text,
 };
 
+/// The three directories every registration in one provider file is resolved
+/// and gated against: `provider_dir` is `__DIR__`, `root` backs the
+/// `base_path()`/`lang_path()` helpers, and `gate_dir` is what containment is
+/// judged by (see [`contained_class_path`]).
+struct PathContext<'a> {
+    provider_dir: &'a Path,
+    root: &'a Path,
+    gate_dir: &'a Path,
+}
+
 /// One registered Livewire class-component namespace: the PHP class
 /// namespace the prefix maps to and the directory its classes live in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,14 +72,16 @@ pub fn extract_livewire_namespaces(
     let file_namespace = php_file_namespace(tree.root_node(), bytes);
     // A module provider is contained by its OWN module, an app provider by
     // the project root — see `contained_class_path`.
-    let gate_dir = module_dir.unwrap_or(root);
+    let paths = PathContext {
+        provider_dir,
+        root,
+        gate_dir: module_dir.unwrap_or(root),
+    };
 
     walk(
         tree.root_node(),
         bytes,
-        provider_dir,
-        root,
-        gate_dir,
+        &paths,
         registrar_methods,
         file_namespace.as_deref(),
         &mut out,
@@ -80,31 +92,21 @@ pub fn extract_livewire_namespaces(
 fn walk(
     node: tree_sitter::Node,
     bytes: &[u8],
-    provider_dir: &Path,
-    root: &Path,
-    gate_dir: &Path,
+    paths: &PathContext,
     registrar_methods: &[String],
     file_namespace: Option<&str>,
     out: &mut HashMap<String, LivewireClassNamespace>,
 ) {
     match node.kind() {
         "scoped_call_expression" => {
-            if let Some((prefix, reg)) =
-                classify_add_namespace(node, bytes, provider_dir, root, gate_dir)
-            {
+            if let Some((prefix, reg)) = classify_add_namespace(node, bytes, paths) {
                 out.insert(prefix, reg);
             }
         }
         "member_call_expression" => {
-            if let Some((prefix, reg)) = classify_registrar_call(
-                node,
-                bytes,
-                provider_dir,
-                root,
-                gate_dir,
-                registrar_methods,
-                file_namespace,
-            ) {
+            if let Some((prefix, reg)) =
+                classify_registrar_call(node, bytes, paths, registrar_methods, file_namespace)
+            {
                 out.insert(prefix, reg);
             }
         }
@@ -112,16 +114,7 @@ fn walk(
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk(
-            child,
-            bytes,
-            provider_dir,
-            root,
-            gate_dir,
-            registrar_methods,
-            file_namespace,
-            out,
-        );
+        walk(child, bytes, paths, registrar_methods, file_namespace, out);
     }
 }
 
@@ -131,9 +124,7 @@ fn walk(
 fn classify_add_namespace(
     node: tree_sitter::Node,
     bytes: &[u8],
-    provider_dir: &Path,
-    root: &Path,
-    gate_dir: &Path,
+    paths: &PathContext,
 ) -> Option<(String, LivewireClassNamespace)> {
     let scope = node.child_by_field_name("scope")?.utf8_text(bytes).ok()?;
     if scope != "Livewire" && !scope.ends_with("\\Livewire") {
@@ -150,8 +141,7 @@ fn classify_add_namespace(
     // quoted text instead of the (truncated) first string_content chunk.
     let class_namespace =
         unescape_php_namespace(&string_literal_raw(*args.get(1)?.as_ref()?, bytes)?);
-    let class_path =
-        contained_class_path(*args.get(2)?.as_ref()?, bytes, provider_dir, root, gate_dir)?;
+    let class_path = contained_class_path(*args.get(2)?.as_ref()?, bytes, paths)?;
 
     Some((
         prefix,
@@ -168,9 +158,7 @@ fn classify_add_namespace(
 fn classify_registrar_call(
     node: tree_sitter::Node,
     bytes: &[u8],
-    provider_dir: &Path,
-    root: &Path,
-    gate_dir: &Path,
+    paths: &PathContext,
     registrar_methods: &[String],
     file_namespace: Option<&str>,
 ) -> Option<(String, LivewireClassNamespace)> {
@@ -183,8 +171,7 @@ fn classify_registrar_call(
     }
 
     let args = collect_arguments(node, bytes, &["path", "prefix"])?;
-    let class_path =
-        contained_class_path(*args.first()?.as_ref()?, bytes, provider_dir, root, gate_dir)?;
+    let class_path = contained_class_path(*args.first()?.as_ref()?, bytes, paths)?;
     let prefix = string_literal_text(*args.get(1)?.as_ref()?, bytes)?;
     if prefix.is_empty() {
         return None;
@@ -210,7 +197,7 @@ fn classify_registrar_call(
 /// `__DIR__.'/../../../..'` never enters the config, so nothing downstream
 /// can walk or probe outside the project.
 ///
-/// `gate_dir` is the provider's OWNING MODULE directory
+/// [`PathContext::gate_dir`] is the provider's OWNING MODULE directory
 /// ([`crate::config::owning_module`]) and falls back to the project root for
 /// an app-level provider. Two things follow, and both are the point:
 ///
@@ -232,12 +219,10 @@ fn classify_registrar_call(
 fn contained_class_path(
     arg: tree_sitter::Node,
     bytes: &[u8],
-    provider_dir: &Path,
-    root: &Path,
-    gate_dir: &Path,
+    paths: &PathContext,
 ) -> Option<PathBuf> {
-    let resolved = resolve_path_arg(arg, bytes, provider_dir, root)?;
-    crate::path_containment::path_within_root_lexical(&resolved, gate_dir)
+    let resolved = resolve_path_arg(arg, bytes, paths.provider_dir, paths.root)?;
+    crate::path_containment::path_within_root_lexical(&resolved, paths.gate_dir)
         .then(|| resolved.canonicalize().unwrap_or(resolved))
 }
 

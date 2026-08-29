@@ -3706,10 +3706,11 @@ class AppServiceProvider extends ServiceProvider {
 
 #[tokio::test]
 async fn snapshot_macros_priority_merges_vendor_and_app() {
-    // A package provider (priority 1) and an app provider (priority 2) both
+    // A package provider (priority 1) and an app provider (priority 3) both
     // register `Str::shared`; the app's site wins on key collision. The package
     // also ships `Str::pkgOnly`, which is resolvable on its own. This is the
-    // framework=0 < package=1 < app=2 merge the binding registry uses, applied to
+    // framework=0 < package=1 < module=2 < app=3 merge the binding registry uses,
+    // applied to
     // macros — vendor providers are already `ServiceProviderFile` Salsa inputs,
     // so the same plumbing covers them.
     use tempfile::TempDir;
@@ -3730,7 +3731,7 @@ class PkgServiceProvider extends ServiceProvider {
 }
 "#;
 
-    // App provider (priority 2): overrides `shared`.
+    // App provider (priority 3): overrides `shared`.
     let app = root.join("app/Providers/AppServiceProvider.php");
     let app_src = r#"<?php
 namespace App\Providers;
@@ -3753,7 +3754,7 @@ class AppServiceProvider extends ServiceProvider {
         .await
         .unwrap();
     handle
-        .register_service_provider_source(app.clone(), app_src.to_string(), 2, root.clone())
+        .register_service_provider_source(app.clone(), app_src.to_string(), 3, root.clone())
         .await
         .unwrap();
 

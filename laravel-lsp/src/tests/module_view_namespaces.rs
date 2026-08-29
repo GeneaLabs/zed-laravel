@@ -387,7 +387,11 @@ fn module_registering_everything(root: &Path, name: &str) -> PathBuf {
     fs::create_dir_all(module.join("app/Providers")).unwrap();
     fs::create_dir_all(module.join("resources/views/components")).unwrap();
     fs::create_dir_all(module.join("View/Components")).unwrap();
-    fs::write(module.join("View/Components/Card.php"), "<?php class Card {}").unwrap();
+    fs::write(
+        module.join("View/Components/Card.php"),
+        "<?php class Card {}",
+    )
+    .unwrap();
     fs::write(
         module.join("composer.json"),
         format!(
@@ -459,7 +463,10 @@ fn winners(config: &LaravelConfigData) -> Vec<(&'static str, Option<String>)> {
     vec![
         (
             "view_namespaces",
-            config.view_namespaces.get("shared-ns").and_then(|p| module_of(p)),
+            config
+                .view_namespaces
+                .get("shared-ns")
+                .and_then(|p| module_of(p)),
         ),
         (
             "component_namespaces",

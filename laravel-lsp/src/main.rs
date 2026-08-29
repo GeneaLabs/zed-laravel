@@ -6164,7 +6164,7 @@ impl LaravelLanguageServer {
     /// with Salsa, which parses them using the tracked `parse_service_provider_source`
     /// function. Salsa handles caching and incremental updates automatically.
     ///
-    /// Priority: framework=0, packages=1, app=2 (higher wins)
+    /// Priority: framework=0, packages=1, modules=2, app=3 (higher wins)
     async fn register_service_provider_files_with_salsa(&self, root: &Path) {
         let documents = self.documents.read().await;
         let mut registered_count = 0;
@@ -6259,7 +6259,7 @@ impl LaravelLanguageServer {
             }
         }
 
-        // Priority 2: Application providers (app/Providers/)
+        // Priority 3: Application providers (app/Providers/)
         let app_providers_path = root.join("app/Providers");
         if app_providers_path.exists() {
             for entry in WalkDir::new(&app_providers_path)
@@ -6354,7 +6354,7 @@ impl LaravelLanguageServer {
             }
         }
 
-        // Priority 2: bootstrap/app.php (Laravel 11+)
+        // Priority 3: bootstrap/app.php (Laravel 11+)
         let bootstrap_app = root.join("bootstrap/app.php");
         if bootstrap_app.exists() {
             let content = if let Ok(uri) = Url::from_file_path(&bootstrap_app) {
@@ -6405,7 +6405,7 @@ impl LaravelLanguageServer {
             }
         }
 
-        // Priority 2: app/Http/Kernel.php (Laravel 10)
+        // Priority 3: app/Http/Kernel.php (Laravel 10)
         let kernel_path = root.join("app/Http/Kernel.php");
         if kernel_path.exists() {
             let content = if let Ok(uri) = Url::from_file_path(&kernel_path) {
@@ -6737,7 +6737,7 @@ impl LaravelLanguageServer {
         let documents = self.documents.read().await;
         let mut registered_count = 0;
 
-        // Priority 2: Application providers (app/Providers/)
+        // Priority 3: Application providers (app/Providers/)
         let app_providers_path = root.join("app/Providers");
         if app_providers_path.exists() {
             for entry in WalkDir::new(&app_providers_path)
@@ -6828,7 +6828,7 @@ impl LaravelLanguageServer {
             }
         }
 
-        // Priority 2: bootstrap/app.php (Laravel 11+)
+        // Priority 3: bootstrap/app.php (Laravel 11+)
         let bootstrap_app = root.join("bootstrap/app.php");
         if bootstrap_app.exists() {
             let content = if let Ok(uri) = Url::from_file_path(&bootstrap_app) {
@@ -6878,7 +6878,7 @@ impl LaravelLanguageServer {
             }
         }
 
-        // Priority 2: app/Http/Kernel.php (Laravel 10)
+        // Priority 3: app/Http/Kernel.php (Laravel 10)
         let kernel_path = root.join("app/Http/Kernel.php");
         if kernel_path.exists() {
             let content = if let Ok(uri) = Url::from_file_path(&kernel_path) {

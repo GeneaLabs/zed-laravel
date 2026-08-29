@@ -1224,7 +1224,11 @@ pub fn owning_module<'a>(module_dirs: &'a [PathBuf], path: &Path) -> Option<(usi
         .iter()
         .enumerate()
         .filter(|(_, dir)| normalized.starts_with(crate::route_discovery::normalize_path(dir)))
-        .max_by_key(|(_, dir)| crate::route_discovery::normalize_path(dir).components().count())
+        .max_by_key(|(_, dir)| {
+            crate::route_discovery::normalize_path(dir)
+                .components()
+                .count()
+        })
         .map(|(index, dir)| (index + 1, dir.as_path()))
 }
 
