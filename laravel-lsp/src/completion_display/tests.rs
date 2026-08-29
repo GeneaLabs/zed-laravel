@@ -709,10 +709,29 @@ fn a_password_whose_leading_run_parses_as_a_port_still_fails_open() {
              comment on mask_url_credentials is stale"
         );
     }
-    // The boundary: one digit more than a port can hold, and the parse fails,
-    // so the fallback masks it. This is what keeps the residue narrow.
+    // The boundary, and it is the port's *value* rather than its length:
+    // `99999` is the same five digits as `65535` and fails only because it is
+    // past `u16::MAX`. Asserted rather than described — this comment used to
+    // read "one digit more than a port can hold", which is false about both
+    // numbers and which no assertion underneath it could contradict.
+    assert_eq!(
+        "99999".len(),
+        "65535".len(),
+        "the two ports must stay the same length, or this fixture stops \
+         demonstrating that the value is what decides"
+    );
+    assert!("65535".parse::<u16>().is_ok());
+    assert!("99999".parse::<u16>().is_err());
     assert_eq!(
         mask_url_credentials("mysql://user:99999/ss@host/db"),
         "mysql://user:***@host/db"
+    );
+
+    // The residue is bounded by the authority rule as well as by the port. The
+    // same password behind an opaque scheme has no authority, so it reaches the
+    // scan and masks.
+    assert_eq!(
+        mask_url_credentials("jdbc:mysql://user:12/34@host/db"),
+        "jdbc:mysql://user:***@host/db"
     );
 }
