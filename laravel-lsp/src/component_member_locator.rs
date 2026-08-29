@@ -125,15 +125,31 @@ pub fn locate_member_of_kind(
 /// Candidates are collected and sorted the same way [`locate_member`] sorts
 /// them, so the summary always describes the declaration goto lands on.
 pub fn member_declaration_summary(source: &str, member: &str) -> Option<String> {
+    member_declaration_summary_of_kind(source, member, None)
+}
+
+/// [`member_declaration_summary`], restricted to one declaration kind.
+///
+/// `want` must be the same filter the caller applied to [`locate_member_of_kind`].
+/// A class can declare `public $save` AND `save()`, and the two halves of a
+/// hover card are rendered from separate calls: the header from the located
+/// declaration, the body from here. Filtered on one side only, the card reads
+/// `Counter::$save` above `public function save(): void` — a description of a
+/// declaration goto refuses to visit (#339, item 5).
+pub fn member_declaration_summary_of_kind(
+    source: &str,
+    member: &str,
+    want: Option<MemberKind>,
+) -> Option<String> {
     let Ok(tree) = parse_php(source) else {
-        return volt_functional::declaration_summary(source, member);
+        return volt_functional::declaration_summary_of_kind(source, member, want);
     };
     let bytes = source.as_bytes();
     let mut found: Vec<(u32, u32, String)> = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(n) = stack.pop() {
         match n.kind() {
-            "method_declaration" => {
+            "method_declaration" if want.is_none_or(|k| k == MemberKind::Method) => {
                 if let Some(name) = n.child_by_field_name("name") {
                     if name.utf8_text(bytes).ok() == Some(member) {
                         let end = n
@@ -148,7 +164,7 @@ pub fn member_declaration_summary(source: &str, member: &str) -> Option<String> 
                     }
                 }
             }
-            "property_declaration" => {
+            "property_declaration" if want.is_none_or(|k| k == MemberKind::Property) => {
                 let mut c = n.walk();
                 for element in n.children(&mut c) {
                     if element.kind() != "property_element" {
@@ -169,7 +185,7 @@ pub fn member_declaration_summary(source: &str, member: &str) -> Option<String> 
                     }
                 }
             }
-            "property_promotion_parameter" => {
+            "property_promotion_parameter" if want.is_none_or(|k| k == MemberKind::Property) => {
                 if let Some(name) = n.child_by_field_name("name") {
                     if matches_dollar_name(name, bytes, member) {
                         let head = collapse_ws(&source[n.start_byte()..name.start_byte()]);
@@ -193,7 +209,7 @@ pub fn member_declaration_summary(source: &str, member: &str) -> Option<String> 
         .into_iter()
         .next()
         .map(|(_, _, text)| text)
-        .or_else(|| volt_functional::declaration_summary(source, member))
+        .or_else(|| volt_functional::declaration_summary_of_kind(source, member, want))
 }
 
 /// `(line, column, payload)` keyed on a name node's position, so summaries
@@ -208,10 +224,10 @@ fn with_position(node: Node, dollar_skip: u32, payload: String) -> (u32, u32, St
 /// anonymous class of a `new class extends Component` front matter.
 ///
 /// Completion must not offer members declared by anything else in the file. A
-/// trait declared beside the component, a second unrelated top-level class,
-/// an enum — all of them are separate declarations whose members are not on
-/// `$this`, and offering them contradicts the documented
-/// trait-provided-members limitation.
+/// second unrelated top-level class, an enum, a trait the component does not
+/// `use` — all of them are separate declarations whose members are not on
+/// `$this`. A trait the component DOES `use` is the exception, and
+/// [`member_surface_roots`] adds it back.
 ///
 /// Falls back to the first trait/enum/interface when the file declares no
 /// class, and finally to the whole file when it declares nothing at all — a
@@ -247,6 +263,116 @@ fn owning_declaration<'tree>(root: Node<'tree>) -> Node<'tree> {
     class_like.or(other).unwrap_or(root)
 }
 
+/// Every declaration whose members are reachable on the component's `$this`:
+/// [`owning_declaration`] plus the same-file traits it actually `use`s,
+/// transitively (a trait may `use` another).
+///
+/// Scoping completion to the owning declaration alone (#339, item 6) traded a
+/// false positive for a false negative: in
+///
+/// ```php
+/// trait HasFoo { public $bar; }
+/// class Counter extends Component { use HasFoo; }
+/// ```
+///
+/// `$bar` IS on `$this` at runtime, and dropping it is worse than the leak the
+/// scoping fixed. Resolution stays inside the file — a `use` naming a trait
+/// declared elsewhere still resolves to nothing, which is the documented
+/// cross-file trait limitation, untouched.
+fn member_surface_roots<'tree>(root: Node<'tree>, bytes: &[u8]) -> Vec<Node<'tree>> {
+    let owner = owning_declaration(root);
+    let mut roots = vec![owner];
+
+    let declared = trait_declarations(root, bytes);
+    if declared.is_empty() {
+        return roots;
+    }
+
+    // Worklist over trait names, with a visited set: `use` cycles are illegal
+    // PHP but cheap to survive, and a trait's own `use` clauses count.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue = vec![owner];
+    while let Some(node) = queue.pop() {
+        for name in used_trait_names(node, bytes) {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(decl) = declared.get(&name) {
+                roots.push(*decl);
+                queue.push(*decl);
+            }
+        }
+    }
+    roots
+}
+
+/// The file's own `trait X { … }` declarations, by name.
+fn trait_declarations<'tree>(
+    root: Node<'tree>,
+    bytes: &[u8],
+) -> std::collections::HashMap<String, Node<'tree>> {
+    let mut out = std::collections::HashMap::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "trait_declaration" {
+            if let Some(name) = n
+                .child_by_field_name("name")
+                .and_then(|nm| nm.utf8_text(bytes).ok())
+            {
+                out.insert(name.to_string(), n);
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    out
+}
+
+/// The trait names `decl`'s own body `use`s, unqualified.
+///
+/// Nested class-like bodies are not descended into: a `use` inside an
+/// anonymous class declared in one of `decl`'s methods binds members onto THAT
+/// object, not onto `$this`. Only the last `\`-separated segment is kept,
+/// because a same-file trait is referenced by its bare name from the same
+/// namespace.
+fn used_trait_names(decl: Node, bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack: Vec<Node> = vec![decl];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "use_declaration" {
+            let mut c = n.walk();
+            for ch in n.children(&mut c) {
+                if !matches!(ch.kind(), "name" | "qualified_name") {
+                    continue;
+                }
+                if let Ok(text) = ch.utf8_text(bytes) {
+                    if let Some(last) = text.rsplit('\\').next() {
+                        if !last.is_empty() {
+                            out.push(last.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            let nested_scope = matches!(
+                ch.kind(),
+                "class_declaration"
+                    | "trait_declaration"
+                    | "interface_declaration"
+                    | "anonymous_class"
+            );
+            if !nested_scope || ch.id() == decl.id() {
+                stack.push(ch);
+            }
+        }
+    }
+    out
+}
+
 /// Every PUBLIC property of the component's own declaration (see
 /// [`owning_declaration`]), as `(name, declared type text)` — `"mixed"` when
 /// untyped. Includes promoted public constructor properties. Unlike the
@@ -260,7 +386,7 @@ pub fn public_property_types(source: &str) -> Vec<(String, String)> {
     };
     let bytes = source.as_bytes();
     let mut out = Vec::new();
-    let mut stack = vec![owning_declaration(tree.root_node())];
+    let mut stack = member_surface_roots(tree.root_node(), bytes);
     while let Some(n) = stack.pop() {
         match n.kind() {
             "property_declaration" | "property_promotion_parameter" => {
@@ -351,7 +477,7 @@ pub fn public_action_method_names(source: &str) -> Vec<String> {
     };
     let bytes = source.as_bytes();
     let mut out = Vec::new();
-    let mut stack = vec![owning_declaration(tree.root_node())];
+    let mut stack = member_surface_roots(tree.root_node(), bytes);
     while let Some(n) = stack.pop() {
         if n.kind() == "method_declaration" {
             let mut public = true; // PHP methods default to public

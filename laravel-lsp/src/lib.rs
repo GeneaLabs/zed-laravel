@@ -61,6 +61,7 @@ pub mod completion_format;
 pub mod component_completion;
 pub mod component_declaration_locator;
 pub mod component_member_locator;
+pub mod component_usage_index;
 pub mod composer_autoload;
 pub mod config;
 pub mod config_key_locator;

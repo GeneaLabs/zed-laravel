@@ -55,6 +55,7 @@ mod nested_module_root_correction;
 mod post_warm_open_buffer_guard;
 mod query_chain_completion_handler;
 mod rename_integration;
+mod render_index_and_buffer_integrity;
 mod route_binding_resolution;
 mod route_diagnostics;
 mod route_hover;

@@ -119,6 +119,17 @@ pub fn action_names(source: &str) -> Vec<String> {
 /// assignment up to (not including) the closure's body. Whitespace runs are
 /// collapsed so a multiline declaration renders as one line.
 pub fn declaration_summary(source: &str, member: &str) -> Option<String> {
+    declaration_summary_of_kind(source, member, None)
+}
+
+/// [`declaration_summary`], restricted to the declaration kind the reference
+/// demands — so a hover card whose header was filtered on `want` cannot show
+/// the body of the other kind's declaration of the same name.
+pub fn declaration_summary_of_kind(
+    source: &str,
+    member: &str,
+    want: Option<MemberKind>,
+) -> Option<String> {
     if !crate::livewire_resolver::source_contains_volt_signature(source) {
         return None;
     }
@@ -132,7 +143,7 @@ pub fn declaration_summary(source: &str, member: &str) -> Option<String> {
                 let mut found = Vec::new();
                 collect_state_keys(n, bytes, &mut found);
                 for (name, loc) in found {
-                    if name == member {
+                    if name == member && want.is_none_or(|k| k == loc.kind) {
                         if let Some(entry) = state_entry_node(n, bytes, member) {
                             hits.push((
                                 loc.line,
@@ -147,7 +158,7 @@ pub fn declaration_summary(source: &str, member: &str) -> Option<String> {
                 let mut found = Vec::new();
                 collect_closure_member(n, bytes, &mut found);
                 for (name, loc) in found {
-                    if name == member {
+                    if name == member && want.is_none_or(|k| k == loc.kind) {
                         let end = closure_body_start(n).unwrap_or_else(|| n.end_byte());
                         hits.push((
                             loc.line,

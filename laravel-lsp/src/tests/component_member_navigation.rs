@@ -260,18 +260,25 @@ async fn open_document(backend: &LaravelLanguageServer, path: &Path, content: &s
     uri
 }
 
-/// A component that declares BOTH a `$save` property and a `save()` method,
+/// A component that declares BOTH a `save()` method and a `$save` property,
 /// so a kind-blind lookup cannot tell which one a reference meant.
+///
+/// **The METHOD is declared first on purpose.** Every lookup here picks the
+/// first candidate in document order, so with the property first a kind filter
+/// that only reaches half a result — a hover header filtered while its body is
+/// not — still shows the property and the tests still pass. Method-first makes
+/// the unfiltered path answer `save()` and the filtered path answer `$save`,
+/// which is what lets these assertions discriminate at all.
 const KIND_CLASH: &str = r#"<?php
 
 use Livewire\Component;
 
 new class extends Component {
-    public $save = '';
-
     public function save(): void
     {
     }
+
+    public $save = '';
 };
 ?>
 
@@ -281,6 +288,14 @@ new class extends Component {
     <span wire:target="save, reset"></span>
 </div>
 "#;
+
+/// A hover header as it is RENDERED. `main` escapes inline markdown in card
+/// headers, so `Counter::increment()` reaches the client as
+/// `Counter\:\:increment\(\)`. Routing the expected text through the same
+/// helper keeps these assertions honest without pinning their escaping.
+fn rendered(text: &str) -> String {
+    laravel_lsp::markdown_safety::escape_inline(text).into_owned()
+}
 
 fn write_blade(root: &Path, rel: &str, source: &str) -> PathBuf {
     let path = root.join(rel);
@@ -345,8 +360,8 @@ async fn wire_model_goto_resolves_the_property_not_the_same_named_method() {
         .expect("a data binding resolves to the property");
     assert_eq!(
         goto_line(&response),
-        5,
-        "wire:model binds `public $save`, declared on line 5 — not `save()` on line 7"
+        9,
+        "wire:model binds `public $save`, declared on line 9 — not `save()` on line 5"
     );
 }
 
@@ -372,8 +387,8 @@ async fn wire_click_goto_resolves_the_method_not_the_same_named_property() {
         .expect("an action binding resolves to the method");
     assert_eq!(
         goto_line(&response),
-        7,
-        "wire:click calls `save()`, declared on line 7"
+        5,
+        "wire:click calls `save()`, declared on line 5"
     );
 }
 
@@ -387,7 +402,8 @@ async fn wire_target_navigates_the_entry_under_the_cursor() {
     let target_line = 16;
     let text = KIND_CLASH.lines().nth(target_line as usize).unwrap();
     // `wire:target="save, reset"` — the first entry names the component's
-    // member, and `wire:target` accepts either kind, so the property answers.
+    // member, and `wire:target` accepts EITHER kind, so the winner is simply
+    // the first declaration in document order: `save()` on line 5.
     let character = text.find("save,").unwrap() as u32;
     let response = backend
         .wire_attribute_goto_definition(
@@ -430,12 +446,26 @@ async fn hover_card_for_a_binding_ignores_the_same_named_method() {
         .await
         .expect("the property is declared");
     assert!(
-        card.contains("::$save"),
+        card.contains(&rendered("::$save")),
         "a property card names the property: {card}"
     );
     assert!(
         !card.contains("::save()"),
         "the method must not answer a property reference: {card}"
+    );
+    // The BODY, not just the header. `member_declaration_summary` is a second,
+    // independent lookup, and unfiltered it renders whichever declaration comes
+    // first — the method, in this fixture. Asserting the absence of `::save()`
+    // cannot catch that: the rendered method reads `public function save():
+    // void`, which contains no `::` at all. Read raw, not through `rendered`:
+    // the code block is fenced PHP, and fenced content is not inline-escaped.
+    assert!(
+        card.contains("public $save"),
+        "the code block shows the property's own declaration: {card}"
+    );
+    assert!(
+        !card.contains("function save"),
+        "the code block must not show the method's signature: {card}"
     );
 }
 
@@ -466,11 +496,11 @@ async fn inline_class_hover_card_names_the_component_not_the_base_class() {
         .await
         .expect("the inline class declares increment()");
     assert!(
-        !card.contains("Component::"),
+        !card.contains(&rendered("Component::")),
         "an anonymous `new class extends Component` is not called `Component`: {card}"
     );
     assert!(
-        card.contains("counter::increment()"),
+        card.contains(&rendered("counter::increment()")),
         "the card names the component: {card}"
     );
 }
@@ -513,7 +543,7 @@ async fn a_named_backing_class_still_shows_its_fqcn() {
         .await
         .expect("the backing class declares increment()");
     assert!(
-        card.contains("App\\Livewire\\Counter::increment()"),
+        card.contains(&rendered("App\\Livewire\\Counter::increment()")),
         "a NAMED class keeps its FQCN — the component-name fallback is only \
          for anonymous and functional shapes: {card}"
     );
@@ -668,11 +698,11 @@ async fn functional_volt_hover_card_names_the_component() {
         .await
         .expect("a functional Volt action gets a card");
     assert!(
-        !card.contains("Component::"),
+        !card.contains(&rendered("Component::")),
         "a functional Volt file declares no class called `Component`: {card}"
     );
     assert!(
-        card.contains("counter::increment()"),
+        card.contains(&rendered("counter::increment()")),
         "the card names the component: {card}"
     );
 }

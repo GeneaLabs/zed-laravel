@@ -13074,9 +13074,19 @@ impl LaravelLanguageServer {
         blade_path: &Path,
     ) -> laravel_lsp::salsa_impl::BladeBackingResolutionData {
         if let Some((generation, entries)) = self.pending_render_index_snapshot() {
-            if self.salsa.set_render_index(entries).await.is_ok() {
+            if self
+                .salsa
+                .set_render_index(generation, entries)
+                .await
+                .is_ok()
+            {
+                // `fetch_max`, not `store`: two tasks can snapshot generations
+                // 5 and 6 and finish their pushes in either order, and a plain
+                // store would let the older one win the gate. The actor refuses
+                // an out-of-order snapshot for the same reason, so both sides
+                // only ever move forward.
                 self.pushed_render_generation
-                    .store(generation, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_max(generation, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -13227,7 +13237,10 @@ impl LaravelLanguageServer {
     ///
     /// Reading `generation()` under the same lock that builds the snapshot is
     /// what makes the pair consistent: a snapshot can never be stamped with a
-    /// generation it doesn't match.
+    /// generation it doesn't match. Consistency of the PAIR is all this can
+    /// promise, though — the push itself happens after an `await`, so which
+    /// snapshot the actor ends up installing is settled on the actor side, by
+    /// `handle_set_render_index` refusing to go backwards.
     ///
     /// Generation 0 is the never-mutated index, which is empty — and the actor
     /// synthesizes an empty render index for a resolution that arrives before
@@ -20423,8 +20436,13 @@ return [
             MemberKind::Method => format!("{class_name}::{member}()"),
             MemberKind::Property => format!("{class_name}::${member}"),
         };
-        let signature =
-            laravel_lsp::component_member_locator::member_declaration_summary(source, member);
+        // Same `want` the header was filtered on. Without it the summary is
+        // free to describe the OTHER declaration of the same name — a class
+        // holding both `public $save` and `save()` would print a header of
+        // `::$save` above the body of `save()` (#339, item 5).
+        let signature = laravel_lsp::component_member_locator::member_declaration_summary_of_kind(
+            source, member, want,
+        );
         let link = self.source_link(class_path, Some(loc.line + 1)).await;
         let rendered = hover::render(&hover::HoverContent {
             header: Some(&header),

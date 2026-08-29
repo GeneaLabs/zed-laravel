@@ -348,3 +348,157 @@ fn an_inline_anonymous_component_class_owns_the_members() {
         "the anonymous class is the component even with a trait above it"
     );
 }
+
+/// A class declaring BOTH kinds under one name: the summary must describe the
+/// kind asked for, not whichever declaration the parser reaches first. The
+/// method is declared first, so an unfiltered call answers with it — which is
+/// what makes these two assertions discriminate.
+const SUMMARY_KIND_CLASH: &str = r#"<?php
+class Counter
+{
+    public function save(): void
+    {
+    }
+
+    public string $save = '';
+}
+"#;
+
+#[test]
+fn declaration_summary_of_kind_describes_the_requested_kind() {
+    assert_eq!(
+        member_declaration_summary_of_kind(SUMMARY_KIND_CLASH, "save", Some(MemberKind::Property))
+            .as_deref(),
+        Some("public string $save"),
+    );
+    assert_eq!(
+        member_declaration_summary_of_kind(SUMMARY_KIND_CLASH, "save", Some(MemberKind::Method))
+            .as_deref(),
+        Some("public function save(): void"),
+    );
+}
+
+#[test]
+fn an_unfiltered_summary_still_answers_in_document_order() {
+    assert_eq!(
+        member_declaration_summary(SUMMARY_KIND_CLASH, "save").as_deref(),
+        Some("public function save(): void"),
+        "no filter means first-in-document-order, which is the method here",
+    );
+}
+
+#[test]
+fn declaration_summary_of_a_kind_the_class_lacks_is_none() {
+    let source = "<?php\nclass Counter\n{\n    public function save(): void {}\n}\n";
+    assert!(
+        member_declaration_summary_of_kind(source, "save", Some(MemberKind::Property)).is_none()
+    );
+}
+
+/// Item 6 scoped the member surface to the component's own declaration. A
+/// trait the component actually `use`s is on `$this` at runtime, so scoping it
+/// away traded a false positive for a false negative.
+const USED_TRAIT: &str = r#"<?php
+trait HasCounter
+{
+    public $fromTrait = 1;
+
+    public function bumpFromTrait(): void
+    {
+    }
+}
+
+trait Unrelated
+{
+    public $fromUnrelated = 1;
+
+    public function bumpFromUnrelated(): void
+    {
+    }
+}
+
+class Counter extends Component
+{
+    use HasCounter;
+
+    public $own = 1;
+}
+"#;
+
+#[test]
+fn a_used_same_file_trait_contributes_its_members() {
+    let properties: Vec<String> = public_property_types(USED_TRAIT)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(properties.contains(&"own".to_string()));
+    assert!(
+        properties.contains(&"fromTrait".to_string()),
+        "`use HasCounter` puts $fromTrait on $this: {properties:?}"
+    );
+
+    let actions = public_action_method_names(USED_TRAIT);
+    assert!(
+        actions.contains(&"bumpFromTrait".to_string()),
+        "`use HasCounter` puts bumpFromTrait() on $this: {actions:?}"
+    );
+}
+
+#[test]
+fn an_unused_same_file_trait_contributes_nothing() {
+    let properties: Vec<String> = public_property_types(USED_TRAIT)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        !properties.contains(&"fromUnrelated".to_string()),
+        "a trait the class never `use`s is not on $this: {properties:?}"
+    );
+    assert!(
+        !public_action_method_names(USED_TRAIT).contains(&"bumpFromUnrelated".to_string()),
+        "a trait the class never `use`s is not on $this"
+    );
+}
+
+#[test]
+fn a_trait_used_by_a_used_trait_contributes_its_members() {
+    let source = r#"<?php
+trait Inner
+{
+    public $deep = 1;
+}
+
+trait Outer
+{
+    use Inner;
+
+    public $middle = 1;
+}
+
+class Counter extends Component
+{
+    use Outer;
+}
+"#;
+    let properties: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(properties.contains(&"middle".to_string()), "{properties:?}");
+    assert!(
+        properties.contains(&"deep".to_string()),
+        "a trait's own `use` clauses count too: {properties:?}"
+    );
+}
+
+/// A `use` naming a trait declared in another file resolves to nothing — the
+/// documented cross-file limitation, unchanged by the same-file fix.
+#[test]
+fn a_use_of_an_absent_trait_is_ignored() {
+    let source = "<?php\nclass Counter extends Component\n{\n    use \\App\\Traits\\Absent;\n\n    public $own = 1;\n}\n";
+    let properties: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(properties, vec!["own".to_string()]);
+}

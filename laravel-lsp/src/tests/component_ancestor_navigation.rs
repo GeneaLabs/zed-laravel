@@ -67,8 +67,9 @@ fn config_for(root: &Path) -> LaravelConfigData {
 }
 
 /// A server wired to `root`: config cached (the walk needs `view_paths` to
-/// name the partial) and the project registered with the Salsa actor (the
-/// reverse lookup sweeps the actor's view-file list).
+/// name the partial) and the project registered with the Salsa actor, which
+/// queues each view file into the reverse component-usage index the walk
+/// reads.
 async fn backend_for(root: &Path) -> LaravelLanguageServer {
     let (service, _socket) = LspService::new(LaravelLanguageServer::new);
     let backend = service.inner().clone();
@@ -86,6 +87,14 @@ async fn backend_for(root: &Path) -> LaravelLanguageServer {
         .await
         .expect("actor registers the tempdir project");
     backend
+}
+
+/// A hover header as it is RENDERED. `main` escapes inline markdown in card
+/// headers, so `Counter::increment()` reaches the client as
+/// `Counter\:\:increment\(\)`. Routing the expected text through the same
+/// helper keeps these assertions honest without pinning their escaping.
+fn rendered(text: &str) -> String {
+    laravel_lsp::markdown_safety::escape_inline(text).into_owned()
 }
 
 fn write(path: &Path, contents: &str) -> PathBuf {
@@ -204,7 +213,7 @@ async fn hover_card_for_a_partial_member_names_the_ancestor_component() {
         .await
         .expect("the ancestor declares save(), so a card must be emitted");
     assert!(
-        card.contains("dashboard::save()"),
+        card.contains(&rendered("dashboard::save()")),
         "the card names the ancestor component, not the partial: {card}"
     );
     assert!(
