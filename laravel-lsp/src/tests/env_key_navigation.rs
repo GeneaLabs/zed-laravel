@@ -262,10 +262,17 @@ async fn cursor_off_the_key_resolves_nothing() {
 }
 
 #[tokio::test]
-async fn second_declaration_of_the_same_key_resolves_nothing() {
-    // `enumerate_keys_in_source` is first-match-wins per key, so only the first
-    // `APP_NAME=` line is a declaration. A cursor on the second one is on text
-    // the enumeration never emitted.
+async fn the_first_of_two_active_declarations_answers_and_the_second_resolves_nothing() {
+    // Both halves of one first-wins guarantee, which two mechanisms have to
+    // agree on. `enumerate_keys_in_source` is first-match-wins per key, so only
+    // the first `APP_NAME=` line is a declaration and a cursor on the second is
+    // on text the enumeration never emitted. The merge behind the card has to
+    // read the pair the same way: two active declarations in one file tie on
+    // priority, and `env_var_supersedes` falls through to keeping the first one
+    // seen. Were that arm to prefer the candidate, the card on the *first* line
+    // would carry the *second* line's value — a card describing a line other
+    // than the one under the cursor, which is the defect this pair of
+    // assertions exists to pin.
     let (server, dir) = server_with(
         &[(".env", "APP_NAME=first\nAPP_NAME=second\n")],
         &[("config/app.php", APP_NAME_CONSUMER)],
@@ -273,9 +280,16 @@ async fn second_declaration_of_the_same_key_resolves_nothing() {
     .await;
     let env = dir.path().join(".env");
 
+    let card = hover_at(&server, &env, position(0, 2))
+        .await
+        .expect("the first declaration must resolve");
     assert!(
-        hover_at(&server, &env, position(0, 2)).await.is_some(),
-        "the first declaration must resolve"
+        card.contains("first"),
+        "the first declaration's own value must answer for it: {card:?}"
+    );
+    assert!(
+        !card.contains("second"),
+        "a later declaration must not answer for the line under the cursor: {card:?}"
     );
     assert!(
         hover_at(&server, &env, position(1, 2)).await.is_none(),
@@ -645,6 +659,28 @@ async fn the_whole_table_merge_keeps_the_active_declaration_too() {
         app_name[0]
     );
     assert_eq!(app_name[0].value, "current-value");
+}
+
+#[tokio::test]
+async fn the_whole_table_merge_keeps_the_first_of_two_active_declarations() {
+    // The tie above resolves through the rule's commented-loses arm. Two
+    // active declarations fall through that arm to first-wins, which is the
+    // other tie the same rule has to settle — pinned on the by-name merge from
+    // the cursor, and here on the table merge, so neither call site can drift.
+    let (server, _dir) = server_with(&[(".env", "APP_NAME=first\nAPP_NAME=second\n")], &[]).await;
+
+    let vars = server
+        .salsa
+        .get_all_parsed_env_vars()
+        .await
+        .expect("the merged env table");
+    let app_name: Vec<_> = vars.iter().filter(|v| v.name == "APP_NAME").collect();
+    assert_eq!(app_name.len(), 1, "the table merges by name: {app_name:?}");
+    assert_eq!(
+        app_name[0].value, "first",
+        "the first declaration seen must keep the key: {:?}",
+        app_name[0]
+    );
 }
 
 #[tokio::test]
