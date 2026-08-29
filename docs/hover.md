@@ -87,6 +87,12 @@ says so, as does a key no `.env*` file defines — and that one keeps its
 consumer count, since a stale or mistyped key is exactly when the call sites
 matter.
 
+The card always describes **the line the cursor is on**, so the ordinary habit
+of commenting an old value out above the live one reads correctly from either
+line: the live one shows its value, the comment says it is commented. A key the
+winning file comments out has no value in effect at all, and the card says so
+rather than quoting an outranked one.
+
 ```
 APP_NAME=Acme
 ^^^^^^^^ hover →  APP_NAME

@@ -1519,13 +1519,14 @@ pub fn parse_env_source<'db>(db: &'db dyn Db, file: EnvFile) -> Vec<ParsedEnvVar
             continue;
         }
 
-        // Check if line is commented
-        let is_commented = line.trim_start().starts_with('#');
-        let working_line = if is_commented {
-            line.trim_start().trim_start_matches('#').trim_start()
-        } else {
-            line
-        };
+        // Check if line is commented — through the one rule every reader of
+        // `.env` text classifies with, so Salsa's view of "commented" and the
+        // buffer-local view the LSP handlers hit-test with cannot disagree.
+        let (is_commented, working_line) =
+            match crate::env_key_locator::commented_declaration_body(line) {
+                Some(body) => (true, body),
+                None => (false, line),
+            };
 
         // Parse VAR=value format
         if let Some((name_part, value_part)) = working_line.split_once('=') {
@@ -11783,6 +11784,28 @@ impl SalsaActor {
         self.translations.invalidate(path);
     }
 
+    /// Whether `candidate` replaces `current` as the merged declaration of a
+    /// key. The one rule both env merges below resolve ties with.
+    ///
+    /// The file-priority ladder decides first: `.env` (2) outranks
+    /// `.env.local` (1) outranks `.env.example` (0). Every declaration *inside*
+    /// one file carries that file's priority and so always ties, and there an
+    /// active declaration outranks a commented one — `# KEY=old` above
+    /// `KEY=new` is one declaration and one comment, not two candidates, and
+    /// keeping the first line seen let the comment answer for the key. Beyond
+    /// that the first line seen still wins.
+    ///
+    /// A commented declaration in a higher-priority file still outranks an
+    /// active one below it: commenting a key out in `.env` is how a project
+    /// turns it off, and the ladder is what gives `.env` the last word.
+    fn env_var_supersedes(candidate: &ParsedEnvVarData, current: &ParsedEnvVarData) -> bool {
+        match candidate.priority.cmp(&current.priority) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => current.is_commented && !candidate.is_commented,
+            std::cmp::Ordering::Less => false,
+        }
+    }
+
     /// Handle getting a parsed env variable by name from Salsa
     fn handle_get_parsed_env_var(&self, name: &str) -> Option<ParsedEnvVarData> {
         // Find the variable with the highest priority
@@ -11804,7 +11827,7 @@ impl SalsaActor {
                     };
                     // Keep the one with highest priority
                     match &best {
-                        Some(existing) if existing.priority >= data.priority => {}
+                        Some(existing) if !Self::env_var_supersedes(&data, existing) => {}
                         _ => best = Some(data),
                     }
                 }
@@ -11837,7 +11860,7 @@ impl SalsaActor {
                 };
 
                 match merged.get(&name) {
-                    Some(existing) if existing.priority >= data.priority => {}
+                    Some(existing) if !Self::env_var_supersedes(&data, existing) => {}
                     _ => {
                         merged.insert(name, data);
                     }

@@ -291,13 +291,15 @@ async fn second_declaration_of_the_same_key_resolves_nothing() {
 
 #[tokio::test]
 async fn hover_in_a_lower_priority_file_shows_the_winning_value() {
-    // `.env` (2) outranks `.env.example` (0). Hovering the key in the example
-    // file must report the value the application actually runs with, and name
+    // The whole ladder, not just its ends: `.env` (2) outranks `.env.local`
+    // (1) outranks `.env.example` (0). Hovering the key in the example file
+    // must report the value the application actually runs with, and name
     // `.env` as the declaring file — the same ladder `hover_for_env` reads for
     // the reverse direction.
     let (server, dir) = server_with(
         &[
             (".env", "APP_NAME=Acme\n"),
+            (".env.local", "APP_NAME=local-only\n"),
             (".env.example", "APP_NAME=placeholder\n"),
         ],
         &[("config/app.php", APP_NAME_CONSUMER)],
@@ -312,8 +314,45 @@ async fn hover_in_a_lower_priority_file_shows_the_winning_value() {
         "must render the winning `.env` value: {card:?}"
     );
     assert!(
+        !card.contains("local-only"),
+        "must not render the middle tier's value: {card:?}"
+    );
+    assert!(
         !card.contains("placeholder"),
         "must not render the outranked value: {card:?}"
+    );
+}
+
+#[tokio::test]
+async fn env_local_outranks_env_example_when_env_is_silent() {
+    // The middle rung of the same ladder, exercised on its own: with no `.env`
+    // declaration to win, `.env.local` (1) must still beat `.env.example` (0).
+    // Without this the priority tests only ever span the two extremes, and a
+    // ladder collapsed to "`.env` or anything else" would pass them both.
+    let (server, dir) = server_with(
+        &[
+            (".env", "APP_NAME=Acme\n"),
+            (".env.local", "MAIL_FROM=local@example.test\n"),
+            (".env.example", "MAIL_FROM=placeholder@example.test\n"),
+        ],
+        &[],
+    )
+    .await;
+    let card = hover_at(&server, &dir.path().join(".env.example"), position(0, 2))
+        .await
+        .expect("hover in .env.example must render a card");
+
+    assert!(
+        card.contains("local@example.test"),
+        "must render the `.env.local` value: {card:?}"
+    );
+    assert!(
+        !card.contains("placeholder@example.test"),
+        "must not render the outranked `.env.example` value: {card:?}"
+    );
+    assert!(
+        card.contains(".env.local"),
+        "must name `.env.local` as the declaring file: {card:?}"
     );
 }
 
@@ -321,15 +360,27 @@ async fn hover_in_a_lower_priority_file_shows_the_winning_value() {
 async fn zero_consumer_key_still_hovers_but_has_nowhere_to_jump() {
     // The two handlers diverge here by design: a card is still useful, a jump
     // to nothing is not.
-    let (server, dir) = server_with(&[(".env", "UNUSED_KEY=1\n")], &[]).await;
+    // Not `*_KEY`: that name matches the sensitive-name pattern, so its value
+    // is redacted out of the card and a value assertion could never hold.
+    let (server, dir) = server_with(&[(".env", "IDLE_SETTING=idle-value\n")], &[]).await;
     let env = dir.path().join(".env");
 
     let card = hover_at(&server, &env, position(0, 2))
         .await
         .expect("a key with no consumers must still render a card");
     assert!(
-        card.contains("UNUSED_KEY"),
+        card.contains("IDLE_SETTING"),
         "card must name the key: {card:?}"
+    );
+    // A *full* card, not a bare count: dropping the value or the source link
+    // in this branch must redden the test.
+    assert!(
+        card.contains("idle-value"),
+        "card must carry the value even with no consumers: {card:?}"
+    );
+    assert!(
+        card.contains(".env"),
+        "card must link the declaring file even with no consumers: {card:?}"
     );
     assert!(
         card.contains("0 references"),
@@ -404,6 +455,14 @@ async fn commented_key_hovers_with_the_commented_out_state() {
         "card must carry the commented-out state: {card:?}"
     );
     assert!(
+        !card.contains("Acme"),
+        "a commented declaration has no value in effect, so none may be shown: {card:?}"
+    );
+    assert!(
+        card.contains(".env"),
+        "card must link the file the commented declaration lives in: {card:?}"
+    );
+    assert!(
         card.contains("1 reference"),
         "card must still carry the consumer count: {card:?}"
     );
@@ -423,6 +482,206 @@ async fn goto_definition_on_a_commented_key_still_jumps() {
         .await
         .expect("a commented key with a consumer must resolve");
     assert_eq!(goto_positions(&response).len(), 1);
+}
+
+// ── two declarations of one key in one file ───────────────────────────────
+
+#[tokio::test]
+async fn a_commented_line_above_the_active_one_does_not_answer_for_it() {
+    // Commenting the old value out directly above the new one is ordinary
+    // `.env` editing. Both declarations carry the same file priority, so no
+    // name-keyed lookup can tell them apart — the card must be built from the
+    // declaration the cursor is on.
+    let (server, dir) = server_with(
+        &[(".env", "# APP_NAME=retired-value\nAPP_NAME=current-value\n")],
+        &[("config/app.php", APP_NAME_CONSUMER)],
+    )
+    .await;
+    let env = dir.path().join(".env");
+
+    let active = hover_at(&server, &env, position(1, 2))
+        .await
+        .expect("the active declaration must render a card");
+    assert!(
+        !active.contains("commented out"),
+        "a live declaration must not be reported as disabled: {active:?}"
+    );
+    assert!(
+        active.contains("current-value"),
+        "the active card must carry the active value: {active:?}"
+    );
+    assert!(
+        !active.contains("retired-value"),
+        "the commented line's value must not answer for the active one: {active:?}"
+    );
+
+    let commented = hover_at(&server, &env, position(0, 4))
+        .await
+        .expect("the commented declaration must render a card");
+    assert!(
+        commented.contains("commented out"),
+        "the commented line must carry the commented-out state: {commented:?}"
+    );
+    assert!(
+        !commented.contains("current-value") && !commented.contains("retired-value"),
+        "a commented declaration has no value in effect: {commented:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_commented_line_below_the_active_one_still_reads_as_commented() {
+    // The same file in the other order. Here the *active* line is the one a
+    // first-match-wins merge keeps, so hovering the comment below it used to
+    // render the active value with no commented-out marker at all — the same
+    // defect pointing the other way.
+    let (server, dir) = server_with(
+        &[(".env", "APP_NAME=current-value\n# APP_NAME=retired-value\n")],
+        &[("config/app.php", APP_NAME_CONSUMER)],
+    )
+    .await;
+    let env = dir.path().join(".env");
+
+    let commented = hover_at(&server, &env, position(1, 4))
+        .await
+        .expect("the commented declaration must render a card");
+    assert!(
+        commented.contains("commented out"),
+        "the commented line must carry the commented-out state: {commented:?}"
+    );
+    assert!(
+        !commented.contains("current-value"),
+        "the active line's value must not answer for the commented one: {commented:?}"
+    );
+
+    let active = hover_at(&server, &env, position(0, 2))
+        .await
+        .expect("the active declaration must render a card");
+    assert!(
+        !active.contains("commented out"),
+        "a live declaration must not be reported as disabled: {active:?}"
+    );
+    assert!(
+        active.contains("current-value"),
+        "the active card must carry the active value: {active:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_commented_card_links_the_file_the_comment_is_in() {
+    // The commented declaration lives in `.env.example`; a live one of the same
+    // key lives in `.env` and outranks it. The card describes the line under
+    // the cursor, so it must link the file that line is in — a name-keyed
+    // lookup would have linked `.env` and quoted its value.
+    let (server, dir) = server_with(
+        &[
+            (".env", "APP_NAME=live-value\n"),
+            (".env.example", "# APP_NAME=placeholder\n"),
+        ],
+        &[("config/app.php", APP_NAME_CONSUMER)],
+    )
+    .await;
+
+    let card = hover_at(&server, &dir.path().join(".env.example"), position(0, 4))
+        .await
+        .expect("the commented declaration must render a card");
+    assert!(
+        card.contains("commented out"),
+        "the commented line must carry the commented-out state: {card:?}"
+    );
+    assert!(
+        card.contains(".env.example"),
+        "the card must link the file the comment is in: {card:?}"
+    );
+    assert!(
+        !card.contains("live-value") && !card.contains("placeholder"),
+        "a commented declaration has no value in effect: {card:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_reverse_direction_reads_the_same_pair_the_same_way() {
+    // `env('APP_NAME')` in PHP resolves through the same merge. A commented
+    // line above the active one must not make the reverse card report the key
+    // as switched off either — one tie-break, both directions.
+    let (server, _dir) = server_with(
+        &[(".env", "# APP_NAME=retired-value\nAPP_NAME=current-value\n")],
+        &[("config/app.php", APP_NAME_CONSUMER)],
+    )
+    .await;
+
+    let card = server.hover_for_env("APP_NAME").await;
+    assert!(
+        !card.contains("commented out"),
+        "the PHP-side card must not report a live key as disabled: {card:?}"
+    );
+    assert!(
+        card.contains("current-value"),
+        "the PHP-side card must carry the active value: {card:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_whole_table_merge_keeps_the_active_declaration_too() {
+    // The by-name lookup is not the only merge: `get_all_parsed_env_vars`
+    // builds the table completion and the disk cache read, and it resolves
+    // ties with the same rule. Driven through the real Salsa actor so this
+    // pins the call site, not the rule in isolation.
+    let (server, _dir) = server_with(
+        &[(".env", "# APP_NAME=retired-value\nAPP_NAME=current-value\n")],
+        &[],
+    )
+    .await;
+
+    let vars = server
+        .salsa
+        .get_all_parsed_env_vars()
+        .await
+        .expect("the merged env table");
+    let app_name: Vec<_> = vars.iter().filter(|v| v.name == "APP_NAME").collect();
+    assert_eq!(app_name.len(), 1, "the table merges by name: {app_name:?}");
+    assert!(
+        !app_name[0].is_commented,
+        "the comment must not answer for the key: {:?}",
+        app_name[0]
+    );
+    assert_eq!(app_name[0].value, "current-value");
+}
+
+#[tokio::test]
+async fn a_key_commented_out_in_the_winning_file_has_no_value_in_effect() {
+    // `.env` (2) outranks `.env.local` (1), and `.env` comments the key out —
+    // switching a key off in `.env` is how a project disables it. The active
+    // declaration under the cursor is real, so the card must not claim it is
+    // commented; but the outranked value is not what the application runs
+    // with, so it must not be presented as the effective one either.
+    let (server, dir) = server_with(
+        &[
+            (".env", "# APP_NAME=disabled-in-env\n"),
+            (".env.local", "APP_NAME=local-value\n"),
+        ],
+        &[("config/app.php", APP_NAME_CONSUMER)],
+    )
+    .await;
+
+    let card = hover_at(&server, &dir.path().join(".env.local"), position(0, 2))
+        .await
+        .expect("the active declaration must still render a card");
+    assert!(
+        card.contains("not defined in .env"),
+        "no declaration is in effect, so the card must say so: {card:?}"
+    );
+    assert!(
+        !card.contains("local-value"),
+        "an outranked value must not be shown as the effective one: {card:?}"
+    );
+    assert!(
+        !card.contains("commented out"),
+        "the line under the cursor is active: {card:?}"
+    );
+    assert!(
+        card.contains("1 reference"),
+        "the consumer count must survive the not-defined state: {card:?}"
+    );
 }
 
 // ── multiple consumers ────────────────────────────────────────────────────

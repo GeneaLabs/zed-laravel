@@ -21148,9 +21148,9 @@ return [
         }
     }
 
-    /// The env key whose *name text* sits under `position` in an open `.env*`
-    /// buffer, or `None` when the cursor is anywhere else — the `=`, the value,
-    /// a blank line, a bare comment.
+    /// The env-key declaration whose *name text* sits under `position` in an
+    /// open `.env*` buffer, or `None` when the cursor is anywhere else — the
+    /// `=`, the value, a blank line, a bare comment.
     ///
     /// Reads the declarations out of the buffer rather than out of Salsa: the
     /// question is "which key is at this position in *this* file", and the
@@ -21165,39 +21165,84 @@ return [
         uri: &Url,
         path: &Path,
         position: Position,
-    ) -> Option<String> {
+    ) -> Option<EnvDeclarationAtCursor> {
         use laravel_lsp::env_key_locator::{
             enumerate_commented_keys_in_source, enumerate_keys_in_source,
         };
 
         let source = self.buffer_text(uri, path).await;
-        key_at_cursor(&enumerate_keys_in_source(&source), position)
-            .or_else(|| key_at_cursor(&enumerate_commented_keys_in_source(&source), position))
+        if let Some(key) = key_at_cursor(&enumerate_keys_in_source(&source), position) {
+            return Some(EnvDeclarationAtCursor {
+                key,
+                is_commented: false,
+            });
+        }
+        key_at_cursor(&enumerate_commented_keys_in_source(&source), position).map(|key| {
+            EnvDeclarationAtCursor {
+                key,
+                is_commented: true,
+            }
+        })
     }
 
-    /// Hover for an env key declaration in a `.env*` buffer: the key, its
-    /// effective value and declaring file, and how many `env('KEY')` call sites
-    /// consume it.
+    /// Hover for the env key declaration under the cursor in a `.env*` buffer:
+    /// the key, its effective value and declaring file, and how many
+    /// `env('KEY')` call sites consume it.
     ///
-    /// Value, source file and commented state all come from
+    /// **Commented state comes from the cursor, never from a lookup.**
+    /// `at.is_commented` says which enumeration matched the position, and that
+    /// is the declaration this card describes; `get_parsed_env_var` is keyed by
+    /// name and merged across files, so asking it "is this one commented?"
+    /// invites a different declaration to answer. A `.env` holding
+    /// `# APP_NAME=old` above `APP_NAME=new` is the ordinary case — two
+    /// declarations of one key, tied on file priority.
+    ///
+    /// Value and declaring file for an **active** declaration still come from
     /// `get_parsed_env_var` — the same priority-merged lookup `hover_for_env`
-    /// reads for the reverse direction (`env('KEY')` in PHP), so the two
-    /// directions agree on which file's declaration wins. The consumer count
-    /// comes from the same `find_references` call the code lens resolves with.
-    async fn hover_for_env_declaration(&self, key: &str, references: usize) -> String {
+    /// reads for the reverse direction (`env('KEY')` in PHP), so both
+    /// directions agree on which file's declaration is in effect. A commented
+    /// one needs no lookup at all: it is the line under the cursor, in this
+    /// buffer, and it has no value in effect to report.
+    ///
+    /// The consumer count comes from the same `find_references` call the code
+    /// lens resolves with.
+    async fn hover_for_env_declaration(
+        &self,
+        at: &EnvDeclarationAtCursor,
+        path: &Path,
+        references: usize,
+    ) -> String {
         use laravel_lsp::hover;
+        let key = at.key.as_str();
         let label = laravel_lsp::code_lens::reference_count_label(references);
+        if at.is_commented {
+            let link = self.source_link(path, None).await;
+            return hover::render(&hover::HoverContent {
+                header: Some(key),
+                detail: Some("*(commented out)*"),
+                source_link: Some(&link),
+                trailer: Some(&label),
+                ..Default::default()
+            });
+        }
         let var = self
             .salsa
             .get_parsed_env_var(key.to_string())
             .await
             .ok()
-            .flatten();
+            .flatten()
+            // A commented winner means the ladder's top declaration of this key
+            // is switched off (`# KEY=` in `.env`, active in `.env.local`), so
+            // no value is in effect. Reporting the outranked value would be a
+            // value the application never sees; reporting "commented out" would
+            // describe a line other than the active one under the cursor.
+            .filter(|var| !var.is_commented);
         let Some(var) = var else {
-            // The key is declared in the buffer but absent from the merged env
-            // table — an unsaved or unregistered file. Mirrors `hover_for_env`'s
-            // not-defined trailer, and keeps the consumer count, which is the
-            // whole reason someone hovers a key the project cannot resolve.
+            // Either the key is absent from the merged env table — an unsaved or
+            // unregistered file — or every declaration that outranks this one is
+            // commented out. Mirrors `hover_for_env`'s not-defined trailer, and
+            // keeps the consumer count, which is the whole reason someone hovers
+            // a key the project cannot resolve.
             let trailer = format!("*(not defined in .env)* — {label}");
             return hover::render(&hover::HoverContent {
                 header: Some(key),
@@ -21206,15 +21251,7 @@ return [
             });
         };
         let link = self.source_link(&var.source_file, None).await;
-        if var.is_commented {
-            hover::render(&hover::HoverContent {
-                header: Some(key),
-                detail: Some("*(commented out)*"),
-                source_link: Some(&link),
-                trailer: Some(&label),
-                ..Default::default()
-            })
-        } else if laravel_lsp::completion_display::is_sensitive_env_name(&var.name) {
+        if laravel_lsp::completion_display::is_sensitive_env_name(&var.name) {
             // Same two redaction guards `hover_for_env` applies to the reverse
             // direction (issues #344, #348). The value being on screen already
             // is not a reason to skip them: this card is LSP output like any
@@ -21246,17 +21283,17 @@ return [
 
     /// `textDocument/hover` for a `.env*` buffer (issue #341).
     async fn env_key_hover(&self, uri: &Url, path: &Path, position: Position) -> Option<Hover> {
-        let key = self.env_key_at_position(uri, path, position).await?;
+        let at = self.env_key_at_position(uri, path, position).await?;
         let references = self
             .reference_locations(vec![laravel_lsp::salsa_impl::SymbolRefData::Env(
-                key.clone(),
+                at.key.clone(),
             )])
             .await
             .len();
         Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
-                value: self.hover_for_env_declaration(&key, references).await,
+                value: self.hover_for_env_declaration(&at, path, references).await,
             }),
             range: None,
         })
@@ -21274,9 +21311,11 @@ return [
         path: &Path,
         position: Position,
     ) -> Option<GotoDefinitionResponse> {
-        let key = self.env_key_at_position(uri, path, position).await?;
+        // Name-keyed by design: `find_references` does not distinguish a
+        // commented declaration from an active one, so both jump alike.
+        let at = self.env_key_at_position(uri, path, position).await?;
         let mut locations = self
-            .reference_locations(vec![laravel_lsp::salsa_impl::SymbolRefData::Env(key)])
+            .reference_locations(vec![laravel_lsp::salsa_impl::SymbolRefData::Env(at.key)])
             .await;
         match locations.len() {
             0 => None,
@@ -22495,6 +22534,18 @@ async fn collect_route_declaration_targets(
     }
 
     targets
+}
+
+/// The env-key declaration a cursor landed on: the key, and whether the line
+/// it was declared on is commented out.
+///
+/// The commented flag records *which enumeration matched*, so the hover card
+/// describes the declaration under the cursor rather than re-deriving one by
+/// name — a name-keyed lookup merges every file's declarations and cannot tell
+/// two lines of the same file apart.
+struct EnvDeclarationAtCursor {
+    key: String,
+    is_commented: bool,
 }
 
 /// The key whose name text covers `position`, from a `.env` key enumeration.
