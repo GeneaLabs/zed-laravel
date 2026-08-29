@@ -2,31 +2,38 @@
 //!
 //! #342 closed the *process*-environment leak. The project's own `.env` is a
 //! milder but real second source: a Laravel `.env` routinely holds `APP_KEY`,
-//! `DB_PASSWORD`, `MAIL_PASSWORD` and third-party tokens, and four surfaces
-//! echoed them — env completion, `.env` hover, `config('…')` completion, and
-//! the warm-start disk cache.
+//! `DB_PASSWORD`, `MAIL_PASSWORD` and third-party tokens, and three
+//! client-rendered surfaces echoed them — env completion, `.env` hover, and
+//! `config('…')` completion.
 //!
-//! A fifth was found in review: the server log. It consults the same predicate
-//! and is covered next to the code that logs, in `database::tests` — these four
-//! are the client-rendered ones.
+//! A fourth was found in review: the server log. It consults the same predicate
+//! and is covered next to the code that logs, in `database::tests` — these
+//! three are the client-rendered ones.
 //!
-//! All four now consult the same two gates: `is_sensitive_env_name`, which
+//! There was a fifth when #344 shipped: the warm-start disk cache, which wrote
+//! a redacted copy of every `.env` variable to `cache.json`. Issue #356 deleted
+//! that cache outright — nothing ever read the map back, so it was a file of
+//! `.env` names with no consumer — and its two tests went with it. What
+//! survives here is `a_pre_bump_cache_is_dropped_wholesale_and_the_rescan_restores_it`,
+//! which guards the `CACHE_VERSION` floor: the v5 files that binary wrote in
+//! cleartext are still on disk, and the version check is still the only thing
+//! stopping a later build from serving them.
+//!
+//! All three now consult the same two gates: `is_sensitive_env_name`, which
 //! reads the variable's **name**, and `mask_url_credentials`, which reads the
 //! value's **shape**. The second exists because the first cannot see
 //! `DATABASE_URL=mysql://user:pass@host/db` — a name matching no sensitive
 //! segment, filled by stock Laravel's `'url' => env('DATABASE_URL')`, whose
 //! password sits inside the value. These tests drive the real entry points —
-//! `completion()`, `hover_for_env`, `get_all_config_keys`, and a genuine
-//! `CacheManager` save/load round trip — with two different matched keyword
-//! categories (`DB_PASSWORD` and `API_TOKEN`) plus the URL shape crossing every
-//! one of them, so a surface that re-implemented either check locally and
-//! drifted is caught by observed behaviour rather than by reading the diff.
+//! `completion()`, `hover_for_env` and `get_all_config_keys` — with two
+//! different matched keyword categories (`DB_PASSWORD` and `API_TOKEN`) plus
+//! the URL shape crossing every one of them, so a surface that re-implemented
+//! either check locally and drifted is caught by observed behaviour rather than
+//! by reading the diff.
 //!
 //! Leak assertions run over the **whole serialized response**, not the fields
 //! this change touches: `insertText`, `label`, `sortText` and friends are just
-//! as visible in a screen-share as `detail` is. The cache assertion reads the
-//! deserialized struct rather than the file's bytes, because a reversible
-//! encoding of the value would pass a bytes-only check and still leak.
+//! as visible in a screen-share as `detail` is.
 //!
 //! Every leak assertion carries a positive control — the ordinary `APP_NAME`
 //! renders exactly as it did before this change — so a fixture that never
@@ -83,6 +90,10 @@ fn url_masked() -> String {
 /// surfaces skip commented entries already; the cache-write loop never did.
 const COMMENTED_NAME: &str = "MAIL_PASSWORD";
 const COMMENTED_VALUE: &str = "mail-hunter2-issue-344";
+
+/// A middleware alias planted only in the pre-bump cache fixture. It exists in
+/// no rescan, so its survival past a version rejection would be unambiguous.
+const PLANTED_MIDDLEWARE: &str = "planted-issue-356";
 
 /// The project `.env` every test registers with Salsa.
 fn dotenv() -> String {
@@ -505,8 +516,29 @@ async fn the_config_completion_response_carries_no_dotenv_secret() {
 }
 
 // ========================================================================
-// Surface 4 — the on-disk warm-start cache
+// The `CACHE_VERSION` floor — the last live consequence of #344 on disk
 // ========================================================================
+
+/// A minimal `LaravelConfigData` for the rescan to cache. `root` is the only
+/// field the assertion reads back; the rest are the least that makes the struct
+/// constructible and non-empty. Mirrors the helper shape the other handler
+/// tests in this tree use.
+fn laravel_config(root: &Path) -> laravel_lsp::salsa_impl::LaravelConfigData {
+    laravel_lsp::salsa_impl::LaravelConfigData {
+        root: root.to_path_buf(),
+        view_paths: vec![root.join("resources/views")],
+        component_paths: vec![],
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: std::collections::HashMap::new(),
+        component_namespaces: std::collections::HashMap::new(),
+        anonymous_component_paths: std::collections::HashMap::new(),
+        anonymous_component_namespaces: std::collections::HashMap::new(),
+        component_aliases: std::collections::HashMap::new(),
+        icon_aliases: std::collections::HashMap::new(),
+        class_component_files: std::collections::HashMap::new(),
+    }
+}
 
 /// Run the real cache-population path and persist it, then load it back with a
 /// fresh `CacheManager`. Returns the reloaded manager.
@@ -524,101 +556,51 @@ async fn round_trip_cache(server: &LaravelLanguageServer, root: &Path) -> CacheM
     CacheManager::load(root)
 }
 
-#[tokio::test]
-async fn the_disk_cache_keeps_sensitive_names_but_never_their_values() {
-    let (_dir, root, server) = project(&dotenv()).await;
-    let reloaded = round_trip_cache(&server, &root).await;
-    let variables = &reloaded
-        .get_env_vars()
-        .expect("env vars should round-trip")
-        .variables;
-
-    // Asserted on the deserialized struct, not on the file's bytes: a
-    // reversible encoding would pass a substring check and still leak.
-    for name in [PASSWORD_NAME, TOKEN_NAME, COMMENTED_NAME] {
-        assert_eq!(
-            variables.get(name).map(String::as_str),
-            Some(""),
-            "{name} must be cached by name with an empty value — present, never plaintext"
-        );
-    }
-    // Not name-matched, so not emptied — but the credential inside it must not
-    // reach the file either. This is the worst of the four surfaces to get
-    // wrong: the cache is long-lived, sits outside the project, and no one
-    // reads it before it leaks.
-    assert_eq!(
-        variables.get(URL_NAME).map(String::as_str),
-        Some(url_masked().as_str()),
-        "{URL_NAME} must be cached with its password masked, never in plaintext"
-    );
-    assert_eq!(
-        variables.get(PLAIN_NAME).map(String::as_str),
-        Some(PLAIN_VALUE),
-        "an unmatched variable must round-trip unchanged"
-    );
-}
-
-/// A cache entry survives the round trip byte-for-byte for an unmatched name,
-/// and registering the reloaded map back into a cold server is accepted — the
-/// path `load_cache_data` takes on a warm start.
+/// A cache file written by a pre-#344 binary holds `.env` plaintext. The
+/// `CACHE_VERSION` bump is what stops it being trusted and served, and #356
+/// deliberately did **not** bump past it — so this guard has to keep holding
+/// with the env-var section gone.
 ///
-/// It stops there deliberately. `register_cached_env_vars` writes the Salsa
-/// actor's `env_variables` map, and **nothing renders from that map**:
-/// `get_env_variable` / `get_env_variable_names` have no caller outside
-/// `salsa_impl`, and all four surfaces read `get_all_parsed_env_vars` /
-/// `get_parsed_env_var`, which walk the registered `.env` *sources* only. So
-/// redaction in the cache is about the plaintext sitting on disk, not about
-/// what a warm start displays; asserting a rendering difference here would be
-/// asserting about code that never runs. The rendering half of the parity
-/// claim is pinned instead by
-/// `an_empty_sensitive_value_redacts_rather_than_reading_empty`, whose fixture
-/// is exactly the shape a cache read produces: a matched name with an empty
-/// value.
-#[tokio::test]
-async fn the_reloaded_cache_registers_cleanly_on_a_cold_server() {
-    let (_dir, root, server) = project(&dotenv()).await;
-    let reloaded = round_trip_cache(&server, &root).await;
-    let cached = reloaded.get_env_vars().expect("env vars").variables.clone();
-    assert_eq!(
-        cached.get(PLAIN_NAME).map(String::as_str),
-        Some(PLAIN_VALUE),
-        "the unmatched value must survive the round trip unchanged"
-    );
-
-    let warm = test_server();
-    warm.salsa
-        .register_cached_env_vars(cached)
-        .await
-        .expect("a redacted cache must still register on warm start");
-}
-
-/// A cache file written by a pre-fix binary already holds plaintext secrets.
-/// The `CACHE_VERSION` bump is what stops it being trusted and served — and the
-/// rescan it forces must leave an ordinary variable exactly as it was.
+/// The fixture is planted against the cached Laravel config, the section that
+/// survived #356, rather than against the deleted `CachedEnvVars`. Two
+/// disciplines carry over from the original: the planted version is derived
+/// from the file's own serialized `version` field, so the next bump cannot
+/// quietly turn this into a test of nothing, and the fixture is produced by a
+/// real `CacheManager::load` / `.save()` round trip rather than a hand-built
+/// struct literal, so a passing run cannot be a parse error in disguise.
 ///
 /// Both halves live in one test on purpose: "the old file is dropped" and "the
-/// replacement is correct" are one behaviour, and splitting them let AC #7's
-/// regression guard be satisfied by combining two fixtures neither of which
-/// contained both variables.
+/// replacement is correct" are one behaviour.
 #[tokio::test]
-async fn a_pre_bump_cache_holding_plaintext_is_rejected_and_rescanned() {
+async fn a_pre_bump_cache_is_dropped_wholesale_and_the_rescan_restores_it() {
     let (_dir, root, server) = project(&dotenv()).await;
+    server
+        .salsa
+        .register_cached_config(laravel_config(&root))
+        .await
+        .expect("register config with salsa");
 
-    // Write a well-formed current-version cache carrying the plaintext, then
-    // rewind only its version field. Hand-writing the JSON instead would risk
-    // the test passing on a parse error rather than on the version check.
+    // Write a well-formed current-version cache through the real path, then
+    // rewind only its version field.
     let mut cache = CacheManager::load(&root);
-    cache.set_env_vars(laravel_lsp::cache_manager::CachedEnvVars {
-        variables: [
-            (PASSWORD_NAME.to_string(), PASSWORD_VALUE.to_string()),
-            // The regression guard rides in the same planted file: an ordinary
-            // variable is dropped along with the secret, and has to come back
-            // unchanged from the rescan.
-            (PLAIN_NAME.to_string(), PLAIN_VALUE.to_string()),
-        ]
-        .into_iter()
-        .collect(),
+    cache.set_laravel_config(laravel_lsp::cache_manager::CachedLaravelConfig {
+        root: root.clone(),
+        view_paths: vec![root.join("resources/views")],
+        ..Default::default()
     });
+    // A second, independent section: "dropped wholesale" means *both* go, not
+    // just the one the rescan happens to rebuild.
+    let mut vendor_scan = laravel_lsp::cache_manager::ScanResult::default();
+    vendor_scan.middleware.insert(
+        PLANTED_MIDDLEWARE.to_string(),
+        laravel_lsp::cache_manager::MiddlewareEntry {
+            class: "App\\Http\\Middleware\\Planted".to_string(),
+            class_file: None,
+            source_file: None,
+            line: 1,
+        },
+    );
+    cache.set_vendor_scan(vendor_scan);
     cache.save().expect("cache should persist");
     let path = cache.cache_path().expect("cache path").to_path_buf();
 
@@ -630,39 +612,32 @@ async fn a_pre_bump_cache_holding_plaintext_is_rejected_and_rescanned() {
     json["version"] = serde_json::json!(version - 1);
     let previous = serde_json::to_string_pretty(&json).expect("serialize cache");
     assert!(
-        previous.contains(PASSWORD_VALUE),
-        "the planted cache must actually hold the plaintext this test is about"
+        previous.contains(PLANTED_MIDDLEWARE),
+        "the planted cache must actually hold the data this test is about"
     );
     std::fs::write(&path, previous).expect("plant pre-bump cache");
 
-    // `get_env_vars()` is the assertion that discriminates: `has_cached_data()`
-    // reads only the vendor/app/config sections and would answer the same with
-    // the version check deleted.
+    // Dropped *wholesale*, not partially reused: every section the file
+    // carried has to be gone, not merely the one the rescan will rebuild.
+    let stale = CacheManager::load(&root);
     assert!(
-        CacheManager::load(&root).get_env_vars().is_none(),
-        "a pre-bump cache must be dropped, not served — it holds plaintext secrets"
+        stale.get_laravel_config().is_none(),
+        "a pre-bump cache must be dropped, not served"
+    );
+    assert!(
+        stale.get_all_middleware().is_empty(),
+        "a pre-bump cache must be dropped wholesale — no section survives the version check"
+    );
+    assert!(
+        !stale.has_cached_data(),
+        "a dropped cache must report no data at all"
     );
 
     // The rescan the rejection forces, through the real populate/save/load path.
     let rescanned = round_trip_cache(&server, &root).await;
-    let variables = &rescanned
-        .get_env_vars()
-        .expect("the rescan must repopulate the cache")
-        .variables;
     assert_eq!(
-        variables.get(PLAIN_NAME).map(String::as_str),
-        Some(PLAIN_VALUE),
-        "an ordinary variable must survive the forced rescan unchanged"
-    );
-    assert_eq!(
-        variables.get(PASSWORD_NAME).map(String::as_str),
-        Some(""),
-        "the rescan must rewrite the secret as an empty value, not restore it"
-    );
-    assert!(
-        !std::fs::read_to_string(&path)
-            .expect("read rescanned cache")
-            .contains(PASSWORD_VALUE),
-        "the rescanned file must not carry the plaintext the planted one did"
+        rescanned.get_laravel_config().map(|c| c.root.clone()),
+        Some(root.clone()),
+        "the forced rescan must repopulate the surviving cache section"
     );
 }
