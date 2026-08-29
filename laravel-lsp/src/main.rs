@@ -216,6 +216,25 @@ fn route_source_label(file: &Path, root: &Path) -> String {
         .unwrap_or_else(|| file.to_string_lossy().into_owned())
 }
 
+/// Render a config file as a short, project-relative label for the completion
+/// detail and documentation lines (e.g. `config/app.php`), with separators
+/// normalized to `/` the way [`route_source_label`] normalizes its own.
+///
+/// The label is user-visible text a client renders verbatim, so it must not
+/// change shape with the host OS. Until #336 it was a hardcoded
+/// `format!("config/{group}.php")`; moving to `strip_prefix` to support module
+/// config dirs picked up the platform separator with it, and rendered
+/// `config\app.php` on Windows alone.
+///
+/// Unlike [`route_source_label`], an out-of-root file keeps its full path: a
+/// module config dir can legitimately sit outside the project root, and the
+/// bare file name (`app.php`) would no longer say which module declared the key.
+fn config_source_label(file: &Path, root: &Path) -> String {
+    LaravelLanguageServer::with_forward_slashes(
+        &file.strip_prefix(root).unwrap_or(file).to_string_lossy(),
+    )
+}
+
 /// A view name for autocomplete
 struct ViewNameCompletion {
     /// The view name in dot notation (e.g., "users.profile")
@@ -14686,11 +14705,7 @@ impl LaravelLanguageServer {
 
         for group in &groups {
             for path in laravel_lsp::config::config_group_files(&root, &module_dirs, group) {
-                let source = path
-                    .strip_prefix(&root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
+                let source = config_source_label(&path, &root);
                 let Ok(content) = std::fs::read_to_string(&path) else {
                     continue;
                 };
