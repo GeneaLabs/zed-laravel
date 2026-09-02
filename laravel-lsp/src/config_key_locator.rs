@@ -169,6 +169,15 @@ fn collect_keys_bounded(
         return;
     }
     for entry in array_entries(array, source) {
+        // A key containing a literal dot is addressable only at the TOP level.
+        // `Arr::get` tests the whole remaining key once, then explodes on
+        // dots — so `['a.b' => …]` at the root resolves, while
+        // `['form' => ['a.b' => …]]` does not: the walk finds `form`, then
+        // looks for `a` and gives up. Emitting `form.a.b` would offer a key
+        // that returns null at runtime, and that no goto could follow.
+        if !prefix.is_empty() && entry.key_text.contains('.') {
+            continue;
+        }
         let dotted = if prefix.is_empty() {
             entry.key_text.clone()
         } else {
@@ -420,10 +429,15 @@ fn integer_literal_value(node: Node, source: &[u8]) -> Option<i64> {
             if inner.kind() != "integer" {
                 return None;
             }
-            let magnitude: i64 = inner.utf8_text(source).ok()?.trim().parse().ok()?;
+            // Re-sign the digits and parse ONCE. Parsing the magnitude alone
+            // and negating it drops `-9223372036854775808`: the digits are one
+            // past `i64::MAX`, so the magnitude parse fails before any negation
+            // happens. `i64::MIN` is a legal PHP array key, and the whole-span
+            // parse this replaced handled it.
+            let digits = inner.utf8_text(source).ok()?.trim();
             match node.child(0)?.utf8_text(source).ok()? {
-                "-" => magnitude.checked_neg(),
-                "+" => Some(magnitude),
+                "-" => format!("-{digits}").parse().ok(),
+                "+" => digits.parse().ok(),
                 _ => None,
             }
         }

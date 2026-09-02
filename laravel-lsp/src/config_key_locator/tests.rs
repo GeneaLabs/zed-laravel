@@ -593,6 +593,14 @@ const SHAPES: &[Shape] = &[
         "<?php\nreturn ['a.b' => 'c'];\n",
         &[("a.b", "c")],
     ),
+    // A dotted key NESTED in an array is unreachable in Laravel: `Arr::get`
+    // tests the whole key once, then walks segments, so `form` → `a` fails.
+    // Offering `form.a.b` would offer a key that resolves to null.
+    (
+        "nested dotted key is unaddressable",
+        "<?php\nreturn ['form' => ['a.b' => 'v'], 'k' => 'y'];\n",
+        &[("form", ""), ("k", "y")],
+    ),
     (
         "quoted numeric key",
         "<?php\nreturn ['404' => 'nf'];\n",

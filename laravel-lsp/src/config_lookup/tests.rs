@@ -183,8 +183,15 @@ return [
     ],
 ];
 "#;
+    let entries = crate::config_key_locator::enumerate_entries_in_source(src);
+    // Without this the test is vacuous: an enumerator returning nothing
+    // trivially satisfies "every enumerated key resolves".
+    assert!(
+        entries.len() >= 6,
+        "the fixture must actually enumerate, got {entries:?}"
+    );
     let mut unresolved = Vec::new();
-    for (key, _, _) in crate::config_key_locator::enumerate_entries_in_source(src) {
+    for (key, _, _) in entries {
         let path: Vec<&str> = key.split('.').collect();
         if resolve_in_source(src, &path).is_none() {
             unresolved.push(key);

@@ -278,22 +278,36 @@ fn translation_value_under_two_hundred_chars_is_not_truncated() {
     assert_eq!(display, value);
 }
 
+/// The display value config completion reports for a single entry — the
+/// successor to `extract_config_value`, which #369 retired with the rest of
+/// the per-line scanner. Exercised through a real catalogue, because the
+/// walker parses a file rather than a line.
+fn config_display_value(value: &str) -> String {
+    let source = format!("<?php\n\nreturn [\n    'key' => '{}',\n];\n", value);
+    let entries = laravel_lsp::config_key_locator::enumerate_entries_in_source(&source);
+    let (_, text, _) = entries
+        .into_iter()
+        .find(|(key, _, _)| key == "key")
+        .expect("the catalogue declares 'key'");
+    // The resolver is the second half of the old function: it turns an
+    // `env(...)` expression into a value and passes anything else through.
+    LaravelLanguageServer::resolve_env_value(&text, &std::collections::HashMap::new())
+}
+
 #[test]
 fn config_value_truncation_is_char_boundary_safe() {
     let value: String = "a".repeat(199) + "ü" + &"ö".repeat(50);
-    let line = format!("'key' => '{}',", value);
-    let env_vars = std::collections::HashMap::new();
-    let display = LaravelLanguageServer::extract_config_value(&line, &env_vars);
-    assert_eq!(display, value, "the extractor must not truncate at all");
+    assert_eq!(
+        config_display_value(&value),
+        value,
+        "the extractor must not truncate at all"
+    );
 }
 
 #[test]
 fn config_value_under_two_hundred_chars_is_not_truncated() {
     let value = "ü".repeat(30);
-    let line = format!("'key' => '{}',", value);
-    let env_vars = std::collections::HashMap::new();
-    let display = LaravelLanguageServer::extract_config_value(&line, &env_vars);
-    assert_eq!(display, value);
+    assert_eq!(config_display_value(&value), value);
 }
 
 #[test]
@@ -305,10 +319,5 @@ fn a_five_thousand_char_translation_value_survives_extraction_whole() {
 #[test]
 fn a_five_thousand_char_config_value_survives_extraction_whole() {
     let value = "ö".repeat(5_000);
-    let line = format!("'key' => '{}',", value);
-    let env_vars = std::collections::HashMap::new();
-    assert_eq!(
-        LaravelLanguageServer::extract_config_value(&line, &env_vars),
-        value
-    );
+    assert_eq!(config_display_value(&value), value);
 }
