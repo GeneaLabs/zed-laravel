@@ -5339,7 +5339,10 @@ impl LaravelLanguageServer {
         //   * Bulk-import in chunks so the actor's pattern_cache.put loop
         //     never holds the actor for too long on a giant project.
         const MAX_CONCURRENT_PARSES: usize = 8;
-        const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024; // 256 KB
+        // The cap and the `.json.php` rule both live in `parse_budget` now, so
+        // the warm pass, the rename scan and the watched-file magic batch
+        // cannot drift apart (issue #371).
+        use laravel_lsp::parse_budget::MAX_PARSED_FILE_SIZE_BYTES;
 
         let salsa = self.salsa.clone();
         // Cloned into the warm task so it can ask the client to re-resolve code
@@ -5493,8 +5496,7 @@ impl LaravelLanguageServer {
                     // — without it, editing a service provider or a config file never
                     // re-registered with Salsa on Windows, so middleware aliases, bindings
                     // and config values silently stopped updating (issue #292).
-                    let path_str = path.to_string_lossy();
-                    if path_str.ends_with(".json.php") {
+                    if laravel_lsp::parse_budget::is_json_php(&path) {
                         return Some((
                             path,
                             Arc::new(laravel_lsp::salsa_impl::ParsedPatternsData::default()),
@@ -5506,12 +5508,12 @@ impl LaravelLanguageServer {
                     // insert empty patterns so the cache lookup
                     // succeeds and never falls through to Salsa.
                     let metadata = std::fs::metadata(&path).ok()?;
-                    if metadata.len() > MAX_FILE_SIZE_BYTES {
+                    if metadata.len() > MAX_PARSED_FILE_SIZE_BYTES {
                         info!(
                             "warming: skipping oversized file {} ({} bytes > {} cap)",
                             path.display(),
                             metadata.len(),
-                            MAX_FILE_SIZE_BYTES
+                            MAX_PARSED_FILE_SIZE_BYTES
                         );
                         return Some((
                             path,
@@ -7875,10 +7877,42 @@ impl LaravelLanguageServer {
         for (path, pending) in batch {
             let is_vendor = path.components().any(|c| c.as_os_str() == "vendor");
 
+            // Parse-budget gate (issue #371). The warm pass refuses to parse
+            // `*.json.php` blobs and anything over 256 KB — 0.4–2.2 s per file,
+            // 1,735 of them under `aws-sdk-php` alone — but this path had
+            // neither rule, and a `composer install` rewrites thousands of
+            // vendor files straight into it, drained serially through the
+            // single Salsa actor thread with no cap.
+            //
+            // Beyond the cost, parsing here would be INCONSISTENT: the warm
+            // pass deliberately left these files out of the index, so a watched
+            // change was quietly pulling in files the rest of the pipeline has
+            // agreed to ignore.
+            //
+            // An excluded file is handled exactly like a deleted one, which is
+            // the honest description of its state: it contributes nothing to
+            // the index. For the overwhelmingly common case — never indexed,
+            // because the warm pass skipped it too — `old_surfaces` is empty
+            // and the branch below is a no-op. For the rarer case of a file
+            // that was indexed while small and has since grown past the cap,
+            // withdrawing its now-unmaintainable contributions and rippling
+            // them to dependents is exactly right.
+            let excluded = laravel_lsp::parse_budget::skip_reason_on_disk(&path);
+            if let Some(reason) = excluded {
+                debug!(
+                    "magic batch: skipping {} ({})",
+                    path.display(),
+                    reason.describe()
+                );
+            }
+
             // Authoritative existence check: read the file NOW. `None` = gone,
             // whatever the advisory `deleted` flag says (a flag-race across
             // overlapping notifications can leave it present-but-missing).
-            let content = self.read_file_for_magic(&path).await;
+            let content = match excluded {
+                Some(_) => None,
+                None => self.read_file_for_magic(&path).await,
+            };
 
             let Some(content) = content else {
                 // Gone: post-change surface is empty, so every pre-change FQCN is
@@ -20836,8 +20870,8 @@ return [
         new_name: &str,
         model_decl_file: Option<&Path>,
     ) -> Vec<laravel_lsp::rename::EditTarget> {
+        use laravel_lsp::parse_budget::MAX_PARSED_FILE_SIZE_BYTES;
         use std::sync::Arc;
-        const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024;
         const MAX_CONCURRENT_PARSES: usize = 8;
 
         let root_owned = root.to_path_buf();
@@ -20856,7 +20890,7 @@ return [
                 let _permit = permit_owner.acquire_owned().await.ok()?;
                 // Per-file size cap — skip oversized files (data dumps).
                 let metadata = std::fs::metadata(&path).ok()?;
-                if metadata.len() > MAX_FILE_SIZE_BYTES {
+                if metadata.len() > MAX_PARSED_FILE_SIZE_BYTES {
                     return None;
                 }
                 let path_for_task = path.clone();
