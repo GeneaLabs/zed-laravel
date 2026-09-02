@@ -16,6 +16,7 @@ mod component_file_navigation_containment;
 mod component_member_navigation;
 mod component_navigation_containment;
 mod composer_autoload_containment;
+mod config_rename_declaration_guard;
 mod controllers_dir_containment;
 mod db_provider_init_idempotency;
 mod diagnostic_severity;

@@ -128,15 +128,23 @@ async fn namespace_only_project_still_completes() {
     let keys = backend.get_all_translation_keys().await;
     let all_keys: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
 
-    assert_eq!(keys.len(), 1, "got {all_keys:?}");
+    // Both the leaf and its parent group, and nothing else — the catalogue
+    // declares `'details' => ['title' => …]`, and since #369 the walker
+    // reports the group key too. Pinned as an exact set so an unrelated
+    // catalogue leaking in still fails the test.
     assert_eq!(
-        keys[0].key,
-        "legal-contractmanagement::contract-management.details.title"
+        all_keys,
+        vec![
+            "legal-contractmanagement::contract-management.details",
+            "legal-contractmanagement::contract-management.details.title",
+        ],
+        "got {all_keys:?}"
     );
     assert!(
-        keys[0].source.starts_with("legal-contractmanagement::"),
+        keys.iter()
+            .all(|k| k.source.starts_with("legal-contractmanagement::")),
         "namespaced source label should carry the namespace too, got {:?}",
-        keys[0].source
+        keys.iter().map(|k| &k.source).collect::<Vec<_>>()
     );
 }
 

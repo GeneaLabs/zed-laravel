@@ -155,3 +155,37 @@ fn a_locale_file_is_read_once_across_repeated_renames() {
         "a rename must not re-read and re-parse every locale's catalogue"
     );
 }
+
+#[test]
+fn rename_refuses_translation_keys_with_no_quoted_text() {
+    // `__('codes.404')` and `__('codes.list.0')` both resolve at runtime, so
+    // both are enumerated for completion and both navigate. Neither is a
+    // rename target: the bare `404` would become a constant lookup if
+    // rewritten, and a list index has no text of its own, so the edit would
+    // land on the value instead.
+    const CODES: &str = r#"<?php
+return [
+    'named' => 'ok',
+    404 => 'Not found',
+    'list' => ['a'],
+];
+"#;
+    let dir = fake_project_with_lang(&[("en", "codes", CODES)]);
+    let mut locator = Locator::default();
+
+    assert!(
+        locator.locate(dir.path(), "codes.404").is_empty(),
+        "a bare integer key is not a rename target"
+    );
+    assert!(
+        locator.locate(dir.path(), "codes.list.0").is_empty(),
+        "a synthesized list index is not a rename target"
+    );
+    // The control: a quoted key in the same catalogue still resolves to an
+    // edit site, so neither assertion above can pass by the lookup failing.
+    assert_eq!(
+        locator.locate(dir.path(), "codes.named").len(),
+        1,
+        "a quoted key is still rewritten"
+    );
+}

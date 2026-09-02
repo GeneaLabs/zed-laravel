@@ -2299,11 +2299,13 @@ impl TranslationCache {
             }
             TranslationKeyTarget::Json(key) => locate_json_key_in_file(&*db, file, key.clone()),
         };
-        found.map(|(line, start_column, end_column)| KeyLocationData {
-            line,
-            start_column,
-            end_column,
-        })
+        found.map(
+            |(line, start_column, end_column, _renameable)| KeyLocationData {
+                line,
+                start_column,
+                end_column,
+            },
+        )
     }
 
     /// Every translation key autocomplete should offer, sorted and deduped.
@@ -2476,7 +2478,10 @@ impl TranslationCache {
             }
             let locale_file = lang_dir.join(&name).join(format!("{file_stem}.php"));
             let file = self.ensure_file(db, &locale_file, root);
-            if let Some(&(line, start_column, end_column)) =
+            // A `false` flag means the key has no quoted text to rewrite — a
+            // list index (`page.items.0`) or a bare `404 =>`. Both resolve for
+            // goto; neither is a rename target.
+            if let Some(&(line, start_column, end_column, true)) =
                 locate_php_key_in_file(&*db, file, key_path.clone()).as_ref()
             {
                 out.push(TranslationKeyLocationData {
@@ -2649,108 +2654,15 @@ pub struct KeyLocationData {
     pub end_column: u32,
 }
 
-/// Parse a PHP translation file to extract all keys and values
-/// Returns a list of (key, value) tuples with dot-notation keys
-fn parse_translation_keys(content: &str, base_key: &str) -> Vec<(String, String)> {
-    let mut results = Vec::new();
-
-    // Simple regex-based parsing for Laravel translation files
-    // This handles: 'key' => 'value', or "key" => "value"
-    //
-    // Compiled once: this used to be rebuilt on every completion request, for
-    // every catalogue in the locale (issue #293).
-    static KEY_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"][\s]*=>"#).unwrap()
-    });
-    let key_pattern = &*KEY_PATTERN;
-
-    // Track nesting depth and current key path
-    let mut key_stack: Vec<String> = vec![base_key.to_string()];
-    let mut in_array_depth = 0;
-    let mut pending_key: Option<String> = None;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        // Skip comments and empty lines
-        if trimmed.is_empty()
-            || trimmed.starts_with("//")
-            || trimmed.starts_with("/*")
-            || trimmed.starts_with("*")
-        {
-            continue;
-        }
-
-        // Handle array opening
-        if trimmed.contains("[") && !trimmed.contains("=>") {
-            in_array_depth += 1;
-            if let Some(key) = pending_key.take() {
-                key_stack.push(key);
-            }
-            continue;
-        }
-
-        // Handle key => [ (nested array on same line)
-        if let Some(caps) = key_pattern.captures(trimmed) {
-            let key_name = caps.get(1).unwrap().as_str();
-
-            if trimmed.contains("=> [") || trimmed.ends_with("=> [") {
-                // This is a nested array
-                pending_key = Some(key_name.to_string());
-                in_array_depth += 1;
-                key_stack.push(key_name.to_string());
-            } else {
-                // This is a simple key => value
-                let full_key = format!("{}.{}", key_stack.join("."), key_name);
-
-                // Extract value
-                let value = extract_translation_value(trimmed);
-                results.push((full_key, value));
-            }
-        }
-
-        // Handle array closing
-        let close_count = trimmed.matches(']').count();
-        for _ in 0..close_count {
-            if in_array_depth > 0 {
-                in_array_depth -= 1;
-                if key_stack.len() > 1 {
-                    key_stack.pop();
-                }
-            }
-        }
-    }
-
-    results
-}
-
-/// Extract the value from a translation line like "'key' => 'value',".
-///
-/// Returns the value at full length — see `completion_display` for why the
-/// truncation lives at the render sites rather than here.
-pub fn extract_translation_value(line: &str) -> String {
-    if let Some(arrow_pos) = line.find("=>") {
-        let after_arrow = &line[arrow_pos + 2..];
-        let value = after_arrow.trim().trim_end_matches(',').trim();
-
-        // Remove the surrounding quotes; the value is returned at full
-        // length. Truncation happens at each render site instead, because
-        // the completion list line and the documentation panel want
-        // different budgets and one shared cut served neither (issue #326).
-        value
-            .trim_start_matches('\'')
-            .trim_start_matches('"')
-            .trim_end_matches('\'')
-            .trim_end_matches('"')
-            .to_string()
-    } else {
-        String::new()
-    }
-}
-
 /// Every `key => value` pair one PHP catalogue declares, dot-prefixed with
 /// `base_key`. Memoized per `(file, base_key)` — autocomplete used to re-read
 /// and re-parse every catalogue in the locale on each request (issue #293).
+///
+/// Enumerated by the same tree-sitter walk that backs go-to-definition
+/// (`config_key_locator`), not by a text scanner. Until #369 this counted `[`
+/// and `]` per line, which mis-nested any catalogue holding a list entry, a
+/// key split across lines, or a `]` inside a value — while goto, resolving the
+/// identical file structurally, stayed correct.
 #[salsa::tracked]
 pub fn translation_keys_in_file(
     db: &dyn Db,
@@ -2761,7 +2673,10 @@ pub fn translation_keys_in_file(
     if text.is_empty() {
         return Vec::new();
     }
-    parse_translation_keys(text, &base_key)
+    crate::config_key_locator::enumerate_entries_in_source(text)
+        .into_iter()
+        .map(|(key, value, _position)| (format!("{base_key}.{key}"), value))
+        .collect()
 }
 
 /// Where a nested key is declared inside a PHP catalogue, as
@@ -2777,14 +2692,21 @@ pub fn locate_php_key_in_file(
     db: &dyn Db,
     file: LangFile,
     key_path: Vec<String>,
-) -> Option<(u32, u32, u32)> {
+) -> Option<(u32, u32, u32, bool)> {
     let text = file.text(db);
     if text.is_empty() {
         return None;
     }
     let refs: Vec<&str> = key_path.iter().map(String::as_str).collect();
     let pos = crate::config_key_locator::locate_in_source(text, &refs)?;
-    Some((pos.line, pos.start_column, pos.end_column))
+    // The bool is "may a rename rewrite this", the only distinction this
+    // boundary needs; `KeyKind` itself stays on the locator's side.
+    Some((
+        pos.line,
+        pos.start_column,
+        pos.end_column,
+        pos.kind == crate::config_key_locator::KeyKind::Quoted,
+    ))
 }
 
 /// Where a text key is declared inside a JSON catalogue, as
@@ -2798,7 +2720,7 @@ pub fn locate_json_key_in_file(
     db: &dyn Db,
     file: LangFile,
     key: String,
-) -> Option<(u32, u32, u32)> {
+) -> Option<(u32, u32, u32, bool)> {
     let text = file.text(db);
     if text.is_empty() {
         return None;
@@ -2808,7 +2730,9 @@ pub fn locate_json_key_in_file(
         let col = line.find(&needle)?;
         // Skip the opening quote so the span covers the key itself.
         let start = (col + 1) as u32;
-        Some((line_num as u32, start, start + key.len() as u32))
+        // A JSON key is always a quoted literal, so always renameable — the
+        // flag exists for PHP's list indices and bare integer keys.
+        Some((line_num as u32, start, start + key.len() as u32, true))
     })
 }
 

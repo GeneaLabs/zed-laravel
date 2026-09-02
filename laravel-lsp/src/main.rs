@@ -14861,10 +14861,24 @@ impl LaravelLanguageServer {
                 let Ok(content) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                for (key, value) in Self::parse_config_keys(&content, group, &env_vars) {
-                    merged.entry(key.clone()).or_insert(ConfigKeyCompletion {
-                        key,
-                        value,
+                // Structural enumeration, the same walk behind config goto,
+                // hover and code lenses. The per-line regex this replaced was
+                // the last of the three scanners #369 found: it mis-nested any
+                // file with a list entry, a key split across lines, or a `]`
+                // inside a value, and it never saw list indices or bare
+                // integer keys at all — so completion offered a different set
+                // of keys than goto could reach.
+                for (key, value, _position) in
+                    laravel_lsp::config_key_locator::enumerate_entries_in_source(&content)
+                {
+                    let dotted = format!("{group}.{key}");
+                    // `env('APP_NAME', 'Laravel')` is not statically foldable,
+                    // so the walker hands back its source text and the resolver
+                    // reads the project's `.env` — redaction included.
+                    let display = Self::resolve_env_value(&value, &env_vars);
+                    merged.entry(dotted.clone()).or_insert(ConfigKeyCompletion {
+                        key: dotted,
+                        value: display,
                         source: source.clone(),
                     });
                 }
@@ -15674,100 +15688,6 @@ impl LaravelLanguageServer {
 
     /// Parse a PHP config file to extract all keys and values
     /// Returns a list of (key, value) tuples with dot-notation keys
-    fn parse_config_keys(
-        content: &str,
-        base_key: &str,
-        env_vars: &std::collections::HashMap<String, String>,
-    ) -> Vec<(String, String)> {
-        let mut results = Vec::new();
-
-        // Simple regex-based parsing for Laravel config files
-        // This handles the common patterns: 'key' => value, or "key" => value
-        // Note: Allows hyphens in keys (kebab-case is common in Laravel configs)
-        let key_pattern = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_-]*)['"][\s]*=>"#).unwrap();
-
-        // Track nesting depth and current key path
-        let mut key_stack: Vec<String> = vec![base_key.to_string()];
-        let mut in_array_depth = 0;
-        let mut pending_key: Option<String> = None;
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-
-            // Skip comments and empty lines
-            if trimmed.is_empty()
-                || trimmed.starts_with("//")
-                || trimmed.starts_with("/*")
-                || trimmed.starts_with("*")
-            {
-                continue;
-            }
-
-            // Handle array opening
-            if trimmed.contains("[") && !trimmed.contains("=>") {
-                in_array_depth += 1;
-                if let Some(key) = pending_key.take() {
-                    key_stack.push(key);
-                }
-                continue;
-            }
-
-            // Handle key => [ (nested array on same line)
-            if let Some(caps) = key_pattern.captures(trimmed) {
-                let key_name = caps.get(1).unwrap().as_str();
-
-                if trimmed.contains("=> [") || trimmed.ends_with("=> [") {
-                    // This is a nested array
-                    pending_key = Some(key_name.to_string());
-                    in_array_depth += 1;
-                    key_stack.push(key_name.to_string());
-                } else {
-                    // This is a simple key => value
-                    let full_key = format!("{}.{}", key_stack.join("."), key_name);
-
-                    // Extract value and resolve env() references
-                    let value = Self::extract_config_value(trimmed, env_vars);
-                    results.push((full_key, value));
-                }
-            }
-
-            // Handle array closing
-            let close_count = trimmed.matches(']').count();
-            for _ in 0..close_count {
-                if in_array_depth > 0 {
-                    in_array_depth -= 1;
-                    if key_stack.len() > 1 {
-                        key_stack.pop();
-                    }
-                }
-            }
-        }
-
-        results
-    }
-
-    /// Extract the value from a config line like "'key' => value,"
-    /// Resolves env() references using the provided env_vars map
-    ///
-    /// Returns the value at full length. Truncation happens at each render
-    /// site instead, because the completion list line and the documentation
-    /// panel want different budgets and one shared cut served neither
-    /// (issue #326) — see `laravel_lsp::completion_display`.
-    fn extract_config_value(
-        line: &str,
-        env_vars: &std::collections::HashMap<String, String>,
-    ) -> String {
-        if let Some(arrow_pos) = line.find("=>") {
-            let after_arrow = &line[arrow_pos + 2..];
-            let value = after_arrow.trim().trim_end_matches(',').trim();
-
-            // Check for env() call pattern: env('VAR_NAME') or env('VAR_NAME', 'default')
-            Self::resolve_env_value(value, env_vars)
-        } else {
-            String::new()
-        }
-    }
-
     /// Resolve an env() call to its actual value
     /// Handles: env('VAR'), env('VAR', 'default'), env('VAR', default_value),
     /// and the `(bool) env('VAR')` cast spelling.
@@ -22397,6 +22317,11 @@ fn collect_config_declaration_target(
     let new_leaf = new_key.rsplit('.').next().unwrap_or(new_key).to_string();
     laravel_lsp::config_key_locator::locate_key_all(root, module_dirs, old_key)
         .into_iter()
+        // Only a quoted key can be rewritten in place: a list index
+        // (`providers.0`) has no source text at all, and rewriting a bare
+        // `404 =>` would turn a string key into a constant lookup. Both stay
+        // navigable; neither is an edit target.
+        .filter(|(_, pos)| pos.kind == laravel_lsp::config_key_locator::KeyKind::Quoted)
         .map(|(file_path, pos)| laravel_lsp::rename::EditTarget {
             file_path,
             line: pos.line,
@@ -25544,9 +25469,15 @@ impl LanguageServer for LaravelLanguageServer {
                 // declaration site gets only its own leaf segment, since the
                 // group `->name('admin.')` prefix lives at a separate decl.
                 if let Some(root) = root_path.as_ref() {
-                    targets.extend(
+                    // Same fail-closed rule as the config and translation arms
+                    // (#369). A route name with call sites but no locatable
+                    // declaration — defined in a package, or by a walker shape
+                    // we do not read — would otherwise have every `route('…')`
+                    // rewritten to a name nothing declares.
+                    targets.extend(laravel_lsp::rename::require_declaration_edits(
+                        name,
                         collect_route_declaration_targets(self, root, name, &new_name).await,
-                    );
+                    )?);
                 }
             }
             laravel_lsp::references::SymbolRef::Config(key) => {
@@ -25556,22 +25487,25 @@ impl LanguageServer for LaravelLanguageServer {
                 // change without moving the config file.
                 if let Some(root) = root_path.as_ref() {
                     let module_dirs = self.module_dirs_for(root).await;
-                    targets.extend(collect_config_declaration_target(
-                        root,
-                        &module_dirs,
+                    let declarations =
+                        collect_config_declaration_target(root, &module_dirs, key, &new_name);
+                    targets.extend(laravel_lsp::rename::require_declaration_edits(
                         key,
-                        &new_name,
-                    ));
+                        declarations,
+                    )?);
                 }
             }
             laravel_lsp::references::SymbolRef::Translation(key) => {
                 // Same shape as config but applied across every locale's lang
                 // file under lang/<locale>/<file>.php.
                 if let Some(root) = root_path.as_ref() {
-                    targets.extend(
+                    let declarations =
                         collect_translation_declaration_targets(&self.salsa, root, key, &new_name)
-                            .await,
-                    );
+                            .await;
+                    targets.extend(laravel_lsp::rename::require_declaration_edits(
+                        key,
+                        declarations,
+                    )?);
                 }
             }
             laravel_lsp::references::SymbolRef::Env(key) => {
@@ -25579,7 +25513,13 @@ impl LanguageServer for LaravelLanguageServer {
                 // at every declaration AND every call site. Touches every
                 // `.env*` file at the project root that has the key.
                 if let Some(root) = root_path.as_ref() {
-                    targets.extend(collect_env_declaration_targets(root, key, &new_name));
+                    // Same fail-closed rule. `env('UNDECLARED_VAR')` has call
+                    // sites and no declaration in any `.env*` file; rewriting
+                    // them alone points every read at a name nothing defines.
+                    targets.extend(laravel_lsp::rename::require_declaration_edits(
+                        key,
+                        collect_env_declaration_targets(root, key, &new_name),
+                    )?);
                 }
             }
             laravel_lsp::references::SymbolRef::Component(name) => {

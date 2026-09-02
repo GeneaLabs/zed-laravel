@@ -544,3 +544,30 @@ fn locate_magic_member_declaration_absent_is_none() {
 fn can_rename_accepts_class_kind() {
     assert!(can_rename(&SymbolRef::Class(r"App\Models\Flight".into())));
 }
+
+// ── #369: a rename never applies call sites without a declaration ─────────
+
+#[test]
+fn require_declaration_edits_passes_through_a_non_empty_list() {
+    let decls = vec!["one", "two"];
+    assert_eq!(
+        super::require_declaration_edits("app.name", decls).expect("a declaration exists"),
+        vec!["one", "two"]
+    );
+}
+
+#[test]
+fn require_declaration_edits_refuses_an_empty_list() {
+    // `config('app.404')` and `config('app.providers.0')` reach the rename
+    // handler since #369 — completion offers them and goto follows them — but
+    // neither has quoted text to rewrite. Applying the call-site edits alone
+    // would repoint every call at a key that does not exist.
+    let empty: Vec<&str> = Vec::new();
+    let err = super::require_declaration_edits("app.404", empty)
+        .expect_err("a key with no quoted declaration must not rename");
+    assert!(
+        err.message.contains("app.404") && err.message.contains("no quoted declaration"),
+        "the toast must name the key and the reason, got {:?}",
+        err.message
+    );
+}
