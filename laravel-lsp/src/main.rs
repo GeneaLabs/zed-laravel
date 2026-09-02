@@ -7876,6 +7876,12 @@ impl LaravelLanguageServer {
     /// `refresh_magic_dependents` blast radius as a save, excluding the present
     /// files already refreshed here.
     async fn run_magic_batch_once(&self, batch: HashMap<PathBuf, PendingWatchedChange>) {
+        // Parse the whole batch OFF the actor thread first, so the serial pass
+        // below reads warm caches instead of parsing (issue #373). Nothing
+        // about the pass changes — it is the same loop, over the same files,
+        // in the same order.
+        self.preparse_batch_off_actor(&batch).await;
+
         let mut changed_classes: HashSet<String> = HashSet::new();
         let mut changed_views: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<PathBuf> = HashSet::new();
@@ -8007,6 +8013,143 @@ impl LaravelLanguageServer {
             changed_views.into_iter().collect(),
         )
         .await;
+    }
+
+    /// Parse every file in `batch` OFF the Salsa actor thread, in parallel,
+    /// and hand the actor finished results (issue #373).
+    ///
+    /// # The problem this removes
+    ///
+    /// `run_magic_batch_once` queries `get_patterns` per file in a serial
+    /// loop. On a cache miss that call does the file read AND the tree-sitter
+    /// parse *inside* `SalsaActor`, which is a single dedicated thread. A
+    /// `composer install` rewrites thousands of vendor files straight into
+    /// that loop, so every one of those parses queues behind the last — the
+    /// "100% of one core, sustained, for minutes" symptom from issue #80.
+    /// Measured before this change: ~600 files/sec, so a 16,000-file
+    /// dependency install spent ~26 seconds pinned to one core of a 20-core
+    /// machine (`benches/vendor_parallelism.rs`).
+    ///
+    /// The fix is not a thread count. It is to move the parse **out** of the
+    /// actor, which is how the warm-start path has always worked — a
+    /// semaphore plus a `JoinSet` of `spawn_blocking` tasks, bulk-imported at
+    /// the end. That asymmetry is exactly why cold start was fast while this
+    /// path was not.
+    ///
+    /// # Why the pass below needs no other change
+    ///
+    /// Both imports land where the serial loop already looks. Patterns go
+    /// straight into the shared `DashMap` the actor reads first, so each
+    /// `get_patterns` becomes a cache hit. Hierarchy goes into the
+    /// actor-owned index that `file_class_surfaces` reads, in one message for
+    /// the whole batch rather than one parse per file.
+    ///
+    /// `bulk_import_hierarchy` performs the same `remove_file` +
+    /// `insert_file` the actor's own miss path performs, and `insert_file`
+    /// no-ops on an empty node list, so a file that declares no class is
+    /// handled identically either way. The only divergence is that the bulk
+    /// path always drops the `class_files_snapshot` where the miss path drops
+    /// it only when a file's FQCN set changed — strictly more conservative,
+    /// and correct for a batch that is about to change many files.
+    ///
+    /// # Two exclusions, both load-bearing
+    ///
+    /// * **Files the parse budget rejects.** The pass below treats an
+    ///   excluded file exactly like a deleted one and never parses it, so
+    ///   parsing it here would do work production does not — and would drag
+    ///   back the `*.json.php` blobs and oversized files issue #371
+    ///   deliberately removed.
+    /// * **Files open in the editor.** The buffer is authoritative for an
+    ///   open file, and a disk parse would describe different text.
+    ///   `bulk_import_patterns` already refuses to overwrite an open path,
+    ///   but `bulk_import_hierarchy` has no such guard, so filtering here is
+    ///   what keeps the two imports describing the same bytes. The serial
+    ///   pass still handles these files, through the actor, exactly as before.
+    async fn preparse_batch_off_actor(&self, batch: &HashMap<PathBuf, PendingWatchedChange>) {
+        let open = self.salsa.open_buffer_paths().await;
+        let candidates: Vec<PathBuf> = batch
+            .keys()
+            .filter(|path| !open.contains(*path))
+            .filter(|path| laravel_lsp::parse_budget::skip_reason_on_disk(path).is_none())
+            .cloned()
+            .collect();
+
+        // One file has no parallelism to win, and the two bulk imports would
+        // cost more than the single actor parse they replace. Below the
+        // threshold the old path is simply the faster one.
+        if candidates.len() < 2 {
+            return;
+        }
+
+        // Bounded, with the reason in `parallelism::bounded_pool_size`. A
+        // watched-file batch fires while the user is working — often right
+        // after a `git checkout` or a `composer install` they are waiting on —
+        // so this pool must not take the machine the editor is running on.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(
+            laravel_lsp::parallelism::bounded_pool_size(),
+        ));
+
+        type ParsedFile = (
+            PathBuf,
+            Arc<laravel_lsp::salsa_impl::ParsedPatternsData>,
+            Vec<laravel_lsp::class_hierarchy_index::ClassNode>,
+        );
+
+        let mut parse_set: tokio::task::JoinSet<Option<ParsedFile>> = tokio::task::JoinSet::new();
+        for path in candidates {
+            let permit_owner = semaphore.clone();
+            parse_set.spawn(async move {
+                let _permit = permit_owner.acquire_owned().await.ok()?;
+                let path_for_task = path.clone();
+                // tree-sitter is CPU-bound and would block the async runtime
+                // if run directly in a tokio task, so the read and the parse
+                // both go to the blocking pool — the same shape the warm pass
+                // uses.
+                let parsed = tokio::task::spawn_blocking(move || {
+                    let text = std::fs::read_to_string(&path_for_task).ok()?;
+                    Some(laravel_lsp::pattern_indexer::parse_owned_with_hierarchy(
+                        &path_for_task,
+                        &text,
+                    ))
+                })
+                .await
+                .ok()
+                .flatten()?;
+                Some((path, parsed.0, parsed.1))
+            });
+        }
+
+        // Drained in completion order, which is all this loop needs: both
+        // imports are order-independent (a `DashMap` insert and a per-file
+        // hierarchy replace), unlike the command index's same-tier tie-break
+        // elsewhere in the tree. A file that vanished between the watcher
+        // event and the read yields `None` and is dropped here — the serial
+        // pass re-reads it and takes its deletion branch, which is the one
+        // authoritative existence check.
+        let mut patterns: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> =
+            Vec::new();
+        let mut hierarchy: Vec<(PathBuf, Vec<laravel_lsp::class_hierarchy_index::ClassNode>)> =
+            Vec::new();
+        while let Some(res) = parse_set.join_next().await {
+            if let Ok(Some((path, data, nodes))) = res {
+                patterns.push((path.clone(), data));
+                hierarchy.push((path, nodes));
+            }
+        }
+
+        if patterns.is_empty() {
+            return;
+        }
+
+        // Patterns first, and the hierarchy only if they landed. The pattern
+        // import fails when no project is registered yet, and in that case the
+        // serial pass falls back to parsing in the actor — importing a
+        // hierarchy for parses the cache will not serve would leave the two
+        // describing different work.
+        if self.salsa.bulk_import_patterns(patterns).await.is_err() {
+            return;
+        }
+        let _ = self.salsa.bulk_import_hierarchy(hierarchy).await;
     }
 
     /// Read a file's authoritative content for a magic refresh: the open editor

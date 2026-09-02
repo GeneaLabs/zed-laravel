@@ -7023,13 +7023,22 @@ impl SalsaHandle {
     }
 
     /// Snapshot the paths of every currently open buffer as a `HashSet`,
-    /// once, for O(1) membership checks. The sole consumer is
-    /// `bulk_import_patterns`, which must not let a disk-parsed warm entry
-    /// overwrite a path the user has open (and possibly edited) — see
-    /// there. Called from async context (the warming task that calls
-    /// `bulk_import_patterns` is itself a `tokio::spawn`ed future, not the
-    /// actor thread), so a plain `.read().await` is correct here.
-    async fn open_buffer_paths(&self) -> std::collections::HashSet<PathBuf> {
+    /// once, for O(1) membership checks.
+    ///
+    /// Two consumers, both needing the same rule: a disk parse must never
+    /// overwrite what the user has open and possibly edited.
+    /// `bulk_import_patterns` applies it to its own writes (see there). The
+    /// watched-file batch's off-actor pre-parse (`preparse_batch_off_actor`
+    /// in `main.rs`, issue #373) applies it a step earlier, to decide which
+    /// files to read from disk at all — it imports patterns AND hierarchy,
+    /// and only the pattern half is guarded downstream, so an open buffer
+    /// filtered out here is what keeps the two halves describing the same
+    /// text.
+    ///
+    /// Public for that second caller. Called from async context (both callers
+    /// run inside `tokio::spawn`ed futures, not on the actor thread), so a
+    /// plain `.read().await` is correct here.
+    pub async fn open_buffer_paths(&self) -> std::collections::HashSet<PathBuf> {
         match self.documents.get() {
             Some(documents) => documents
                 .read()
