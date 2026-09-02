@@ -271,10 +271,18 @@ pub fn load_into(
 /// independent mtime stat (a filesystem `metadata` call — the dominant
 /// cost on a cold FS cache) plus a position-index rebuild. Serially that
 /// was a multi-second startup stall; `into_par_iter` fans it across the
-/// rayon pool. The result is identical to a serial pass — DashMap inserts
+/// pool. The result is identical to a serial pass — DashMap inserts
 /// are lock-free, the counters are atomics, and the surfaced hierarchy is
 /// order-independent (the caller bulk-imports it as a set) — so the only
 /// observable change is that it finishes sooner.
+///
+/// The pass runs on the server's own bounded pool via
+/// [`crate::parallelism::install`], not rayon's global one (issue #373).
+/// The global pool is one thread per core, so on a 4-core laptop this
+/// stat pass took all four while the user was waiting on the editor that
+/// spawned it. Bounding it changes no result and is not expected to
+/// change the wall clock — the pass is stat-bound, so the threads it
+/// gives back were buying little. It is a contention fix.
 pub fn load_into_reporting(
     pattern_cache: &Arc<DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
     project_root: &Path,
@@ -320,41 +328,44 @@ pub fn load_into_reporting(
     // doesn't matter — it's imported as a set.
     let restored = AtomicUsize::new(0);
     let dropped = AtomicUsize::new(0);
-    let hierarchy: Vec<(PathBuf, Vec<ClassNode>)> = cache
-        .entries
-        .into_par_iter()
-        .filter_map(|(path, entry)| {
-            // Stat the file. If it's gone, or its mtime differs from the
-            // cached value, drop the entry — warming will re-parse it.
-            let node_entry = match read_mtime(&path) {
-                Some((s, n)) if s == entry.mtime_secs && n == entry.mtime_nanos => {
-                    // Fresh: insert as-is. The position index isn't rebuilt
-                    // here — it's derived data (skipped on serialize, see
-                    // `ParsedPatternsData::sorted_positions`) that
-                    // `find_at_position` now builds lazily on its own first
-                    // call, so a 40k-entry warm restore no longer pays an
-                    // eager sort for every file, only the handful the cursor
-                    // actually visits.
-                    let patterns = entry.patterns;
-                    // Surface the file's hierarchy nodes so the caller can
-                    // re-import them — the index is otherwise empty on a warm
-                    // start (no parse runs for disk-restored files).
-                    let node_entry = (!entry.nodes.is_empty()).then(|| (path.clone(), entry.nodes));
-                    pattern_cache.insert(path, (0, Arc::new(patterns)));
-                    restored.fetch_add(1, Ordering::Relaxed);
-                    node_entry
+    let entries = cache.entries;
+    let hierarchy: Vec<(PathBuf, Vec<ClassNode>)> = crate::parallelism::install(|| {
+        entries
+            .into_par_iter()
+            .filter_map(|(path, entry)| {
+                // Stat the file. If it's gone, or its mtime differs from the
+                // cached value, drop the entry — warming will re-parse it.
+                let node_entry = match read_mtime(&path) {
+                    Some((s, n)) if s == entry.mtime_secs && n == entry.mtime_nanos => {
+                        // Fresh: insert as-is. The position index isn't rebuilt
+                        // here — it's derived data (skipped on serialize, see
+                        // `ParsedPatternsData::sorted_positions`) that
+                        // `find_at_position` now builds lazily on its own first
+                        // call, so a 40k-entry warm restore no longer pays an
+                        // eager sort for every file, only the handful the cursor
+                        // actually visits.
+                        let patterns = entry.patterns;
+                        // Surface the file's hierarchy nodes so the caller can
+                        // re-import them — the index is otherwise empty on a warm
+                        // start (no parse runs for disk-restored files).
+                        let node_entry =
+                            (!entry.nodes.is_empty()).then(|| (path.clone(), entry.nodes));
+                        pattern_cache.insert(path, (0, Arc::new(patterns)));
+                        restored.fetch_add(1, Ordering::Relaxed);
+                        node_entry
+                    }
+                    _ => {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                };
+                if let Some(p) = progress {
+                    p.done.fetch_add(1, Ordering::Relaxed);
                 }
-                _ => {
-                    dropped.fetch_add(1, Ordering::Relaxed);
-                    None
-                }
-            };
-            if let Some(p) = progress {
-                p.done.fetch_add(1, Ordering::Relaxed);
-            }
-            node_entry
-        })
-        .collect();
+                node_entry
+            })
+            .collect()
+    });
 
     LoadResult {
         restored: restored.into_inner(),

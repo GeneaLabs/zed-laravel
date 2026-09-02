@@ -11,6 +11,12 @@
 //!
 //! So every pool is bounded, and bounded the same way.
 
+use std::sync::OnceLock;
+
+/// Built on first use and reused for the process lifetime — a pool is threads,
+/// and rebuilding one per call would cost more than the work it fans out.
+static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+
 /// Worker count for a pool that fans project-file work across cores.
 ///
 /// `min(8, max(2, available_parallelism() / 2))`, which reads as three rules:
@@ -38,6 +44,45 @@ pub fn bounded_pool_size() -> usize {
         .unwrap_or(FLOOR);
 
     half.clamp(FLOOR, CEILING)
+}
+
+/// The server's own rayon pool, built once at [`bounded_pool_size`] threads.
+///
+/// `None` only if rayon refuses to build it, which in practice means the
+/// process cannot spawn threads at all.
+fn pool() -> Option<&'static rayon::ThreadPool> {
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(bounded_pool_size())
+            .thread_name(|i| format!("laravel-lsp-cpu-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// Run `op` on the server's bounded rayon pool, so any `par_iter` inside it
+/// fans across [`bounded_pool_size`] threads rather than rayon's global pool.
+///
+/// **Why not the global pool.** rayon's default is one thread per core. On a
+/// 20-core workstation that is 20 threads of work; on a 4-core laptop it takes
+/// all four, and the editor competes with its own language server for the
+/// machine. The global pool is also shared with every other rayon user linked
+/// into this binary (salsa among them), so resizing it would reach past this
+/// server's own work. A dedicated pool bounds ours and leaves theirs alone.
+///
+/// Expect no speedup from this — it is a contention fix. The passes it wraps
+/// are partly I/O-bound, so the threads it removes were buying little.
+///
+/// Falls back to running `op` on the calling thread if the pool could not be
+/// built. Work inside would then reach the global pool, which is the
+/// unbounded behaviour this replaces — worse, but not wrong, and better than
+/// refusing to load the cache at all.
+pub fn install<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    match pool() {
+        Some(pool) => pool.install(op),
+        None => op(),
+    }
 }
 
 #[cfg(test)]
