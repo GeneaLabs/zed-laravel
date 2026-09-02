@@ -122,6 +122,16 @@ harness = false
 name = "magic_members"
 harness = false
 
+# Step-0 measurement for issue #373 — splits the shared vendor pass into walk /
+# stat / read / classify so the parallelizable fraction is measured rather than
+# assumed, and times the single-threaded Salsa parse funnel a dependency change
+# drives. Unlike the two benches above it needs a REAL `vendor/` tree (it skips
+# cleanly without one). Same custom timing harness; run with
+# `cargo bench --bench vendor_parallelism`.
+[[bench]]
+name = "vendor_parallelism"
+harness = false
+
 [profile.release]
 lto = true
 opt-level = 3
