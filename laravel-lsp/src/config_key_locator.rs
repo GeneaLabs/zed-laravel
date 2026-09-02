@@ -32,6 +32,11 @@ pub struct KeyPosition {
     pub line: u32,
     pub start_column: u32,
     pub end_column: u32,
+    /// True when the span covers a quoted key literal, which a rename may
+    /// rewrite in place. False for a synthesized list index (`sizes.0`) and
+    /// for an unquoted integer key (`404 => …`): both are real, navigable
+    /// keys, but neither has quoted text a new name could replace.
+    pub is_literal_key: bool,
 }
 
 /// Locate the source position of `dotted_key` (e.g. `"app.name"`,
@@ -94,6 +99,20 @@ pub fn locate_in_source(source: &str, key_path: &[&str]) -> Option<KeyPosition> 
 /// are skipped. The caller prepends the file stem to form the full dotted key
 /// (`database.` / `auth.`). Powers config + translation code lenses (#59).
 pub fn enumerate_keys_in_source(source: &str) -> Vec<(String, KeyPosition)> {
+    enumerate_entries_in_source(source)
+        .into_iter()
+        .map(|(key, _value, position)| (key, position))
+        .collect()
+}
+
+/// [`enumerate_keys_in_source`] plus each entry's scalar value text, as
+/// `(in-file dotted path, value text, key position)`.
+///
+/// The value is for display only — translation completion shows it beside the
+/// key. It is the string's content without quotes, the raw source text for any
+/// other scalar, and empty for an array-valued (intermediate) key, which has
+/// no scalar of its own to show.
+pub fn enumerate_entries_in_source(source: &str) -> Vec<(String, String, KeyPosition)> {
     let Ok(tree) = crate::parser::parse_php(source) else {
         return Vec::new();
     };
@@ -108,22 +127,25 @@ pub fn enumerate_keys_in_source(source: &str) -> Vec<(String, KeyPosition)> {
 
 /// Recurse an array literal, accumulating the dotted key path. `prefix` is the
 /// path to `array` (empty at the top level).
-fn collect_keys(array: Node, source: &[u8], prefix: &str, out: &mut Vec<(String, KeyPosition)>) {
-    let mut cursor = array.walk();
-    for child in array.children(&mut cursor) {
-        if child.kind() != "array_element_initializer" {
-            continue;
-        }
-        let Some(entry) = parse_array_entry(child, source) else {
-            continue;
-        };
+fn collect_keys(
+    array: Node,
+    source: &[u8],
+    prefix: &str,
+    out: &mut Vec<(String, String, KeyPosition)>,
+) {
+    for entry in array_entries(array, source) {
         let dotted = if prefix.is_empty() {
             entry.key_text.clone()
         } else {
             format!("{prefix}.{}", entry.key_text)
         };
-        out.push((dotted.clone(), entry.key_position));
-        if let Some(nested) = find_array_in_expression(entry.value_node) {
+        let nested = find_array_in_expression(entry.value_node);
+        let value = match nested {
+            Some(_) => String::new(),
+            None => scalar_value_text(entry.value_node, source),
+        };
+        out.push((dotted.clone(), value, entry.key_position));
+        if let Some(nested) = nested {
             collect_keys(nested, source, &dotted, out);
         }
     }
@@ -173,20 +195,17 @@ fn find_array_in_expression(node: Node) -> Option<Node> {
 }
 
 /// Walk an `array_creation_expression` along the given path. At each step,
-/// find the entry whose key string content matches the path segment. If it's
-/// the last segment, return the key position; otherwise descend into the
-/// value (which must itself be an array) and recurse.
+/// find the entry whose key matches the path segment. If it's the last
+/// segment, return the key position; otherwise descend into the value (which
+/// must itself be an array) and recurse.
 fn locate_at_path<'a>(array: Node<'a>, source: &[u8], path: &[&str]) -> Option<KeyPosition> {
     let (head, tail) = path.split_first()?;
-
-    let mut cursor = array.walk();
-    for child in array.children(&mut cursor) {
-        if child.kind() != "array_element_initializer" {
-            continue;
-        }
-        let entry = parse_array_entry(child, source)?;
+    for entry in array_entries(array, source) {
         if entry.key_text != *head {
-            // Try the next entry; we only act on a key match.
+            // Try the next entry; we only act on a key match. An entry we
+            // cannot parse is skipped by `array_entries`, never fatal — it
+            // used to abort the whole lookup, so a single list entry hid
+            // every key declared after it.
             continue;
         }
         if tail.is_empty() {
@@ -208,64 +227,279 @@ struct ParsedEntry<'a> {
     value_node: Node<'a>,
 }
 
-/// Parse one `array_element_initializer` of the shape `key => value`.
-/// Returns `None` when the key isn't a literal string (numeric keys,
-/// expressions, etc. — we can't rename those positionally).
-fn parse_array_entry<'a>(node: Node<'a>, source: &[u8]) -> Option<ParsedEntry<'a>> {
-    // Layout (tree-sitter-php): the element has children separated by `=>`,
-    // tagged via field names `key` and `value`. Some grammar revisions use
-    // unnamed positional children — handle both.
-    let key_node = node
-        .child_by_field_name("key")
-        .or_else(|| named_child(node, 0))?;
-    let value_node = node
-        .child_by_field_name("value")
-        .or_else(|| named_child(node, 1))?;
-
-    let (key_text, key_position) = string_literal_content(key_node, source)?;
-    Some(ParsedEntry {
-        key_text,
-        key_position,
-        value_node,
-    })
+/// Every resolvable entry of an array literal, in document order, with PHP's
+/// own index rules applied to keyless entries.
+///
+/// PHP gives a keyless entry the next free integer index: the counter starts
+/// at 0 and jumps to `n + 1` whenever an explicit integer key `n` appears.
+/// `['a', 5 => 'b', 'c']` is therefore `0`, `5`, `6`. A spread (`...$other`)
+/// contributes an unknown number of elements, so every later position is
+/// unknowable — positional entries after one are dropped rather than guessed.
+fn array_entries<'a>(array: Node<'a>, source: &[u8]) -> Vec<ParsedEntry<'a>> {
+    let mut out = Vec::new();
+    let mut next_index: Option<i64> = Some(0);
+    let mut cursor = array.walk();
+    for child in array.children(&mut cursor) {
+        if child.kind() != "array_element_initializer" {
+            continue;
+        }
+        if is_spread(child) {
+            next_index = None;
+            continue;
+        }
+        let Some((key_node, value_node)) = entry_key_and_value(child) else {
+            continue;
+        };
+        match key_node {
+            Some(key_node) => {
+                if let Some(n) = integer_literal_value(key_node, source) {
+                    next_index = Some(next_index.map_or(n + 1, |c| c.max(n + 1)));
+                }
+                if let Some((key_text, key_position)) = literal_key(key_node, source) {
+                    out.push(ParsedEntry {
+                        key_text,
+                        key_position,
+                        value_node,
+                    });
+                }
+            }
+            None => {
+                let Some(index) = next_index else { continue };
+                next_index = Some(index + 1);
+                out.push(ParsedEntry {
+                    key_text: index.to_string(),
+                    key_position: synthesized_index_position(value_node),
+                    value_node,
+                });
+            }
+        }
+    }
+    out
 }
 
-/// Return the n-th named child of a node, ignoring whitespace and `=>`
-/// punctuation. Fallback used when `child_by_field_name` isn't supported
-/// for the current grammar revision.
-fn named_child(node: Node, index: usize) -> Option<Node> {
+/// Split one `array_element_initializer` into `(key, value)`. The key is
+/// `None` for a keyless (list) entry. Handles both the field-named grammar
+/// revision and the older positional one.
+fn entry_key_and_value<'a>(node: Node<'a>) -> Option<(Option<Node<'a>>, Node<'a>)> {
+    if let Some(value) = node.child_by_field_name("value") {
+        return Some((node.child_by_field_name("key"), value));
+    }
     let mut cursor = node.walk();
-    let result = node.named_children(&mut cursor).nth(index);
-    result
+    let named: Vec<Node<'a>> = node.named_children(&mut cursor).collect();
+    match named.len() {
+        0 => None,
+        1 => Some((None, named[0])),
+        _ => Some((Some(named[0]), named[1])),
+    }
 }
 
-/// Extract the literal string content + position from a `string` /
-/// `encapsed_string` node. Returns `None` for non-string keys.
-fn string_literal_content<'a>(node: Node<'a>, source: &[u8]) -> Option<(String, KeyPosition)> {
+/// True for a `...$other` spread element, whose element count is unknown.
+fn is_spread(node: Node) -> bool {
+    if node.kind().contains("variadic") {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let spread = node
+        .children(&mut cursor)
+        .any(|child| child.kind() == "..." || child.kind().contains("variadic"));
+    spread
+}
+
+/// The integer a literal integer key denotes, e.g. `404 => …`.
+fn integer_literal_value(node: Node, source: &[u8]) -> Option<i64> {
+    (node.kind() == "integer")
+        .then(|| node.utf8_text(source).ok()?.parse().ok())
+        .flatten()
+}
+
+/// The dotted-path text a literal key contributes, and where it is declared.
+///
+/// A quoted key reports `is_literal_key: true` — rename can rewrite it inside
+/// its quotes. An unquoted integer key (`404 => …`) reports `false`: it is a
+/// real, resolvable key, but replacing the bare digits with a name would
+/// produce a constant lookup rather than a string key.
+fn literal_key(node: Node, source: &[u8]) -> Option<(String, KeyPosition)> {
+    if let Some(text) = string_literal_text(node, source) {
+        return Some((text, string_body_position(node)));
+    }
+    let value = integer_literal_value(node, source)?;
+    let start = node.start_position();
+    let end = node.end_position();
+    Some((
+        value.to_string(),
+        KeyPosition {
+            line: start.row as u32,
+            start_column: start.column as u32,
+            end_column: if end.row == start.row {
+                end.column as u32
+            } else {
+                start.column as u32
+            },
+            is_literal_key: false,
+        },
+    ))
+}
+
+/// Where a synthesized list index points: the start of the entry's value.
+/// Zero-width, because the index has no text of its own in the source.
+fn synthesized_index_position(value_node: Node) -> KeyPosition {
+    let start = value_node.start_position();
+    KeyPosition {
+        line: start.row as u32,
+        start_column: start.column as u32,
+        end_column: start.column as u32,
+        is_literal_key: false,
+    }
+}
+
+/// The span of a string literal's body — inside the quotes.
+///
+/// Derived from the literal's own extent rather than from its `string_content`
+/// child, because an escape splits that child in two: `'it\'s'` is
+/// `string_content("it")` + `escape_sequence` + `string_content("s")`, and the
+/// first run alone spans only `it`.
+fn string_body_position(node: Node) -> KeyPosition {
+    let start = node.start_position();
+    let end = node.end_position();
+    let start_column = start.column as u32 + 1;
+    KeyPosition {
+        line: start.row as u32,
+        start_column,
+        end_column: if end.row == start.row && end.column as u32 > start_column {
+            end.column as u32 - 1
+        } else {
+            start_column
+        },
+        is_literal_key: true,
+    }
+}
+
+/// A string literal's text with PHP's escape sequences resolved. `None` for
+/// any node that is not a single- or double-quoted literal.
+fn string_literal_text(node: Node, source: &[u8]) -> Option<String> {
     if node.kind() != "string" && node.kind() != "encapsed_string" {
         return None;
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "string_content" {
-            let text = child.utf8_text(source).ok()?.to_string();
-            let start = child.start_position();
-            let end = child.end_position();
-            return Some((
-                text,
-                KeyPosition {
-                    line: start.row as u32,
-                    start_column: start.column as u32,
-                    end_column: if end.row == start.row {
-                        end.column as u32
-                    } else {
-                        start.column as u32
-                    },
-                },
-            ));
+    let raw = node.utf8_text(source).ok()?;
+    let quote = raw.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let body = raw
+        .strip_prefix(quote)
+        .and_then(|rest| rest.strip_suffix(quote))
+        .unwrap_or(&raw[quote.len_utf8()..]);
+    Some(unescape_php(body, quote))
+}
+
+/// Resolve PHP's escape sequences for the given quote style.
+///
+/// A single-quoted literal resolves only `\'` and `\\`; every other backslash
+/// stands for itself, so `'a\nb'` really does contain a backslash and an `n`.
+/// A double-quoted literal resolves the usual control escapes too. Variable
+/// interpolation is not attempted — see [`fold_value`].
+fn unescape_php(body: &str, quote: char) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            None => out.push('\\'),
+            Some(next) if quote == '\'' => {
+                if next == '\'' || next == '\\' {
+                    out.push(next);
+                } else {
+                    out.push('\\');
+                    out.push(next);
+                }
+            }
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('v') => out.push('\u{0B}'),
+            Some('f') => out.push('\u{0C}'),
+            Some('e') => out.push('\u{1B}'),
+            Some('0') => out.push('\0'),
+            Some(next @ ('\\' | '"' | '$')) => out.push(next),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
         }
     }
-    None
+    out
+}
+
+/// The display text of a non-array value. Statically knowable values are
+/// resolved to what PHP would produce; anything else falls back to its source
+/// text, which at least shows the reader where the value comes from.
+fn scalar_value_text(node: Node, source: &[u8]) -> String {
+    fold_value(node, source)
+        .unwrap_or_else(|| node.utf8_text(source).unwrap_or_default().to_string())
+}
+
+/// The runtime text of a value expression when it can be known without
+/// running PHP: a string literal, a heredoc or nowdoc body, or a `.`
+/// concatenation whose every operand is one of those.
+///
+/// `None` for anything needing runtime state — `env(…)`, a constant, an
+/// interpolated variable — so the caller shows the source text instead of a
+/// confidently wrong answer.
+fn fold_value(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "string" => string_literal_text(node, source),
+        "encapsed_string" => {
+            // `"Hi $name"` has no static value. Only a literal run (plus its
+            // escapes) can be folded.
+            let mut cursor = node.walk();
+            let interpolated = node.children(&mut cursor).any(|child| {
+                !matches!(
+                    child.kind(),
+                    "string_content" | "escape_sequence" | "\"" | "'"
+                )
+            });
+            (!interpolated).then(|| string_literal_text(node, source))?
+        }
+        "heredoc" | "nowdoc" => {
+            let mut cursor = node.walk();
+            let body = node
+                .children(&mut cursor)
+                .find(|child| child.kind().ends_with("_body"))?;
+            // The body node starts at the newline that ends the `<<<EOT`
+            // opener; that newline is a delimiter, not content.
+            let text = body.utf8_text(source).ok()?;
+            let text = text
+                .strip_prefix("\r\n")
+                .or_else(|| text.strip_prefix('\n'))
+                .unwrap_or(text);
+            // A nowdoc (`<<<'EOT'`) is single-quote semantics; a heredoc is
+            // double-quote semantics.
+            Some(match node.kind() {
+                "nowdoc" => text.to_string(),
+                _ => unescape_php(text, '"'),
+            })
+        }
+        "binary_expression" => {
+            let operator = node.child_by_field_name("operator")?;
+            if operator.utf8_text(source).ok()? != "." {
+                return None;
+            }
+            let left = fold_value(node.child_by_field_name("left")?, source)?;
+            let right = fold_value(node.child_by_field_name("right")?, source)?;
+            Some(left + &right)
+        }
+        "expression" | "primary_expression" | "parenthesized_expression" => {
+            let mut cursor = node.walk();
+            let folded = node
+                .named_children(&mut cursor)
+                .find_map(|child| fold_value(child, source));
+            folded
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
