@@ -847,7 +847,7 @@ async fn salsa_config_indexes_anonymous_component_registrations() {
     let root = PathBuf::from("/tmp/zed-laravel-issue44");
 
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -885,7 +885,7 @@ async fn salsa_config_refreshes_when_provider_registered_after_first_build() {
     let root = PathBuf::from("/tmp/zed-laravel-issue44-late");
 
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
 
@@ -2671,7 +2671,7 @@ async fn livewire_config_namespaces_merge_into_laravel_config() {
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     let config = handle
@@ -2810,7 +2810,7 @@ async fn scope_project() -> (TempDir, SalsaHandle, PathBuf) {
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -2885,7 +2885,7 @@ class C {
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -2941,7 +2941,7 @@ class C {
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -2999,7 +2999,7 @@ class C {
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -3395,7 +3395,7 @@ async fn facade_alias_snapshot_seeds_defaults() {
     let root = dir.path().to_path_buf();
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
 
@@ -3446,7 +3446,7 @@ return Application::configure(basePath: __DIR__)
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -3691,7 +3691,7 @@ class AppServiceProvider extends ServiceProvider {
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -3746,7 +3746,7 @@ class AppServiceProvider extends ServiceProvider {
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -3820,7 +3820,7 @@ class {n}ServiceProvider extends ServiceProvider {{
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     // Register in the REVERSE of the winning order (F→A), so an insertion-ordered
@@ -3895,7 +3895,7 @@ class AppServiceProvider extends ServiceProvider {
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -4021,7 +4021,7 @@ return [
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
 
@@ -4093,7 +4093,7 @@ class Ids {
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -4205,7 +4205,7 @@ class AboutController {{
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     // Registering the provider source parses the `auth → AuthManager` binding
@@ -4377,7 +4377,7 @@ class AboutController {
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -4500,7 +4500,7 @@ class AboutController {{
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -4669,7 +4669,7 @@ class PageController {{
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle
@@ -4770,7 +4770,7 @@ class AppServiceProvider extends ServiceProvider {
 
     let handle = SalsaActor::spawn();
     handle
-        .register_config_files(root.clone(), None, None, None)
+        .register_config_files(root.clone(), None, None, None, None)
         .await
         .unwrap();
     handle

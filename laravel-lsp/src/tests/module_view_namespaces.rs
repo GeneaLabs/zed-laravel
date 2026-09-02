@@ -87,7 +87,7 @@ async fn view_namespace_dir_named(
 ) -> Option<PathBuf> {
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .expect("salsa actor accepts config root");
     backend
@@ -106,7 +106,7 @@ async fn view_namespace_dir_named(
 async fn view_namespace_dir(backend: &LaravelLanguageServer, root: &Path) -> Option<PathBuf> {
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .expect("salsa actor accepts config root");
     backend
@@ -434,7 +434,7 @@ class Registrar
 async fn config_for(backend: &LaravelLanguageServer, root: &Path) -> LaravelConfigData {
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .expect("salsa actor accepts config root");
     backend

@@ -32,7 +32,7 @@ async fn handle_for(root: &Path) -> SalsaHandle {
     // always sets it first — either here or via `RegisterCachedConfig` — so a
     // fixture that skips it is under-registering, not exercising a real state.
     handle
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .expect("actor registers the tempdir project root");
     handle

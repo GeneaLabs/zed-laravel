@@ -4980,6 +4980,11 @@ impl LaravelLanguageServer {
         // Read config/livewire.php
         let livewire_config = fs::read_to_string(root_path.join("config/livewire.php")).ok();
 
+        // Read composer.lock — the authority on whether Livewire is installed,
+        // because `composer.json` names only direct requirements and Livewire
+        // usually arrives transitively (Flux, Volt, Filament, MaryUI).
+        let composer_lock = fs::read_to_string(root_path.join("composer.lock")).ok();
+
         // Register with Salsa
         if let Err(e) = self
             .salsa
@@ -4988,6 +4993,7 @@ impl LaravelLanguageServer {
                 composer_json,
                 view_config,
                 livewire_config,
+                composer_lock,
             )
             .await
         {

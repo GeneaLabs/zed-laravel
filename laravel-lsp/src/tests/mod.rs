@@ -50,6 +50,7 @@ mod laravel_root_worktree_discovery;
 mod livewire_component_completion;
 mod livewire_component_resolution;
 mod livewire_tag_navigation_containment;
+mod livewire_transitive_detection;
 mod loop_variable_resolution;
 mod macro_goto_def_handler;
 mod module_config_surfaces;

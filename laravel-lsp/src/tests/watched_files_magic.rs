@@ -184,7 +184,7 @@ class AppServiceProvider extends ServiceProvider {
     let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_v1);
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     backend
@@ -261,7 +261,7 @@ class AppServiceProvider extends ServiceProvider {
     let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_v1);
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     backend
@@ -368,7 +368,7 @@ class AppServiceProvider extends ServiceProvider {
     let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_src);
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     backend
@@ -455,7 +455,7 @@ class AppServiceProvider extends ServiceProvider {
     let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_v1);
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     backend
@@ -542,7 +542,7 @@ class AppServiceProvider extends ServiceProvider {
     let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_src);
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     backend

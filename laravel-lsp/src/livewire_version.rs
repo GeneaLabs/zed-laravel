@@ -46,6 +46,24 @@ pub fn detect_from_composer_lock(json: &str) -> LivewireVersion {
     }
 }
 
+/// Is `livewire/livewire` present in this `composer.lock`?
+///
+/// The installation test that `has_livewire` needs. It searches the whole lock
+/// document, so it matches whether the package sits in `packages` or in
+/// `packages-dev`. That is deliberate: the question is "does this project have
+/// Livewire on disk", and `composer install` writes both sets into `vendor/`.
+/// A dev-only Livewire still puts components under `app/Livewire` and still
+/// wants completion and navigation.
+///
+/// It also matches regardless of WHY the package is there — a direct
+/// requirement or a transitive one pulled in by Flux, Volt, Filament or MaryUI.
+/// That is the whole point: `composer.json` names only direct requirements, so
+/// testing it misses every project that acquires Livewire through a starter kit
+/// or a UI package.
+pub fn is_installed(composer_lock_json: &str) -> bool {
+    find_livewire_name(composer_lock_json).is_some()
+}
+
 const LOOKAHEAD_BYTES: usize = 500;
 
 fn find_livewire_name(json: &str) -> Option<usize> {
