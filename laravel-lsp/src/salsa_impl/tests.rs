@@ -5220,6 +5220,14 @@ async fn register_temp_project(handle: &SalsaHandle, php_files: usize) -> tempfi
             vec![dir.path().join("resources/views")],
             None,
             PathBuf::from("routes"),
+            // The shared vendor walk the production caller passes in
+            // (issue #371) — built from the same root, so the actor
+            // registers exactly what it would in production.
+            crate::vendor_index::VendorIndex::build(dir.path())
+                .files()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect(),
         )
         .await
         .unwrap();

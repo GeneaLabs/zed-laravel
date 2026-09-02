@@ -6499,6 +6499,11 @@ pub enum SalsaRequest {
         view_paths: Vec<PathBuf>,
         livewire_path: Option<PathBuf>,
         routes_path: PathBuf,
+        /// Every `vendor/` PHP file, from the shared vendor walk (issue #371).
+        /// Handed in rather than re-walked here: this actor runs on its own
+        /// thread and cannot reach the server's cached
+        /// [`crate::vendor_index::VendorIndex`].
+        vendor_files: Vec<PathBuf>,
         reply: oneshot::Sender<()>,
     },
     /// Find all references to a specific view across the project
@@ -7366,6 +7371,7 @@ impl SalsaHandle {
         view_paths: Vec<PathBuf>,
         livewire_path: Option<PathBuf>,
         routes_path: PathBuf,
+        vendor_files: Vec<PathBuf>,
     ) -> Result<(), &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
@@ -7375,6 +7381,7 @@ impl SalsaHandle {
                 view_paths,
                 livewire_path,
                 routes_path,
+                vendor_files,
                 reply: reply_tx,
             })
             .await
@@ -9250,6 +9257,7 @@ impl SalsaActor {
                     view_paths,
                     livewire_path,
                     routes_path,
+                    vendor_files,
                     reply,
                 } => {
                     self.handle_register_project_files(
@@ -9258,6 +9266,7 @@ impl SalsaActor {
                         view_paths,
                         livewire_path,
                         routes_path,
+                        vendor_files,
                     );
                     let _ = reply.send(());
                 }
@@ -11246,6 +11255,7 @@ impl SalsaActor {
         view_paths: Vec<PathBuf>,
         livewire_path: Option<PathBuf>,
         routes_path: PathBuf,
+        vendor_files: Vec<PathBuf>,
     ) {
         use walkdir::WalkDir;
 
@@ -11369,43 +11379,20 @@ impl SalsaActor {
             }
         }
 
-        // Scan vendor/ — Composer packages can declare Livewire,
-        // routes, controllers, views, translations. We index every
-        // `*.php` and `*.blade.php` under vendor/ and rely on the
-        // warming-stage filters (skip `*.json.php` data files, drop
-        // anything >256KB) to keep tree-sitter away from pathological
-        // auto-generated content.
+        // Vendor files come from the shared vendor walk (issue #371) instead
+        // of a fifth independent `WalkDir` over the Composer tree. The caller
+        // filters `.git` out for us — this pass never descended into it — and
+        // the set is otherwise identical: every `*.php` and `*.blade.php`,
+        // unbounded depth. `.blade.php` needs no separate test because its
+        // extension is already `php`.
         //
-        // Yes, this reads ~21k file contents on a real-world project,
-        // which adds a few seconds to first registration. Subsequent
-        // startups load most of those entries from the disk cache
-        // (see pattern_disk_cache.rs), so the cost is bounded and
-        // one-time per `composer install`.
-        let vendor_dir = root_path.join("vendor");
-        if vendor_dir.is_dir() {
-            for entry in WalkDir::new(&vendor_dir)
-                .into_iter()
-                .filter_entry(|e| e.file_name().to_str().map(|s| s != ".git").unwrap_or(true))
-                .filter_map(|e| e.ok())
-            {
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy();
-                // Match both `*.php` and `*.blade.php` in one pass. The
-                // `.blade.php` test must come first because a file
-                // ending in `.blade.php` also satisfies `.php`.
-                let is_blade = name.ends_with(".blade.php");
-                let is_php = !is_blade && name.ends_with(".php");
-                if !(is_php || is_blade) {
-                    continue;
-                }
-                let path = entry.path().to_path_buf();
-                self.vendor_files.push(path);
-                // Salsa input deferred to first cache miss — see
-                // handle_get_patterns for the architectural why.
-            }
-        }
+        // Composer packages can declare Livewire components, routes,
+        // controllers, views and translations, so all of them are indexed; the
+        // warming-stage filters (skip `*.json.php` data files, drop anything
+        // >256KB) keep tree-sitter away from pathological auto-generated
+        // content. Salsa inputs are deferred to the first cache miss — see
+        // `handle_get_patterns` for the architectural why.
+        self.vendor_files = vendor_files;
 
         // Scan the whole project (minus vendor + noise dirs) for every
         // `*.php` / `*.blade.php`. The categorized scans above cover the

@@ -2068,3 +2068,182 @@ $this->app->resource('photos', PhotoController::class);
         "resource() must keep its current receiver-agnostic behavior",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Shared vendor walk equivalence (issue #371)
+// ---------------------------------------------------------------------------
+
+/// Route-file discovery as it was before the shared vendor walk: the project
+/// legs, plus its OWN `WalkDir::new(vendor).max_depth(8)`.
+///
+/// An executable oracle, kept because the refactor's claim is about the old
+/// implementation and there is no other way to test such a claim.
+fn discover_route_files_own_walk(root: &Path) -> Vec<RouteFile> {
+    let mut seen: HashMap<PathBuf, u8> = HashMap::new();
+
+    let project_routes = root.join("routes");
+    if project_routes.exists() {
+        for path in walk_php_files(&project_routes, 6) {
+            promote(&mut seen, path, PRIORITY_APP);
+        }
+    }
+
+    let vendor = root.join("vendor");
+    if vendor.exists() {
+        for entry in WalkDir::new(&vendor)
+            .max_depth(8)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "php") {
+                continue;
+            }
+            if is_under_routes_dir(path) {
+                promote(
+                    &mut seen,
+                    path.to_path_buf(),
+                    priority_for_vendor_path(path),
+                );
+                continue;
+            }
+            if file_registers_named_routes(path) {
+                promote(
+                    &mut seen,
+                    path.to_path_buf(),
+                    priority_for_vendor_path(path),
+                );
+            }
+        }
+    }
+
+    for candidate in app_provider_candidates(root) {
+        if candidate.exists() && file_registers_named_routes(&candidate) {
+            promote(&mut seen, candidate, PRIORITY_APP);
+        }
+    }
+
+    seen.into_iter()
+        .map(|(path, priority)| RouteFile { path, priority })
+        .collect()
+}
+
+fn as_sorted_pairs(files: &[RouteFile]) -> Vec<(PathBuf, u8)> {
+    let mut v: Vec<_> = files.iter().map(|f| (f.path.clone(), f.priority)).collect();
+    v.sort();
+    v
+}
+
+/// A project holding every shape the vendor leg's rules key on: a package
+/// `routes/` file (accepted with no read), a provider that registers routes by
+/// content, a framework-tier file (different priority), a non-registering file,
+/// a registering file just inside the depth-8 budget, one just outside it, and
+/// one inside a `node_modules/` subtree the route walk has never pruned.
+fn seed_route_project(root: &Path) {
+    let route_src = "<?php\nRoute::get('/x', fn () => 'ok')->name('x');\n";
+    let write = |rel: &str, body: &str| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+    };
+    write("routes/web.php", route_src);
+    write("app/Providers/RouteServiceProvider.php", route_src);
+    write(
+        "vendor/acme/pkg/routes/web.php",
+        "<?php\n// no routes here\n",
+    );
+    write("vendor/acme/pkg/src/Provider.php", route_src);
+    write("vendor/acme/pkg/src/Plain.php", "<?php\nclass Plain {}\n");
+    write(
+        "vendor/laravel/framework/src/Illuminate/Foo/Bar.php",
+        route_src,
+    );
+    // depth 8 — the last depth the vendor leg considers.
+    write("vendor/acme/pkg/a/b/c/d/e/In.php", route_src);
+    // depth 9 — past it.
+    write("vendor/acme/pkg/a/b/c/d/e/f/Out.php", route_src);
+    write("vendor/acme/pkg/node_modules/Bundled.php", route_src);
+}
+
+#[test]
+fn shared_vendor_walk_discovers_the_same_route_files_as_its_own_walk() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    seed_route_project(root);
+
+    let shared =
+        discover_route_files_with_vendor(root, &crate::vendor_index::VendorIndex::build(root));
+    let oracle = discover_route_files_own_walk(root);
+
+    assert_eq!(
+        as_sorted_pairs(&shared),
+        as_sorted_pairs(&oracle),
+        "sharing the vendor walk must not change which files are discovered, \
+         nor their priorities"
+    );
+
+    // Fixture checks, so the equality above cannot pass vacuously.
+    let has = |rel: &str| shared.iter().any(|f| f.path == root.join(rel));
+    assert!(
+        has("vendor/acme/pkg/routes/web.php"),
+        "a package routes/ file is accepted by convention even though its \
+         content registers nothing — proving the no-read branch still runs"
+    );
+    assert!(
+        has("vendor/acme/pkg/src/Provider.php"),
+        "a content-matched vendor file is still discovered — proving the \
+         shared read pass reaches the classifier"
+    );
+    assert!(
+        !has("vendor/acme/pkg/src/Plain.php"),
+        "a vendor file registering no routes is still rejected"
+    );
+    assert!(
+        has("vendor/acme/pkg/a/b/c/d/e/In.php"),
+        "depth 8 is inside the vendor budget"
+    );
+    assert!(
+        !has("vendor/acme/pkg/a/b/c/d/e/f/Out.php"),
+        "depth 9 is outside it — the budget must still bind now that the \
+         shared walk itself is unbounded"
+    );
+    assert!(
+        has("vendor/acme/pkg/node_modules/Bundled.php"),
+        "route discovery never pruned node_modules, and must not start now \
+         just because another consumer of the shared walk does"
+    );
+    assert_eq!(
+        shared
+            .iter()
+            .find(|f| f.path == root.join("vendor/laravel/framework/src/Illuminate/Foo/Bar.php"))
+            .map(|f| f.priority),
+        Some(PRIORITY_FRAMEWORK),
+        "framework files keep their own tier"
+    );
+}
+
+#[test]
+fn shared_vendor_walk_matches_the_old_walk_without_a_vendor_dir() {
+    // The former code guarded the whole vendor leg on `vendor.exists()`. The
+    // shared index reports `is_empty()` instead; the project legs must still
+    // produce exactly what they did.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("routes")).unwrap();
+    std::fs::write(
+        root.join("routes/web.php"),
+        "<?php\nRoute::get('/x', fn () => 'ok')->name('x');\n",
+    )
+    .unwrap();
+
+    let shared =
+        discover_route_files_with_vendor(root, &crate::vendor_index::VendorIndex::build(root));
+    let oracle = discover_route_files_own_walk(root);
+
+    assert_eq!(as_sorted_pairs(&shared), as_sorted_pairs(&oracle));
+    assert_eq!(
+        shared.len(),
+        1,
+        "fixture check — the project leg found its file"
+    );
+}

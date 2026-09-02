@@ -824,6 +824,14 @@ async fn incremental_batch_runs_regardless_of_project_size() {
             vec![root.join("resources/views")],
             None,
             PathBuf::from("routes"),
+            // The shared vendor walk the production caller passes in
+            // (issue #371) — built from the same root, so the actor
+            // registers exactly what it would in production.
+            laravel_lsp::vendor_index::VendorIndex::build(root)
+                .files()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect(),
         )
         .await
         .unwrap();

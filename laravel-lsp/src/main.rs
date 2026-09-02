@@ -34,6 +34,7 @@ use laravel_lsp::query_chain::cursor::char_col_to_byte_offset;
 use laravel_lsp::route_discovery::{
     build_route_index, discover_route_files, normalize_path, RouteIndex,
 };
+use laravel_lsp::vendor_index::VendorIndex;
 
 // Salsa 0.25 database - integrated via actor pattern for async compatibility
 use laravel_lsp::salsa_impl::{
@@ -2068,6 +2069,16 @@ struct LaravelLanguageServer {
     /// Populated at init by walking routes/, vendor/*/routes/, and content-matched
     /// vendor PHP files. Replaces the legacy hard-coded route-file scan.
     route_index: Arc<RwLock<Option<RouteIndex>>>,
+
+    /// The shared walk of `<root>/vendor`, built once and reused by every
+    /// subsystem that used to walk the Composer tree for itself (issue #371).
+    ///
+    /// Keyed by the root it describes, so a project-root change rebuilds rather
+    /// than serving another project's files. Dropped by
+    /// [`LaravelLanguageServer::invalidate_vendor_index`] whenever the tree can
+    /// have changed under us — which is the same `composer.lock` signal that
+    /// already drives the vendor provider rescan.
+    vendor_index: Arc<RwLock<Option<(PathBuf, Arc<VendorIndex>)>>>,
 
     /// `true` once first-load warming has built the reference indexes. The
     /// unused-symbol diagnostic gates on this — running it mid-warm (empty
@@ -4689,6 +4700,7 @@ impl LaravelLanguageServer {
             database_schema: Arc::new(RwLock::new(None)),
             db_provider_task: Arc::new(tokio::sync::Mutex::new(None)),
             route_index: Arc::new(RwLock::new(None)),
+            vendor_index: Arc::new(RwLock::new(None)),
             warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexing_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_index: Arc::new(RwLock::new(None)),
@@ -5135,6 +5147,21 @@ impl LaravelLanguageServer {
             p.report("Discovering project files…", Some(0), true).await;
         }
 
+        // The shared vendor walk (issue #371). The actor used to run its own
+        // fifth `WalkDir` over `vendor/`; it lives on a dedicated thread and
+        // cannot reach this cache, so the list is handed in. `.git` is filtered
+        // here because that pass never descended into it.
+        let vendor = self.vendor_index(root_path).await;
+        let vendor_root = vendor.vendor_root().to_path_buf();
+        let vendor_files: Vec<PathBuf> = vendor
+            .files()
+            .iter()
+            .filter(|f| {
+                !laravel_lsp::vendor_index::has_pruned_ancestor(&f.path, &vendor_root, &[".git"])
+            })
+            .map(|f| f.path.clone())
+            .collect();
+
         // Register with Salsa
         if let Err(e) = self
             .salsa
@@ -5144,6 +5171,7 @@ impl LaravelLanguageServer {
                 view_paths,
                 livewire_path,
                 PathBuf::from("routes"),
+                vendor_files,
             )
             .await
         {
@@ -5982,6 +6010,96 @@ impl LaravelLanguageServer {
         Some(decls)
     }
 
+    /// The shared walk of `<root>/vendor`, built on first use and reused
+    /// (issue #371).
+    ///
+    /// Before this, five subsystems each ran their own `WalkDir` over the
+    /// Composer tree — 16,051 `.php` files on this repo's `test-project/`, and
+    /// a bare stat walk of that costs ~0.25 s. They now filter one shared
+    /// result, each re-applying its own former depth and pruning limits as a
+    /// path predicate, so every consumer sees exactly the file set it saw
+    /// before.
+    ///
+    /// The build runs in `spawn_blocking`: it is a synchronous filesystem walk
+    /// and must never occupy a Tokio worker. Two callers arriving together can
+    /// both build — harmless, since the walk is a pure function of the tree and
+    /// the loser's result is simply replaced — and worth far less than holding
+    /// the write lock across the whole walk.
+    async fn vendor_index(&self, root: &Path) -> Arc<VendorIndex> {
+        {
+            let guard = self.vendor_index.read().await;
+            if let Some((cached_root, index)) = guard.as_ref() {
+                if cached_root == root {
+                    return index.clone();
+                }
+            }
+        }
+        let owned = root.to_path_buf();
+        let built = Arc::new(
+            tokio::task::spawn_blocking(move || VendorIndex::build(&owned))
+                .await
+                .unwrap_or_default(),
+        );
+        *self.vendor_index.write().await = Some((root.to_path_buf(), built.clone()));
+        built
+    }
+
+    /// Register every vendor service-provider / `Http/Kernel.php` source with
+    /// Salsa, returning how many registrations succeeded.
+    ///
+    /// Shared by the init scan and the `composer.lock` rescan, which carried
+    /// byte-identical copies of these two legs before (issue #371).
+    ///
+    /// The split matters as much as the sharing: the walk-and-read half is
+    /// synchronous filesystem work and runs inside `spawn_blocking`, leaving
+    /// only the `await`-ing Salsa registrations on the async side. Both former
+    /// copies did the reads inline in an `async fn`, blocking a Tokio worker
+    /// for the whole scan.
+    ///
+    /// Only ~73 of 16,051 vendor files match on a real project, so the reads
+    /// are not worth sharing with the route/command pass — the *walk* is, and
+    /// that comes from `vendor`.
+    async fn register_vendor_provider_sources(
+        &self,
+        root: &Path,
+        vendor: &Arc<VendorIndex>,
+    ) -> usize {
+        let root_buf = root.to_path_buf();
+        let index = vendor.clone();
+        let sources =
+            tokio::task::spawn_blocking(move || collect_vendor_provider_sources(&root_buf, &index))
+                .await
+                .unwrap_or_default();
+
+        let mut registered = 0;
+        for source in sources {
+            if self
+                .salsa
+                .register_service_provider_source(
+                    source.path,
+                    source.content,
+                    source.priority,
+                    root.to_path_buf(),
+                )
+                .await
+                .is_ok()
+            {
+                registered += 1;
+            }
+        }
+        registered
+    }
+
+    /// Drop the cached vendor walk so the next consumer rebuilds it.
+    ///
+    /// Called wherever the Composer tree can have changed — the same
+    /// `composer.lock` signal that already triggers the vendor provider
+    /// rescan. Dropping rather than rebuilding keeps the cost off whichever
+    /// path noticed the change.
+    async fn invalidate_vendor_index(&self) {
+        *self.vendor_index.write().await = None;
+    }
+
     /// The inherited external-load name prefixes (issue #43) that apply to
     /// `path`, read from the warm route index. Always includes `""`.
     ///
@@ -6214,95 +6332,15 @@ impl LaravelLanguageServer {
         let documents = self.documents.read().await;
         let mut registered_count = 0;
 
-        // Priority 0: Framework providers
-        let framework_path = root.join("vendor/laravel/framework/src/Illuminate");
-        if framework_path.exists() {
-            for entry in WalkDir::new(&framework_path)
-                .max_depth(10)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                let path = entry.path();
-                if path.is_file()
-                    && path.extension().is_some_and(|ext| ext == "php")
-                    && path
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().ends_with("ServiceProvider.php"))
-                {
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        if self
-                            .salsa
-                            .register_service_provider_source(
-                                path.to_path_buf(),
-                                content,
-                                0, // framework priority
-                                root.to_path_buf(),
-                            )
-                            .await
-                            .is_ok()
-                        {
-                            registered_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Priority 1: Package providers and Kernel files (for middleware definitions)
-        let vendor_path = root.join("vendor");
-        debug!(
-            "🔍 Scanning vendor path: {:?} (exists={})",
-            vendor_path,
-            vendor_path.exists()
-        );
-        if vendor_path.exists() {
-            for entry in WalkDir::new(&vendor_path)
-                .max_depth(6)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                let path = entry.path();
-                // Skip framework (already done with priority 0)
-                if path.starts_with(&framework_path) {
-                    continue;
-                }
-                if path.is_file() && path.extension().is_some_and(|ext| ext == "php") {
-                    let file_name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let path_str = path.to_string_lossy();
-
-                    // Scan ServiceProvider files for middleware/binding registrations
-                    // and Http/Kernel.php files for middleware alias/group definitions
-                    let is_service_provider = file_name.ends_with("ServiceProvider.php");
-                    let is_http_kernel = file_name == "Kernel.php"
-                        && (path_str.contains("/Http/") || path_str.contains("\\Http\\"));
-
-                    if is_service_provider || is_http_kernel {
-                        debug!(
-                            "📄 [init] Found vendor file: {} (SP={}, Kernel={})",
-                            path_str, is_service_provider, is_http_kernel
-                        );
-                        if let Ok(content) = std::fs::read_to_string(path) {
-                            if self
-                                .salsa
-                                .register_service_provider_source(
-                                    path.to_path_buf(),
-                                    content,
-                                    1, // package priority
-                                    root.to_path_buf(),
-                                )
-                                .await
-                                .is_ok()
-                            {
-                                registered_count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Priority 0 (framework) + 1 (packages): every vendor service provider
+        // and `Http/Kernel.php`. Both legs used to run a `WalkDir` and a
+        // `std::fs::read_to_string` inline in this `async fn` — synchronous
+        // filesystem work occupying a Tokio worker thread — and the identical
+        // code appeared again in `rescan_vendor_providers`. Now: one shared
+        // walk, the reads done in `spawn_blocking`, and only the Salsa
+        // registrations left on the async side (issue #371).
+        let vendor = self.vendor_index(root).await;
+        registered_count += self.register_vendor_provider_sources(root, &vendor).await;
 
         // Priority 3: Application providers (app/Providers/)
         let app_providers_path = root.join("app/Providers");
@@ -6626,9 +6664,8 @@ impl LaravelLanguageServer {
             let route_root = root.to_path_buf();
             let server = self.clone_for_spawn();
             tokio::spawn(async move {
-                server.rebuild_route_index(&route_root).await;
+                server.rebuild_route_and_command_indexes(&route_root).await;
                 server.rebuild_migration_index(&route_root).await;
-                server.rebuild_command_index(&route_root).await;
             });
         }
 
@@ -6662,86 +6699,15 @@ impl LaravelLanguageServer {
         let mut middleware_count = 0;
         let mut bindings_count = 0;
 
-        // Priority 0: Framework providers
-        let framework_path = root.join("vendor/laravel/framework/src/Illuminate");
-        if framework_path.exists() {
-            for entry in WalkDir::new(&framework_path)
-                .max_depth(10)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                let path = entry.path();
-                if path.is_file()
-                    && path.extension().is_some_and(|ext| ext == "php")
-                    && path
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().ends_with("ServiceProvider.php"))
-                {
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        if self
-                            .salsa
-                            .register_service_provider_source(
-                                path.to_path_buf(),
-                                content,
-                                0, // framework priority
-                                root.to_path_buf(),
-                            )
-                            .await
-                            .is_ok()
-                        {
-                            registered_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Priority 1: Package providers and Kernel files (for middleware definitions)
-        let vendor_path = root.join("vendor");
-        if vendor_path.exists() {
-            for entry in WalkDir::new(&vendor_path)
-                .max_depth(6)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                let path = entry.path();
-                // Skip framework (already done with priority 0)
-                if path.starts_with(&framework_path) {
-                    continue;
-                }
-                if path.is_file() && path.extension().is_some_and(|ext| ext == "php") {
-                    let file_name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let path_str = path.to_string_lossy();
-
-                    // Scan ServiceProvider files for middleware/binding registrations
-                    // and Http/Kernel.php files for middleware alias/group definitions
-                    let is_service_provider = file_name.ends_with("ServiceProvider.php");
-                    let is_http_kernel = file_name == "Kernel.php"
-                        && (path_str.contains("/Http/") || path_str.contains("\\Http\\"));
-
-                    if is_service_provider || is_http_kernel {
-                        if let Ok(content) = std::fs::read_to_string(path) {
-                            if self
-                                .salsa
-                                .register_service_provider_source(
-                                    path.to_path_buf(),
-                                    content,
-                                    1, // package priority
-                                    root.to_path_buf(),
-                                )
-                                .await
-                                .is_ok()
-                            {
-                                registered_count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // The same two vendor legs the init scan runs, through the same shared
+        // walk and the same `spawn_blocking` reads. These were byte-identical
+        // copies of the init code before (issue #371).
+        //
+        // The shared walk is invalidated first: this path exists precisely
+        // because `composer.lock` changed, so the cached file list is stale.
+        self.invalidate_vendor_index().await;
+        let vendor = self.vendor_index(root).await;
+        registered_count += self.register_vendor_provider_sources(root, &vendor).await;
 
         drop(documents);
 
@@ -7977,9 +7943,8 @@ impl LaravelLanguageServer {
 
         // Rebuild the route name index so any route definition changes (added,
         // renamed, removed) are reflected on the next goto-definition request.
-        self.rebuild_route_index(&root).await;
+        self.rebuild_route_and_command_indexes(&root).await;
         self.rebuild_migration_index(&root).await;
-        self.rebuild_command_index(&root).await;
 
         // Populate cache with ALL parsed middleware/bindings AFTER all rescans complete
         // This ensures we capture middleware from both vendor and app sources
@@ -8315,9 +8280,9 @@ impl LaravelLanguageServer {
         info!("========================================");
         info!("🛣️  Building route index from root: {:?}", discovered_root);
         info!("========================================");
-        self.rebuild_route_index(&discovered_root).await;
+        self.rebuild_route_and_command_indexes(&discovered_root)
+            .await;
         self.rebuild_migration_index(&discovered_root).await;
-        self.rebuild_command_index(&discovered_root).await;
 
         // Initialize environment variables with Salsa
         info!("========================================");
@@ -17513,52 +17478,106 @@ return [
     /// for `Command` subclasses. Mirrors `rebuild_migration_index` — the
     /// (blocking) walk runs off the async runtime, then the index is swapped in.
     async fn rebuild_command_index(&self, root: &Path) {
-        // Cold start: restore the disk-cached index immediately so
-        // goto-definition/hover on command strings work without waiting for
-        // the full project+vendor walk below. Only on a cold index (None) —
-        // file-watcher rebuilds already have a live index and skip this. The
-        // full build that follows corrects any drift (added/removed commands
-        // while the LSP was off) and re-saves the cache.
-        if self.command_index.read().await.is_none() {
-            let root_for_load = root.to_path_buf();
-            if let Ok(Some(cached)) = tokio::task::spawn_blocking(move || {
-                laravel_lsp::command_disk_cache::load_index(&root_for_load)
-            })
-            .await
-            {
-                info!(
-                    "🗄️  Command index: restored {} commands from disk cache",
-                    cached.len()
-                );
-                *self.command_index.write().await = Some(cached);
-            }
-        }
+        self.restore_command_index_from_disk(root).await;
 
         let root_buf = root.to_path_buf();
         let index = tokio::task::spawn_blocking(move || build_command_index(&root_buf)).await;
         match index {
-            Ok(index) => {
-                info!("🎛️  Command index built: {} commands", index.len());
-
-                // Persist the freshly built index so the next cold start can
-                // skip the walk. Advisory — a save failure doesn't affect the
-                // live in-memory index.
-                let to_save = index.clone();
-                let root_for_save = root.to_path_buf();
-                let saved = tokio::task::spawn_blocking(move || {
-                    laravel_lsp::command_disk_cache::save_index(&to_save, &root_for_save)
-                })
-                .await;
-                match saved {
-                    Ok(Ok(n)) => info!("🗄️  Command disk cache: saved {} commands", n),
-                    Ok(Err(e)) => debug!("Command disk cache save failed: {}", e),
-                    Err(e) => debug!("Command disk cache save task panicked: {}", e),
-                }
-
-                *self.command_index.write().await = Some(index);
-            }
+            Ok(index) => self.publish_command_index(root, index).await,
             Err(e) => {
                 tracing::warn!("Failed to build command index: {}", e);
+            }
+        }
+    }
+
+    /// Cold start: restore the disk-cached command index immediately so
+    /// goto-definition/hover on command strings work without waiting for the
+    /// full project+vendor walk. Only on a cold index (`None`) — file-watcher
+    /// rebuilds already have a live index and skip this. Whichever full build
+    /// follows corrects any drift (commands added/removed while the LSP was
+    /// off) and re-saves the cache.
+    async fn restore_command_index_from_disk(&self, root: &Path) {
+        if self.command_index.read().await.is_some() {
+            return;
+        }
+        let root_for_load = root.to_path_buf();
+        if let Ok(Some(cached)) = tokio::task::spawn_blocking(move || {
+            laravel_lsp::command_disk_cache::load_index(&root_for_load)
+        })
+        .await
+        {
+            info!(
+                "🗄️  Command index: restored {} commands from disk cache",
+                cached.len()
+            );
+            *self.command_index.write().await = Some(cached);
+        }
+    }
+
+    /// Persist a freshly built command index and swap it in.
+    ///
+    /// The save is advisory — a failure doesn't affect the live in-memory
+    /// index, it only costs the next cold start its shortcut.
+    async fn publish_command_index(
+        &self,
+        root: &Path,
+        index: laravel_lsp::command_index::CommandIndex,
+    ) {
+        info!("🎛️  Command index built: {} commands", index.len());
+
+        let to_save = index.clone();
+        let root_for_save = root.to_path_buf();
+        let saved = tokio::task::spawn_blocking(move || {
+            laravel_lsp::command_disk_cache::save_index(&to_save, &root_for_save)
+        })
+        .await;
+        match saved {
+            Ok(Ok(n)) => info!("🗄️  Command disk cache: saved {} commands", n),
+            Ok(Err(e)) => debug!("Command disk cache save failed: {}", e),
+            Err(e) => debug!("Command disk cache save task panicked: {}", e),
+        }
+
+        *self.command_index.write().await = Some(index);
+    }
+
+    /// Rebuild the route index and the command index together, from ONE pass
+    /// over the vendor tree (issue #371).
+    ///
+    /// Both are derived from the same vendor files, and every caller that
+    /// wants one wants the other immediately afterwards. Built separately they
+    /// read every vendor `.php` twice — ~31,400 reads on this repo's
+    /// `test-project/` against ~16,200 for the shared pass. The single-index
+    /// rebuilds stay for the incremental paths (a saved routes file, a changed
+    /// `Commands` file), which need only one and run rarely.
+    ///
+    /// Output is identical to calling both in sequence; see
+    /// `vendor_scan::build_route_files_and_command_index`.
+    async fn rebuild_route_and_command_indexes(&self, root: &Path) {
+        self.restore_command_index_from_disk(root).await;
+
+        let vendor = self.vendor_index(root).await;
+        let root_buf = root.to_path_buf();
+        let built = tokio::task::spawn_blocking(move || {
+            let (files, commands) =
+                laravel_lsp::vendor_scan::build_route_files_and_command_index(&root_buf, &vendor);
+            let file_count = files.len();
+            let routes = build_route_index(&root_buf, &files);
+            (file_count, routes, commands)
+        })
+        .await;
+
+        match built {
+            Ok((file_count, routes, commands)) => {
+                info!(
+                    "🛣️  Route index built: {} named routes from {} files",
+                    routes.len(),
+                    file_count
+                );
+                *self.route_index.write().await = Some(routes);
+                self.publish_command_index(root, commands).await;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to build vendor-derived indexes: {}", e);
             }
         }
     }
@@ -18397,6 +18416,7 @@ return [
             database_schema: self.database_schema.clone(),
             db_provider_task: self.db_provider_task.clone(),
             route_index: self.route_index.clone(),
+            vendor_index: self.vendor_index.clone(),
             warm_complete: self.warm_complete.clone(),
             indexing_in_flight: self.indexing_in_flight.clone(),
             migration_index: self.migration_index.clone(),
@@ -22217,6 +22237,84 @@ async fn decl_range_at(
 /// file doesn't exist yet, a permission error) we fall back to comparing the
 /// uncanonicalized paths rather than guess — no panic, and the same behaviour
 /// for in-memory paths that aren't on disk.
+/// Depth budget the framework service-provider leg used, counted from
+/// `vendor/laravel/framework/src/Illuminate` (its own former `WalkDir` root).
+const FRAMEWORK_PROVIDER_MAX_DEPTH: usize = 10;
+/// Depth budget the package service-provider leg used, counted from `vendor/`.
+const PACKAGE_PROVIDER_MAX_DEPTH: usize = 6;
+
+/// One vendor file the service-provider registry wants, with the priority tier
+/// its location implies.
+struct VendorProviderSource {
+    path: PathBuf,
+    content: String,
+    priority: u8,
+}
+
+/// Which priority tier, if any, the vendor provider scan registers `file` at.
+///
+/// Reproduces the two former `WalkDir` legs exactly:
+///
+/// * **Framework (0)** — `*ServiceProvider.php` under
+///   `vendor/laravel/framework/src/Illuminate`, within 10 levels of *that*
+///   directory. Measured against the framework root rather than `vendor/`, so
+///   the budget cannot drift with where the package happens to sit.
+/// * **Package (1)** — anything else in `vendor/` within 6 levels, named
+///   `*ServiceProvider.php` or an `Http/**/Kernel.php`.
+///
+/// A framework-owned `Http/Kernel.php` belongs to neither: the framework leg
+/// admitted only providers, and the package leg skipped framework paths
+/// outright. Returning `None` for it preserves that.
+fn vendor_provider_priority(
+    framework_root: &Path,
+    file: &laravel_lsp::vendor_index::VendorFile,
+) -> Option<u8> {
+    let name = file.path.file_name()?.to_string_lossy().to_string();
+
+    if file.path.starts_with(framework_root) {
+        let depth = laravel_lsp::vendor_index::depth_below(&file.path, framework_root)?;
+        let admitted =
+            depth <= FRAMEWORK_PROVIDER_MAX_DEPTH && name.ends_with("ServiceProvider.php");
+        return admitted.then_some(0);
+    }
+
+    if file.depth > PACKAGE_PROVIDER_MAX_DEPTH {
+        return None;
+    }
+    let path_str = file.path.to_string_lossy();
+    let is_service_provider = name.ends_with("ServiceProvider.php");
+    let is_http_kernel =
+        name == "Kernel.php" && (path_str.contains("/Http/") || path_str.contains("\\Http\\"));
+    (is_service_provider || is_http_kernel).then_some(1)
+}
+
+/// Read every vendor provider / kernel source the registry needs, from the
+/// shared vendor walk.
+///
+/// Blocking: a predicate over the whole file list plus a few dozen reads. Runs
+/// inside `spawn_blocking` — see
+/// [`LaravelLanguageServer::register_vendor_provider_sources`].
+fn collect_vendor_provider_sources(
+    root: &Path,
+    vendor: &laravel_lsp::vendor_index::VendorIndex,
+) -> Vec<VendorProviderSource> {
+    let framework_root = root.join("vendor/laravel/framework/src/Illuminate");
+    let mut out = Vec::new();
+    vendor.for_each_source(
+        |file| vendor_provider_priority(&framework_root, file).is_some(),
+        |file, content| {
+            if let Some(priority) = vendor_provider_priority(&framework_root, file) {
+                out.push(VendorProviderSource {
+                    path: file.path.clone(),
+                    content: content.to_string(),
+                    priority,
+                });
+            }
+        },
+    );
+    out
+}
+
 fn is_in_routes_dir(root: Option<&Path>, path: &Path) -> bool {
     let Some(r) = root else {
         return false;

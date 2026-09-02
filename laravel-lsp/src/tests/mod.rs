@@ -72,6 +72,7 @@ mod translation_namespace_check;
 mod translation_namespace_completion;
 mod translation_namespace_navigation;
 mod translation_salsa_cache;
+mod vendor_provider_scan;
 mod view_diagnostic_containment;
 mod view_navigation_containment;
 mod vite_completion_context;

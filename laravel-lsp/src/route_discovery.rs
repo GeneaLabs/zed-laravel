@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 use walkdir::WalkDir;
 
+use crate::vendor_index::{VendorFile, VendorIndex};
+
 /// A `->group(...)`/`::group(...)` callsite that loads an *external file*
 /// instead of running a closure body (issue #43). Laravel `require`s the file
 /// and applies the group's attributes — including its `->as('admin.')` name
@@ -167,6 +169,83 @@ pub fn discovery_walk_count() -> u64 {
     DISCOVERY_WALKS.with(|c| c.get())
 }
 
+/// Depth budget for the vendor leg of route discovery, in `WalkDir` terms
+/// (`vendor/` itself is depth 0). Was `WalkDir::max_depth(8)` before the shared
+/// vendor walk; it is now applied as a predicate over
+/// [`VendorIndex`](crate::vendor_index::VendorIndex), which sees the whole
+/// tree so that other consumers can apply their own, different budgets.
+pub const VENDOR_ROUTE_MAX_DEPTH: usize = 8;
+
+/// Accumulates discovered route files, keeping the highest priority seen per
+/// path. Merging by maximum rather than by arrival is what makes discovery
+/// independent of walk order.
+#[derive(Debug, Default)]
+pub struct RouteFileSet(HashMap<PathBuf, u8>);
+
+impl RouteFileSet {
+    /// Record `path` at `priority`, keeping whichever priority is higher.
+    pub fn promote(&mut self, path: PathBuf, priority: u8) {
+        promote(&mut self.0, path, priority);
+    }
+
+    pub fn into_files(self) -> Vec<RouteFile> {
+        self.0
+            .into_iter()
+            .map(|(path, priority)| RouteFile { path, priority })
+            .collect()
+    }
+}
+
+/// True when route discovery needs this vendor file's **text** to decide.
+///
+/// Two kinds of file need no read: one past the depth budget, which discovery
+/// never considered at all, and one under a package `routes/` directory, which
+/// is a route file by Laravel convention regardless of content. Everything else
+/// is decided by content match, so the shared vendor pass reads it for us.
+pub fn vendor_route_needs_source(file: &VendorFile) -> bool {
+    file.depth <= VENDOR_ROUTE_MAX_DEPTH && !is_under_routes_dir(&file.path)
+}
+
+/// Record the vendor route files that need no read — everything under a package
+/// `routes/` directory, within the depth budget.
+pub fn collect_conventional_vendor_route_files(vendor: &VendorIndex, out: &mut RouteFileSet) {
+    for file in vendor.files() {
+        if file.depth <= VENDOR_ROUTE_MAX_DEPTH && is_under_routes_dir(&file.path) {
+            out.promote(file.path.clone(), priority_for_vendor_path(&file.path));
+        }
+    }
+}
+
+/// Record an already-read vendor file if its text shows route-registration
+/// shape (a router token AND a `->name(` call).
+///
+/// This is what catches macro bodies (Laravel UI's `AuthRouteMethods`),
+/// service-provider `boot()` registrations, and Filament-style
+/// `Panel::routes(fn () => ...)` panels.
+pub fn accept_vendor_route_source(out: &mut RouteFileSet, path: &Path, content: &str) {
+    if content_registers_named_routes(content) {
+        out.promote(path.to_path_buf(), priority_for_vendor_path(path));
+    }
+}
+
+/// Record the non-vendor route files: the project's own `routes/` tree, plus
+/// app service providers and `bootstrap/app.php` that register routes in
+/// `boot()`. Those are content-matched to avoid pulling in unrelated `app/`
+/// files.
+pub fn collect_project_route_files(root: &Path, out: &mut RouteFileSet) {
+    let project_routes = root.join("routes");
+    if project_routes.exists() {
+        for path in walk_php_files(&project_routes, 6) {
+            out.promote(path, PRIORITY_APP);
+        }
+    }
+    for candidate in app_provider_candidates(root) {
+        if candidate.exists() && file_registers_named_routes(&candidate) {
+            out.promote(candidate, PRIORITY_APP);
+        }
+    }
+}
+
 /// Walk the project to discover every file likely to define named routes.
 ///
 /// The returned list is deduplicated by path. Order is not significant — the
@@ -174,73 +253,31 @@ pub fn discovery_walk_count() -> u64 {
 ///
 /// **Expensive.** Content-matching the vendor tree means a `read_to_string` of
 /// every `.php` file below `vendor/`. Call this from warm-up/rebuild paths
-/// only; request handlers read the cached [`RouteIndex`] instead.
+/// only; request handlers read the cached [`RouteIndex`] instead. Warm start
+/// shares its vendor reads with the command index — see
+/// [`discover_route_files_with_vendor`].
 pub fn discover_route_files(root: &Path) -> Vec<RouteFile> {
+    discover_route_files_with_vendor(root, &VendorIndex::build(root))
+}
+
+/// [`discover_route_files`] driven by an already-built shared vendor walk.
+///
+/// Identical output to walking `vendor/` here: `vendor` holds the whole tree
+/// and the depth budget is re-applied per file by [`vendor_route_needs_source`]
+/// and [`collect_conventional_vendor_route_files`]. Splitting it out lets warm
+/// start read each vendor file once for this *and* the command index instead of
+/// twice (issue #371).
+pub fn discover_route_files_with_vendor(root: &Path, vendor: &VendorIndex) -> Vec<RouteFile> {
     DISCOVERY_WALKS.with(|c| c.set(c.get().saturating_add(1)));
-    let mut seen: HashMap<PathBuf, u8> = HashMap::new();
+    let mut out = RouteFileSet::default();
 
-    // Project routes/ — recursive, every *.php
-    let project_routes = root.join("routes");
-    if project_routes.exists() {
-        for path in walk_php_files(&project_routes, 6) {
-            promote(&mut seen, path, PRIORITY_APP);
-        }
-    }
+    collect_project_route_files(root, &mut out);
+    collect_conventional_vendor_route_files(vendor, &mut out);
+    vendor.for_each_source(vendor_route_needs_source, |file, content| {
+        accept_vendor_route_source(&mut out, &file.path, content);
+    });
 
-    // Package routes/*.php and any vendor file whose content registers routes.
-    let vendor = root.join("vendor");
-    if vendor.exists() {
-        for entry in WalkDir::new(&vendor)
-            .max_depth(8)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if path.extension().is_none_or(|ext| ext != "php") {
-                continue;
-            }
-
-            // Anything under a vendor `routes/` subdirectory is a route file
-            // by Laravel package convention.
-            if is_under_routes_dir(path) {
-                promote(
-                    &mut seen,
-                    path.to_path_buf(),
-                    priority_for_vendor_path(path),
-                );
-                continue;
-            }
-
-            // Otherwise content-match: register the file only if it both
-            // contains a route-registration token AND a `->name(` call.
-            // This is what catches macro bodies (Laravel UI's
-            // AuthRouteMethods), service-provider `boot()` registrations,
-            // and Filament-style `Panel::routes(fn () => ...)` panels.
-            if file_registers_named_routes(path) {
-                promote(
-                    &mut seen,
-                    path.to_path_buf(),
-                    priority_for_vendor_path(path),
-                );
-            }
-        }
-    }
-
-    // App-level service providers and bootstrap/app.php often register routes
-    // directly in `boot()`. Scan with content match to avoid pulling in
-    // unrelated *.php files in app/.
-    for candidate in app_provider_candidates(root) {
-        if candidate.exists() && file_registers_named_routes(&candidate) {
-            promote(&mut seen, candidate, PRIORITY_APP);
-        }
-    }
-
-    seen.into_iter()
-        .map(|(path, priority)| RouteFile { path, priority })
-        .collect()
+    out.into_files()
 }
 
 /// Build a complete route name → location index from the given files.

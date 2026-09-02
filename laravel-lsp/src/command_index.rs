@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::command_signature::{extends_console_command, extract_command_signature};
+use crate::vendor_index::{has_pruned_ancestor, VendorFile, VendorIndex};
 
 /// Source tier of a command declaration. Higher wins when two classes declare
 /// the same command name (`App` overrides a `Package` which overrides the
@@ -156,32 +157,79 @@ pub fn class_name_from_content(content: &str) -> Option<String> {
 
 /// Directory names never worth descending into when hunting for command
 /// classes — build output and VCS metadata, none of which hold PHP source.
-const SKIP_DIRS: &[&str] = &["node_modules", ".git", "storage", "public"];
+pub const SKIP_DIRS: &[&str] = &["node_modules", ".git", "storage", "public"];
+
+/// True when the command index wants this vendor file's text.
+///
+/// The former walk pruned [`SKIP_DIRS`] with `WalkDir::filter_entry`; the
+/// shared vendor walk prunes nothing (other consumers descend into those
+/// directories), so the same exclusion is re-applied here per file.
+pub fn vendor_command_needs_source(vendor_root: &Path, file: &VendorFile) -> bool {
+    !has_pruned_ancestor(&file.path, vendor_root, SKIP_DIRS)
+}
 
 /// Build the index by walking every `*.php` under `<root>` (project + vendor),
 /// keeping the highest-priority declaration per command name. Non-PHP files,
 /// build/VCS directories, and files that don't `extends ...Command` are skipped
 /// cheaply so a large `vendor/` tree doesn't dominate the walk.
 pub fn build_command_index(root: &Path) -> CommandIndex {
+    build_command_index_with_vendor(root, &VendorIndex::build(root))
+}
+
+/// [`build_command_index`] driven by an already-built shared vendor walk
+/// (issue #371), so warm start reads each vendor file once for this *and* the
+/// route index instead of twice.
+///
+/// Output is identical to the single walk this replaces. The former traversal
+/// visited project and vendor files interleaved in `root` order, and
+/// `insert_entry` keeps the first file walked on a *same-tier* duplicate — but
+/// [`classify_priority`] derives the tier from the path, and `App` means
+/// exactly "not under `vendor/`". So a same-tier collision can never straddle
+/// the project/vendor split, and preserving order *within* each leg (the
+/// project walk below, and [`VendorIndex`]'s retained walk order) preserves
+/// every winner.
+pub fn build_command_index_with_vendor(root: &Path, vendor: &VendorIndex) -> CommandIndex {
     let mut index = CommandIndex::default();
+    index_project_commands(root, &mut index);
+    let vendor_root = vendor.vendor_root().to_path_buf();
+    vendor.for_each_source(
+        |file| vendor_command_needs_source(&vendor_root, file),
+        |file, content| index_command_file(&mut index, &file.path, content),
+    );
+    index
+}
+
+/// The non-vendor leg: walk `<root>` for command declarations, skipping the
+/// build/VCS directories and the top-level `vendor/` that the shared index
+/// already covers.
+///
+/// Only `<root>/vendor` is skipped, not every directory named `vendor`. A
+/// nested `app/vendor/` was walked by the former single pass and is not part of
+/// the shared index, so pruning it by name would silently drop its commands.
+pub fn index_project_commands(root: &Path, index: &mut CommandIndex) {
     for entry in WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
-            !(e.file_type().is_dir()
-                && e.file_name()
-                    .to_str()
-                    .is_some_and(|n| SKIP_DIRS.contains(&n)))
+            if !e.file_type().is_dir() {
+                return true;
+            }
+            let Some(name) = e.file_name().to_str() else {
+                return true;
+            };
+            if e.depth() == 1 && name == "vendor" {
+                return false;
+            }
+            !SKIP_DIRS.contains(&name)
         })
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
         if path.is_file() && path.extension().is_some_and(|ext| ext == "php") {
             if let Ok(content) = std::fs::read_to_string(path) {
-                index_command_file(&mut index, path, &content);
+                index_command_file(index, path, &content);
             }
         }
     }
-    index
 }
 
 /// Index a single PHP file's command declaration, if it has one. Exposed for

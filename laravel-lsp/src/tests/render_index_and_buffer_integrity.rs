@@ -42,6 +42,14 @@ async fn handle_for(root: &Path) -> SalsaHandle {
             vec![root.join("resources/views")],
             Some(root.join("resources/views/livewire")),
             PathBuf::from("routes"),
+            // The shared vendor walk the production caller passes in
+            // (issue #371) — built from the same root, so the actor
+            // registers exactly what it would in production.
+            laravel_lsp::vendor_index::VendorIndex::build(root)
+                .files()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect(),
         )
         .await
         .expect("actor registers the tempdir project");

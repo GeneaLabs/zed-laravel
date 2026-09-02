@@ -93,6 +93,14 @@ async fn bulk_import_skips_open_buffer_and_position_still_resolves() {
             vec![dir.path().join("resources/views")],
             None,
             std::path::PathBuf::from("routes"),
+            // The shared vendor walk the production caller passes in
+            // (issue #371) — built from the same root, so the actor
+            // registers exactly what it would in production.
+            laravel_lsp::vendor_index::VendorIndex::build(dir.path())
+                .files()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect(),
         )
         .await
         .unwrap();

@@ -126,6 +126,8 @@ pub mod slot_navigation;
 pub mod translation_key_locator;
 pub mod translation_lookup;
 pub mod validation_rules;
+pub mod vendor_index;
+pub mod vendor_scan;
 pub mod vendor_translations;
 pub mod view_declaration_locator;
 
