@@ -1383,6 +1383,16 @@ pub fn parse_composer_json(db: &dyn Db, file: ConfigFile) -> (bool, Vec<String>)
     (has_livewire, packages)
 }
 
+/// Is Livewire installed, according to `composer.lock`?
+///
+/// A Salsa-tracked query over the lock file, so the answer is cached and
+/// invalidated through the same config path as every other parsed config
+/// input — no separate filesystem probe and no separate invalidation story.
+#[salsa::tracked]
+pub fn parse_composer_lock(db: &dyn Db, file: ConfigFile) -> bool {
+    crate::livewire_version::is_installed(file.text(db))
+}
+
 /// Parse config/view.php to extract view paths
 #[salsa::tracked(returns(clone))]
 pub fn parse_view_config(db: &dyn Db, file: ConfigFile, root: PathBuf) -> Vec<PathBuf> {
@@ -1610,11 +1620,34 @@ pub fn build_laravel_config<'db>(
     composer: Option<ConfigFile>,
     view_config: Option<ConfigFile>,
     livewire_config: Option<ConfigFile>,
+    composer_lock: Option<ConfigFile>,
 ) -> LaravelConfigRef<'db> {
-    // Parse composer.json for Livewire detection
-    let has_livewire = composer
-        .map(|f| parse_composer_json(db, f).0)
-        .unwrap_or(false);
+    // Is Livewire installed? Read `composer.lock`, NOT `composer.json`.
+    //
+    // `composer.json` lists only DIRECT requirements, and Livewire very
+    // commonly arrives transitively — `livewire/flux`, `livewire/volt`,
+    // `filament/filament` and `robsontenorio/mary` all depend on it, and
+    // Laravel's own `livewire-starter-kit` ships exactly that shape. Testing
+    // `composer.json` therefore reported "no Livewire" for a project whose
+    // `app/Livewire` is full of components: `livewire_path` stayed `None`, so
+    // `<livewire:` completion returned nothing and the Livewire directory was
+    // never registered with the file watcher.
+    //
+    // `composer.lock` lists every installed package, direct or transitive,
+    // which is the question actually being asked. It changes exactly when
+    // packages are installed or removed, which is exactly when this answer
+    // should change.
+    //
+    // Fallback when the lock is absent (a fresh clone before `composer
+    // install`): the old `composer.json` test. It is strictly better than
+    // assuming "not installed", and it preserves today's behaviour for the
+    // projects it did serve correctly — those that require Livewire directly.
+    let has_livewire = match composer_lock {
+        Some(lock) => *parse_composer_lock(db, lock),
+        None => composer
+            .map(|f| parse_composer_json(db, f).0)
+            .unwrap_or(false),
+    };
 
     // Parse view config for view paths
     let view_paths = view_config
@@ -6445,6 +6478,8 @@ pub enum SalsaRequest {
         composer_json: Option<String>,
         view_config: Option<String>,
         livewire_config: Option<String>,
+        /// `composer.lock`, the authority on whether Livewire is installed.
+        composer_lock: Option<String>,
         reply: oneshot::Sender<()>,
     },
     /// Update a specific configuration file
@@ -6499,6 +6534,11 @@ pub enum SalsaRequest {
         view_paths: Vec<PathBuf>,
         livewire_path: Option<PathBuf>,
         routes_path: PathBuf,
+        /// Every `vendor/` PHP file, from the shared vendor walk (issue #371).
+        /// Handed in rather than re-walked here: this actor runs on its own
+        /// thread and cannot reach the server's cached
+        /// [`crate::vendor_index::VendorIndex`].
+        vendor_files: Vec<PathBuf>,
         reply: oneshot::Sender<()>,
     },
     /// Find all references to a specific view across the project
@@ -7306,6 +7346,7 @@ impl SalsaHandle {
         composer_json: Option<String>,
         view_config: Option<String>,
         livewire_config: Option<String>,
+        composer_lock: Option<String>,
     ) -> Result<(), &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
@@ -7314,6 +7355,7 @@ impl SalsaHandle {
                 composer_json,
                 view_config,
                 livewire_config,
+                composer_lock,
                 reply: reply_tx,
             })
             .await
@@ -7366,6 +7408,7 @@ impl SalsaHandle {
         view_paths: Vec<PathBuf>,
         livewire_path: Option<PathBuf>,
         routes_path: PathBuf,
+        vendor_files: Vec<PathBuf>,
     ) -> Result<(), &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
@@ -7375,6 +7418,7 @@ impl SalsaHandle {
                 view_paths,
                 livewire_path,
                 routes_path,
+                vendor_files,
                 reply: reply_tx,
             })
             .await
@@ -9224,6 +9268,7 @@ impl SalsaActor {
                     composer_json,
                     view_config,
                     livewire_config,
+                    composer_lock,
                     reply,
                 } => {
                     self.handle_register_config_files(
@@ -9231,6 +9276,7 @@ impl SalsaActor {
                         composer_json,
                         view_config,
                         livewire_config,
+                        composer_lock,
                     );
                     let _ = reply.send(());
                 }
@@ -9250,6 +9296,7 @@ impl SalsaActor {
                     view_paths,
                     livewire_path,
                     routes_path,
+                    vendor_files,
                     reply,
                 } => {
                     self.handle_register_project_files(
@@ -9258,6 +9305,7 @@ impl SalsaActor {
                         view_paths,
                         livewire_path,
                         routes_path,
+                        vendor_files,
                     );
                     let _ = reply.send(());
                 }
@@ -9809,7 +9857,6 @@ impl SalsaActor {
         // new patterns aren't parsed until something asks for them
         // via get_patterns anyway. Lazy refresh amortizes both costs.
         self.symbol_index.mark_dirty(&path);
-        self.class_hierarchy_index.mark_dirty(&path);
         // A Blade edit can add or delete an `<x-…>` / `<livewire:…>` tag, so
         // the reverse usage index has to re-read this file before its next
         // answer (no-op for non-Blade paths).
@@ -9987,7 +10034,6 @@ impl SalsaActor {
         // rebuild, and which are the whole reason `did_close` refuses
         // `RemoveFile`.
         self.symbol_index.mark_dirty(path);
-        self.class_hierarchy_index.mark_dirty(path);
         self.component_usage_index.mark_dirty(path);
     }
 
@@ -10956,6 +11002,7 @@ impl SalsaActor {
         composer_json: Option<String>,
         view_config: Option<String>,
         livewire_config: Option<String>,
+        composer_lock: Option<String>,
     ) {
         self.config_root = Some(root_path.clone());
         self.config_version += 1;
@@ -10978,6 +11025,13 @@ impl SalsaActor {
         // Register config/livewire.php
         if let Some(text) = livewire_config {
             let path = root_path.join("config/livewire.php");
+            let file = ConfigFile::new(&self.db, path.clone(), self.config_version, text);
+            self.config_files.insert(path, file);
+        }
+
+        // Register composer.lock — the Livewire installation authority.
+        if let Some(text) = composer_lock {
+            let path = root_path.join("composer.lock");
             let file = ConfigFile::new(&self.db, path.clone(), self.config_version, text);
             self.config_files.insert(path, file);
         }
@@ -11020,6 +11074,7 @@ impl SalsaActor {
             .config_files
             .get(&root.join("config/livewire.php"))
             .copied();
+        let composer_lock = self.config_files.get(&root.join("composer.lock")).copied();
 
         // Use Salsa query to build config
         let config_ref = build_laravel_config(
@@ -11028,6 +11083,7 @@ impl SalsaActor {
             composer,
             view_config,
             livewire_config,
+            composer_lock,
         );
 
         // THE MERGE RULE, for all five registries below: the highest
@@ -11246,6 +11302,7 @@ impl SalsaActor {
         view_paths: Vec<PathBuf>,
         livewire_path: Option<PathBuf>,
         routes_path: PathBuf,
+        vendor_files: Vec<PathBuf>,
     ) {
         use walkdir::WalkDir;
 
@@ -11369,43 +11426,20 @@ impl SalsaActor {
             }
         }
 
-        // Scan vendor/ — Composer packages can declare Livewire,
-        // routes, controllers, views, translations. We index every
-        // `*.php` and `*.blade.php` under vendor/ and rely on the
-        // warming-stage filters (skip `*.json.php` data files, drop
-        // anything >256KB) to keep tree-sitter away from pathological
-        // auto-generated content.
+        // Vendor files come from the shared vendor walk (issue #371) instead
+        // of a fifth independent `WalkDir` over the Composer tree. The caller
+        // filters `.git` out for us — this pass never descended into it — and
+        // the set is otherwise identical: every `*.php` and `*.blade.php`,
+        // unbounded depth. `.blade.php` needs no separate test because its
+        // extension is already `php`.
         //
-        // Yes, this reads ~21k file contents on a real-world project,
-        // which adds a few seconds to first registration. Subsequent
-        // startups load most of those entries from the disk cache
-        // (see pattern_disk_cache.rs), so the cost is bounded and
-        // one-time per `composer install`.
-        let vendor_dir = root_path.join("vendor");
-        if vendor_dir.is_dir() {
-            for entry in WalkDir::new(&vendor_dir)
-                .into_iter()
-                .filter_entry(|e| e.file_name().to_str().map(|s| s != ".git").unwrap_or(true))
-                .filter_map(|e| e.ok())
-            {
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy();
-                // Match both `*.php` and `*.blade.php` in one pass. The
-                // `.blade.php` test must come first because a file
-                // ending in `.blade.php` also satisfies `.php`.
-                let is_blade = name.ends_with(".blade.php");
-                let is_php = !is_blade && name.ends_with(".php");
-                if !(is_php || is_blade) {
-                    continue;
-                }
-                let path = entry.path().to_path_buf();
-                self.vendor_files.push(path);
-                // Salsa input deferred to first cache miss — see
-                // handle_get_patterns for the architectural why.
-            }
-        }
+        // Composer packages can declare Livewire components, routes,
+        // controllers, views and translations, so all of them are indexed; the
+        // warming-stage filters (skip `*.json.php` data files, drop anything
+        // >256KB) keep tree-sitter away from pathological auto-generated
+        // content. Salsa inputs are deferred to the first cache miss — see
+        // `handle_get_patterns` for the architectural why.
+        self.vendor_files = vendor_files;
 
         // Scan the whole project (minus vendor + noise dirs) for every
         // `*.php` / `*.blade.php`. The categorized scans above cover the

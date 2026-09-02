@@ -95,6 +95,7 @@ pub mod magic_dependency_index;
 pub mod magic_disk_cache;
 pub mod markdown_safety;
 pub mod naming;
+pub mod parse_budget;
 pub mod parser;
 pub mod path_containment;
 pub mod path_join;
@@ -126,6 +127,8 @@ pub mod slot_navigation;
 pub mod translation_key_locator;
 pub mod translation_lookup;
 pub mod validation_rules;
+pub mod vendor_index;
+pub mod vendor_scan;
 pub mod vendor_translations;
 pub mod view_declaration_locator;
 

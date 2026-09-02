@@ -32,7 +32,7 @@ async fn handle_for(root: &Path) -> SalsaHandle {
     // always sets it first — either here or via `RegisterCachedConfig` — so a
     // fixture that skips it is under-registering, not exercising a real state.
     handle
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .expect("actor registers the tempdir project root");
     handle
@@ -42,6 +42,14 @@ async fn handle_for(root: &Path) -> SalsaHandle {
             vec![root.join("resources/views")],
             Some(root.join("resources/views/livewire")),
             PathBuf::from("routes"),
+            // The shared vendor walk the production caller passes in
+            // (issue #371) — built from the same root, so the actor
+            // registers exactly what it would in production.
+            laravel_lsp::vendor_index::VendorIndex::build(root)
+                .files()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect(),
         )
         .await
         .expect("actor registers the tempdir project");

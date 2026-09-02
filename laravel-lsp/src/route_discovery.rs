@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 use walkdir::WalkDir;
 
+use crate::vendor_index::{VendorFile, VendorIndex};
+
 /// A `->group(...)`/`::group(...)` callsite that loads an *external file*
 /// instead of running a closure body (issue #43). Laravel `require`s the file
 /// and applies the group's attributes — including its `->as('admin.')` name
@@ -86,12 +88,18 @@ pub struct RouteIndex {
     /// routes, so consumers (e.g. the code-lens handler) resolve a file's
     /// fully-qualified route names without re-parsing every route file. Use
     /// [`RouteIndex::external_prefixes_for`], which defaults to `[""]`.
+    ///
+    /// **Ordered:** `""` first, then the inherited prefixes lexicographically.
+    /// A caller taking the first non-empty entry as the file's primary
+    /// project-level name therefore gets the same answer every run — see the
+    /// sort in `compute_effective_prefixes`.
     pub external_prefixes: HashMap<PathBuf, Vec<String>>,
 }
 
 impl RouteIndex {
     /// The inherited external-load name prefixes that apply to `path` (always
-    /// includes `""`). Reads the map cached at build time — no I/O.
+    /// includes `""` first, then the rest lexicographically). Reads the map
+    /// cached at build time — no I/O.
     pub fn external_prefixes_for(&self, path: &Path) -> Vec<String> {
         self.external_prefixes
             .get(&normalize_path(path))
@@ -135,75 +143,141 @@ pub struct RouteFile {
     pub priority: u8,
 }
 
+thread_local! {
+    /// How many [`discover_route_files`] walks this thread has started.
+    ///
+    /// The walk reads *every* `.php` file under `vendor/` — tens of thousands
+    /// on a real project — so it belongs in warm-up (`rebuild_route_index`,
+    /// which runs it inside `spawn_blocking`) and nowhere near a per-request
+    /// handler. This counter is the seam the regression tests use to prove a
+    /// handler answered from the warm [`RouteIndex::external_prefixes`] cache
+    /// instead of re-walking (issue #80).
+    ///
+    /// Thread-local rather than a global `AtomicU64` so tests running in
+    /// parallel cannot see each other's walks: a `#[tokio::test]` drives its
+    /// current-thread runtime on the test's own thread, and the one production
+    /// walk site hands the work to a `spawn_blocking` thread. `Cell<u64>` is
+    /// enough — a thread-local is never shared, so no atomics are needed.
+    static DISCOVERY_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many [`discover_route_files`] walks the **calling thread** has started.
+///
+/// Test instrumentation: take a reading, drive a handler, take another. An
+/// unchanged count proves the handler touched no route file on disk.
+pub fn discovery_walk_count() -> u64 {
+    DISCOVERY_WALKS.with(|c| c.get())
+}
+
+/// Depth budget for the vendor leg of route discovery, in `WalkDir` terms
+/// (`vendor/` itself is depth 0). Was `WalkDir::max_depth(8)` before the shared
+/// vendor walk; it is now applied as a predicate over
+/// [`VendorIndex`](crate::vendor_index::VendorIndex), which sees the whole
+/// tree so that other consumers can apply their own, different budgets.
+pub const VENDOR_ROUTE_MAX_DEPTH: usize = 8;
+
+/// Accumulates discovered route files, keeping the highest priority seen per
+/// path. Merging by maximum rather than by arrival is what makes discovery
+/// independent of walk order.
+#[derive(Debug, Default)]
+pub struct RouteFileSet(HashMap<PathBuf, u8>);
+
+impl RouteFileSet {
+    /// Record `path` at `priority`, keeping whichever priority is higher.
+    pub fn promote(&mut self, path: PathBuf, priority: u8) {
+        promote(&mut self.0, path, priority);
+    }
+
+    pub fn into_files(self) -> Vec<RouteFile> {
+        self.0
+            .into_iter()
+            .map(|(path, priority)| RouteFile { path, priority })
+            .collect()
+    }
+}
+
+/// True when route discovery needs this vendor file's **text** to decide.
+///
+/// Two kinds of file need no read: one past the depth budget, which discovery
+/// never considered at all, and one under a package `routes/` directory, which
+/// is a route file by Laravel convention regardless of content. Everything else
+/// is decided by content match, so the shared vendor pass reads it for us.
+pub fn vendor_route_needs_source(file: &VendorFile) -> bool {
+    file.depth <= VENDOR_ROUTE_MAX_DEPTH && !is_under_routes_dir(&file.path)
+}
+
+/// Record the vendor route files that need no read — everything under a package
+/// `routes/` directory, within the depth budget.
+pub fn collect_conventional_vendor_route_files(vendor: &VendorIndex, out: &mut RouteFileSet) {
+    for file in vendor.files() {
+        if file.depth <= VENDOR_ROUTE_MAX_DEPTH && is_under_routes_dir(&file.path) {
+            out.promote(file.path.clone(), priority_for_vendor_path(&file.path));
+        }
+    }
+}
+
+/// Record an already-read vendor file if its text shows route-registration
+/// shape (a router token AND a `->name(` call).
+///
+/// This is what catches macro bodies (Laravel UI's `AuthRouteMethods`),
+/// service-provider `boot()` registrations, and Filament-style
+/// `Panel::routes(fn () => ...)` panels.
+pub fn accept_vendor_route_source(out: &mut RouteFileSet, path: &Path, content: &str) {
+    if content_registers_named_routes(content) {
+        out.promote(path.to_path_buf(), priority_for_vendor_path(path));
+    }
+}
+
+/// Record the non-vendor route files: the project's own `routes/` tree, plus
+/// app service providers and `bootstrap/app.php` that register routes in
+/// `boot()`. Those are content-matched to avoid pulling in unrelated `app/`
+/// files.
+pub fn collect_project_route_files(root: &Path, out: &mut RouteFileSet) {
+    let project_routes = root.join("routes");
+    if project_routes.exists() {
+        for path in walk_php_files(&project_routes, 6) {
+            out.promote(path, PRIORITY_APP);
+        }
+    }
+    for candidate in app_provider_candidates(root) {
+        if candidate.exists() && file_registers_named_routes(&candidate) {
+            out.promote(candidate, PRIORITY_APP);
+        }
+    }
+}
+
 /// Walk the project to discover every file likely to define named routes.
 ///
 /// The returned list is deduplicated by path. Order is not significant — the
 /// final index resolves conflicts via priority.
+///
+/// **Expensive.** Content-matching the vendor tree means a `read_to_string` of
+/// every `.php` file below `vendor/`. Call this from warm-up/rebuild paths
+/// only; request handlers read the cached [`RouteIndex`] instead. Warm start
+/// shares its vendor reads with the command index — see
+/// [`discover_route_files_with_vendor`].
 pub fn discover_route_files(root: &Path) -> Vec<RouteFile> {
-    let mut seen: HashMap<PathBuf, u8> = HashMap::new();
+    discover_route_files_with_vendor(root, &VendorIndex::build(root))
+}
 
-    // Project routes/ — recursive, every *.php
-    let project_routes = root.join("routes");
-    if project_routes.exists() {
-        for path in walk_php_files(&project_routes, 6) {
-            promote(&mut seen, path, PRIORITY_APP);
-        }
-    }
+/// [`discover_route_files`] driven by an already-built shared vendor walk.
+///
+/// Identical output to walking `vendor/` here: `vendor` holds the whole tree
+/// and the depth budget is re-applied per file by [`vendor_route_needs_source`]
+/// and [`collect_conventional_vendor_route_files`]. Splitting it out lets warm
+/// start read each vendor file once for this *and* the command index instead of
+/// twice (issue #371).
+pub fn discover_route_files_with_vendor(root: &Path, vendor: &VendorIndex) -> Vec<RouteFile> {
+    DISCOVERY_WALKS.with(|c| c.set(c.get().saturating_add(1)));
+    let mut out = RouteFileSet::default();
 
-    // Package routes/*.php and any vendor file whose content registers routes.
-    let vendor = root.join("vendor");
-    if vendor.exists() {
-        for entry in WalkDir::new(&vendor)
-            .max_depth(8)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if path.extension().is_none_or(|ext| ext != "php") {
-                continue;
-            }
+    collect_project_route_files(root, &mut out);
+    collect_conventional_vendor_route_files(vendor, &mut out);
+    vendor.for_each_source(vendor_route_needs_source, |file, content| {
+        accept_vendor_route_source(&mut out, &file.path, content);
+    });
 
-            // Anything under a vendor `routes/` subdirectory is a route file
-            // by Laravel package convention.
-            if is_under_routes_dir(path) {
-                promote(
-                    &mut seen,
-                    path.to_path_buf(),
-                    priority_for_vendor_path(path),
-                );
-                continue;
-            }
-
-            // Otherwise content-match: register the file only if it both
-            // contains a route-registration token AND a `->name(` call.
-            // This is what catches macro bodies (Laravel UI's
-            // AuthRouteMethods), service-provider `boot()` registrations,
-            // and Filament-style `Panel::routes(fn () => ...)` panels.
-            if file_registers_named_routes(path) {
-                promote(
-                    &mut seen,
-                    path.to_path_buf(),
-                    priority_for_vendor_path(path),
-                );
-            }
-        }
-    }
-
-    // App-level service providers and bootstrap/app.php often register routes
-    // directly in `boot()`. Scan with content match to avoid pulling in
-    // unrelated *.php files in app/.
-    for candidate in app_provider_candidates(root) {
-        if candidate.exists() && file_registers_named_routes(&candidate) {
-            promote(&mut seen, candidate, PRIORITY_APP);
-        }
-    }
-
-    seen.into_iter()
-        .map(|(path, priority)| RouteFile { path, priority })
-        .collect()
+    out.into_files()
 }
 
 /// Build a complete route name → location index from the given files.
@@ -273,14 +347,23 @@ fn dedup_prefixes(prefixes: &[String]) -> Vec<String> {
 /// A file referenced via `Route::as('admin.')->group(base_path('that.php'))`
 /// from somewhere in the project inherits the loading group's name prefix
 /// (`"admin."`) transitively across the entire `->group(<path>)` load graph.
-/// This is exactly the set [`build_route_index`] applies when indexing the file
-/// — exposed standalone so rename / find-references / document-symbols can
-/// resolve a route's project-level name without re-running a full index build.
 ///
-/// Runs [`discover_route_files`] + the same BFS load-graph expansion and
-/// prefix propagation as [`build_route_index`], then looks up `file`'s
-/// normalized key. Returns `["".into()]` when `file` isn't reachable (it's
-/// still scanned directly, so the empty prefix always applies).
+/// **Not for request handlers.** This is the uncached reference implementation:
+/// it runs [`discover_route_files`] — a `read_to_string` of every `.php` file
+/// under `vendor/` — plus the same BFS load-graph expansion and prefix
+/// propagation as [`build_route_index`], and only then looks up `file`'s
+/// normalized key. [`build_route_index`] already stores the identical answer
+/// for every file in [`RouteIndex::external_prefixes`], so anything holding a
+/// built index must call [`RouteIndex::external_prefixes_for`] instead. Calling
+/// this per request is what made `textDocument/documentSymbol` on a routes file
+/// cost ~510 ms against ~0.2 ms elsewhere (issue #80).
+///
+/// It stays as the independent oracle the tests compare the cached map against
+/// — see `external_prefixes_for_file_agrees_with_the_built_index`, which is
+/// what licenses every handler to read the cache instead.
+///
+/// Returns `["".into()]` when `file` isn't reachable (it's still scanned
+/// directly, so the empty prefix always applies).
 pub fn external_prefixes_for_file(root: &Path, file: &Path) -> Vec<String> {
     let files = discover_route_files(root);
     let expansion = expand_load_graph(root, &files);
@@ -296,25 +379,6 @@ pub fn external_prefixes_for_file(root: &Path, file: &Path) -> Vec<String> {
         }
     }
     out
-}
-
-/// Like [`external_prefixes_for_file`] but computes the inherited external-load
-/// prefixes for EVERY route file in one pass, keyed by normalized path. Callers
-/// iterating many files (rename / find-references) build this once instead of
-/// re-running the whole project load graph per file (avoids O(files²)).
-///
-/// Each returned entry always includes `""`. A file with no inherited prefix is
-/// simply absent from the map — callers should treat a miss as `["".into()]`.
-pub fn external_prefixes_map(root: &Path) -> HashMap<PathBuf, Vec<String>> {
-    let files = discover_route_files(root);
-    let expansion = expand_load_graph(root, &files);
-    let effective = compute_effective_prefixes(&expansion.files, &expansion.loads);
-
-    let mut map: HashMap<PathBuf, Vec<String>> = HashMap::new();
-    for (key, prefixes) in effective {
-        map.insert(key, dedup_prefixes(&prefixes));
-    }
-    map
 }
 
 /// The fully-expanded working set produced by following `->group(<path>)`
@@ -459,6 +523,29 @@ fn compute_effective_prefixes(
     let mut effective: HashMap<PathBuf, Vec<String>> = HashMap::new();
     for start in &known {
         propagate(start, "", &edges, &mut effective, &mut Vec::new(), 0);
+    }
+
+    // Sort each file's prefixes. The DFS above visits `known` (a `HashSet`) and
+    // `files` (a `HashMap` drain, via `discover_route_files`) in whatever order
+    // the hasher's per-instance seed produces, so a file reachable under two
+    // different prefixes collected them in an order that changed from run to
+    // run — and from call to call inside one process.
+    //
+    // That is not cosmetic. `classify_with_decl_fallback` anchors a route
+    // declaration to the FIRST non-empty prefix, so a file loaded by both
+    // `Route::as('admin.')->group(...)` and `Route::as('blog.')->group(...)`
+    // resolved to `admin.x` or `blog.x` at random — find-references and rename
+    // would disagree with themselves between two invocations on the same
+    // unedited project.
+    //
+    // Sorting the output (rather than the traversal) is what makes the result
+    // stable: the reachable SET is already start-order independent — each DFS
+    // is bounded by its own cycle stack and its own depth budget — so only the
+    // order ever varied. Lexicographic is an arbitrary but total rule; the load
+    // graph ranks sibling loaders in no other way, and a caller taking `.first()`
+    // needs *some* defined answer.
+    for prefixes in effective.values_mut() {
+        prefixes.sort();
     }
     effective
 }

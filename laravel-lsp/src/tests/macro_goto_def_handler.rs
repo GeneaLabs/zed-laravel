@@ -107,7 +107,7 @@ async fn prime_macro_project(server: &LaravelLanguageServer, root: &Path) -> std
 
     server
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     server
@@ -198,7 +198,7 @@ class Ids {
 
     server
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     server

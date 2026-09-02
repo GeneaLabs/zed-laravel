@@ -15,9 +15,16 @@
 //! ## Shape
 //!
 //! Mirrors `symbol_index`: a forward map (`fqcn → ClassNode`) plus reverse
-//! adjacency maps, a `by_file` reverse index for cheap eviction, and a lazy
-//! `dirty` set. Owned by the SalsaActor; all access is single-threaded
-//! through the actor queue, so no internal locking.
+//! adjacency maps and a `by_file` reverse index for cheap eviction. Owned by
+//! the SalsaActor; all access is single-threaded through the actor queue, so
+//! no internal locking.
+//!
+//! Unlike `symbol_index` there is **no lazy `dirty` set**. This index is
+//! refreshed eagerly, in `handle_get_patterns`: every parse of a PHP file
+//! runs `remove_file` + `insert_file` for that path, which is the only
+//! populator for files warming skipped. A deferred-refresh queue alongside
+//! that would be a second mechanism for a job already done — see the removal
+//! note in issue #371.
 //!
 //! ## FQCN resolution
 //!
@@ -35,7 +42,6 @@
 //!    extends/implements/trait_uses.
 //! 2. `remove_file(p)` evicts only nodes whose `file_path == p`, so a
 //!    duplicate FQCN declared elsewhere survives.
-//! 3. `take_dirty()` is idempotent: a second call returns an empty Vec.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -183,8 +189,6 @@ pub struct ClassHierarchyIndex {
     subclasses: HashMap<String, Vec<String>>,
     /// path → FQCNs that file contributed, for eviction.
     by_file: HashMap<PathBuf, Vec<String>>,
-    /// Files whose nodes may have drifted; refreshed lazily by the caller.
-    dirty: HashSet<PathBuf>,
 }
 
 impl ClassHierarchyIndex {
@@ -254,16 +258,6 @@ impl ClassHierarchyIndex {
         }
     }
 
-    /// Mark a path as needing refresh (cheap; work deferred to `take_dirty`).
-    pub fn mark_dirty(&mut self, path: &Path) {
-        self.dirty.insert(path.to_path_buf());
-    }
-
-    /// Drain and return the dirty set so the caller can re-index each path.
-    pub fn take_dirty(&mut self) -> Vec<PathBuf> {
-        self.dirty.drain().collect()
-    }
-
     /// Drop everything — used to rebuild from scratch after warming.
     pub fn clear(&mut self) {
         self.classes.clear();
@@ -271,7 +265,6 @@ impl ClassHierarchyIndex {
         self.trait_users.clear();
         self.subclasses.clear();
         self.by_file.clear();
-        self.dirty.clear();
     }
 
     /// The declaration node for a class FQCN, if indexed.

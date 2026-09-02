@@ -25,7 +25,7 @@ async fn backend_with_root(root: &Path) -> LaravelLanguageServer {
     // that sets only `root_path` is under-registering.
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .expect("actor registers the tempdir project root");
     backend

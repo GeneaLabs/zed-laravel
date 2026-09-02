@@ -55,7 +55,7 @@ async fn backend_for(root: &Path) -> LaravelLanguageServer {
     // is about.
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .expect("actor registers the tempdir project root");
     backend

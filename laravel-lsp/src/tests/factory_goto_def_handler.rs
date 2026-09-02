@@ -103,7 +103,7 @@ async fn prime_factory_project(server: &LaravelLanguageServer, root: &Path) -> P
 
     server
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     for (path, src) in &files {
@@ -183,7 +183,7 @@ async fn factory_call_without_factory_file_does_not_resolve() {
 
     server
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     for (path, src) in [(&model, MODEL_SRC), (&caller, CALLER_SRC)] {

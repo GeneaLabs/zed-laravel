@@ -52,8 +52,15 @@ use crate::command_index::{CommandEntry, CommandIndex};
 /// matches.
 ///
 /// History:
-///   v1 — initial command index cache.
-const SCHEMA_VERSION: u32 = 1;
+///   v1 — initial command index cache (command declarations only).
+///   v2 — records EVERY scanned `*.php` file with its mtime, not just the ones
+///        that declared a command. A cache of declarations alone can say
+///        "this command is unchanged", but it cannot say "this file declares
+///        nothing and still declares nothing" — so it could never authorise
+///        skipping the read. Recording the negative verdicts is what turns the
+///        cache from a cold-start display accelerator into a real skip
+///        (issue #371).
+const SCHEMA_VERSION: u32 = 2;
 
 const CACHE_FILENAME: &str = "command_cache.bin";
 
@@ -63,18 +70,30 @@ const CACHE_FILENAME: &str = "command_cache.bin";
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
     schema_version: u32,
-    entries: Vec<CachedEntry>,
+    /// Every `*.php` file the last scan looked at, **in walk order**. Order is
+    /// load-bearing: `CommandIndex::insert_entry` keeps the first file walked
+    /// on a same-tier duplicate, so replaying these in a different order could
+    /// resolve a colliding command name to a different file.
+    files: Vec<ScannedFile>,
 }
 
-/// One resolved command declaration plus the mtime we observed for its
-/// declaring file when it was indexed. Both `secs` and `nanos` are stored
-/// independently for byte-exact comparison — a `touch` that preserves the
-/// second but bumps the nanos must still count as "changed."
-#[derive(Serialize, Deserialize)]
-struct CachedEntry {
-    mtime_secs: u64,
-    mtime_nanos: u32,
-    entry: CommandEntry,
+/// One file the scan looked at, the mtime observed then, and the command it
+/// declared — `None` when it declared none.
+///
+/// Both `secs` and `nanos` are stored independently for byte-exact comparison:
+/// a `touch` that preserves the second but bumps the nanos must still count as
+/// "changed".
+///
+/// The `None` case is the whole point of schema v2. A cache holding only
+/// declarations can tell you a known command is unchanged, but it cannot tell
+/// you that the other 16,000 files still declare nothing — so every one of them
+/// had to be read and regex-scanned again on every startup.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ScannedFile {
+    pub mtime_secs: u64,
+    pub mtime_nanos: u32,
+    pub path: PathBuf,
+    pub entry: Option<CommandEntry>,
 }
 
 /// Where the cache file for `project_root` lives on disk. Returns `None` only
@@ -110,17 +129,52 @@ fn read_mtime(path: &Path) -> Option<(u64, u32)> {
         .and_then(split_mtime)
 }
 
-/// Restore the cached command index for `project_root`, validating every entry
-/// against its declaring file's current mtime. Returns the rebuilt index, or
-/// `None` when there's no cache, it's unreadable, or the schema doesn't match —
-/// in every case the caller falls back to a full
-/// [`crate::command_index::build_command_index`].
+/// A previous scan's per-file verdicts, keyed by path.
 ///
-/// Stale entries (changed, moved, or deleted files) are silently skipped; the
-/// returned index contains only the entries that still match disk, with the
-/// App > Package > Framework priority merge re-applied via
-/// [`CommandIndex::insert_entry`].
-pub fn load_index(project_root: &Path) -> Option<CommandIndex> {
+/// Consulted by [`crate::command_index::scan_commands`] to skip reading a file
+/// whose mtime is unchanged — the same per-file staleness model
+/// [`crate::pattern_disk_cache`] uses.
+#[derive(Default)]
+pub struct CommandScanCache {
+    by_path: std::collections::HashMap<PathBuf, ScannedFile>,
+}
+
+impl CommandScanCache {
+    /// The verdict recorded for `path`, **only if** the file's current mtime
+    /// still matches what the scan observed.
+    ///
+    /// `Some(None)` means "known to declare nothing" — a real answer, and the
+    /// one that saves nearly all the work. `None` means unknown or stale, so
+    /// the caller must read the file.
+    ///
+    /// `current` is passed in rather than stat'd here so the caller can reuse
+    /// the `metadata` its directory walk already produced.
+    pub fn verdict(&self, path: &Path, current: (u64, u32)) -> Option<Option<&CommandEntry>> {
+        let cached = self.by_path.get(path)?;
+        (cached.mtime_secs == current.0 && cached.mtime_nanos == current.1)
+            .then_some(cached.entry.as_ref())
+    }
+
+    /// How many files the cache holds verdicts for.
+    pub fn len(&self) -> usize {
+        self.by_path.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_path.is_empty()
+    }
+}
+
+/// Load the previous scan's verdicts for `project_root`.
+///
+/// `None` when there is no cache, it is unreadable, or the schema does not
+/// match — the caller then does a full scan, which is exactly the pre-cache
+/// behaviour.
+///
+/// Entries are NOT mtime-validated here. Validation happens per file in
+/// [`CommandScanCache::verdict`], against the mtime the caller's walk already
+/// read, so this load performs no I/O beyond the single cache-file read.
+pub fn load_scan(project_root: &Path) -> Option<CommandScanCache> {
     let path = cache_file_path(project_root)?;
     let bytes = std::fs::read(&path).ok()?;
 
@@ -142,13 +196,46 @@ pub fn load_index(project_root: &Path) -> Option<CommandIndex> {
         return None;
     }
 
+    let mut by_path = std::collections::HashMap::with_capacity(cache.files.len());
+    for file in cache.files {
+        by_path.insert(file.path.clone(), file);
+    }
+    Some(CommandScanCache { by_path })
+}
+
+/// Restore a command index from the cache for `project_root`, validating every
+/// entry against its declaring file's current mtime.
+///
+/// The cold-start accelerator: goto-definition and hover on command strings
+/// work off this while the full scan runs. Returns `None` when there is no
+/// usable cache.
+///
+/// Files are replayed in the recorded walk order so the App > Package >
+/// Framework merge — and its first-walked-wins tie-break on same-tier
+/// duplicates — reproduces the scan that wrote the cache.
+pub fn load_index(project_root: &Path) -> Option<CommandIndex> {
+    let path = cache_file_path(project_root)?;
+    let bytes = std::fs::read(&path).ok()?;
+
+    let cache: CacheFile =
+        match bincode::serde::decode_from_slice(&bytes, bincode::config::standard()) {
+            Ok((c, _)) => c,
+            Err(e) => {
+                tracing::debug!("command_disk_cache: decode failed, ignoring: {}", e);
+                return None;
+            }
+        };
+    if cache.schema_version != SCHEMA_VERSION {
+        return None;
+    }
+
     let mut index = CommandIndex::default();
-    for cached in cache.entries {
-        // Only restore the entry if its declaring file is still present and
-        // unchanged. Anything else falls through to the full rebuild.
-        match read_mtime(&cached.entry.file) {
-            Some((s, n)) if s == cached.mtime_secs && n == cached.mtime_nanos => {
-                index.insert_entry(cached.entry);
+    for file in cache.files {
+        let Some(entry) = file.entry else { continue };
+        // Only restore a declaration whose file is still present and unchanged.
+        match read_mtime(&entry.file) {
+            Some((s, n)) if s == file.mtime_secs && n == file.mtime_nanos => {
+                index.insert_entry(entry);
             }
             _ => {}
         }
@@ -156,38 +243,26 @@ pub fn load_index(project_root: &Path) -> Option<CommandIndex> {
     Some(index)
 }
 
-/// Persist `index` to disk, stamping each command with its declaring file's
-/// CURRENT mtime. Called after every successful build/rebuild. Safe to run on
-/// the blocking pool — it's sync I/O.
+/// Persist a completed scan. Called after every successful build/rebuild.
+/// Safe to run on the blocking pool — it is sync I/O.
 ///
-/// Returns the number of entries written, or an error if the cache directory
-/// or file couldn't be written. Errors are advisory — failing to persist
-/// doesn't affect the live in-memory index.
-pub fn save_index(index: &CommandIndex, project_root: &Path) -> Result<usize> {
+/// Returns the number of file verdicts written. Errors are advisory: failing
+/// to persist does not affect the live in-memory index, it only costs the next
+/// startup its shortcut.
+///
+/// Unlike the v1 `save_index` this replaces, the mtimes are NOT re-stat'd here.
+/// They are the ones the scan observed when it read each file, which is the
+/// only value that makes the verdict sound: re-stat'ing at save time would
+/// stamp a file modified DURING the scan as clean, and the next run would trust
+/// a verdict derived from the pre-edit contents.
+pub fn save_scan(files: &[ScannedFile], project_root: &Path) -> Result<usize> {
     let cache_path =
         cache_file_path(project_root).context("could not resolve cache directory for project")?;
 
-    let mut entries: Vec<CachedEntry> = Vec::with_capacity(index.len());
-    for entry in index.entries() {
-        // Stat the declaring file at save time so the stamped mtime reflects
-        // what's on disk RIGHT NOW. A file modified since indexing simply
-        // fails the next load's mtime check and gets re-parsed.
-        let Some((secs, nanos)) = read_mtime(&entry.file) else {
-            // File vanished between build and save — skip it; load_index would
-            // drop a dangling entry anyway.
-            continue;
-        };
-        entries.push(CachedEntry {
-            mtime_secs: secs,
-            mtime_nanos: nanos,
-            entry: entry.clone(),
-        });
-    }
-
-    let total = entries.len();
+    let total = files.len();
     let cache = CacheFile {
         schema_version: SCHEMA_VERSION,
-        entries,
+        files: files.to_vec(),
     };
 
     let encoded = bincode::serde::encode_to_vec(&cache, bincode::config::standard())
