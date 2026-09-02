@@ -2080,6 +2080,16 @@ struct LaravelLanguageServer {
     /// already drives the vendor provider rescan.
     vendor_index: Arc<RwLock<Option<(PathBuf, Arc<VendorIndex>)>>>,
 
+    /// Cached `<x-` / `<flux:` / `<livewire:` completion enumerations
+    /// (issue #371). See [`ComponentCompletionCache`].
+    component_completions: Arc<RwLock<ComponentCompletionCache>>,
+
+    /// TTL backstop for [`Self::component_completions`], normally
+    /// [`COMPONENT_COMPLETION_TTL`]. A field rather than a constant so tests
+    /// can disable it and prove the watcher hook works on its own — see
+    /// [`CachedEnumeration::fresh`].
+    component_completion_ttl: std::time::Duration,
+
     /// `true` once first-load warming has built the reference indexes. The
     /// unused-symbol diagnostic gates on this — running it mid-warm (empty
     /// index) would flag every lensed symbol with a false "no references"
@@ -4701,6 +4711,8 @@ impl LaravelLanguageServer {
             db_provider_task: Arc::new(tokio::sync::Mutex::new(None)),
             route_index: Arc::new(RwLock::new(None)),
             vendor_index: Arc::new(RwLock::new(None)),
+            component_completions: Arc::new(RwLock::new(ComponentCompletionCache::default())),
+            component_completion_ttl: COMPONENT_COMPLETION_TTL,
             warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexing_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_index: Arc::new(RwLock::new(None)),
@@ -6088,6 +6100,114 @@ impl LaravelLanguageServer {
             }
         }
         registered
+    }
+
+    /// Drop every cached component enumeration.
+    ///
+    /// The primary freshness mechanism for [`ComponentCompletionCache`], called
+    /// from `did_change_watched_files` on any watched `.php`/`.blade.php`
+    /// change and from `invalidate_config_cache` — the scanned directory set is
+    /// itself config-derived, so a config change can move it.
+    async fn invalidate_component_completions(&self) {
+        *self.component_completions.write().await = ComponentCompletionCache::default();
+    }
+
+    /// The project root, or `None` when none has been discovered yet.
+    async fn completion_root(&self) -> Option<PathBuf> {
+        self.root_path.read().await.clone()
+    }
+
+    /// Blade `<x-…>` candidates, cached. Rebuilds on a miss.
+    async fn cached_blade_components(
+        &self,
+    ) -> Arc<Vec<laravel_lsp::component_completion::ComponentCandidate>> {
+        let Some(root) = self.completion_root().await else {
+            return Arc::new(Vec::new());
+        };
+        {
+            let cache = self.component_completions.read().await;
+            if cache.matches(&root) {
+                if let Some(hit) = cache
+                    .blade
+                    .as_ref()
+                    .and_then(|e| e.fresh(std::time::Instant::now(), self.component_completion_ttl))
+                {
+                    return hit;
+                }
+            }
+        }
+        let items = Arc::new(self.get_all_blade_components().await);
+        let mut cache = self.component_completions.write().await;
+        cache.retain_only(&root);
+        cache.blade = Some(CachedEnumeration {
+            built_at: std::time::Instant::now(),
+            items: items.clone(),
+        });
+        items
+    }
+
+    /// Flux `<flux:…>` candidates, cached. Rebuilds on a miss.
+    async fn cached_flux_components(
+        &self,
+    ) -> Arc<Vec<laravel_lsp::component_completion::ComponentCandidate>> {
+        let Some(root) = self.completion_root().await else {
+            return Arc::new(Vec::new());
+        };
+        {
+            let cache = self.component_completions.read().await;
+            if cache.matches(&root) {
+                if let Some(hit) = cache
+                    .flux
+                    .as_ref()
+                    .and_then(|e| e.fresh(std::time::Instant::now(), self.component_completion_ttl))
+                {
+                    return hit;
+                }
+            }
+        }
+        // Blocking: three `WalkDir`s plus a `canonicalize` per emitted entry.
+        let scan_root = root.clone();
+        let items = Arc::new(
+            tokio::task::spawn_blocking(move || {
+                laravel_lsp::component_completion::collect_flux_components(&scan_root)
+            })
+            .await
+            .unwrap_or_default(),
+        );
+        let mut cache = self.component_completions.write().await;
+        cache.retain_only(&root);
+        cache.flux = Some(CachedEnumeration {
+            built_at: std::time::Instant::now(),
+            items: items.clone(),
+        });
+        items
+    }
+
+    /// Livewire `<livewire:…>` candidates, cached. Rebuilds on a miss.
+    async fn cached_livewire_components(&self) -> Arc<Vec<LivewireComponentCompletion>> {
+        let Some(root) = self.completion_root().await else {
+            return Arc::new(Vec::new());
+        };
+        {
+            let cache = self.component_completions.read().await;
+            if cache.matches(&root) {
+                if let Some(hit) = cache
+                    .livewire
+                    .as_ref()
+                    .and_then(|e| e.fresh(std::time::Instant::now(), self.component_completion_ttl))
+                {
+                    return hit;
+                }
+            }
+        }
+        let items = Arc::new(self.get_all_livewire_components().await);
+        let mut cache = self.component_completions.write().await;
+        cache.retain_only(&root);
+        cache.livewire = Some(CachedEnumeration {
+            built_at: std::time::Instant::now(),
+            items: items.clone(),
+        });
+        items
     }
 
     /// Drop the cached vendor walk so the next consumer rebuilds it.
@@ -9213,6 +9333,12 @@ impl LaravelLanguageServer {
         // Module directories are derived from the filesystem too (a module
         // may appear or disappear alongside its composer.json/config).
         *self.cached_module_dirs.write().await = None;
+        // The component-completion scans read their directory set FROM that
+        // config — view paths, anonymous component paths/namespaces, class
+        // component namespaces, the Livewire path, module registrars. A config
+        // change can move the directories, not just their contents, so the
+        // cached enumerations have to go with it (issue #371).
+        self.invalidate_component_completions().await;
     }
 
     /// Get middleware from cache first, then Salsa
@@ -18417,6 +18543,8 @@ return [
             db_provider_task: self.db_provider_task.clone(),
             route_index: self.route_index.clone(),
             vendor_index: self.vendor_index.clone(),
+            component_completions: self.component_completions.clone(),
+            component_completion_ttl: self.component_completion_ttl,
             warm_complete: self.warm_complete.clone(),
             indexing_in_flight: self.indexing_in_flight.clone(),
             migration_index: self.migration_index.clone(),
@@ -22315,6 +22443,89 @@ fn collect_vendor_provider_sources(
     out
 }
 
+/// How long a cached component enumeration may still be served, as a
+/// **backstop only**.
+///
+/// The watcher hook is the mechanism: `did_change_watched_files` drops this
+/// cache on any watched `.php`/`.blade.php` create/change/delete, and
+/// `invalidate_config_cache` drops it when the config that *defines* the
+/// scanned directory set changes. Between them they cover every conventional
+/// project layout, which is the same way `route_index`, `command_index`,
+/// `migration_index` and the config cache are all kept fresh.
+///
+/// This timeout exists only for the directories those globs cannot see:
+/// `Blade::anonymousComponentPath`, `Blade::anonymousComponentNamespace`,
+/// `Blade::componentNamespace` (resolved through PSR-4) and
+/// `Livewire::addNamespace` / module registrars can each point at a directory
+/// the watcher was never registered for. Without a backstop a component
+/// created there would be missing from completion for the rest of the session.
+/// Because the watcher carries the common case, the exact value here is not
+/// load-bearing and is deliberately not tuned.
+///
+/// Completion is the right surface to accept bounded staleness on: a
+/// completion item missing for two seconds is an annoyance, whereas a stale
+/// go-to-definition target sends the reader to the wrong file. That asymmetry
+/// is what justifies a TTL here, and it does not transfer to a navigation
+/// cache.
+const COMPONENT_COMPLETION_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One cached component enumeration, with the instant it was built.
+struct CachedEnumeration<T> {
+    built_at: std::time::Instant,
+    items: Arc<Vec<T>>,
+}
+
+impl<T> CachedEnumeration<T> {
+    /// The entry, unless the TTL backstop has expired.
+    ///
+    /// `ttl` is passed in rather than read from
+    /// [`COMPONENT_COMPLETION_TTL`] so tests can hold the clock. A
+    /// two-mechanism cache fails badly when the backstop MASKS a broken
+    /// primary: if the watcher hook ever stops firing, a live TTL turns that
+    /// into "completions feel intermittently stale" — self-correcting, never
+    /// reported, and able to survive for years. Tests therefore raise the TTL
+    /// beyond reach and assert the watcher and config hooks each clear the
+    /// cache on their own.
+    fn fresh(&self, now: std::time::Instant, ttl: std::time::Duration) -> Option<Arc<Vec<T>>> {
+        (now.duration_since(self.built_at) < ttl).then(|| self.items.clone())
+    }
+}
+
+/// The three tag-context completion enumerations, cached per project root.
+///
+/// Each is filled on first use and dropped as a group by
+/// [`LaravelLanguageServer::invalidate_component_completions`]. Before this
+/// cache existed, every keystroke in a `<x-`, `<flux:` or `<livewire:` context
+/// re-walked the component directories and paid a `canonicalize()` per emitted
+/// entry — measured at ~23 ms and ~16 ms per request on this repo's
+/// `test-project/`, with no repeat ever cheaper than the first (issue #371).
+#[derive(Default)]
+struct ComponentCompletionCache {
+    /// The project root the entries below describe. A different root discards
+    /// them rather than answering with another project's components.
+    root: Option<PathBuf>,
+    blade: Option<CachedEnumeration<laravel_lsp::component_completion::ComponentCandidate>>,
+    flux: Option<CachedEnumeration<laravel_lsp::component_completion::ComponentCandidate>>,
+    livewire: Option<CachedEnumeration<LivewireComponentCompletion>>,
+}
+
+impl ComponentCompletionCache {
+    /// Drop everything if these entries describe a different project root.
+    fn retain_only(&mut self, root: &Path) {
+        if self.root.as_deref() != Some(root) {
+            *self = Self {
+                root: Some(root.to_path_buf()),
+                ..Self::default()
+            };
+        }
+    }
+
+    /// True when the cached entries belong to `root`.
+    fn matches(&self, root: &Path) -> bool {
+        self.root.as_deref() == Some(root)
+    }
+}
+
 fn is_in_routes_dir(root: Option<&Path>, path: &Path) -> bool {
     let Some(r) = root else {
         return false;
@@ -24334,6 +24545,10 @@ impl LanguageServer for LaravelLanguageServer {
         // Did this batch record any `.php` magic change? Gates the debounced
         // incremental batch — an Inertia-only burst does no magic work.
         let mut magic_dirty = false;
+        // Did this batch touch any `.php`/`.blade.php`? Drops the cached
+        // component-completion enumerations once for the whole batch rather
+        // than per event in a burst.
+        let mut components_changed = false;
         // Did a service provider change? The vendor translation-namespace map
         // is built by scanning providers, and is cached for the whole session.
         let mut providers_changed = false;
@@ -24455,6 +24670,13 @@ impl LanguageServer for LaravelLanguageServer {
                 let is_delete = matches!(change.typ, FileChangeType::DELETED);
                 self.record_watched_change(&path, is_delete).await;
                 magic_dirty = true;
+                // A `.php`/`.blade.php` create, change or delete anywhere the
+                // watcher covers can add or remove a component tag, so the
+                // cached `<x-` / `<flux:` / `<livewire:` enumerations are stale
+                // (issue #371). This is the PRIMARY freshness mechanism for
+                // that cache — its TTL is only a backstop for directories these
+                // globs cannot see.
+                components_changed = true;
             }
             match change.typ {
                 FileChangeType::CREATED => {
@@ -24562,6 +24784,14 @@ impl LanguageServer for LaravelLanguageServer {
             // in the editor or restarted the server: a registration that
             // failed the gate at index time stayed failed forever.
             *self.cached_livewire.write().await = None;
+        }
+
+        // A component file changed on disk — drop the cached tag-completion
+        // enumerations so the next `<x-` / `<flux:` / `<livewire:` keystroke
+        // rescans. One per batch rather than per event, so a `git pull` that
+        // rewrites hundreds of views clears the cache once.
+        if components_changed {
+            self.invalidate_component_completions().await;
         }
 
         // A Command class changed on disk — rebuild the Artisan command index so
@@ -27320,14 +27550,14 @@ impl LanguageServer for LaravelLanguageServer {
                 );
 
                 // Get all Blade components
-                let components = self.get_all_blade_components().await;
+                let components = self.cached_blade_components().await;
 
                 use laravel_lsp::component_completion::CandidateKind;
 
                 // Build completion items, filtering by prefix (case-insensitive)
                 let prefix_lower = component_ctx.prefix.to_lowercase();
                 let items: Vec<CompletionItem> = components
-                    .into_iter()
+                    .iter()
                     .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
                     .map(|c| {
                         let (item_kind, summary) = match c.kind {
@@ -27390,14 +27620,11 @@ impl LanguageServer for LaravelLanguageServer {
                     flux_ctx.prefix
                 );
 
-                let candidates = match self.root_path.read().await.clone() {
-                    Some(root) => laravel_lsp::component_completion::collect_flux_components(&root),
-                    None => Vec::new(),
-                };
+                let candidates = self.cached_flux_components().await;
 
                 let prefix_lower = flux_ctx.prefix.to_lowercase();
                 let items: Vec<CompletionItem> = candidates
-                    .into_iter()
+                    .iter()
                     .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
                     .map(|c| CompletionItem {
                         label: c.name.clone(),
@@ -27591,12 +27818,12 @@ impl LanguageServer for LaravelLanguageServer {
                 );
 
                 // Get all Livewire components
-                let components = self.get_all_livewire_components().await;
+                let components = self.cached_livewire_components().await;
 
                 // Build completion items, filtering by prefix (case-insensitive)
                 let prefix_lower = livewire_prefix.to_lowercase();
                 let items: Vec<CompletionItem> = components
-                    .into_iter()
+                    .iter()
                     .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
                     .map(|c| CompletionItem {
                         label: c.name.clone(),
