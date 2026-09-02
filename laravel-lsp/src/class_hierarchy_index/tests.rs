@@ -120,15 +120,6 @@ fn remove_file_evicts_node_and_reverse_edges() {
 }
 
 #[test]
-fn take_dirty_drains_and_is_idempotent() {
-    let mut idx = ClassHierarchyIndex::default();
-    idx.mark_dirty(&PathBuf::from("/p/A.php"));
-    idx.mark_dirty(&PathBuf::from("/p/A.php"));
-    assert_eq!(idx.take_dirty().len(), 1);
-    assert!(idx.take_dirty().is_empty());
-}
-
-#[test]
 fn fqcn_file_map_maps_each_class_to_its_file() {
     let mut idx = ClassHierarchyIndex::default();
     let user_path = PathBuf::from("/proj/app/Models/User.php");

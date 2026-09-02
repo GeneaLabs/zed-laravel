@@ -9818,7 +9818,6 @@ impl SalsaActor {
         // new patterns aren't parsed until something asks for them
         // via get_patterns anyway. Lazy refresh amortizes both costs.
         self.symbol_index.mark_dirty(&path);
-        self.class_hierarchy_index.mark_dirty(&path);
         // A Blade edit can add or delete an `<x-…>` / `<livewire:…>` tag, so
         // the reverse usage index has to re-read this file before its next
         // answer (no-op for non-Blade paths).
@@ -9996,7 +9995,6 @@ impl SalsaActor {
         // rebuild, and which are the whole reason `did_close` refuses
         // `RemoveFile`.
         self.symbol_index.mark_dirty(path);
-        self.class_hierarchy_index.mark_dirty(path);
         self.component_usage_index.mark_dirty(path);
     }
 

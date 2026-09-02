@@ -7,6 +7,7 @@ mod blade_var_rename_handler;
 mod byte_offset_panic_hardening;
 mod cache_root_poisoning;
 mod cast_type_context;
+mod class_hierarchy_freshness;
 mod class_locator_and_properties;
 mod code_action_create_containment;
 mod code_lens_opt_in;
