@@ -194,8 +194,14 @@ fn find_return_array(root: Node) -> Option<Node> {
     // statements`. Walk every descendant looking for a `return_statement`
     // whose expression is `array_creation_expression`. This handles both
     // top-level and namespaced files uniformly.
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    // Breadth-first, and siblings in document order. A LIFO stack visited
+    // later siblings first, so a file with two top-level `return`s resolved
+    // against the SECOND — dead code PHP never reaches, since a module stops
+    // at the first. Breadth-first also keeps the shallowest `return` winning,
+    // which is what makes a `return` inside an earlier closure lose to the
+    // file's own.
+    let mut queue = std::collections::VecDeque::from([root]);
+    while let Some(node) = queue.pop_front() {
         if node.kind() == "return_statement" {
             // The expression is typically a direct child, but tree-sitter
             // can wrap it in `expression`/`primary_expression` indirections.
@@ -208,7 +214,7 @@ fn find_return_array(root: Node) -> Option<Node> {
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            stack.push(child);
+            queue.push_back(child);
         }
     }
     None
@@ -330,17 +336,22 @@ fn array_entries<'a>(array: Node<'a>, source: &[u8]) -> Vec<ParsedEntry<'a>> {
                 let parsed = literal_key(key_node, source);
                 // PHP advances the counter past an integer key however it was
                 // spelled — bare `7 =>` or the string `'7' =>`, which it casts.
-                // `saturating_add` keeps a `PHP_INT_MAX` key from overflowing:
-                // debug builds panicked, release wrapped to i64::MIN and then
-                // synthesized negative indices for every later entry.
+                //
+                // A `PHP_INT_MAX` key has no next index: PHP itself cannot
+                // place a further keyless entry. Saturating would hand the
+                // next one the SAME index, emitting one dotted key twice with
+                // two different values — ambiguous for goto and rename, and
+                // offered twice by completion. Stop synthesizing instead, the
+                // same answer a spread gets.
                 let as_int = integer_literal_value(key_node, source).or_else(|| {
                     parsed
                         .as_ref()
                         .and_then(|(text, _)| php_canonical_int(text))
                 });
                 if let Some(n) = as_int {
-                    let next = n.saturating_add(1);
-                    next_index = Some(next_index.map_or(next, |c| c.max(next)));
+                    next_index = n
+                        .checked_add(1)
+                        .map(|next| next_index.map_or(next, |c| c.max(next)));
                 }
                 if let Some((key_text, key_position)) = parsed {
                     out.push(ParsedEntry {
@@ -352,7 +363,7 @@ fn array_entries<'a>(array: Node<'a>, source: &[u8]) -> Vec<ParsedEntry<'a>> {
             }
             None => {
                 let Some(index) = next_index else { continue };
-                next_index = Some(index.saturating_add(1));
+                next_index = index.checked_add(1);
                 out.push(ParsedEntry {
                     key_text: index.to_string(),
                     key_position: synthesized_index_position(value_node),
@@ -401,11 +412,20 @@ fn integer_literal_value(node: Node, source: &[u8]) -> Option<i64> {
     match node.kind() {
         "integer" => node.utf8_text(source).ok()?.parse().ok(),
         "unary_op_expression" => {
-            let text = node.utf8_text(source).ok()?;
+            // Read the operator and the operand separately. Parsing the whole
+            // node span instead fails on `- 5`, because the span carries the
+            // whitespace and `i64::parse` rejects it; and testing the span for
+            // a leading `-` drops `+5`, which PHP accepts as key 5.
             let inner = node.child_by_field_name("argument")?;
-            (inner.kind() == "integer" && text.starts_with('-'))
-                .then(|| text.parse().ok())
-                .flatten()
+            if inner.kind() != "integer" {
+                return None;
+            }
+            let magnitude: i64 = inner.utf8_text(source).ok()?.trim().parse().ok()?;
+            match node.child(0)?.utf8_text(source).ok()? {
+                "-" => magnitude.checked_neg(),
+                "+" => Some(magnitude),
+                _ => None,
+            }
         }
         _ => None,
     }

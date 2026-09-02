@@ -197,13 +197,21 @@ return [
 }
 
 #[test]
-fn a_key_after_a_list_entry_resolves() {
-    // The scanner returned None here: the list items before `after` aborted
-    // its whole walk.
-    let src = "<?php\nreturn [\n    'options' => ['a', 'b'],\n    'after' => 'sibling',\n];\n";
+fn a_key_after_a_non_string_key_resolves() {
+    // The retired byte scanner skipped a LIST value by counting balanced
+    // brackets, so a list before the target was survivable. What actually
+    // aborted its walk was a non-string KEY at the target's own nesting
+    // level: `read_string_key` required a quote, found a digit, and gave up
+    // on the rest of the array. Everything declared after `404 =>` was
+    // unreachable.
+    let src = "<?php\nreturn [\n    404 => 'Not found',\n    'after' => 'sibling',\n];\n";
     assert_eq!(
         resolve_in_source(src, &["after"]).as_deref(),
         Some("'sibling'")
+    );
+    assert_eq!(
+        resolve_in_source(src, &["404"]).as_deref(),
+        Some("'Not found'")
     );
 }
 

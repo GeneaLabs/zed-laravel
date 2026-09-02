@@ -608,6 +608,22 @@ const SHAPES: &[Shape] = &[
         "<?php\nreturn [-5 => 'x'];\n",
         &[("-5", "x")],
     ),
+    // PHP accepts a unary plus, and whitespace around either operator.
+    (
+        "unary-plus key",
+        "<?php\nreturn [+5 => 'x'];\n",
+        &[("5", "x")],
+    ),
+    (
+        "spaced unary key",
+        "<?php\nreturn [- 5 => 'x'];\n",
+        &[("-5", "x")],
+    ),
+    (
+        "unary key advances counter",
+        "<?php\nreturn ['l' => [+5 => 'a', 'b']];\n",
+        &[("l", ""), ("l.5", "a"), ("l.6", "b")],
+    ),
     (
         "escaped quote in key",
         "<?php\nreturn ['it\\'s' => 'v'];\n",
@@ -760,14 +776,15 @@ fn every_shape_navigates_to_every_key_it_enumerates() {
     let mut failures = Vec::new();
     for (label, src, _) in SHAPES {
         for (key, _) in enum_entries(src) {
-            let path: Vec<&str> = key.split('.').collect();
-            // A literal dotted key ('a.b') is one segment that split() breaks
-            // apart; the locator resolves it by its full text, checked in
-            // b5_hyphenated_numeric_and_dotted_keys_all_enumerate.
-            if src.contains(&format!("'{key}'")) && key.contains('.') {
-                continue;
-            }
-            if locate_in_source(src, &path).is_none() {
+            // A dotted key is ambiguous on its face: `a.b` is either one
+            // literal key or a path through `a`. Try both spellings rather
+            // than guessing from the source text — an earlier version asked
+            // whether `'a.b'` appeared anywhere in the file, which any
+            // unrelated decoy string could satisfy, silently excusing a
+            // genuinely unreachable nested key.
+            let whole = locate_in_source(src, &[key.as_str()]).is_some();
+            let split: Vec<&str> = key.split('.').collect();
+            if !whole && locate_in_source(src, &split).is_none() {
                 failures.push(format!(
                     "{label}: enumerated {key:?} but cannot navigate to it"
                 ));
@@ -797,18 +814,45 @@ fn pathological_input_degrades_instead_of_aborting() {
         "'v'",
         "]".repeat(500)
     );
-    let _ = enum_entries(&deep);
+    let nested = enum_entries(&deep);
+    // Nesting past the bound is truncated, not crashed — and every key ABOVE
+    // the bound must survive, or the guard would be eating real catalogue
+    // keys. Asserting the exact count pins the truncation depth; discarding
+    // the result (as this line once did) passed even with the bound cut to 10.
+    assert_eq!(
+        nested.len(),
+        128,
+        "one key per level, capped at MAX_NEST_DEPTH"
+    );
+    assert_eq!(nested[0].0, "a", "the outermost key is still reported");
 
     // `PHP_INT_MAX` as a key used to panic in debug and wrap to i64::MIN in
     // release, which then synthesized negative indices for every later entry.
+    // Saturating instead was no better: it handed the next keyless entry the
+    // SAME index, emitting one dotted key twice with two different values.
+    // PHP cannot place a further keyless entry after `PHP_INT_MAX` either, so
+    // index synthesis stops — the answer a spread already gets.
     let max = "<?php\nreturn ['l' => [9223372036854775807 => 'x', 'y']];\n";
     assert_eq!(
         enum_entries(max),
         vec![
             ("l".to_string(), String::new()),
             ("l.9223372036854775807".to_string(), "x".to_string()),
-            ("l.9223372036854775807".to_string(), "y".to_string()),
         ],
-        "saturates rather than wrapping"
+        "no next index exists, so no duplicate key is invented"
     );
+}
+
+#[test]
+fn the_first_top_level_return_wins_and_a_closure_return_never_does() {
+    // PHP stops at the first `return` in an included file; anything after it
+    // is unreachable. A LIFO walk picked the LAST one.
+    let two = "<?php\nreturn ['a' => 'one'];\nreturn ['a' => 'two'];\n";
+    assert_eq!(value_of(two, "a").as_deref(), Some("one"));
+
+    // The shallowest return still wins, so a `return` inside an earlier
+    // closure does not hijack the file's own config array.
+    let closure = "<?php\n$f = function () { return ['i' => 'nope']; };\nreturn ['a' => 'app'];\n";
+    assert_eq!(value_of(closure, "a").as_deref(), Some("app"));
+    assert_eq!(value_of(closure, "i"), None);
 }
