@@ -2478,9 +2478,9 @@ impl TranslationCache {
             }
             let locale_file = lang_dir.join(&name).join(format!("{file_stem}.php"));
             let file = self.ensure_file(db, &locale_file, root);
-            // `is_literal_key` false means the key has no quoted text to
-            // rewrite — a list index (`page.items.0`) or a bare `404 =>`.
-            // Both resolve for goto; neither is a rename target.
+            // A `false` flag means the key has no quoted text to rewrite — a
+            // list index (`page.items.0`) or a bare `404 =>`. Both resolve for
+            // goto; neither is a rename target.
             if let Some(&(line, start_column, end_column, true)) =
                 locate_php_key_in_file(&*db, file, key_path.clone()).as_ref()
             {

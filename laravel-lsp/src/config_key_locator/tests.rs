@@ -555,3 +555,260 @@ fn an_interpolated_value_is_not_folded() {
     // No static answer; the source text is the honest display.
     assert_eq!(value_of(src, "greet").as_deref(), Some("\"Hi $name\""));
 }
+
+// ── the shape matrix ──────────────────────────────────────────────────────
+//
+// Every PHP catalogue shape the walker claims to read, in one place, as data.
+// Mutation testing proves the walker discriminates the logic we wrote; only
+// this table proves we thought of the *shape*. Add a row before adding a
+// branch — a gap here is invisible to every other test in this file.
+//
+// Each row is (label, php source, expected `(dotted key, value)` pairs in
+// document order). An empty value means "array-valued, no scalar of its own".
+
+type Shape = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
+const SHAPES: &[Shape] = &[
+    (
+        "plain string key",
+        "<?php\nreturn ['a' => 'b'];\n",
+        &[("a", "b")],
+    ),
+    (
+        "double-quoted key",
+        "<?php\nreturn [\"a\" => \"b\"];\n",
+        &[("a", "b")],
+    ),
+    (
+        "hyphenated key",
+        "<?php\nreturn ['a-b' => 'c'];\n",
+        &[("a-b", "c")],
+    ),
+    (
+        "dotted key",
+        "<?php\nreturn ['a.b' => 'c'];\n",
+        &[("a.b", "c")],
+    ),
+    (
+        "quoted numeric key",
+        "<?php\nreturn ['404' => 'nf'];\n",
+        &[("404", "nf")],
+    ),
+    (
+        "bare integer key",
+        "<?php\nreturn [404 => 'nf'];\n",
+        &[("404", "nf")],
+    ),
+    (
+        "negative integer key",
+        "<?php\nreturn [-5 => 'x'];\n",
+        &[("-5", "x")],
+    ),
+    (
+        "escaped quote in key",
+        "<?php\nreturn ['it\\'s' => 'v'];\n",
+        &[("it's", "v")],
+    ),
+    (
+        "nested arrays",
+        "<?php\nreturn ['a' => ['b' => 'c']];\n",
+        &[("a", ""), ("a.b", "c")],
+    ),
+    (
+        "array() long syntax",
+        "<?php\nreturn array('a' => array('b' => 'c'));\n",
+        &[("a", ""), ("a.b", "c")],
+    ),
+    (
+        "scalar list",
+        "<?php\nreturn ['l' => ['x', 'y']];\n",
+        &[("l", ""), ("l.0", "x"), ("l.1", "y")],
+    ),
+    (
+        "list of arrays",
+        "<?php\nreturn ['l' => [['k' => 'v']]];\n",
+        &[("l", ""), ("l.0", ""), ("l.0.k", "v")],
+    ),
+    // PHP: an explicit integer key moves the counter to n + 1.
+    (
+        "int key advances counter",
+        "<?php\nreturn ['l' => ['a', 5 => 'b', 'c']];\n",
+        &[("l", ""), ("l.0", "a"), ("l.5", "b"), ("l.6", "c")],
+    ),
+    // PHP casts a canonical decimal string key to an integer, counter included.
+    (
+        "string-int key advances counter",
+        "<?php\nreturn ['l' => ['7' => 'a', 'b']];\n",
+        &[("l", ""), ("l.7", "a"), ("l.8", "b")],
+    ),
+    // '07' is not canonical, so it stays a string and moves nothing.
+    (
+        "leading-zero key stays a string",
+        "<?php\nreturn ['l' => ['07' => 'a', 'b']];\n",
+        &[("l", ""), ("l.07", "a"), ("l.0", "b")],
+    ),
+    (
+        "empty string value",
+        "<?php\nreturn ['a' => ''];\n",
+        &[("a", "")],
+    ),
+    (
+        "single-quote escapes",
+        "<?php\nreturn ['a' => 'x\\nz', 'b' => 'q\\\\r'];\n",
+        &[("a", "x\\nz"), ("b", "q\\r")],
+    ),
+    (
+        "double-quote escapes",
+        "<?php\nreturn [\"a\" => \"x\\nz\", \"b\" => \"say \\\"hi\\\"\"];\n",
+        &[("a", "x\nz"), ("b", "say \"hi\"")],
+    ),
+    (
+        "hex escape",
+        "<?php\nreturn [\"a\" => \"\\x41\"];\n",
+        &[("a", "A")],
+    ),
+    (
+        "octal escape",
+        "<?php\nreturn [\"a\" => \"\\101\"];\n",
+        &[("a", "A")],
+    ),
+    (
+        "nul escape",
+        "<?php\nreturn [\"a\" => \"\\0\"];\n",
+        &[("a", "\0")],
+    ),
+    (
+        "unicode escape",
+        "<?php\nreturn [\"a\" => \"\\u{41}\"];\n",
+        &[("a", "A")],
+    ),
+    (
+        "malformed hex escape stays literal",
+        "<?php\nreturn [\"a\" => \"\\xZZ\"];\n",
+        &[("a", "\\xZZ")],
+    ),
+    (
+        "literal concatenation folds",
+        "<?php\nreturn ['a' => 'x' . 'y'];\n",
+        &[("a", "xy")],
+    ),
+    (
+        "dynamic concatenation keeps source",
+        "<?php\nreturn ['a' => 'x' . $y];\n",
+        &[("a", "'x' . $y")],
+    ),
+    (
+        "interpolation keeps source",
+        "<?php\nreturn ['a' => \"hi $n\"];\n",
+        &[("a", "\"hi $n\"")],
+    ),
+    (
+        "non-string scalar keeps source",
+        "<?php\nreturn ['a' => 42, 'b' => true];\n",
+        &[("a", "42"), ("b", "true")],
+    ),
+    (
+        "call keeps whole source",
+        "<?php\nreturn ['a' => env('X', 'd')];\n",
+        &[("a", "env('X', 'd')")],
+    ),
+    (
+        "comments between entries",
+        "<?php\nreturn [\n // c\n 'a' => 'b',\n /* c */ 'd' => 'e',\n];\n",
+        &[("a", "b"), ("d", "e")],
+    ),
+    // A spread contributes an unknown element count, so later positions are
+    // unnameable — keyed entries after it are still fine.
+    (
+        "spread halts index synthesis",
+        "<?php\nreturn ['l' => ['a', ...$o, 'c'], 'k' => 'v'];\n",
+        &[("l", ""), ("l.0", "a"), ("k", "v")],
+    ),
+    (
+        "constant key skipped",
+        "<?php\nreturn [Foo::BAR => 'b', 'a' => 'c'];\n",
+        &[("a", "c")],
+    ),
+    ("no return array", "<?php\n$x = 1;\n", &[]),
+];
+
+#[test]
+fn every_shape_enumerates_as_documented() {
+    let mut failures = Vec::new();
+    for (label, src, expected) in SHAPES {
+        let got = enum_entries(src);
+        let want: Vec<(String, String)> = expected
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        if got != want {
+            failures.push(format!("{label}\n     got {got:?}\n    want {want:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "\n  {}", failures.join("\n  "));
+}
+
+#[test]
+fn every_shape_navigates_to_every_key_it_enumerates() {
+    // The invariant #369 exists to protect: completion must never offer a key
+    // go-to-definition cannot follow. Checked across the whole matrix, so a new
+    // row cannot add an enumerable-but-unreachable key unnoticed.
+    let mut failures = Vec::new();
+    for (label, src, _) in SHAPES {
+        for (key, _) in enum_entries(src) {
+            let path: Vec<&str> = key.split('.').collect();
+            // A literal dotted key ('a.b') is one segment that split() breaks
+            // apart; the locator resolves it by its full text, checked in
+            // b5_hyphenated_numeric_and_dotted_keys_all_enumerate.
+            if src.contains(&format!("'{key}'")) && key.contains('.') {
+                continue;
+            }
+            if locate_in_source(src, &path).is_none() {
+                failures.push(format!(
+                    "{label}: enumerated {key:?} but cannot navigate to it"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n  {}", failures.join("\n  "));
+}
+
+#[test]
+fn pathological_input_degrades_instead_of_aborting() {
+    // Both of these overflowed the stack and killed the process. A language
+    // server must not die because a file is strange.
+    let chain = std::iter::repeat_n("'a'", 50_000)
+        .collect::<Vec<_>>()
+        .join(" . ");
+    let src = format!("<?php\nreturn ['k' => {chain}];\n");
+    assert_eq!(
+        enum_entries(&src).len(),
+        1,
+        "deep concatenation must not abort"
+    );
+
+    let deep = format!(
+        "<?php\nreturn {}{}{};\n",
+        "['a' => ".repeat(500),
+        "'v'",
+        "]".repeat(500)
+    );
+    let _ = enum_entries(&deep);
+
+    // `PHP_INT_MAX` as a key used to panic in debug and wrap to i64::MIN in
+    // release, which then synthesized negative indices for every later entry.
+    let max = "<?php\nreturn ['l' => [9223372036854775807 => 'x', 'y']];\n";
+    assert_eq!(
+        enum_entries(max),
+        vec![
+            ("l".to_string(), String::new()),
+            ("l.9223372036854775807".to_string(), "x".to_string()),
+            ("l.9223372036854775807".to_string(), "y".to_string()),
+        ],
+        "saturates rather than wrapping"
+    );
+}

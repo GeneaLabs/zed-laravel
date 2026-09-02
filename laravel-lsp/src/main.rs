@@ -25561,22 +25561,25 @@ impl LanguageServer for LaravelLanguageServer {
                 // change without moving the config file.
                 if let Some(root) = root_path.as_ref() {
                     let module_dirs = self.module_dirs_for(root).await;
-                    targets.extend(collect_config_declaration_target(
-                        root,
-                        &module_dirs,
+                    let declarations =
+                        collect_config_declaration_target(root, &module_dirs, key, &new_name);
+                    targets.extend(laravel_lsp::rename::require_declaration_edits(
                         key,
-                        &new_name,
-                    ));
+                        declarations,
+                    )?);
                 }
             }
             laravel_lsp::references::SymbolRef::Translation(key) => {
                 // Same shape as config but applied across every locale's lang
                 // file under lang/<locale>/<file>.php.
                 if let Some(root) = root_path.as_ref() {
-                    targets.extend(
+                    let declarations =
                         collect_translation_declaration_targets(&self.salsa, root, key, &new_name)
-                            .await,
-                    );
+                            .await;
+                    targets.extend(laravel_lsp::rename::require_declaration_edits(
+                        key,
+                        declarations,
+                    )?);
                 }
             }
             laravel_lsp::references::SymbolRef::Env(key) => {

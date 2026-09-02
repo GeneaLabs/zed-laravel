@@ -150,6 +150,24 @@ fn collect_keys(
     prefix: &str,
     out: &mut Vec<(String, String, KeyPosition)>,
 ) {
+    collect_keys_bounded(array, source, prefix, out, 0)
+}
+
+/// How deep [`collect_keys`] will descend into nested arrays. A catalogue is
+/// hand-written and never approaches this; the cap exists so a pathological or
+/// generated file cannot overflow the stack and abort the language server.
+const MAX_NEST_DEPTH: u32 = 128;
+
+fn collect_keys_bounded(
+    array: Node,
+    source: &[u8],
+    prefix: &str,
+    out: &mut Vec<(String, String, KeyPosition)>,
+    depth: u32,
+) {
+    if depth >= MAX_NEST_DEPTH {
+        return;
+    }
     for entry in array_entries(array, source) {
         let dotted = if prefix.is_empty() {
             entry.key_text.clone()
@@ -163,7 +181,7 @@ fn collect_keys(
         };
         out.push((dotted.clone(), value, entry.key_position));
         if let Some(nested) = nested {
-            collect_keys(nested, source, &dotted, out);
+            collect_keys_bounded(nested, source, &dotted, out, depth + 1);
         }
     }
 }
@@ -199,12 +217,28 @@ fn find_return_array(root: Node) -> Option<Node> {
 /// Recurse through `expression` / `primary_expression` wrappers to reach
 /// the underlying `array_creation_expression`, if present.
 fn find_array_in_expression(node: Node) -> Option<Node> {
+    find_array_bounded(node, 0)
+}
+
+/// Depth-bounded body of [`find_array_in_expression`].
+///
+/// This walks the WHOLE value subtree, not just wrapper nodes, so its depth is
+/// the expression's depth rather than a small constant. PHP's `.` is
+/// left-associative, so an N-term concatenation is an N-deep tree: a value
+/// built from 50,000 literals recursed 50,000 frames and aborted the language
+/// server with a stack overflow. An array nested past this depth is simply not
+/// descended into, which costs a few unreachable keys on a file no human
+/// wrote.
+fn find_array_bounded(node: Node, depth: u32) -> Option<Node> {
+    if depth >= MAX_NEST_DEPTH {
+        return None;
+    }
     if node.kind() == "array_creation_expression" {
         return Some(node);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if let Some(arr) = find_array_in_expression(child) {
+        if let Some(arr) = find_array_bounded(child, depth + 1) {
             return Some(arr);
         }
     }
@@ -216,6 +250,30 @@ fn find_array_in_expression(node: Node) -> Option<Node> {
 /// segment, return the key position; otherwise descend into the value (which
 /// must itself be an array) and recurse.
 fn locate_at_path<'a>(array: Node<'a>, source: &[u8], path: &[&str]) -> Option<KeyPosition> {
+    entry_at_path(array, source, path).map(|entry| entry.key_position)
+}
+
+/// The source text of the value declared at `key_path`, exactly as written —
+/// `env('APP_NAME', 'Laravel')`, `'Laravel'`, `['a', 'b']`.
+///
+/// The structural counterpart to `config_lookup`'s byte scanner. Same answer
+/// for a well-formed entry; unlike the scanner it also reaches a key declared
+/// after a list entry, and a list index itself. Without it, completion and
+/// goto could offer a key whose value hover reported as missing, and whose use
+/// raised a false "not found" diagnostic.
+pub fn resolve_value_source(source: &str, key_path: &[&str]) -> Option<String> {
+    if key_path.is_empty() {
+        return None;
+    }
+    let tree = crate::parser::parse_php(source).ok()?;
+    let bytes = source.as_bytes();
+    let array = find_return_array(tree.root_node())?;
+    let entry = entry_at_path(array, bytes, key_path)?;
+    Some(entry.value_node.utf8_text(bytes).ok()?.trim().to_string())
+}
+
+/// Walk `array` along `path` and return the whole matching entry.
+fn entry_at_path<'a>(array: Node<'a>, source: &[u8], path: &[&str]) -> Option<ParsedEntry<'a>> {
     let (head, tail) = path.split_first()?;
     for entry in array_entries(array, source) {
         if entry.key_text != *head {
@@ -226,11 +284,11 @@ fn locate_at_path<'a>(array: Node<'a>, source: &[u8], path: &[&str]) -> Option<K
             continue;
         }
         if tail.is_empty() {
-            return Some(entry.key_position);
+            return Some(entry);
         }
         // Descend into the value, which must be another array.
         if let Some(nested) = find_array_in_expression(entry.value_node) {
-            return locate_at_path(nested, source, tail);
+            return entry_at_path(nested, source, tail);
         }
         // Path expects more nesting but the value isn't an array.
         return None;
@@ -269,10 +327,22 @@ fn array_entries<'a>(array: Node<'a>, source: &[u8]) -> Vec<ParsedEntry<'a>> {
         };
         match key_node {
             Some(key_node) => {
-                if let Some(n) = integer_literal_value(key_node, source) {
-                    next_index = Some(next_index.map_or(n + 1, |c| c.max(n + 1)));
+                let parsed = literal_key(key_node, source);
+                // PHP advances the counter past an integer key however it was
+                // spelled — bare `7 =>` or the string `'7' =>`, which it casts.
+                // `saturating_add` keeps a `PHP_INT_MAX` key from overflowing:
+                // debug builds panicked, release wrapped to i64::MIN and then
+                // synthesized negative indices for every later entry.
+                let as_int = integer_literal_value(key_node, source).or_else(|| {
+                    parsed
+                        .as_ref()
+                        .and_then(|(text, _)| php_canonical_int(text))
+                });
+                if let Some(n) = as_int {
+                    let next = n.saturating_add(1);
+                    next_index = Some(next_index.map_or(next, |c| c.max(next)));
                 }
-                if let Some((key_text, key_position)) = literal_key(key_node, source) {
+                if let Some((key_text, key_position)) = parsed {
                     out.push(ParsedEntry {
                         key_text,
                         key_position,
@@ -282,7 +352,7 @@ fn array_entries<'a>(array: Node<'a>, source: &[u8]) -> Vec<ParsedEntry<'a>> {
             }
             None => {
                 let Some(index) = next_index else { continue };
-                next_index = Some(index + 1);
+                next_index = Some(index.saturating_add(1));
                 out.push(ParsedEntry {
                     key_text: index.to_string(),
                     key_position: synthesized_index_position(value_node),
@@ -322,18 +392,47 @@ fn is_spread(node: Node) -> bool {
     spread
 }
 
-/// The integer a literal integer key denotes, e.g. `404 => …`.
+/// The integer a literal integer key denotes, e.g. `404 => …` or `-5 => …`.
+///
+/// A negative key is `unary_op_expression` wrapping an `integer`, never a bare
+/// `integer` with a sign in its text, so it needs its own branch — without it
+/// `-5 => 'x'` is dropped from enumeration entirely.
 fn integer_literal_value(node: Node, source: &[u8]) -> Option<i64> {
-    (node.kind() == "integer")
-        .then(|| node.utf8_text(source).ok()?.parse().ok())
-        .flatten()
+    match node.kind() {
+        "integer" => node.utf8_text(source).ok()?.parse().ok(),
+        "unary_op_expression" => {
+            let text = node.utf8_text(source).ok()?;
+            let inner = node.child_by_field_name("argument")?;
+            (inner.kind() == "integer" && text.starts_with('-'))
+                .then(|| text.parse().ok())
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// The integer a *string* key is cast to, following PHP's rule: a string key
+/// that is a canonical decimal integer becomes an integer key, and so advances
+/// the auto-index counter. `'7'` casts; `'07'`, `'+7'` and `'7.0'` do not.
+///
+/// Without this, `['7' => 'a', 'b']` numbers the keyless entry `0` instead of
+/// PHP's `8`, inventing a key that does not exist at runtime.
+fn php_canonical_int(text: &str) -> Option<i64> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// The dotted-path text a literal key contributes, and where it is declared.
 ///
-/// A quoted key reports `is_literal_key: true` — rename can rewrite it inside
-/// its quotes. An unquoted integer key (`404 => …`) reports `false`: it is a
-/// real, resolvable key, but replacing the bare digits with a name would
+/// A quoted key reports [`KeyKind::Quoted`] — rename can rewrite it inside its
+/// quotes. An unquoted integer key (`404 => …`) reports [`KeyKind::BareInteger`]:
+/// it is a real, resolvable key, but replacing the bare digits with a name would
 /// produce a constant lookup rather than a string key.
 fn literal_key(node: Node, source: &[u8]) -> Option<(String, KeyPosition)> {
     if let Some(text) = string_literal_text(node, source) {
@@ -439,8 +538,44 @@ fn unescape_php(body: &str, quote: char) -> String {
             Some('v') => out.push('\u{0B}'),
             Some('f') => out.push('\u{0C}'),
             Some('e') => out.push('\u{1B}'),
-            Some('0') => out.push('\0'),
             Some(next @ ('\\' | '"' | '$')) => out.push(next),
+            // `\xNN`, `\u{NNNN}` and octal `\NNN` — PHP resolves all three in
+            // a double-quoted context. Anything malformed is left as written
+            // rather than guessed at, matching PHP, which also emits the text.
+            Some('x') => match take_radix(&mut chars, 16, 2) {
+                Some(v) => out.push(v as u8 as char),
+                None => out.push_str("\\x"),
+            },
+            Some('u') if chars.as_str().starts_with('{') => {
+                chars.next();
+                let digits: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                match u32::from_str_radix(&digits, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                {
+                    Some(c) => out.push(c),
+                    None => {
+                        out.push_str("\\u{");
+                        out.push_str(&digits);
+                        out.push('}');
+                    }
+                }
+            }
+            Some(first @ '0'..='7') => {
+                // `\0` alone is NUL; `\101` is 'A'. Up to three octal digits,
+                // the first already consumed.
+                let mut value = first as u32 - '0' as u32;
+                for _ in 0..2 {
+                    match chars.clone().next().filter(|c| ('0'..='7').contains(c)) {
+                        Some(d) => {
+                            chars.next();
+                            value = value * 8 + (d as u32 - '0' as u32);
+                        }
+                        None => break,
+                    }
+                }
+                out.push((value as u8) as char);
+            }
             Some(other) => {
                 out.push('\\');
                 out.push(other);
@@ -450,13 +585,43 @@ fn unescape_php(body: &str, quote: char) -> String {
     out
 }
 
+/// Consume up to `max` digits in `radix` from `chars`, returning their value.
+/// `None` — leaving `chars` untouched — when the first character is not a
+/// digit, so a malformed escape can be emitted as written.
+fn take_radix(chars: &mut std::str::Chars, radix: u32, max: usize) -> Option<u32> {
+    let mut probe = chars.clone();
+    let mut value = 0u32;
+    let mut seen = 0usize;
+    while seen < max {
+        match probe.clone().next().and_then(|c| c.to_digit(radix)) {
+            Some(d) => {
+                probe.next();
+                value = value * radix + d;
+                seen += 1;
+            }
+            None => break,
+        }
+    }
+    (seen > 0).then(|| {
+        *chars = probe;
+        value
+    })
+}
+
 /// The display text of a non-array value. Statically knowable values are
 /// resolved to what PHP would produce; anything else falls back to its source
 /// text, which at least shows the reader where the value comes from.
 fn scalar_value_text(node: Node, source: &[u8]) -> String {
-    fold_value(node, source)
+    fold_value_bounded(node, source, 0)
         .unwrap_or_else(|| node.utf8_text(source).unwrap_or_default().to_string())
 }
+
+/// How deep [`fold_value`] will descend. PHP's `.` is left-associative, so an
+/// N-term concatenation is an N-deep AST; folding it by recursion overflowed
+/// the stack and aborted the whole language server on a file that merely
+/// contained one. Past this depth the value falls back to its source text,
+/// which is the same answer any unfoldable expression gets.
+const MAX_FOLD_DEPTH: u32 = 128;
 
 /// The runtime text of a value expression when it can be known without
 /// running PHP: a string literal, a heredoc or nowdoc body, or a `.`
@@ -465,7 +630,10 @@ fn scalar_value_text(node: Node, source: &[u8]) -> String {
 /// `None` for anything needing runtime state — `env(…)`, a constant, an
 /// interpolated variable — so the caller shows the source text instead of a
 /// confidently wrong answer.
-fn fold_value(node: Node, source: &[u8]) -> Option<String> {
+fn fold_value_bounded(node: Node, source: &[u8], depth: u32) -> Option<String> {
+    if depth >= MAX_FOLD_DEPTH {
+        return None;
+    }
     match node.kind() {
         "string" => string_literal_text(node, source),
         "encapsed_string" => {
@@ -504,15 +672,15 @@ fn fold_value(node: Node, source: &[u8]) -> Option<String> {
             if operator.utf8_text(source).ok()? != "." {
                 return None;
             }
-            let left = fold_value(node.child_by_field_name("left")?, source)?;
-            let right = fold_value(node.child_by_field_name("right")?, source)?;
+            let left = fold_value_bounded(node.child_by_field_name("left")?, source, depth + 1)?;
+            let right = fold_value_bounded(node.child_by_field_name("right")?, source, depth + 1)?;
             Some(left + &right)
         }
         "expression" | "primary_expression" | "parenthesized_expression" => {
             let mut cursor = node.walk();
             let folded = node
                 .named_children(&mut cursor)
-                .find_map(|child| fold_value(child, source));
+                .find_map(|child| fold_value_bounded(child, source, depth + 1));
             folded
         }
         _ => None,

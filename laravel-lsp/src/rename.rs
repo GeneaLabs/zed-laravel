@@ -90,6 +90,30 @@ pub fn can_rename(symbol: &SymbolRef) -> bool {
     )
 }
 
+/// Refuse a rename that produced no declaration edit.
+///
+/// [`can_rename`] gates on the symbol's KIND, but a dotted config or
+/// translation key can pass that gate and still have no rewritable
+/// declaration: since #369 a key spelled `404 =>`, or a list index like
+/// `providers.0`, is offered by completion and reachable by go-to-definition,
+/// yet neither has quoted text a new name could replace.
+///
+/// Call sites are collected unconditionally and earlier, so without this the
+/// rename would apply them alone — silently pointing every call at a key that
+/// does not exist. That is the "never call-sites-only" invariant [`can_rename`]
+/// documents, enforced rather than assumed.
+pub fn require_declaration_edits<T>(
+    key: &str,
+    declarations: Vec<T>,
+) -> Result<Vec<T>, tower_lsp::jsonrpc::Error> {
+    if declarations.is_empty() {
+        return Err(rename_error(format!(
+            "'{key}' cannot be renamed: it has no quoted declaration to rewrite."
+        )));
+    }
+    Ok(declarations)
+}
+
 /// Build a generic rename-related LSP error with the message a Zed toast
 /// will display. Wraps the verbose `jsonrpc::Error` boilerplate for the
 /// rename handler's many short-circuit cases (invalid new name, vendor

@@ -161,3 +161,58 @@ return [
         Some("'matched'")
     );
 }
+
+// ── #369: navigation and value resolution must agree ──────────────────────
+
+/// Every key the enumerator offers must also resolve to a value here.
+///
+/// These two paths used to be different implementations over the same file:
+/// completion and goto walked the AST, hover and the "not found" diagnostic
+/// counted brackets. The scanner stopped at the first entry it could not
+/// parse, so it disagreed exactly where list entries appear — and #369 made
+/// those keys reachable, turning a latent split into a visible one.
+#[test]
+fn every_enumerated_key_also_resolves_to_a_value() {
+    let src = r#"<?php
+return [
+    'options' => ['a', 'b'],
+    'after' => 'sibling',
+    404 => 'Not found',
+    'nested' => [
+        ['deep' => 'value'],
+    ],
+];
+"#;
+    let mut unresolved = Vec::new();
+    for (key, _, _) in crate::config_key_locator::enumerate_entries_in_source(src) {
+        let path: Vec<&str> = key.split('.').collect();
+        if resolve_in_source(src, &path).is_none() {
+            unresolved.push(key);
+        }
+    }
+    assert!(
+        unresolved.is_empty(),
+        "these keys are offered but resolve to nothing: {unresolved:?}"
+    );
+}
+
+#[test]
+fn a_key_after_a_list_entry_resolves() {
+    // The scanner returned None here: the list items before `after` aborted
+    // its whole walk.
+    let src = "<?php\nreturn [\n    'options' => ['a', 'b'],\n    'after' => 'sibling',\n];\n";
+    assert_eq!(
+        resolve_in_source(src, &["after"]).as_deref(),
+        Some("'sibling'")
+    );
+}
+
+#[test]
+fn a_list_index_resolves_to_its_element() {
+    // The scanner could never resolve a bare list index, for any array.
+    let src = "<?php\nreturn [\n    'options' => ['a', 'b'],\n];\n";
+    assert_eq!(
+        resolve_in_source(src, &["options", "1"]).as_deref(),
+        Some("'b'")
+    );
+}
