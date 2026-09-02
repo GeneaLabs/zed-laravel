@@ -481,7 +481,7 @@ return [
 }
 
 #[test]
-fn only_a_quoted_key_is_marked_renameable() {
+fn each_key_kind_reports_how_it_is_written() {
     let src = r#"<?php
 return [
     'quoted' => 'a',
@@ -489,12 +489,12 @@ return [
     'list' => ['c'],
 ];
 "#;
-    let flag = |path: &[&str]| locate_in_source(src, path).unwrap().is_literal_key;
-    assert!(flag(&["quoted"]), "a quoted key can be rewritten in place");
-    // Rewriting bare `404` would make it a constant lookup.
-    assert!(!flag(&["404"]));
-    // A list index has no source text at all.
-    assert!(!flag(&["list", "0"]));
+    let kind = |path: &[&str]| locate_in_source(src, path).unwrap().kind;
+    assert_eq!(kind(&["quoted"]), KeyKind::Quoted);
+    assert_eq!(kind(&["404"]), KeyKind::BareInteger);
+    assert_eq!(kind(&["list", "0"]), KeyKind::SynthesizedIndex);
+    // Every kind resolves — the distinction is only about the key's own text.
+    assert!(locate_in_source(src, &["list", "0"]).is_some());
 }
 
 #[test]

@@ -32,11 +32,28 @@ pub struct KeyPosition {
     pub line: u32,
     pub start_column: u32,
     pub end_column: u32,
-    /// True when the span covers a quoted key literal, which a rename may
-    /// rewrite in place. False for a synthesized list index (`sizes.0`) and
-    /// for an unquoted integer key (`404 => …`): both are real, navigable
-    /// keys, but neither has quoted text a new name could replace.
-    pub is_literal_key: bool,
+    /// How the key is written in the source. Each consumer accepts a
+    /// different set — see [`KeyKind`].
+    pub kind: KeyKind,
+}
+
+/// How an array key is spelled in the source, which decides what each feature
+/// may do with it. Every kind is equally *resolvable* — Laravel finds a value
+/// for all three — so completion and go-to-definition accept all of them. The
+/// distinctions matter only to features that need the key's own text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    /// `'name' => …` or `"name" => …`. The span covers the text inside the
+    /// quotes, so a rename can rewrite it in place. The only renameable kind.
+    Quoted,
+    /// `404 => …`. Real text at a real position, so a code lens can annotate
+    /// it, but a rename must not: replacing the bare digits with a name would
+    /// turn a string key into a constant lookup.
+    BareInteger,
+    /// The `0` in `['sm', 'md']` — an index PHP assigns, written nowhere. It
+    /// is a navigable key (`sizes.0` resolves), but there is no text to
+    /// annotate or rewrite, so the span is zero-width at the value's start.
+    SynthesizedIndex,
 }
 
 /// Locate the source position of `dotted_key` (e.g. `"app.name"`,
@@ -335,7 +352,7 @@ fn literal_key(node: Node, source: &[u8]) -> Option<(String, KeyPosition)> {
             } else {
                 start.column as u32
             },
-            is_literal_key: false,
+            kind: KeyKind::BareInteger,
         },
     ))
 }
@@ -348,7 +365,7 @@ fn synthesized_index_position(value_node: Node) -> KeyPosition {
         line: start.row as u32,
         start_column: start.column as u32,
         end_column: start.column as u32,
-        is_literal_key: false,
+        kind: KeyKind::SynthesizedIndex,
     }
 }
 
@@ -370,7 +387,7 @@ fn string_body_position(node: Node) -> KeyPosition {
         } else {
             start_column
         },
-        is_literal_key: true,
+        kind: KeyKind::Quoted,
     }
 }
 

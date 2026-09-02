@@ -2699,11 +2699,13 @@ pub fn locate_php_key_in_file(
     }
     let refs: Vec<&str> = key_path.iter().map(String::as_str).collect();
     let pos = crate::config_key_locator::locate_in_source(text, &refs)?;
+    // The bool is "may a rename rewrite this", the only distinction this
+    // boundary needs; `KeyKind` itself stays on the locator's side.
     Some((
         pos.line,
         pos.start_column,
         pos.end_column,
-        pos.is_literal_key,
+        pos.kind == crate::config_key_locator::KeyKind::Quoted,
     ))
 }
 

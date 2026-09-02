@@ -732,3 +732,34 @@ fn compound_lens_anchor_class_less_php_falls_back_to_line_zero() {
         "a class-less PHP file must fall back to the line-0 anchor"
     );
 }
+
+#[test]
+fn a_synthesized_list_index_gets_no_lens_but_a_bare_integer_key_does() {
+    let src = r#"<?php
+return [
+    'name' => 'App',
+    'providers' => [
+        App\Providers\A::class,
+        App\Providers\B::class,
+    ],
+    404 => 'Not found',
+];
+"#;
+    let keys: Vec<String> = config_lens_targets("app", src)
+        .into_iter()
+        .map(|t| match t.symbol {
+            SymbolRefData::Config(k) => k,
+            other => panic!("expected a config symbol, got {other:?}"),
+        })
+        .collect();
+    // `config('app.providers.0')` resolves, so it is enumerated and navigable
+    // — but it is written nowhere, so annotating it would put a zero-width
+    // lens on every entry of a providers array.
+    assert!(
+        !keys.iter().any(|k| k.starts_with("app.providers.")),
+        "got {keys:?}"
+    );
+    // `404` IS written, and `__('app.404')` is a real call, so it keeps a lens.
+    assert!(keys.contains(&"app.404".to_string()), "got {keys:?}");
+    assert_eq!(keys, vec!["app.name", "app.providers", "app.404"]);
+}

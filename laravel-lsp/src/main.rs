@@ -22397,11 +22397,11 @@ fn collect_config_declaration_target(
     let new_leaf = new_key.rsplit('.').next().unwrap_or(new_key).to_string();
     laravel_lsp::config_key_locator::locate_key_all(root, module_dirs, old_key)
         .into_iter()
-        // A key with no quoted text cannot be renamed in place: a list index
+        // Only a quoted key can be rewritten in place: a list index
         // (`providers.0`) has no source text at all, and rewriting a bare
         // `404 =>` would turn a string key into a constant lookup. Both stay
         // navigable; neither is an edit target.
-        .filter(|(_, pos)| pos.is_literal_key)
+        .filter(|(_, pos)| pos.kind == laravel_lsp::config_key_locator::KeyKind::Quoted)
         .map(|(file_path, pos)| laravel_lsp::rename::EditTarget {
             file_path,
             line: pos.line,

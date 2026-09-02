@@ -542,3 +542,38 @@ async fn the_completion_label_is_built_by_the_shared_helper() {
         "the completion label must come from `config_source_label`"
     );
 }
+
+#[test]
+fn rename_refuses_keys_that_have_no_quoted_text_to_rewrite() {
+    // Both keys below resolve — `config('codes.404')` and
+    // `config('codes.list.0')` return values — so both are enumerated and
+    // navigable. Neither may be a rename target: rewriting the bare `404`
+    // would turn a string key into a constant lookup, and a list index is
+    // written nowhere at all, so the edit would land on the value.
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+    std::fs::write(
+        tmp.path().join("config/codes.php"),
+        "<?php\nreturn [\n    'named' => 'ok',\n    404 => 'Not found',\n    'list' => ['a'],\n];\n",
+    )
+    .unwrap();
+
+    let targets =
+        |old: &str, new: &str| crate::collect_config_declaration_target(tmp.path(), &[], old, new);
+
+    assert!(
+        targets("codes.404", "codes.missing").is_empty(),
+        "a bare integer key is not a rename target"
+    );
+    assert!(
+        targets("codes.list.0", "codes.list.first").is_empty(),
+        "a synthesized list index is not a rename target"
+    );
+    // The control: an ordinary quoted key in the same file still renames, so
+    // the assertions above cannot pass by the lookup simply failing.
+    assert_eq!(
+        targets("codes.named", "codes.renamed").len(),
+        1,
+        "a quoted key is still rewritten"
+    );
+}

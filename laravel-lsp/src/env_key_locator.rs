@@ -131,7 +131,7 @@ pub fn locate_in_source(source: &str, key: &str) -> Option<KeyPosition> {
             line: line_idx as u32,
             start_column: start_col,
             end_column: end_col,
-            is_literal_key: true,
+            kind: crate::config_key_locator::KeyKind::Quoted,
         });
     }
     None
@@ -158,7 +158,7 @@ pub fn enumerate_keys_in_source(source: &str) -> Vec<(String, KeyPosition)> {
                 line: line_idx as u32,
                 start_column: start_col,
                 end_column: end_col,
-                is_literal_key: true,
+                kind: crate::config_key_locator::KeyKind::Quoted,
             },
         ));
     }
@@ -221,7 +221,7 @@ pub fn enumerate_commented_keys_in_source(source: &str) -> Vec<(String, KeyPosit
                 line: line_idx as u32,
                 start_column: start_col + offset,
                 end_column: end_col + offset,
-                is_literal_key: true,
+                kind: crate::config_key_locator::KeyKind::Quoted,
             },
         ));
     }
