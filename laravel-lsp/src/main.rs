@@ -5982,6 +5982,46 @@ impl LaravelLanguageServer {
         Some(decls)
     }
 
+    /// The inherited external-load name prefixes (issue #43) that apply to
+    /// `path`, read from the warm route index. Always includes `""`.
+    ///
+    /// `route_discovery::external_prefixes_for_file` answers the same question,
+    /// but it gets there by running `discover_route_files` — a `read_to_string`
+    /// of every `.php` file under `vendor/` (16k+ on a real project) on every
+    /// single call. `RouteIndex::external_prefixes` is the *identical* map:
+    /// `build_route_index` fills it from the same load-graph pass that produced
+    /// the routes, and `did_save` rebuilds the index whenever a contributing
+    /// file changes. So this is the same answer for free.
+    ///
+    /// Cold start (index not built yet) yields `[""]` — the same default
+    /// `RouteIndex::external_prefixes_for` gives for a file the load graph
+    /// never reached, and the answer that leaves route names unprefixed rather
+    /// than guessing a prefix.
+    async fn cached_external_prefixes(&self, path: &Path) -> Vec<String> {
+        let guard = self.route_index.read().await;
+        guard
+            .as_ref()
+            .map(|index| index.external_prefixes_for(path))
+            .unwrap_or_else(|| vec![String::new()])
+    }
+
+    /// The whole normalized-path → inherited-prefixes map from the warm route
+    /// index, for callers that need it for many files at once.
+    ///
+    /// Cloned out rather than handed back behind the `RwLock` guard: callers
+    /// iterate the map across `.await` points that take other locks, and
+    /// holding a read guard across those is how deadlocks start. The map holds
+    /// one small entry per contributing route file, so the clone is far cheaper
+    /// than the vendor walk it replaces. Cold start yields an empty map, which
+    /// every caller already reads as `[""]` per file.
+    async fn cached_external_prefix_map(&self) -> HashMap<PathBuf, Vec<String>> {
+        let guard = self.route_index.read().await;
+        guard
+            .as_ref()
+            .map(|index| index.external_prefixes.clone())
+            .unwrap_or_default()
+    }
+
     /// The fully-qualified Folio route name a `.blade.php` page declares, IF the
     /// cursor at `position` sits on the page's own `name('...')` helper call.
     ///
@@ -22080,11 +22120,14 @@ async fn classify_with_decl_fallback(
     // project-level name (`admin.x`). Anchor the symbol to that resolved name
     // so find-references / rename match every contributing site across files.
     // The raw name still matches via `find_declarations_named_with_external`'s
-    // always-present `""` prefix. `external_prefixes_for_file` runs the
-    // cross-file load graph, so it's only worth paying when `root` is known.
-    let resolved = root
-        .map(|r| laravel_lsp::route_discovery::external_prefixes_for_file(r, file_path))
-        .and_then(|prefixes| prefixes.into_iter().find(|p| !p.is_empty()))
+    // always-present `""` prefix. Read from the warm route index — the
+    // cross-file load graph already ran once at index build time, and rerunning
+    // it here would re-read the whole vendor tree per request (issue #80).
+    let resolved = server
+        .cached_external_prefixes(file_path)
+        .await
+        .into_iter()
+        .find(|p| !p.is_empty())
         .map(|primary| format!("{}{}", primary, decl.full_name))
         .unwrap_or_else(|| decl.full_name.clone());
 
@@ -22094,9 +22137,12 @@ async fn classify_with_decl_fallback(
 /// Look up the source-text range a `prepare_rename` should return when the
 /// cursor sat on a declaration-fallback site (parser saw nothing, but the
 /// locator did). Used for prepare_rename's editor-highlight range.
+///
+/// Takes no project root: the external-load prefixes it needs come from the
+/// server's warm route index, which is already keyed by absolute path (issue
+/// #80).
 async fn decl_range_at(
     server: &LaravelLanguageServer,
-    root: Option<&Path>,
     file_path: &Path,
     position: Position,
     symbol: &laravel_lsp::references::SymbolRef,
@@ -22109,9 +22155,8 @@ async fn decl_range_at(
     if let Some(decls) = server.cached_route_decls(file_path).await {
         // `name` may carry an external-file group prefix (issue #43); match a raw
         // in-file decl whose name equals `name` once that prefix is prepended.
-        let external = root
-            .map(|r| laravel_lsp::route_discovery::external_prefixes_for_file(r, file_path))
-            .unwrap_or_else(|| vec![String::new()]);
+        // Warm-index read, not a fresh load-graph walk (issue #80).
+        let external = server.cached_external_prefixes(file_path).await;
         for d in decls.iter().filter(|d| {
             external
                 .iter()
@@ -22350,10 +22395,11 @@ async fn collect_declaration_locations(
             if !routes_dir.exists() {
                 return out;
             }
-            // Inherited external-load prefixes for EVERY route file, computed
-            // once per request instead of re-running the project load graph per
-            // file inside the loop below (avoids O(files²)).
-            let external_prefix_map = laravel_lsp::route_discovery::external_prefixes_map(root);
+            // Inherited external-load prefixes for EVERY route file, read from
+            // the warm route index. `external_prefixes_map` computes the same
+            // map, but by re-walking the vendor tree on every request (issue
+            // #80); the index already holds it, refreshed on save.
+            let external_prefix_map = server.cached_external_prefix_map().await;
             for entry in WalkDir::new(&routes_dir)
                 .max_depth(6)
                 .into_iter()
@@ -22571,10 +22617,11 @@ async fn collect_route_declaration_targets(
     let mut targets = Vec::new();
     let routes_dir = root.join("routes");
     if routes_dir.exists() {
-        // Inherited external-load prefixes for EVERY route file, computed once
-        // per request instead of re-running the project load graph per file
-        // inside the loop below (avoids O(files²)).
-        let external_prefix_map = laravel_lsp::route_discovery::external_prefixes_map(root);
+        // Inherited external-load prefixes for EVERY route file, read from the
+        // warm route index. `external_prefixes_map` computes the same map, but
+        // by re-walking the vendor tree on every request (issue #80); the index
+        // already holds it, refreshed on save.
+        let external_prefix_map = server.cached_external_prefix_map().await;
         for entry in WalkDir::new(&routes_dir)
             .max_depth(6)
             .into_iter()
@@ -24972,24 +25019,28 @@ impl LanguageServer for LaravelLanguageServer {
         // externally-prefixed route file we recompute the route symbols here
         // with the prefix applied; every other file uses the cached Salsa
         // result unchanged.
-        let root_path = self.root_path.read().await.clone();
+        //
+        // Ordering matters (issue #80): the prefix lookup reads the warm route
+        // index, and nothing more expensive than that runs before the
+        // "is there actually a prefix?" test. This handler used to call
+        // `route_discovery::external_prefixes_for_file`, which re-walked the
+        // whole vendor tree *first* and then threw the result away for the
+        // overwhelmingly common unprefixed file — 510 ms per repeat request on
+        // a routes file against 0.2 ms on any other PHP file.
         if laravel_lsp::document_symbols::classify_file(&file_path)
             == laravel_lsp::document_symbols::FileKind::RouteFile
         {
-            if let Some(root) = root_path.as_ref() {
-                let external =
-                    laravel_lsp::route_discovery::external_prefixes_for_file(root, &file_path);
-                if external.iter().any(|p| !p.is_empty()) {
-                    if let Some(content) = self.document_or_disk_content(uri, &file_path).await {
-                        let entries = laravel_lsp::document_symbols::extract_symbols_with_external(
-                            &content,
-                            laravel_lsp::document_symbols::FileKind::RouteFile,
-                            &external,
-                        );
-                        let symbols: Vec<DocumentSymbol> =
-                            entries.iter().map(symbol_entry_to_lsp).collect();
-                        return Ok(Some(DocumentSymbolResponse::Nested(symbols)));
-                    }
+            let external = self.cached_external_prefixes(&file_path).await;
+            if external.iter().any(|p| !p.is_empty()) {
+                if let Some(content) = self.document_or_disk_content(uri, &file_path).await {
+                    let entries = laravel_lsp::document_symbols::extract_symbols_with_external(
+                        &content,
+                        laravel_lsp::document_symbols::FileKind::RouteFile,
+                        &external,
+                    );
+                    let symbols: Vec<DocumentSymbol> =
+                        entries.iter().map(symbol_entry_to_lsp).collect();
+                    return Ok(Some(DocumentSymbolResponse::Nested(symbols)));
                 }
             }
         }
@@ -25260,7 +25311,7 @@ impl LanguageServer for LaravelLanguageServer {
         let pattern_range = pattern_range_at(&patterns, position.line, position.character);
         let range = match pattern_range {
             Some(r) => Some(r),
-            None => decl_range_at(self, root_path.as_deref(), &file_path, position, &symbol).await,
+            None => decl_range_at(self, &file_path, position, &symbol).await,
         };
         match &range {
             Some(r) => debug!(

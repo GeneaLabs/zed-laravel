@@ -62,6 +62,7 @@ mod render_index_and_buffer_integrity;
 mod route_binding_resolution;
 mod route_diagnostics;
 mod route_hover;
+mod route_prefix_cache;
 mod routes_dir_gate;
 mod scan_dir_containment;
 mod slot_navigation_containment;
