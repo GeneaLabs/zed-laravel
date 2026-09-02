@@ -21,7 +21,7 @@ use walkdir::WalkDir;
 use laravel_lsp::cache_manager::{
     BindingEntry, CacheManager, CachedLaravelConfig, MiddlewareEntry, RescanType, ScanResult,
 };
-use laravel_lsp::command_index::{build_command_index, CommandIndex};
+use laravel_lsp::command_index::CommandIndex;
 use laravel_lsp::completion_format::CompletionDoc;
 use laravel_lsp::config::{find_project_root, is_same_git_repo};
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
@@ -17641,9 +17641,16 @@ return [
         self.restore_command_index_from_disk(root).await;
 
         let root_buf = root.to_path_buf();
-        let index = tokio::task::spawn_blocking(move || build_command_index(&root_buf)).await;
-        match index {
-            Ok(index) => self.publish_command_index(root, index).await,
+        let vendor = self.vendor_index(root).await;
+        let scan = tokio::task::spawn_blocking(move || {
+            // Per-file mtime skip (issue #371): an unchanged file costs a
+            // `metadata` call and a hash lookup instead of a read plus regex.
+            let cache = laravel_lsp::command_disk_cache::load_scan(&root_buf);
+            laravel_lsp::command_index::scan_commands(&root_buf, &vendor, cache.as_ref())
+        })
+        .await;
+        match scan {
+            Ok(scan) => self.publish_command_scan(root, scan).await,
             Err(e) => {
                 tracing::warn!("Failed to build command index: {}", e);
             }
@@ -17678,26 +17685,33 @@ return [
     ///
     /// The save is advisory — a failure doesn't affect the live in-memory
     /// index, it only costs the next cold start its shortcut.
-    async fn publish_command_index(
+    async fn publish_command_scan(
         &self,
         root: &Path,
-        index: laravel_lsp::command_index::CommandIndex,
+        scan: laravel_lsp::command_index::CommandScan,
     ) {
-        info!("🎛️  Command index built: {} commands", index.len());
+        info!(
+            "🎛️  Command index built: {} commands from {} files",
+            scan.index.len(),
+            scan.files.len()
+        );
 
-        let to_save = index.clone();
+        // Persist every file's verdict, not just the declarations — the
+        // "declares nothing" answers are what let the next scan skip the read
+        // (issue #371).
+        let files = scan.files;
         let root_for_save = root.to_path_buf();
         let saved = tokio::task::spawn_blocking(move || {
-            laravel_lsp::command_disk_cache::save_index(&to_save, &root_for_save)
+            laravel_lsp::command_disk_cache::save_scan(&files, &root_for_save)
         })
         .await;
         match saved {
-            Ok(Ok(n)) => info!("🗄️  Command disk cache: saved {} commands", n),
+            Ok(Ok(n)) => info!("🗄️  Command disk cache: saved {} file verdicts", n),
             Ok(Err(e)) => debug!("Command disk cache save failed: {}", e),
             Err(e) => debug!("Command disk cache save task panicked: {}", e),
         }
 
-        *self.command_index.write().await = Some(index);
+        *self.command_index.write().await = Some(scan.index);
     }
 
     /// Rebuild the route index and the command index together, from ONE pass
@@ -17718,8 +17732,12 @@ return [
         let vendor = self.vendor_index(root).await;
         let root_buf = root.to_path_buf();
         let built = tokio::task::spawn_blocking(move || {
-            let (files, commands) =
-                laravel_lsp::vendor_scan::build_route_files_and_command_index(&root_buf, &vendor);
+            let cache = laravel_lsp::command_disk_cache::load_scan(&root_buf);
+            let (files, commands) = laravel_lsp::vendor_scan::build_route_files_and_command_index(
+                &root_buf,
+                &vendor,
+                cache.as_ref(),
+            );
             let file_count = files.len();
             let routes = build_route_index(&root_buf, &files);
             (file_count, routes, commands)
@@ -17734,7 +17752,7 @@ return [
                     file_count
                 );
                 *self.route_index.write().await = Some(routes);
-                self.publish_command_index(root, commands).await;
+                self.publish_command_scan(root, commands).await;
             }
             Err(e) => {
                 tracing::warn!("Failed to build vendor-derived indexes: {}", e);

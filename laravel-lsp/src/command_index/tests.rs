@@ -301,3 +301,231 @@ fn shared_vendor_walk_keeps_the_same_winner_on_a_same_tier_collision() {
          or this test proves nothing about order"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Per-file mtime skip (issue #371)
+// ---------------------------------------------------------------------------
+//
+// `build_command_index` read and regex-scanned every `*.php` file in the
+// project AND `vendor/` on every startup, and on every watched change under a
+// `Commands/` directory — 16,202 files on this repo's `test-project/`. The disk
+// cache existed but only accelerated the cold-start display: the full walk ran
+// afterwards unconditionally, because a cache holding only DECLARATIONS cannot
+// say "these 16,000 other files still declare nothing".
+//
+// The observable for "was this file read?" is a file whose on-disk contents no
+// longer match the cached verdict. If the scan reads it, the new contents win;
+// if it trusts the cache, the old verdict survives. That discriminates a real
+// skip from a scan that merely produces the right answer by re-reading.
+
+use crate::command_disk_cache::{load_scan, save_scan, CommandScanCache};
+use crate::vendor_index::VendorIndex;
+
+/// Scan `root` twice: once cold, then once with the first scan's verdicts.
+fn scan_twice(root: &Path) -> (CommandScan, CommandScanCache) {
+    let vendor = VendorIndex::build(root);
+    let first = scan_commands(root, &vendor, None);
+    save_scan(&first.files, root).unwrap();
+    let cache = load_scan(root).expect("the scan we just saved must load");
+    (first, cache)
+}
+
+/// The file's mtime in the `(secs, nanos)` form the cache stores.
+fn mtime_of(path: &Path) -> (u64, u32) {
+    let d = std::fs::metadata(path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap();
+    (d.as_secs(), d.subsec_nanos())
+}
+
+#[test]
+fn an_unchanged_file_is_not_reread() {
+    // Discriminator: the cache is given a verdict that DISAGREES with the
+    // file's contents, stamped with the file's real current mtime. A scan that
+    // re-reads reports what is on disk; one that honours the cache reports the
+    // planted verdict. Built through the public save/load API rather than by
+    // rewinding the clock, so it needs no extra dependency.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("app/Console/Commands")).unwrap();
+    let cmd = root.join("app/Console/Commands/Send.php");
+    std::fs::write(&cmd, command_class("Send", "mail:ondisk")).unwrap();
+
+    let (secs, nanos) = mtime_of(&cmd);
+    let planted = crate::command_disk_cache::ScannedFile {
+        mtime_secs: secs,
+        mtime_nanos: nanos,
+        path: cmd.clone(),
+        entry: Some(CommandEntry {
+            name: "mail:cached".to_string(),
+            class_name: "Send".to_string(),
+            raw_signature: "mail:cached".to_string(),
+            file: cmd.clone(),
+            line: 0,
+            start_column: 0,
+            end_column: 0,
+            priority: CommandPriority::App,
+        }),
+    };
+    save_scan(&[planted], root).unwrap();
+    let cache = load_scan(root).expect("the planted scan must load");
+
+    let vendor = VendorIndex::build(root);
+    let scan = scan_commands(root, &vendor, Some(&cache));
+
+    assert!(
+        scan.index.resolve("mail:cached").is_some(),
+        "an unchanged mtime must be answered from the cache"
+    );
+    assert!(
+        scan.index.resolve("mail:ondisk").is_none(),
+        "the file was never read, so its on-disk signature cannot have been seen          — if this resolves, the scan is still reading every file"
+    );
+}
+
+#[test]
+fn a_changed_file_is_reread() {
+    // The other half: the skip must not survive a real edit, or the index goes
+    // permanently stale.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("app/Console/Commands")).unwrap();
+    let cmd = root.join("app/Console/Commands/Send.php");
+    std::fs::write(&cmd, command_class("Send", "mail:send")).unwrap();
+
+    let (_, cache) = scan_twice(root);
+
+    // A genuine edit: contents AND mtime move.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    std::fs::write(&cmd, command_class("Send", "mail:changed")).unwrap();
+
+    let vendor = VendorIndex::build(root);
+    let second = scan_commands(root, &vendor, Some(&cache));
+
+    assert!(
+        second.index.resolve("mail:changed").is_some(),
+        "a changed mtime must force a re-read"
+    );
+    assert!(second.index.resolve("mail:send").is_none());
+}
+
+#[test]
+fn a_new_file_is_read_even_though_the_cache_is_fresh() {
+    // A cache of declarations could never authorise skipping a file it had
+    // never seen. Neither may this one.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("app/Console/Commands")).unwrap();
+    std::fs::write(
+        root.join("app/Console/Commands/Send.php"),
+        command_class("Send", "mail:send"),
+    )
+    .unwrap();
+
+    let (_, cache) = scan_twice(root);
+
+    std::fs::write(
+        root.join("app/Console/Commands/Prune.php"),
+        command_class("Prune", "db:prune"),
+    )
+    .unwrap();
+
+    let vendor = VendorIndex::build(root);
+    let second = scan_commands(root, &vendor, Some(&cache));
+
+    assert!(
+        second.index.resolve("db:prune").is_some(),
+        "a file with no cached verdict must be read"
+    );
+    assert!(
+        second.index.resolve("mail:send").is_some(),
+        "and the cached one is still served"
+    );
+}
+
+#[test]
+fn a_deleted_file_leaves_the_index() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("app/Console/Commands")).unwrap();
+    let cmd = root.join("app/Console/Commands/Send.php");
+    std::fs::write(&cmd, command_class("Send", "mail:send")).unwrap();
+
+    let (_, cache) = scan_twice(root);
+    std::fs::remove_file(&cmd).unwrap();
+
+    let vendor = VendorIndex::build(root);
+    let second = scan_commands(root, &vendor, Some(&cache));
+
+    assert!(
+        second.index.resolve("mail:send").is_none(),
+        "a deleted file is never walked, so its cached verdict is never replayed"
+    );
+}
+
+#[test]
+fn the_scan_records_a_verdict_for_every_file_including_non_commands() {
+    // The negative verdicts ARE the feature. Recording only declarations is
+    // what made the old cache unable to skip anything.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("app/Console/Commands")).unwrap();
+    std::fs::write(
+        root.join("app/Console/Commands/Send.php"),
+        command_class("Send", "mail:send"),
+    )
+    .unwrap();
+    std::fs::write(root.join("app/Plain.php"), "<?php\nclass Plain {}\n").unwrap();
+
+    let vendor = VendorIndex::build(root);
+    let scan = scan_commands(root, &vendor, None);
+
+    assert_eq!(
+        scan.files.len(),
+        2,
+        "both files get a verdict: {:?}",
+        scan.files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>()
+    );
+    let plain = scan
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("Plain.php"))
+        .expect("the non-command file must be recorded");
+    assert!(
+        plain.entry.is_none(),
+        "its verdict is `declares nothing` — a real answer, not an absence"
+    );
+}
+
+#[test]
+fn an_unusable_cache_degrades_to_a_full_scan() {
+    // Missing, stale or schema-mismatched: every one must fall back to reading,
+    // never to a wrong index.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("app/Console/Commands")).unwrap();
+    std::fs::write(
+        root.join("app/Console/Commands/Send.php"),
+        command_class("Send", "mail:send"),
+    )
+    .unwrap();
+
+    let vendor = VendorIndex::build(root);
+    assert!(
+        scan_commands(root, &vendor, None)
+            .index
+            .resolve("mail:send")
+            .is_some(),
+        "no cache at all must still find the command"
+    );
+    assert!(
+        load_scan(root).is_none(),
+        "fixture check — nothing has been saved for this project yet"
+    );
+}

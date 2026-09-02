@@ -7,7 +7,7 @@
 //! 2. **Fewer reads.** If it did not, the module would be pure overhead.
 
 use super::*;
-use crate::command_index::{build_command_index_with_vendor, CommandPriority};
+use crate::command_index::{build_command_index_with_vendor, CommandIndex, CommandPriority};
 use crate::route_discovery::discover_route_files_with_vendor;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -74,7 +74,8 @@ fn combined_pass_produces_the_same_two_indexes_as_building_them_separately() {
     seed(root);
     let vendor = VendorIndex::build(root);
 
-    let (routes, commands) = build_route_files_and_command_index(root, &vendor);
+    let (routes, commands) = build_route_files_and_command_index(root, &vendor, None);
+    let commands = commands.index;
     let routes_alone = discover_route_files_with_vendor(root, &vendor);
     let commands_alone = build_command_index_with_vendor(root, &vendor);
 
@@ -120,7 +121,8 @@ fn combined_pass_keeps_each_consumers_own_limits() {
     seed(root);
     let vendor = VendorIndex::build(root);
 
-    let (routes, commands) = build_route_files_and_command_index(root, &vendor);
+    let (routes, commands) = build_route_files_and_command_index(root, &vendor, None);
+    let commands = commands.index;
 
     assert!(
         commands
