@@ -243,16 +243,29 @@ fn detect_method_name_position_detects_instance_past_multibyte_char() {
 // *absence* of a cut rather than a safe one.
 //
 // `extract_translation_value` moved into `salsa_impl` when translation reads
-// were routed through Salsa (issue #293); it is the same function, and this
-// coverage follows it rather than being dropped.
+// were routed through Salsa (issue #293), then was retired outright by #369
+// along with the rest of the per-line text scanner. The property it guarded is
+// now `config_key_locator::enumerate_entries_in_source`'s, so this coverage
+// follows it a second time rather than being dropped.
+
+/// The display value the catalogue walker reports for a single entry — the
+/// successor to `extract_translation_value`, exercised through a real
+/// catalogue because the walker parses a file rather than a line.
+fn translation_display_value(value: &str) -> String {
+    let source = format!("<?php\n\nreturn [\n    'key' => '{}',\n];\n", value);
+    laravel_lsp::config_key_locator::enumerate_entries_in_source(&source)
+        .into_iter()
+        .find(|(key, _, _)| key == "key")
+        .map(|(_, value, _)| value)
+        .expect("the catalogue declares 'key'")
+}
 
 #[test]
 fn translation_value_truncation_is_char_boundary_safe() {
     // 199 ASCII chars, then a two-byte 'č', then padding well past the old
     // 200-char limit — the cut point the byte slice used to panic on.
     let value: String = "a".repeat(199) + "č" + &"é".repeat(50);
-    let line = format!("'key' => '{}',", value);
-    let display = laravel_lsp::salsa_impl::extract_translation_value(&line);
+    let display = translation_display_value(&value);
     assert_eq!(display, value, "the extractor must not truncate at all");
 }
 
@@ -261,8 +274,7 @@ fn translation_value_under_two_hundred_chars_is_not_truncated() {
     // A 30-char/60-byte Czech string used to get truncated (and could
     // panic) under the old byte-slice/50-char threshold.
     let value = "č".repeat(30);
-    let line = format!("'key' => '{}',", value);
-    let display = laravel_lsp::salsa_impl::extract_translation_value(&line);
+    let display = translation_display_value(&value);
     assert_eq!(display, value);
 }
 
@@ -287,11 +299,7 @@ fn config_value_under_two_hundred_chars_is_not_truncated() {
 #[test]
 fn a_five_thousand_char_translation_value_survives_extraction_whole() {
     let value = "ž".repeat(5_000);
-    let line = format!("'key' => '{}',", value);
-    assert_eq!(
-        laravel_lsp::salsa_impl::extract_translation_value(&line),
-        value
-    );
+    assert_eq!(translation_display_value(&value), value);
 }
 
 #[test]
