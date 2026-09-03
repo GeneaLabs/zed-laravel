@@ -184,7 +184,7 @@ class AppServiceProvider extends ServiceProvider {
     let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_v1);
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     backend
@@ -261,7 +261,7 @@ class AppServiceProvider extends ServiceProvider {
     let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_v1);
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     backend
@@ -368,7 +368,7 @@ class AppServiceProvider extends ServiceProvider {
     let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_src);
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     backend
@@ -455,7 +455,7 @@ class AppServiceProvider extends ServiceProvider {
     let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_v1);
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     backend
@@ -542,7 +542,7 @@ class AppServiceProvider extends ServiceProvider {
     let provider = write_file(root, "app/Providers/AppServiceProvider.php", provider_src);
     backend
         .salsa
-        .register_config_files(root.to_path_buf(), None, None, None)
+        .register_config_files(root.to_path_buf(), None, None, None, None)
         .await
         .unwrap();
     backend
@@ -824,6 +824,14 @@ async fn incremental_batch_runs_regardless_of_project_size() {
             vec![root.join("resources/views")],
             None,
             PathBuf::from("routes"),
+            // The shared vendor walk the production caller passes in
+            // (issue #371) — built from the same root, so the actor
+            // registers exactly what it would in production.
+            laravel_lsp::vendor_index::VendorIndex::build(root)
+                .files()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect(),
         )
         .await
         .unwrap();
@@ -1234,5 +1242,220 @@ async fn app_file_open_does_not_trigger_vendor_refresh() {
         backend.vendor_open_magic_lru.lock().unwrap().len(),
         0,
         "an app open must not occupy a vendor-LRU slot"
+    );
+}
+
+/// A provider changing ON DISK must drop the cached Livewire class-namespace
+/// map, not just the vendor translation namespaces.
+///
+/// The map's registrations are gated on the class DIRECTORY existing, so a
+/// registration that failed that gate at index time stayed failed for the rest
+/// of the session. `artisan module:make-livewire Counter Blog` creates the
+/// first component — and `Livewire/` with it — through the watcher, never the
+/// editor, so `<livewire:blog::counter>` stayed dead until the user happened
+/// to edit a provider in the editor or restarted the server. Same for a
+/// `git pull` or a branch switch that adds a provider.
+#[tokio::test]
+async fn a_watched_provider_change_drops_the_cached_livewire_config() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    fs::write(root.join("composer.json"), COMPOSER).unwrap();
+    let backend = backend_for(root).await;
+
+    let provider = write_file(
+        root,
+        "app/Providers/AppServiceProvider.php",
+        "<?php\nnamespace App\\Providers;\nclass AppServiceProvider {}\n",
+    );
+
+    // Prime the cache the way `get_cached_livewire` does.
+    *backend.cached_livewire.write().await = Some((
+        root.to_path_buf(),
+        laravel_lsp::livewire_config::LivewireConfig::defaults(root),
+        laravel_lsp::livewire_version::LivewireVersion::V3,
+    ));
+    assert!(
+        backend.cached_livewire.read().await.is_some(),
+        "precondition: the cache is primed"
+    );
+
+    backend
+        .did_change_watched_files(watched(&provider, FileChangeType::CHANGED))
+        .await;
+    drain_batch(&backend).await;
+
+    assert!(
+        backend.cached_livewire.read().await.is_none(),
+        "a provider change on disk must invalidate the Livewire namespace map"
+    );
+}
+
+// === Parse budget in the watched batch (issue #371) =========================
+//
+// The warm pass refuses to parse `*.json.php` blobs and anything over 256 KB
+// (0.4–2.2 s per file; 1,735 blobs under `aws-sdk-php` alone). This path had
+// neither rule, so a `composer install` — which rewrites thousands of vendor
+// files — drained them all serially through the single Salsa actor thread,
+// uncapped. It was also inconsistent: files the warm pass deliberately left
+// unindexed were being pulled in by a watched change.
+//
+// The observable is convergence. A dependent gains `headline` only when the
+// batch actually parsed the model declaring `getHeadlineAttribute`, so a
+// consumer that stays empty is a model that was not parsed. Each exclusion test
+// is paired with a control differing ONLY in the excluded property, so a test
+// that stayed green because the fixture never converged at all would fail its
+// control.
+
+/// Pad `src` past the parse budget with a trailing PHP comment, leaving the
+/// class declaration byte-identical to the unpadded control.
+fn padded_past_budget(src: &str) -> String {
+    let cap = laravel_lsp::parse_budget::MAX_PARSED_FILE_SIZE_BYTES as usize;
+    let mut out = String::from(src);
+    out.push_str("\n// ");
+    out.push_str(&"x".repeat(cap + 1));
+    out.push('\n');
+    out
+}
+
+/// Drive one file through `run_magic_batch_once` as a present, changed file,
+/// and report the members the consumer resolved.
+async fn batch_and_read_consumer(
+    backend: &LaravelLanguageServer,
+    model: &Path,
+    consumer: &Path,
+) -> HashSet<String> {
+    let mut batch = HashMap::new();
+    batch.insert(
+        model.to_path_buf(),
+        PendingWatchedChange {
+            old_surfaces: HashMap::new(),
+            old_render_views: Vec::new(),
+            deleted: false,
+        },
+    );
+    backend.run_magic_batch_once(batch).await;
+    member_names(backend, consumer).await
+}
+
+#[tokio::test]
+async fn the_batch_parses_a_model_within_the_budget() {
+    // Control for both exclusion tests below. Same model, same consumer, same
+    // batch — only the size and the filename differ there.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let backend = backend_for(root).await;
+    write_file(root, "composer.json", COMPOSER);
+
+    let post_src = post_with_accessors(&["Headline"]);
+    let post = write_file(root, "app/Models/Post.php", &post_src);
+    let consumer = write_file(root, "app/Http/Controllers/PostController.php", CONSUMER);
+    seed(&backend, &consumer, CONSUMER).await;
+
+    let members = batch_and_read_consumer(&backend, &post, &consumer).await;
+
+    assert!(
+        members.contains("headline"),
+        "a model inside the parse budget must still converge its dependent — \
+         without this the exclusion tests below would pass for the wrong \
+         reason; got {members:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_batch_skips_a_model_over_the_size_cap() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let backend = backend_for(root).await;
+    write_file(root, "composer.json", COMPOSER);
+
+    // Byte-identical class declaration to the control, padded past the cap.
+    let post_src = padded_past_budget(&post_with_accessors(&["Headline"]));
+    let post = write_file(root, "app/Models/Post.php", &post_src);
+    let consumer = write_file(root, "app/Http/Controllers/PostController.php", CONSUMER);
+    seed(&backend, &consumer, CONSUMER).await;
+
+    let members = batch_and_read_consumer(&backend, &post, &consumer).await;
+
+    assert!(
+        !members.contains("headline"),
+        "a model past the 256 KB cap must not be parsed by the batch — the warm \
+         pass excludes it, and parsing it here both costs 0.4–2.2 s and pulls \
+         in a file the rest of the pipeline ignores; got {members:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_batch_skips_a_json_php_blob() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let backend = backend_for(root).await;
+    write_file(root, "composer.json", COMPOSER);
+
+    // Small enough to pass the size cap, so only the `.json.php` rule can
+    // exclude it.
+    let post_src = post_with_accessors(&["Headline"]);
+    let post = write_file(root, "app/Models/Post.json.php", &post_src);
+    let consumer = write_file(root, "app/Http/Controllers/PostController.php", CONSUMER);
+    seed(&backend, &consumer, CONSUMER).await;
+    assert!(
+        post_src.len() < laravel_lsp::parse_budget::MAX_PARSED_FILE_SIZE_BYTES as usize,
+        "fixture check — this file must be excluded for its NAME, not its size"
+    );
+
+    let members = batch_and_read_consumer(&backend, &post, &consumer).await;
+
+    assert!(
+        !members.contains("headline"),
+        "a `.json.php` data blob must not be parsed by the batch; got {members:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_excluded_file_withdraws_its_earlier_contributions() {
+    // The rarer case the delete-shaped handling exists for: a file indexed
+    // while small, then grown past the cap by a `composer install`. Its
+    // contributions can no longer be maintained, so they are withdrawn and
+    // rippled to dependents rather than left to rot.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let backend = backend_for(root).await;
+    write_file(root, "composer.json", COMPOSER);
+
+    // Post reads its OWN accessor, so it holds a `by_file` dependency
+    // contribution — the thing the withdrawal has to purge. `post_with_accessors`
+    // alone only declares the accessor and contributes nothing.
+    let small_src = "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Post extends Model {\n    public function getHeadlineAttribute(): string { return ''; }\n    public function describe(): string { return $this->headline; }\n}\n".to_string();
+    let post = write_file(root, "app/Models/Post.php", &small_src);
+    let consumer = write_file(root, "app/Http/Controllers/PostController.php", CONSUMER);
+    seed(&backend, &post, &small_src).await;
+    seed(&backend, &consumer, CONSUMER).await;
+    assert!(
+        member_names(&backend, &consumer).await.contains("headline"),
+        "fixture check — the dependent must be converged BEFORE the file grows"
+    );
+    assert!(magic_deps_has(&backend, &post));
+
+    // The file grows past the cap on disk, then a watched change arrives.
+    fs::write(&post, padded_past_budget(&small_src)).unwrap();
+    let old_surfaces = backend
+        .salsa
+        .file_class_surfaces(post.clone())
+        .await
+        .unwrap();
+    let mut batch = HashMap::new();
+    batch.insert(
+        post.clone(),
+        PendingWatchedChange {
+            old_surfaces,
+            old_render_views: Vec::new(),
+            deleted: false,
+        },
+    );
+    backend.run_magic_batch_once(batch).await;
+
+    assert!(
+        !magic_deps_has(&backend, &post),
+        "a file that has left the parse budget must have its dependency \
+         contributions purged, not stranded"
     );
 }

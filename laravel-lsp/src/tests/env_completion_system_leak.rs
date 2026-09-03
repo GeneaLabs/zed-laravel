@@ -34,9 +34,9 @@
 //! stays green under that mutation by design: its fixture `.env` declares the
 //! process variable's own name, so the deleted loop's own
 //! `!seen_names.contains(&name)` guard skipped that variable even before this
-//! fix. A second mutation discriminates it — change the `.env` echo format
-//! (`format!("{} (from {})", …)` in `completion()`) and its `detail` assertion
-//! fails.
+//! fix. A second mutation discriminates it — that name is secret-bearing, so
+//! dropping the redaction branch added for issue #344 changes its `detail` and
+//! its documentation panel, and both assertions fail.
 
 use crate::LaravelLanguageServer;
 use std::path::PathBuf;
@@ -65,7 +65,13 @@ const SECRET_VALUE: &str = "s3cr3t-value-set-only-by-issue-342-tests";
 const TYPED_PREFIX: &str = "AWS_SECRET";
 
 /// A variable the *project* declares, sharing `TYPED_PREFIX` with the secret.
-const DECLARED_NAME: &str = "AWS_SECRET_DECLARED";
+///
+/// `SECRETARIAT` deliberately is not the segment `SECRET`: this control asserts
+/// the untouched `.env` echo format, so its name must fall outside
+/// `completion_display::is_sensitive_env_name` (issue #344) — which redacts by
+/// whole `_`-delimited segment, and would otherwise blank the very value this
+/// control is here to see.
+const DECLARED_NAME: &str = "AWS_SECRETARIAT_REGION";
 const DECLARED_VALUE: &str = "declared-in-dotenv";
 
 /// `.env` fixture: one variable under the typed prefix, one outside it. Built
@@ -187,6 +193,26 @@ fn dissect(response: Option<CompletionResponse>) -> (Vec<CompletionItem>, String
     }
 }
 
+/// The serialized response, with backslashes stripped so a search for a secret
+/// keeps the "any field" reach every leak assertion here claims.
+///
+/// The documentation panel's summary arrives markdown-escaped
+/// (`markdown_safety::escape_inline`), and a value carrying ASCII punctuation
+/// spells `s3cr3t\-value\-set…` there — no longer the raw needle. `label` and
+/// `detail` are not escaped, so a value reaching either still matches raw and
+/// this is not what discriminates a restored `std::env::vars()` loop; it is
+/// what stops `summary` becoming a field the search silently stopped covering.
+/// Stripping makes the search blind to the escaping rather than defeated by it,
+/// and can only ever match more.
+///
+/// Named rather than inlined because the reasoning is the thing that has to
+/// reach every call site. Spelled out at one of this file's two leak searches
+/// and not the other, it left that other one hunting a needle the panel no
+/// longer spells.
+fn searchable(json: &str) -> String {
+    json.replace('\\', "")
+}
+
 /// Assert the process variable left no trace — by value, in any field of any
 /// item, which no relabelling can dodge — and that no item is derived from its
 /// name either. Returns the items so callers can make positive assertions.
@@ -196,7 +222,7 @@ fn assert_no_process_var_leak(
 ) -> Vec<CompletionItem> {
     let (items, json) = dissect(response);
     assert!(
-        !json.contains(SECRET_VALUE),
+        !searchable(&json).contains(SECRET_VALUE),
         "{context}: the process variable's value leaked into the completion response: {json}"
     );
     assert!(
@@ -204,6 +230,29 @@ fn assert_no_process_var_leak(
         "{context}: an item was derived from the process variable {SECRET_NAME}"
     );
     items
+}
+
+/// `searchable` is load-bearing for every leak assertion in this file, and
+/// nothing in the green suite exercises it: the escaping only hides a needle
+/// when there is a leak to hide, so deleting the strip leaves all of these
+/// tests passing and silently narrows their reach to the plain-text fields.
+/// This pins it at its own definition instead.
+///
+/// The first assertion is what keeps the second honest — it fails if
+/// `SECRET_VALUE` ever loses its ASCII punctuation, at which point the escaping
+/// no longer transforms the needle and the rest of this test proves nothing.
+#[test]
+fn the_leak_search_still_finds_a_needle_the_panel_spells_with_escapes() {
+    let escaped = laravel_lsp::markdown_safety::escape_inline(SECRET_VALUE);
+    assert!(
+        !escaped.contains(SECRET_VALUE),
+        "this fixture is only meaningful while the escaping transforms the \
+         needle; {SECRET_VALUE} now survives escape_inline unchanged: {escaped}"
+    );
+    assert!(
+        searchable(&escaped).contains(SECRET_VALUE),
+        "the leak search must see through the panel's escaping: {escaped}"
+    );
 }
 
 /// The documentation panel's markdown, or a failure naming what arrived instead.
@@ -223,7 +272,21 @@ fn documentation_markdown(item: &CompletionItem, context: &str) -> String {
 /// the bolded header, the value as the summary, `Source: <file>` as the trailing
 /// section. Asserted whole rather than by substring, so dropping any one of the
 /// three builder calls fails — not only the `.section(...)` this fix is about.
+/// Both the name and the value arrive markdown-escaped
+/// (`markdown_safety::escape_inline`), because neither a `.env` key nor a
+/// `.env` value has a charset and the panel is rendered as markdown — the
+/// header escaped by `CompletionDoc::render` for every caller, the summary by
+/// the call site, whose field is markdown-bearing by contract.
+///
+/// Building the expectation with the same helper is not circular: the escaping
+/// itself is pinned by `markdown_safety`'s own literal-expectation tests, by
+/// the link/image fixtures in `env_key_navigation.rs`, and by
+/// `env_value_redaction`'s `a_value_spelling_a_markdown_link_renders_inert_in_the_panel`.
+/// What *this* helper asserts is the panel's structure and its redaction, and
+/// those must not become unreadable to spell an underscore.
 fn expected_documentation(name: &str, value: &str, source_file: &str) -> String {
+    let name = laravel_lsp::markdown_safety::escape_inline(name);
+    let value = laravel_lsp::markdown_safety::escape_inline(value);
     format!("**{name}**\n\n{value}\n\nSource: {source_file}")
 }
 
@@ -446,7 +509,7 @@ async fn dotenv_declaration_shadowing_a_process_var_still_completes_from_the_fil
 
     let (items, json) = dissect(complete_at_end_of_line(&server, uri, &line).await);
     assert!(
-        !json.contains(SECRET_VALUE),
+        !searchable(&json).contains(SECRET_VALUE),
         "the process value must not surface even when the .env declares the same name: {json}"
     );
 
@@ -457,14 +520,22 @@ async fn dotenv_declaration_shadowing_a_process_var_still_completes_from_the_fil
         "the declared variable must be offered exactly once, got {:?}",
         items.iter().map(|i| &i.label).collect::<Vec<_>>()
     );
+    // `AWS_SECRET_ACCESS_KEY_TEST` is secret-bearing, so issue #344 redacts its
+    // value on this surface. That is orthogonal to what this test is about —
+    // the declaration is still the one that wins, and it is still offered
+    // exactly once — but the rendering it asserts is now the redacted one.
     assert_eq!(
         shadowing[0].detail.as_deref(),
-        Some("dotenv-owns-this-name (from .env)"),
-        "the declared value and source file must be reported unchanged"
+        Some("(from .env)"),
+        "the source file must still be reported, with the value redacted"
     );
     assert_eq!(
         documentation_markdown(shadowing[0], "shadowing"),
-        expected_documentation(SECRET_NAME, "dotenv-owns-this-name", ".env"),
-        "the documentation panel must report the declared value and source unchanged"
+        expected_documentation(
+            SECRET_NAME,
+            laravel_lsp::completion_display::REDACTED_ENV_VALUE,
+            ".env"
+        ),
+        "the documentation panel must report the redaction string and the source"
     );
 }

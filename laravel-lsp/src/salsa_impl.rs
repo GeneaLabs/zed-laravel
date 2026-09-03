@@ -15,6 +15,7 @@ use salsa::Setter;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -38,27 +39,75 @@ use crate::route_discovery::normalize_path;
 // The lexical (non-fail-closed) entry point of the shared containment guard —
 // admits speculative candidates that don't exist on disk yet (issue #156).
 use crate::path_containment::path_within_root_lexical;
+// The two guards `ensure_external_php_source_loaded` splits across its
+// branches (issue #364): the emit-safe one for the client-owned path it
+// returns without reading, the registration one for the path it reads.
+use crate::path_containment::{canonical_within_root_registration, path_within_root_emit_safe};
 
 // ============================================================================
 // Database Definition
 // ============================================================================
 
+/// Body-execution counters for the memoized backing-class queries (#339,
+/// item 7). Incremented inside a query's BODY, so the count answers the one
+/// question a return value cannot: was this served from the memo, or recomputed?
+///
+/// Per-database rather than a process-wide static, so a test measuring one
+/// database is not perturbed by whatever the Salsa actor thread is doing in
+/// another test. Shared across clones of the database, which is what Salsa's
+/// own snapshotting produces.
+#[derive(Debug, Default)]
+pub struct QueryRunCounts {
+    /// Body runs of [`render_source_files`].
+    pub render_source_files: AtomicUsize,
+    /// Body runs of [`blade_backing_class_sources`].
+    pub blade_backing_class_sources: AtomicUsize,
+}
+
+impl QueryRunCounts {
+    /// A plain snapshot of the counters, for transfer across the actor's
+    /// async boundary.
+    pub fn snapshot(&self) -> QueryRunCountsData {
+        QueryRunCountsData {
+            render_source_files: self.render_source_files.load(Ordering::Relaxed),
+            blade_backing_class_sources: self.blade_backing_class_sources.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Data transfer type for [`QueryRunCounts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryRunCountsData {
+    pub render_source_files: usize,
+    pub blade_backing_class_sources: usize,
+}
+
 /// The Salsa database trait for Laravel LSP
 #[salsa::db]
-pub trait Db: salsa::Database {}
+pub trait Db: salsa::Database {
+    /// This database's query body-execution counters. See [`QueryRunCounts`].
+    fn query_run_counts(&self) -> &QueryRunCounts;
+}
 
 /// The concrete database implementation
 #[salsa::db]
 #[derive(Default, Clone)]
 pub struct LaravelDatabase {
     storage: salsa::Storage<Self>,
+    /// Shared with every clone of this database, so a snapshot's query runs
+    /// are counted against the same totals.
+    run_counts: Arc<QueryRunCounts>,
 }
 
 #[salsa::db]
 impl salsa::Database for LaravelDatabase {}
 
 #[salsa::db]
-impl Db for LaravelDatabase {}
+impl Db for LaravelDatabase {
+    fn query_run_counts(&self) -> &QueryRunCounts {
+        &self.run_counts
+    }
+}
 
 // ============================================================================
 // Input Types - Source data provided to the system
@@ -121,6 +170,24 @@ pub struct ProjectFiles {
     pub route_files: Vec<PathBuf>,
 }
 
+/// The project-wide render index: every `(view name, rendering file)` pair
+/// the controller / Livewire scan has observed.
+///
+/// The flattened reverse of `ViewVarIndex::by_file`. Holding it as a Salsa
+/// input is what turns backing-class resolution from an O(entire index) linear
+/// sweep *per keystroke* into a memoized lookup that only recomputes when the
+/// index itself changes (issue #339, item 7).
+#[salsa::input]
+pub struct RenderIndex {
+    /// Version incremented when the index contents change
+    #[returns(copy)]
+    pub version: i32,
+
+    /// `(view name, file that renders it)`, one entry per render site
+    #[returns(ref)]
+    pub entries: Vec<(String, PathBuf)>,
+}
+
 /// Represents a service provider file with priority
 #[salsa::input]
 pub struct ServiceProviderFile {
@@ -136,7 +203,7 @@ pub struct ServiceProviderFile {
     #[returns(ref)]
     pub text: String,
 
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     #[returns(copy)]
     pub priority: u8,
 }
@@ -1316,6 +1383,16 @@ pub fn parse_composer_json(db: &dyn Db, file: ConfigFile) -> (bool, Vec<String>)
     (has_livewire, packages)
 }
 
+/// Is Livewire installed, according to `composer.lock`?
+///
+/// A Salsa-tracked query over the lock file, so the answer is cached and
+/// invalidated through the same config path as every other parsed config
+/// input — no separate filesystem probe and no separate invalidation story.
+#[salsa::tracked]
+pub fn parse_composer_lock(db: &dyn Db, file: ConfigFile) -> bool {
+    crate::livewire_version::is_installed(file.text(db))
+}
+
 /// Parse config/view.php to extract view paths
 #[salsa::tracked(returns(clone))]
 pub fn parse_view_config(db: &dyn Db, file: ConfigFile, root: PathBuf) -> Vec<PathBuf> {
@@ -1375,6 +1452,123 @@ pub fn parse_blade_php_assignments(db: &dyn Db, file: SourceFile) -> Vec<(String
     crate::blade_php_block::extract_php_block_assignments(text)
 }
 
+// ============================================================================
+// Blade backing-class resolution (issue #339, item 7)
+// ============================================================================
+
+/// Whether `path` is a plain `.php` file rather than a `.blade.php` template.
+///
+/// A Blade template has no standalone class for `component_member_locator` to
+/// parse — its inline `new class extends Component` (or Volt front matter) is
+/// handled separately, by [`blade_backing_class_sources`]'s `inline` arm.
+pub fn is_plain_php_path(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("php")
+        && !path.to_string_lossy().ends_with(".blade.php")
+}
+
+/// Every file that renders `view_name`, sorted lexicographically by path.
+///
+/// The sort is load-bearing, not cosmetic: [`blade_backing_class_files`]'s
+/// consumers take the FIRST hit over this list, so an unsorted result would
+/// flap between two contributing classes that both declare the same member.
+///
+/// Memoized: only re-runs when the [`RenderIndex`] input changes.
+#[salsa::tracked(returns(clone))]
+pub fn render_source_files(db: &dyn Db, index: RenderIndex, view_name: String) -> Vec<PathBuf> {
+    db.query_run_counts()
+        .render_source_files
+        .fetch_add(1, Ordering::Relaxed);
+    let mut files: Vec<PathBuf> = index
+        .entries(db)
+        .iter()
+        .filter(|(view, _)| *view == view_name)
+        .map(|(_, path)| path.clone())
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// The plain-`.php` files backing a Blade template's rendered content — the
+/// union of two independent sources, in precedence order:
+///   1. the render index's contributors for `view_name` (a Filament-style
+///      `$view`-property page, or any controller `view(...)` call site);
+///   2. `livewire_paths`, the conventionally-resolved Livewire component class
+///      for a Blade file that lives under Livewire's view path.
+///
+/// (1) comes first so a direct render site outranks the Livewire convention.
+/// A partial that has NEITHER resolves through the component that rendered it,
+/// one level up — but that walk lives in `Backend::blade_backing_class_
+/// resolution` (#339, item 1), which calls this query per candidate rather than
+/// climbing inside it, so a direct render site is always tried before any
+/// ancestor.
+///
+/// Deduped, and restricted to plain `.php` paths. Existence is NOT checked
+/// here: this query is pure, and the actor drops paths it cannot read when it
+/// loads them as Salsa inputs.
+///
+/// Memoized: only re-runs when the [`RenderIndex`], the view name, or the
+/// resolved Livewire paths change.
+#[salsa::tracked(returns(clone))]
+pub fn blade_backing_class_files(
+    db: &dyn Db,
+    index: RenderIndex,
+    view_name: Option<String>,
+    livewire_paths: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(view) = view_name {
+        out.extend(render_source_files(db, index, view));
+    }
+    out.extend(livewire_paths);
+
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    out.retain(|p| is_plain_php_path(p) && seen.insert(p.clone()));
+    out
+}
+
+/// Every `(path, source)` pair whose PHP class backs a Blade template: the
+/// plain-`.php` backing files of [`blade_backing_class_files`], plus the Blade
+/// file ITSELF (`inline`) when it declares an inline
+/// `new class extends Component` (a Livewire v4 single-file component or a
+/// class-based Volt component) or carries a functional Volt signature. Those
+/// shapes have no standalone `.php` source — the members live in the
+/// template's own front matter.
+///
+/// Memoized against each backing file's CONTENT, not merely its path: `files`
+/// are [`SourceFile`] inputs, so editing a backing class invalidates this
+/// query and the next call recomputes rather than serving a stale source.
+#[salsa::tracked(returns(clone))]
+pub fn blade_backing_class_sources(
+    db: &dyn Db,
+    files: Vec<SourceFile>,
+    inline: Option<SourceFile>,
+) -> Vec<(PathBuf, String)> {
+    db.query_run_counts()
+        .blade_backing_class_sources
+        .fetch_add(1, Ordering::Relaxed);
+    let mut out: Vec<(PathBuf, String)> = files
+        .iter()
+        .map(|file| (file.path(db).clone(), file.text(db).clone()))
+        .collect();
+
+    if let Some(blade) = inline {
+        let text = blade.text(db);
+        // A FUNCTIONAL Volt file declares no class at all, so
+        // `detect_inline_livewire_class` is false for it — but its
+        // `state([...])` keys and top-level closure assignments ARE the
+        // component's members, and `component_member_locator` reads them.
+        // Both inline shapes therefore hand the template itself to the
+        // locator (#339, item 3).
+        if crate::php_class::detect_inline_livewire_class(text)
+            || crate::livewire_resolver::source_contains_volt_signature(text)
+        {
+            out.push((blade.path(db).clone(), text.clone()));
+        }
+    }
+    out
+}
+
 /// Extract the document-symbol tree for a file (route file, Blade template,
 /// Livewire component, or Eloquent model). Returns an empty vec for other file
 /// kinds. Memoized: only re-runs when the file's text changes.
@@ -1426,11 +1620,34 @@ pub fn build_laravel_config<'db>(
     composer: Option<ConfigFile>,
     view_config: Option<ConfigFile>,
     livewire_config: Option<ConfigFile>,
+    composer_lock: Option<ConfigFile>,
 ) -> LaravelConfigRef<'db> {
-    // Parse composer.json for Livewire detection
-    let has_livewire = composer
-        .map(|f| parse_composer_json(db, f).0)
-        .unwrap_or(false);
+    // Is Livewire installed? Read `composer.lock`, NOT `composer.json`.
+    //
+    // `composer.json` lists only DIRECT requirements, and Livewire very
+    // commonly arrives transitively — `livewire/flux`, `livewire/volt`,
+    // `filament/filament` and `robsontenorio/mary` all depend on it, and
+    // Laravel's own `livewire-starter-kit` ships exactly that shape. Testing
+    // `composer.json` therefore reported "no Livewire" for a project whose
+    // `app/Livewire` is full of components: `livewire_path` stayed `None`, so
+    // `<livewire:` completion returned nothing and the Livewire directory was
+    // never registered with the file watcher.
+    //
+    // `composer.lock` lists every installed package, direct or transitive,
+    // which is the question actually being asked. It changes exactly when
+    // packages are installed or removed, which is exactly when this answer
+    // should change.
+    //
+    // Fallback when the lock is absent (a fresh clone before `composer
+    // install`): the old `composer.json` test. It is strictly better than
+    // assuming "not installed", and it preserves today's behaviour for the
+    // projects it did serve correctly — those that require Livewire directly.
+    let has_livewire = match composer_lock {
+        Some(lock) => *parse_composer_lock(db, lock),
+        None => composer
+            .map(|f| parse_composer_json(db, f).0)
+            .unwrap_or(false),
+    };
 
     // Parse view config for view paths
     let view_paths = view_config
@@ -1519,13 +1736,14 @@ pub fn parse_env_source<'db>(db: &'db dyn Db, file: EnvFile) -> Vec<ParsedEnvVar
             continue;
         }
 
-        // Check if line is commented
-        let is_commented = line.trim_start().starts_with('#');
-        let working_line = if is_commented {
-            line.trim_start().trim_start_matches('#').trim_start()
-        } else {
-            line
-        };
+        // Check if line is commented — through the one rule every reader of
+        // `.env` text classifies with, so Salsa's view of "commented" and the
+        // buffer-local view the LSP handlers hit-test with cannot disagree.
+        let (is_commented, working_line) =
+            match crate::env_key_locator::commented_declaration_body(line) {
+                Some(body) => (true, body),
+                None => (false, line),
+            };
 
         // Parse VAR=value format
         if let Some((name_part, value_part)) = working_line.split_once('=') {
@@ -1667,41 +1885,6 @@ pub fn locales_in_dir(db: &dyn Db, dir: LangDir) -> Vec<String> {
     locales
 }
 
-/// The locale whose catalogues supply autocomplete's preview values.
-///
-/// Completion offers keys from exactly one locale (see
-/// [`TranslationCache::completion_keys`]), so *which* one decides every value
-/// previewed next to a key. That used to be the alphabetically-first
-/// directory, which is deterministic but arbitrary: a project with `lang/de/`,
-/// `lang/en/` and `'locale' => 'en'` previewed German for every key
-/// (issue #340).
-///
-/// The chain, first match wins:
-///
-/// 1. `app.locale` from `config/app.php`, normalized by
-///    [`config_string_literal`], when it names one of `candidates`;
-/// 2. `app.fallback_locale`, under the same normalization and the same
-///    membership check — Laravel ships it `env()`-wrapped, so it needs the
-///    normalization just as much as `app.locale` does;
-/// 3. the alphabetically-first candidate, preserving the pre-#340 behaviour
-///    for any project whose config cannot be read statically.
-///
-/// `candidates` is read, never mutated: step 3 sees the whole list
-/// [`locales_in_dir`] returned, not what the earlier steps failed to match, so
-/// the fallback answers with the same locale it always did.
-///
-/// `None` only when `candidates` is empty — a project with no locale
-/// directories has nothing to preview, whatever its config says.
-fn completion_locale(root: &Path, candidates: &[String]) -> Option<String> {
-    ["app.locale", "app.fallback_locale"]
-        .into_iter()
-        .find_map(|key| {
-            let locale = config_string_literal(&crate::config_lookup::resolve_value(root, key)?)?;
-            candidates.contains(&locale).then_some(locale)
-        })
-        .or_else(|| candidates.iter().min().cloned())
-}
-
 /// The string a PHP config value denotes, or `None` when it denotes none
 /// statically.
 ///
@@ -1771,13 +1954,31 @@ pub fn translation_namespaces_in_provider(
 ///
 /// # Containment
 ///
-/// [`Self::ensure_file`] and [`Self::ensure_dir`] are the **only** places this
-/// module touches disk, and both are fail-closed: a path that cannot be proven
-/// inside the project root is never read (issue #248). Candidate paths are built
-/// from `vendor::` namespaces and `loadTranslationsFrom` arguments lifted
-/// verbatim out of parsed source, so they are untrusted and may carry traversal
-/// or be absolute. Keeping the guard at these two functions is what lets
-/// `translation_lookup` be pure path arithmetic without weakening #248.
+/// Five methods read from disk — each counted by [`Self::disk_reads`]. The
+/// containment guard applies to exactly the two that build a path out of
+/// untrusted text:
+///
+/// - [`Self::ensure_file`] and [`Self::ensure_dir`] are **guarded** and
+///   fail-closed: a path that cannot be proven inside the project root is never
+///   read (issue #248). Their candidate paths are built from `vendor::`
+///   namespaces and `loadTranslationsFrom` arguments lifted verbatim out of
+///   parsed source, so they are untrusted and may carry traversal or be
+///   absolute. Keeping the guard here is what lets `translation_lookup` be pure
+///   path arithmetic without weakening #248.
+/// - [`Self::ensure_provider`], [`Self::ensure_provider_files`] and
+///   [`Self::ensure_config`] are **unguarded**, and deliberately so: none of
+///   them joins attacker-controlled text onto the root. The first two walk the
+///   project's own `vendor/` and `app/Providers/` trees (see
+///   `ensure_provider`'s own note); `ensure_config` names
+///   `<root>/config/<group>.php` from a group segment that is hardcoded at its
+///   only call site — `"app.locale"` and `"app.fallback_locale"` — never from
+///   parsed source. There is nothing for #248 to fence.
+///
+/// A read is not the only way to touch disk: [`Self::completion_keys`] *stats*
+/// the lang roots, and [`Self::ensure_config`] stats the config path through
+/// `config_group_files`. Neither is counted, because neither opens a file —
+/// the distinction is what lets a test attribute an exact number of reads to
+/// one code path.
 #[derive(Default)]
 pub struct TranslationCache {
     /// Catalogues keyed by absolute path. An entry with **empty text** is a
@@ -1788,6 +1989,18 @@ pub struct TranslationCache {
     /// Directory listings backing locale discovery, keyed by absolute path. An
     /// empty listing likewise caches "absent, or nothing in it".
     dirs: HashMap<PathBuf, LangDir>,
+    /// Config-file texts backing completion's locale choice, keyed by the
+    /// project config path the group resolves to (`<root>/config/<group>.php`).
+    /// A `None` value is a negative cache: the group contributes no readable
+    /// file, and the *absence* is what must not be re-probed — without it every
+    /// completion request on a project with no `config/app.php` would re-stat
+    /// it, which is the shape [`Self::ensure_file`] already fail-closes for.
+    ///
+    /// Not a Salsa input: nothing derives from this text through a tracked
+    /// query, so there is no memoized result for a version bump to invalidate.
+    /// A plain map keyed by path is the whole mechanism, and
+    /// [`Self::invalidate_config`] is its only eviction.
+    configs: HashMap<PathBuf, Option<String>>,
     /// Version counter shared by files and directories; bumped on every
     /// registration so Salsa sees a changed input.
     version: i32,
@@ -1796,6 +2009,13 @@ pub struct TranslationCache {
     /// The discovered provider set. `None` until the first scan, and reset by
     /// [`Self::invalidate_providers`] so a create or delete is picked up.
     provider_files: Option<TranslationProviderFiles>,
+    /// Additional first-party provider files registered by the LSP host —
+    /// module service providers discovered via the `modules.paths` setting,
+    /// which live outside `app/Providers/` (e.g.
+    /// `app/{Parent}/{Module}/Providers/`). Scanned like app providers, but
+    /// ordered BEFORE them so a real `app/Providers/` registration still
+    /// wins on a namespace conflict (the app boots last).
+    extra_provider_files: Vec<PathBuf>,
     /// How many times this cache has touched disk — one per
     /// `fs::read_to_string` or `read_dir` that actually ran. Lets a test prove
     /// a second resolution is served from Salsa rather than re-read.
@@ -1908,6 +2128,102 @@ impl TranslationCache {
         handle
     }
 
+    /// The text of the config file backing group `group` (`config/app.php` for
+    /// `app`), read at most once per cache instance.
+    ///
+    /// `None` — cached as such — when no readable file contributes to the
+    /// group. `config_group_files` owns which files those are and in what
+    /// precedence; called with no module directories, as
+    /// [`crate::config_lookup::resolve_value`] itself does, it yields the
+    /// project file alone, so its first entry is the whole group. Completion
+    /// deliberately keeps that no-module scope: widening which files decide the
+    /// preview locale is a change of a different kind from caching the read.
+    ///
+    /// The `is_file()` inside `config_group_files` is why an absent file costs
+    /// no counted read: the probe is a stat, and only a file that exists is
+    /// opened. That is what lets a test attribute exactly one
+    /// [`Self::disk_reads`] to config resolution by differencing two fixtures.
+    fn ensure_config(&mut self, root: &Path, group: &str) -> Option<&str> {
+        let key = root.join("config").join(format!("{group}.php"));
+        if !self.configs.contains_key(&key) {
+            let files = crate::config::config_group_files(root, &[], group);
+            let mut text = None;
+            if let Some(path) = files.first() {
+                self.disk_reads += 1;
+                text = std::fs::read_to_string(path).ok();
+            }
+            self.configs.insert(key.clone(), text);
+        }
+        self.configs[&key].as_deref()
+    }
+
+    /// The source text of the value at `dotted_key`, resolved against the
+    /// cached config text rather than a fresh read.
+    ///
+    /// A wrapper around [`crate::config_lookup::resolve_in_source`], not a
+    /// change to [`crate::config_lookup::resolve_value`]: that function still
+    /// reads on every call, and `hover_for_config` still uses it, so a hover
+    /// keeps reflecting an edit immediately. Only this completion path is
+    /// cached, and only it needs the invalidation wiring that comes with a
+    /// cache.
+    fn config_value(&mut self, root: &Path, dotted_key: &str) -> Option<String> {
+        let mut parts = dotted_key.split('.');
+        let group = parts.next()?;
+        let key_path: Vec<&str> = parts.collect();
+        let text = self.ensure_config(root, group)?;
+        crate::config_lookup::resolve_in_source(text, &key_path)
+    }
+
+    /// Drop a config file's cached text, so the next completion re-reads it.
+    ///
+    /// Clears a negative entry as well as a positive one: a `config/app.php`
+    /// that did not exist when completion first asked is exactly the case a
+    /// `CREATED` event reports, and leaving the cached absence in place would
+    /// make the new file invisible for the rest of the session.
+    pub fn invalidate_config(&mut self, path: &Path) {
+        self.configs.remove(path);
+    }
+
+    /// The locale whose catalogues supply autocomplete's preview values.
+    ///
+    /// Completion offers keys from exactly one locale (see
+    /// [`Self::completion_keys`]), so *which* one decides every value previewed
+    /// next to a key. That used to be the alphabetically-first directory, which
+    /// is deterministic but arbitrary: a project with `lang/de/`, `lang/en/` and
+    /// `'locale' => 'en'` previewed German for every key (issue #340).
+    ///
+    /// The chain, first match wins:
+    ///
+    /// 1. `app.locale` from `config/app.php`, normalized by
+    ///    [`config_string_literal`], when it names one of `candidates`;
+    /// 2. `app.fallback_locale`, under the same normalization and the same
+    ///    membership check — Laravel ships it `env()`-wrapped, so it needs the
+    ///    normalization just as much as `app.locale` does;
+    /// 3. the alphabetically-first candidate, preserving the pre-#340 behaviour
+    ///    for any project whose config cannot be read statically.
+    ///
+    /// Both lookups go through [`Self::config_value`], so a project whose chain
+    /// runs to step 2 still pays one read of `config/app.php`, not two — and a
+    /// second completion request pays none (issue #349). Before that, this read
+    /// bypassed [`Self::disk_reads`] entirely, so the cache-hit regression tests
+    /// could not see it at all.
+    ///
+    /// `candidates` is read, never mutated: step 3 sees the whole list
+    /// [`locales_in_dir`] returned, not what the earlier steps failed to match,
+    /// so the fallback answers with the same locale it always did.
+    ///
+    /// `None` only when `candidates` is empty — a project with no locale
+    /// directories has nothing to preview, whatever its config says.
+    fn completion_locale(&mut self, root: &Path, candidates: &[String]) -> Option<String> {
+        ["app.locale", "app.fallback_locale"]
+            .into_iter()
+            .find_map(|key| {
+                let locale = config_string_literal(&self.config_value(root, key)?)?;
+                candidates.contains(&locale).then_some(locale)
+            })
+            .or_else(|| candidates.iter().min().cloned())
+    }
+
     /// Resolve `key` in `locale`, returning the value and the catalogue it came
     /// from. Candidates are tried in
     /// [`translation_candidates`](crate::translation_lookup::translation_candidates)
@@ -2016,11 +2332,13 @@ impl TranslationCache {
             }
             TranslationKeyTarget::Json(key) => locate_json_key_in_file(&*db, file, key.clone()),
         };
-        found.map(|(line, start_column, end_column)| KeyLocationData {
-            line,
-            start_column,
-            end_column,
-        })
+        found.map(
+            |(line, start_column, end_column, _renameable)| KeyLocationData {
+                line,
+                start_column,
+                end_column,
+            },
+        )
     }
 
     /// Every translation key autocomplete should offer, sorted and deduped.
@@ -2048,48 +2366,93 @@ impl TranslationCache {
         db: &mut LaravelDatabase,
         root: &Path,
     ) -> Vec<TranslationKeyCompletionData> {
-        let Some(lang_root) = crate::translation_lookup::project_lang_roots(root)
-            .into_iter()
-            .find(|dir| dir.exists())
-        else {
-            return Vec::new();
-        };
-        let listing = self.ensure_dir(db, &lang_root, root);
-        // `locales_in_dir` preserves the directory listing order, which is
-        // filesystem-dependent — APFS hands entries back sorted, ext4 does
-        // not. So the choice must never depend on position in that list:
-        // `completion_locale` selects by name, and its own last resort is the
-        // alphabetical minimum rather than whatever the filesystem listed
-        // first (the platform split CI caught on ubuntu while macOS stayed
-        // green).
-        let candidates = locales_in_dir(&*db, listing).clone();
-        let Some(locale) = completion_locale(root, &candidates) else {
-            return Vec::new();
-        };
-
-        let locale_dir = lang_root.join(&locale);
-        let files = self.ensure_dir(db, &locale_dir, root).entries(&*db).clone();
-
+        // Root-catalogue scan. Its absence must not end the request early:
+        // a project whose ONLY catalogues live under registered namespaces
+        // (never published to a root `lang/`) still gets the namespaced
+        // completions below.
         let mut completions = Vec::new();
-        for (name, is_dir) in files {
-            if is_dir {
-                continue;
+        let lang_root = crate::translation_lookup::project_lang_roots(root)
+            .into_iter()
+            .find(|dir| dir.exists());
+        let locale = lang_root.as_ref().and_then(|lang_root| {
+            let listing = self.ensure_dir(db, lang_root, root);
+            // `completion_locale` selects by NAME (configured locale first,
+            // alphabetical minimum as the last resort) — never by position
+            // in the filesystem-dependent listing order.
+            let candidates = locales_in_dir(&*db, listing).clone();
+            self.completion_locale(root, &candidates)
+        });
+        if let (Some(lang_root), Some(locale)) = (lang_root, locale) {
+            let locale_dir = lang_root.join(&locale);
+            let files = self.ensure_dir(db, &locale_dir, root).entries(&*db).clone();
+
+            for (name, is_dir) in files {
+                if is_dir {
+                    continue;
+                }
+                let path = locale_dir.join(&name);
+                if path.extension().is_none_or(|ext| ext != "php") {
+                    continue;
+                }
+                let Some(base_key) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let source = format!("lang/{}/{}", locale, name);
+                let file = self.ensure_file(db, &path, root);
+                for (key, value) in
+                    translation_keys_in_file(&*db, file, base_key.to_string()).clone()
+                {
+                    completions.push(TranslationKeyCompletionData {
+                        key,
+                        value,
+                        source: source.clone(),
+                    });
+                }
             }
-            let path = locale_dir.join(&name);
-            if path.extension().is_none_or(|ext| ext != "php") {
-                continue;
-            }
-            let Some(base_key) = path.file_stem().and_then(|s| s.to_str()) else {
+        }
+
+        // Namespaced catalogues — every provider-registered `ns::` lang
+        // directory (vendor packages, modules, app `loadTranslationsFrom`
+        // calls). Without these, a project that keeps a namespace's
+        // catalogues only under its registered directory (never published
+        // to root `lang/vendor/…`) gets zero completions for
+        // `ns::file.key`. Same locale-selection rule as the root scan.
+        let namespaces = self.vendor_namespaces(db, root);
+        let mut namespace_pairs: Vec<(String, PathBuf)> = namespaces.into_iter().collect();
+        namespace_pairs.sort();
+        for (namespace, ns_dir) in namespace_pairs {
+            let listing = self.ensure_dir(db, &ns_dir, root);
+            let ns_locales = locales_in_dir(&*db, listing).clone();
+            let Some(ns_locale) = self.completion_locale(root, &ns_locales) else {
                 continue;
             };
-            let source = format!("lang/{}/{}", locale, name);
-            let file = self.ensure_file(db, &path, root);
-            for (key, value) in translation_keys_in_file(&*db, file, base_key.to_string()).clone() {
-                completions.push(TranslationKeyCompletionData {
-                    key,
-                    value,
-                    source: source.clone(),
-                });
+            let ns_locale_dir = ns_dir.join(&ns_locale);
+            let files = self
+                .ensure_dir(db, &ns_locale_dir, root)
+                .entries(&*db)
+                .clone();
+            for (name, is_dir) in files {
+                if is_dir {
+                    continue;
+                }
+                let path = ns_locale_dir.join(&name);
+                if path.extension().is_none_or(|ext| ext != "php") {
+                    continue;
+                }
+                let Some(base_key) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let source = format!("{}::lang/{}/{}", namespace, ns_locale, name);
+                let file = self.ensure_file(db, &path, root);
+                for (key, value) in
+                    translation_keys_in_file(&*db, file, base_key.to_string()).clone()
+                {
+                    completions.push(TranslationKeyCompletionData {
+                        key: format!("{}::{}", namespace, key),
+                        value,
+                        source: source.clone(),
+                    });
+                }
             }
         }
 
@@ -2148,7 +2511,10 @@ impl TranslationCache {
             }
             let locale_file = lang_dir.join(&name).join(format!("{file_stem}.php"));
             let file = self.ensure_file(db, &locale_file, root);
-            if let Some(&(line, start_column, end_column)) =
+            // A `false` flag means the key has no quoted text to rewrite — a
+            // list index (`page.items.0`) or a bare `404 =>`. Both resolve for
+            // goto; neither is a rename target.
+            if let Some(&(line, start_column, end_column, true)) =
                 locate_php_key_in_file(&*db, file, key_path.clone()).as_ref()
             {
                 out.push(TranslationKeyLocationData {
@@ -2174,6 +2540,19 @@ impl TranslationCache {
     pub fn invalidate_providers(&mut self) {
         self.provider_files = None;
         self.providers.clear();
+    }
+
+    /// Replace the host-registered extra provider files (module providers
+    /// from the `modules.paths` setting). A no-op when the set is unchanged;
+    /// otherwise the discovered provider set is dropped so the next lookup
+    /// folds the new files in.
+    pub fn set_extra_provider_files(&mut self, mut files: Vec<PathBuf>) {
+        files.sort();
+        if files == self.extra_provider_files {
+            return;
+        }
+        self.extra_provider_files = files;
+        self.invalidate_providers();
     }
 
     /// The Salsa input for one provider's text, registering it on first touch.
@@ -2212,7 +2591,8 @@ impl TranslationCache {
         }
         self.disk_reads += 1;
         let vendor = crate::vendor_translations::vendor_provider_candidates(root);
-        let app = crate::vendor_translations::app_provider_candidates(root);
+        let mut app = self.extra_provider_files.clone();
+        app.extend(crate::vendor_translations::app_provider_candidates(root));
         self.version += 1;
         let files = TranslationProviderFiles::new(&*db, self.version, vendor, app);
         self.provider_files = Some(files);
@@ -2307,108 +2687,15 @@ pub struct KeyLocationData {
     pub end_column: u32,
 }
 
-/// Parse a PHP translation file to extract all keys and values
-/// Returns a list of (key, value) tuples with dot-notation keys
-fn parse_translation_keys(content: &str, base_key: &str) -> Vec<(String, String)> {
-    let mut results = Vec::new();
-
-    // Simple regex-based parsing for Laravel translation files
-    // This handles: 'key' => 'value', or "key" => "value"
-    //
-    // Compiled once: this used to be rebuilt on every completion request, for
-    // every catalogue in the locale (issue #293).
-    static KEY_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"][\s]*=>"#).unwrap()
-    });
-    let key_pattern = &*KEY_PATTERN;
-
-    // Track nesting depth and current key path
-    let mut key_stack: Vec<String> = vec![base_key.to_string()];
-    let mut in_array_depth = 0;
-    let mut pending_key: Option<String> = None;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        // Skip comments and empty lines
-        if trimmed.is_empty()
-            || trimmed.starts_with("//")
-            || trimmed.starts_with("/*")
-            || trimmed.starts_with("*")
-        {
-            continue;
-        }
-
-        // Handle array opening
-        if trimmed.contains("[") && !trimmed.contains("=>") {
-            in_array_depth += 1;
-            if let Some(key) = pending_key.take() {
-                key_stack.push(key);
-            }
-            continue;
-        }
-
-        // Handle key => [ (nested array on same line)
-        if let Some(caps) = key_pattern.captures(trimmed) {
-            let key_name = caps.get(1).unwrap().as_str();
-
-            if trimmed.contains("=> [") || trimmed.ends_with("=> [") {
-                // This is a nested array
-                pending_key = Some(key_name.to_string());
-                in_array_depth += 1;
-                key_stack.push(key_name.to_string());
-            } else {
-                // This is a simple key => value
-                let full_key = format!("{}.{}", key_stack.join("."), key_name);
-
-                // Extract value
-                let value = extract_translation_value(trimmed);
-                results.push((full_key, value));
-            }
-        }
-
-        // Handle array closing
-        let close_count = trimmed.matches(']').count();
-        for _ in 0..close_count {
-            if in_array_depth > 0 {
-                in_array_depth -= 1;
-                if key_stack.len() > 1 {
-                    key_stack.pop();
-                }
-            }
-        }
-    }
-
-    results
-}
-
-/// Extract the value from a translation line like "'key' => 'value',".
-///
-/// Returns the value at full length — see `completion_display` for why the
-/// truncation lives at the render sites rather than here.
-pub fn extract_translation_value(line: &str) -> String {
-    if let Some(arrow_pos) = line.find("=>") {
-        let after_arrow = &line[arrow_pos + 2..];
-        let value = after_arrow.trim().trim_end_matches(',').trim();
-
-        // Remove the surrounding quotes; the value is returned at full
-        // length. Truncation happens at each render site instead, because
-        // the completion list line and the documentation panel want
-        // different budgets and one shared cut served neither (issue #326).
-        value
-            .trim_start_matches('\'')
-            .trim_start_matches('"')
-            .trim_end_matches('\'')
-            .trim_end_matches('"')
-            .to_string()
-    } else {
-        String::new()
-    }
-}
-
 /// Every `key => value` pair one PHP catalogue declares, dot-prefixed with
 /// `base_key`. Memoized per `(file, base_key)` — autocomplete used to re-read
 /// and re-parse every catalogue in the locale on each request (issue #293).
+///
+/// Enumerated by the same tree-sitter walk that backs go-to-definition
+/// (`config_key_locator`), not by a text scanner. Until #369 this counted `[`
+/// and `]` per line, which mis-nested any catalogue holding a list entry, a
+/// key split across lines, or a `]` inside a value — while goto, resolving the
+/// identical file structurally, stayed correct.
 #[salsa::tracked]
 pub fn translation_keys_in_file(
     db: &dyn Db,
@@ -2419,7 +2706,10 @@ pub fn translation_keys_in_file(
     if text.is_empty() {
         return Vec::new();
     }
-    parse_translation_keys(text, &base_key)
+    crate::config_key_locator::enumerate_entries_in_source(text)
+        .into_iter()
+        .map(|(key, value, _position)| (format!("{base_key}.{key}"), value))
+        .collect()
 }
 
 /// Where a nested key is declared inside a PHP catalogue, as
@@ -2435,14 +2725,21 @@ pub fn locate_php_key_in_file(
     db: &dyn Db,
     file: LangFile,
     key_path: Vec<String>,
-) -> Option<(u32, u32, u32)> {
+) -> Option<(u32, u32, u32, bool)> {
     let text = file.text(db);
     if text.is_empty() {
         return None;
     }
     let refs: Vec<&str> = key_path.iter().map(String::as_str).collect();
     let pos = crate::config_key_locator::locate_in_source(text, &refs)?;
-    Some((pos.line, pos.start_column, pos.end_column))
+    // The bool is "may a rename rewrite this", the only distinction this
+    // boundary needs; `KeyKind` itself stays on the locator's side.
+    Some((
+        pos.line,
+        pos.start_column,
+        pos.end_column,
+        pos.kind == crate::config_key_locator::KeyKind::Quoted,
+    ))
 }
 
 /// Where a text key is declared inside a JSON catalogue, as
@@ -2456,7 +2753,7 @@ pub fn locate_json_key_in_file(
     db: &dyn Db,
     file: LangFile,
     key: String,
-) -> Option<(u32, u32, u32)> {
+) -> Option<(u32, u32, u32, bool)> {
     let text = file.text(db);
     if text.is_empty() {
         return None;
@@ -2466,7 +2763,9 @@ pub fn locate_json_key_in_file(
         let col = line.find(&needle)?;
         // Skip the opening quote so the span covers the key itself.
         let start = (col + 1) as u32;
-        Some((line_num as u32, start, start + key.len() as u32))
+        // A JSON key is always a quoted literal, so always renameable — the
+        // flag exists for PHP's list indices and bare integer keys.
+        Some((line_num as u32, start, start + key.len() as u32, true))
     })
 }
 
@@ -2497,7 +2796,7 @@ pub struct ParsedMiddlewareReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2522,7 +2821,7 @@ pub struct ParsedBindingReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2553,7 +2852,7 @@ pub struct ParsedMacroReg<'db> {
     /// 0-based definition line — the closure's line, or the mixin method's line.
     #[returns(copy)]
     pub decl_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
 }
@@ -2570,7 +2869,7 @@ pub struct ParsedViewNamespaceReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2593,7 +2892,7 @@ pub struct ParsedBladeComponentReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2613,7 +2912,7 @@ pub struct ParsedComponentNamespaceReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2634,7 +2933,7 @@ pub struct ParsedAnonymousComponentPathReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -2655,7 +2954,7 @@ pub struct ParsedAnonymousComponentNamespaceReg<'db> {
     /// Line in source file where registered
     #[returns(copy)]
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     #[returns(copy)]
     pub priority: u8,
     /// Source file where registered
@@ -3403,8 +3702,9 @@ struct ProviderMacro {
 /// ## Coverage boundaries (be honest about the caps)
 ///
 /// - **Which files**: every file registered as a [`ServiceProviderFile`] Salsa
-///   input — app providers (priority 2), framework providers (0), and package
-///   providers (1), the last two discovered by the vendor scan
+///   input — app providers (priority 3), module providers (2, from the
+///   `modules.paths` globs), package providers (1), and framework providers
+///   (0), the last two discovered by the vendor scan
 ///   (`rescan_vendor_providers`). Priority merging happens in
 ///   [`SalsaActor::build_macro_registry`], not here.
 /// - **Which calls**: only a STATIC `Receiver::macro(...)` / `Receiver::mixin(...)`
@@ -5227,8 +5527,10 @@ pub fn component_candidate_paths(
     // Windows and a wasted `stat` on POSIX. Namespaced forms resolve via the
     // PSR-4 `componentNamespace` block below instead, so skip them here.
     if !name.contains(':') {
-        candidates
-            .push(crate::component_declaration_locator::conventional_class_file_path(name, config));
+        // A name that can't form a safe relative path yields no candidate.
+        candidates.extend(
+            crate::component_declaration_locator::conventional_class_file_path(name, config),
+        );
     }
 
     // Explicit class-backed registration: Blade::component('tag', Class::class)
@@ -5353,7 +5655,7 @@ pub struct MiddlewareRegistrationData {
     pub source_file: Option<PathBuf>,
     /// Line number in source file (0-based)
     pub source_line: Option<usize>,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5381,7 +5683,7 @@ pub struct BindingRegistrationData {
     pub source_file: Option<PathBuf>,
     /// Line number in source file (0-based)
     pub source_line: Option<usize>,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5399,7 +5701,7 @@ pub struct MacroRegistrationData {
     pub decl_file: PathBuf,
     /// 0-based definition line.
     pub decl_line: u32,
-    /// Priority: 0=framework, 1=package, 2=app (higher wins on key collision).
+    /// Priority: 0=framework, 1=package, 2=module, 3=app (higher wins on key collision).
     pub priority: u8,
 }
 
@@ -5543,25 +5845,6 @@ impl crate::member_resolver::ClassFileResolver for ContainerAwareResolver<'_> {
     }
 }
 
-/// Environment variable data for transfer across async boundaries
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct EnvVariableData {
-    /// The variable name (e.g., "APP_NAME")
-    pub name: String,
-    /// The value (e.g., "Laravel")
-    pub value: String,
-    /// Which file this was defined in
-    pub file_path: PathBuf,
-    /// Line number where defined (0-based)
-    pub line: usize,
-    /// Column where the variable name starts (0-based)
-    pub column: usize,
-    /// Column where the value starts (after the =)
-    pub value_column: usize,
-    /// Whether this variable is commented out
-    pub is_commented: bool,
-}
-
 /// Package view namespace data for transfer across async boundaries
 /// From: $this->loadViewsFrom(__DIR__.'/../resources/views', 'courier')
 #[derive(Debug, Clone, serde::Serialize)]
@@ -5574,7 +5857,7 @@ pub struct ViewNamespaceData {
     pub source_file: PathBuf,
     /// Line number in source file
     pub source_line: u32,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5592,7 +5875,7 @@ pub struct BladeComponentRegData {
     pub source_file: PathBuf,
     /// Line number in source file
     pub source_line: u32,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5608,7 +5891,7 @@ pub struct ComponentNamespaceData {
     pub source_file: PathBuf,
     /// Line number in source file
     pub source_line: u32,
-    /// Priority: 0=framework, 1=package, 2=app
+    /// Priority: 0=framework, 1=package, 2=module, 3=app
     pub priority: u8,
 }
 
@@ -5648,7 +5931,7 @@ pub struct ParsedMiddlewareData {
     pub file_path: Option<PathBuf>,
     /// Line in source file
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     pub priority: u8,
     /// Source file path
     pub source_file: PathBuf,
@@ -5667,7 +5950,7 @@ pub struct ParsedBindingData {
     pub binding_type: BindingTypeEnum,
     /// Line in source file
     pub source_line: u32,
-    /// Priority (0=framework, 1=package, 2=app)
+    /// Priority (0=framework, 1=package, 2=module, 3=app)
     pub priority: u8,
     /// Source file path
     pub source_file: PathBuf,
@@ -6084,6 +6367,24 @@ pub struct FacadeReceiverTarget {
 }
 
 /// Requests that can be sent to the Salsa actor
+/// The answer to one backing-class resolution for a Blade template (#339,
+/// item 7): the plain-`.php` files that back it, and each of those files'
+/// current source, plus the template itself when it declares its component
+/// inline.
+///
+/// Both halves come from the same pair of memoized queries in one actor
+/// round-trip, so a caller that needs only the paths (the item 1 up-walk, which
+/// calls this once per ancestor) never pays for a second request that would
+/// recompute the same lookup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BladeBackingResolutionData {
+    /// Backing `.php` paths that exist and could be read, in precedence order.
+    pub files: Vec<PathBuf>,
+    /// `(path, source)` for each entry of `files`, plus the Blade template
+    /// itself when it carries an inline component class.
+    pub sources: Vec<(PathBuf, String)>,
+}
+
 pub enum SalsaRequest {
     /// Update or create a file in the database
     UpdateFile {
@@ -6121,6 +6422,21 @@ pub enum SalsaRequest {
     },
     /// Remove a file from the database
     RemoveFile {
+        path: PathBuf,
+        reply: oneshot::Sender<()>,
+    },
+    /// Record that an editor buffer for this path is open, so a `didClose`
+    /// for an earlier buffer of the same path cannot hand the live one back
+    /// to the loader — see [`SalsaActor::acquire_external_php_ownership`].
+    AcquireExternalPhpOwnership {
+        path: PathBuf,
+        reply: oneshot::Sender<()>,
+    },
+
+    /// Hand a client-pushed path's text back to the backing-class loader once
+    /// its last buffer closes, evicting nothing — see
+    /// [`SalsaActor::release_external_php_ownership`].
+    ReleaseExternalPhpOwnership {
         path: PathBuf,
         reply: oneshot::Sender<()>,
     },
@@ -6162,6 +6478,8 @@ pub enum SalsaRequest {
         composer_json: Option<String>,
         view_config: Option<String>,
         livewire_config: Option<String>,
+        /// `composer.lock`, the authority on whether Livewire is installed.
+        composer_lock: Option<String>,
         reply: oneshot::Sender<()>,
     },
     /// Update a specific configuration file
@@ -6175,6 +6493,38 @@ pub enum SalsaRequest {
         reply: oneshot::Sender<Option<LaravelConfigData>>,
     },
 
+    // === Blade backing-class resolution (#339, item 7) ===
+    /// Read the actor database's query body-execution counters. Exists so a
+    /// test driving the real LSP handler can prove the memo was hit, which a
+    /// return value alone cannot show.
+    QueryRunCounts {
+        reply: oneshot::Sender<QueryRunCountsData>,
+    },
+    /// Replace the render-index snapshot the backing-class queries read.
+    /// Bumps the Salsa revision, so only send this when the index has actually
+    /// changed — see `Backend::pending_render_index_snapshot`.
+    SetRenderIndex {
+        /// `ViewVarIndex::generation()` this snapshot was taken at. The actor
+        /// drops a snapshot older than the one it holds, so two concurrent
+        /// pushes cannot leave it serving the loser's data.
+        generation: u64,
+        entries: Vec<(String, PathBuf)>,
+        reply: oneshot::Sender<()>,
+    },
+    /// Resolve the PHP class(es) backing a Blade template, memoized against
+    /// the render index and each backing file's content.
+    BladeBackingClassResolution {
+        blade_path: PathBuf,
+        /// The template's own Laravel view name, when it has one.
+        view_name: Option<String>,
+        /// Livewire-convention class paths the caller already resolved.
+        livewire_paths: Vec<PathBuf>,
+        /// The live editor buffer for `blade_path`, when the document is open.
+        /// `None` falls back to the file on disk.
+        live_blade_text: Option<String>,
+        reply: oneshot::Sender<BladeBackingResolutionData>,
+    },
+
     // === Reference Finding ===
     /// Register project files for reference finding
     /// Scans directories and registers all PHP/Blade files
@@ -6184,12 +6534,30 @@ pub enum SalsaRequest {
         view_paths: Vec<PathBuf>,
         livewire_path: Option<PathBuf>,
         routes_path: PathBuf,
+        /// Every `vendor/` PHP file, from the shared vendor walk (issue #371).
+        /// Handed in rather than re-walked here: this actor runs on its own
+        /// thread and cannot reach the server's cached
+        /// [`crate::vendor_index::VendorIndex`].
+        vendor_files: Vec<PathBuf>,
         reply: oneshot::Sender<()>,
     },
     /// Find all references to a specific view across the project
     FindViewReferences {
         view_name: String,
         reply: oneshot::Sender<Vec<ViewReferenceLocationData>>,
+    },
+    /// Every Blade template that RENDERS one of these components — the reverse
+    /// edge the item-1 up-walk climbs (#339). `component_names` are matched
+    /// against `<x-…>` tags (`ParsedPatternsData::components`) and
+    /// `livewire_names` against `<livewire:…>` tags
+    /// (`ParsedPatternsData::livewire_refs`), because a partial is used through
+    /// either syntax and indexing only the first would leave the other silent.
+    ///
+    /// Replies with the rendering `.blade.php` paths, sorted and deduped.
+    FilesRenderingComponent {
+        component_names: Vec<String>,
+        livewire_names: Vec<String>,
+        reply: oneshot::Sender<Vec<PathBuf>>,
     },
     /// Find all references to a classified symbol across the project.
     /// Iterates `ProjectFiles` and filters parser-classified patterns by name —
@@ -6422,20 +6790,6 @@ pub enum SalsaRequest {
         reply: oneshot::Sender<Vec<ComponentNamespaceData>>,
     },
 
-    // === Environment Variable Management ===
-    /// Register environment variables from the env cache
-    RegisterEnvVariables {
-        variables: std::collections::HashMap<String, EnvVariableData>,
-        reply: oneshot::Sender<()>,
-    },
-    /// Get an environment variable by name
-    GetEnvVariable {
-        name: String,
-        reply: oneshot::Sender<Option<EnvVariableData>>,
-    },
-    /// Get all environment variable names (for autocomplete)
-    GetEnvVariableNames { reply: oneshot::Sender<Vec<String>> },
-
     // === Salsa-based Environment Variable Management (New) ===
     /// Register a raw .env file for Salsa to parse
     RegisterEnvSource {
@@ -6486,6 +6840,12 @@ pub enum SalsaRequest {
         path: PathBuf,
         reply: oneshot::Sender<()>,
     },
+    /// Drop a config path's cached text, so the next completion re-reads it.
+    /// Covers external create, change and delete, and an in-editor edit.
+    InvalidateConfigPath {
+        path: PathBuf,
+        reply: oneshot::Sender<()>,
+    },
     /// Locate a key's declaration inside one catalogue
     LocateTranslationKey {
         root: PathBuf,
@@ -6511,6 +6871,20 @@ pub enum SalsaRequest {
     },
     /// Drop everything derived from service providers
     InvalidateTranslationProviders { reply: oneshot::Sender<()> },
+
+    /// Replace the host-registered extra translation-provider files (module
+    /// providers from the `modules.paths` setting).
+    SetTranslationProviderExtras {
+        files: Vec<PathBuf>,
+        reply: oneshot::Sender<()>,
+    },
+    /// Replace the configured module directories, in `modules.paths`
+    /// glob-match order. The registration merge reads their order as the
+    /// equal-priority tie-break rank.
+    SetModuleDirs {
+        dirs: Vec<PathBuf>,
+        reply: oneshot::Sender<()>,
+    },
     /// How many times the translation cache has touched disk
     LangDiskReads { reply: oneshot::Sender<usize> },
 
@@ -6519,7 +6893,7 @@ pub enum SalsaRequest {
     RegisterServiceProviderSource {
         path: PathBuf,
         text: String,
-        priority: u8, // 0=framework, 1=package, 2=app
+        priority: u8, // 0=framework, 1=package, 2=module, 3=app
         root_path: PathBuf,
         reply: oneshot::Sender<()>,
     },
@@ -6580,12 +6954,6 @@ pub enum SalsaRequest {
     /// clippy::large_enum_variant).
     RegisterCachedConfig {
         config: Box<LaravelConfigData>,
-        reply: oneshot::Sender<()>,
-    },
-
-    /// Register env variables from disk cache (bypasses parsing)
-    RegisterCachedEnvVars {
-        variables: std::collections::HashMap<String, String>,
         reply: oneshot::Sender<()>,
     },
 
@@ -6655,13 +7023,22 @@ impl SalsaHandle {
     }
 
     /// Snapshot the paths of every currently open buffer as a `HashSet`,
-    /// once, for O(1) membership checks. The sole consumer is
-    /// `bulk_import_patterns`, which must not let a disk-parsed warm entry
-    /// overwrite a path the user has open (and possibly edited) — see
-    /// there. Called from async context (the warming task that calls
-    /// `bulk_import_patterns` is itself a `tokio::spawn`ed future, not the
-    /// actor thread), so a plain `.read().await` is correct here.
-    async fn open_buffer_paths(&self) -> std::collections::HashSet<PathBuf> {
+    /// once, for O(1) membership checks.
+    ///
+    /// Two consumers, both needing the same rule: a disk parse must never
+    /// overwrite what the user has open and possibly edited.
+    /// `bulk_import_patterns` applies it to its own writes (see there). The
+    /// watched-file batch's off-actor pre-parse (`preparse_batch_off_actor`
+    /// in `main.rs`, issue #373) applies it a step earlier, to decide which
+    /// files to read from disk at all — it imports patterns AND hierarchy,
+    /// and only the pattern half is guarded downstream, so an open buffer
+    /// filtered out here is what keeps the two halves describing the same
+    /// text.
+    ///
+    /// Public for that second caller. Called from async context (both callers
+    /// run inside `tokio::spawn`ed futures, not on the actor thread), so a
+    /// plain `.read().await` is correct here.
+    pub async fn open_buffer_paths(&self) -> std::collections::HashSet<PathBuf> {
         match self.documents.get() {
             Some(documents) => documents
                 .read()
@@ -6773,6 +7150,64 @@ impl SalsaHandle {
 
     /// Resolve a `$this->X` member access in a Livewire component PHP file.
     /// Auto-registers the file as a Salsa input on first access, invalidates on mtime change.
+    /// Read the actor database's query body-execution counters.
+    pub async fn query_run_counts(&self) -> Result<QueryRunCountsData, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::QueryRunCounts { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Push a render-index snapshot into the actor. Invalidates the memoized
+    /// backing-class queries, so send it only when the index has changed.
+    pub async fn set_render_index(
+        &self,
+        generation: u64,
+        entries: Vec<(String, PathBuf)>,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SetRenderIndex {
+                generation,
+                entries,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Resolve the PHP class(es) backing `blade_path`. See
+    /// [`BladeBackingResolutionData`].
+    pub async fn blade_backing_class_resolution(
+        &self,
+        blade_path: PathBuf,
+        view_name: Option<String>,
+        livewire_paths: Vec<PathBuf>,
+        live_blade_text: Option<String>,
+    ) -> Result<BladeBackingResolutionData, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::BladeBackingClassResolution {
+                blade_path,
+                view_name,
+                livewire_paths,
+                live_blade_text,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
     pub async fn resolve_livewire_member(
         &self,
         path: PathBuf,
@@ -6797,6 +7232,43 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::RemoveFile {
+                path,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Register an open editor buffer for `path`, the acquire half of
+    /// [`SalsaHandle::release_external_php_ownership`]. Call it BEFORE the
+    /// buffer's [`SalsaHandle::update_file`] push — see
+    /// [`SalsaActor::acquire_external_php_ownership`] for what that ordering
+    /// buys.
+    pub async fn acquire_external_php_ownership(&self, path: PathBuf) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::AcquireExternalPhpOwnership {
+                path,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Release one open buffer's claim on `path`'s text. Once the last claim
+    /// goes, the backing-class loader re-reads disk on its next resolution.
+    /// Evicts nothing — see [`SalsaActor::release_external_php_ownership`] for
+    /// why this is not [`SalsaHandle::remove_file`].
+    pub async fn release_external_php_ownership(&self, path: PathBuf) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ReleaseExternalPhpOwnership {
                 path,
                 reply: reply_tx,
             })
@@ -6883,6 +7355,7 @@ impl SalsaHandle {
         composer_json: Option<String>,
         view_config: Option<String>,
         livewire_config: Option<String>,
+        composer_lock: Option<String>,
     ) -> Result<(), &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
@@ -6891,6 +7364,7 @@ impl SalsaHandle {
                 composer_json,
                 view_config,
                 livewire_config,
+                composer_lock,
                 reply: reply_tx,
             })
             .await
@@ -6943,6 +7417,7 @@ impl SalsaHandle {
         view_paths: Vec<PathBuf>,
         livewire_path: Option<PathBuf>,
         routes_path: PathBuf,
+        vendor_files: Vec<PathBuf>,
     ) -> Result<(), &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
@@ -6952,6 +7427,7 @@ impl SalsaHandle {
                 view_paths,
                 livewire_path,
                 routes_path,
+                vendor_files,
                 reply: reply_tx,
             })
             .await
@@ -6971,6 +7447,29 @@ impl SalsaHandle {
         self.sender
             .send(SalsaRequest::FindViewReferences {
                 view_name,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Every Blade template that renders one of `component_names` (as
+    /// `<x-…>`) or `livewire_names` (as `<livewire:…>`), sorted and deduped.
+    /// Backs the item-1 up-walk from a partial to the component that rendered
+    /// it (#339).
+    pub async fn files_rendering_component(
+        &self,
+        component_names: Vec<String>,
+        livewire_names: Vec<String>,
+    ) -> Result<Vec<PathBuf>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::FilesRenderingComponent {
+                component_names,
+                livewire_names,
                 reply: reply_tx,
             })
             .await
@@ -7603,56 +8102,6 @@ impl SalsaHandle {
             .map_err(|_| "Salsa actor dropped reply channel")
     }
 
-    // === Environment Variable Methods ===
-
-    /// Register environment variables from the env cache
-    pub async fn register_env_variables(
-        &self,
-        variables: std::collections::HashMap<String, EnvVariableData>,
-    ) -> Result<(), &'static str> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(SalsaRequest::RegisterEnvVariables {
-                variables,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| "Salsa actor disconnected")?;
-        reply_rx
-            .await
-            .map_err(|_| "Salsa actor dropped reply channel")
-    }
-
-    /// Get an environment variable by name
-    pub async fn get_env_variable(
-        &self,
-        name: String,
-    ) -> Result<Option<EnvVariableData>, &'static str> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(SalsaRequest::GetEnvVariable {
-                name,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| "Salsa actor disconnected")?;
-        reply_rx
-            .await
-            .map_err(|_| "Salsa actor dropped reply channel")
-    }
-
-    /// Get all environment variable names (for autocomplete)
-    pub async fn get_env_variable_names(&self) -> Result<Vec<String>, &'static str> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(SalsaRequest::GetEnvVariableNames { reply: reply_tx })
-            .await
-            .map_err(|_| "Salsa actor disconnected")?;
-        reply_rx
-            .await
-            .map_err(|_| "Salsa actor dropped reply channel")
-    }
-
     // === Salsa-based Environment Variable Methods (New - Phase 1) ===
 
     /// Register a raw .env file for Salsa to parse
@@ -7861,6 +8310,42 @@ impl SalsaHandle {
             .map_err(|_| "Salsa actor dropped reply channel")
     }
 
+    /// Register module service-provider files (from the `modules.paths`
+    /// setting) as first-party translation-namespace providers.
+    pub async fn set_translation_provider_extras(
+        &self,
+        files: Vec<PathBuf>,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SetTranslationProviderExtras {
+                files,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Hand the actor the configured module directories in `modules.paths`
+    /// order, so the registration merge can break an equal-priority tie by
+    /// module rank instead of by provider path.
+    pub async fn set_module_dirs(&self, dirs: Vec<PathBuf>) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SetModuleDirs {
+                dirs,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
     /// Drop everything derived from service providers after one changed.
     pub async fn invalidate_translation_providers(&self) -> Result<(), &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -7895,6 +8380,26 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::InvalidateLangPath {
+                path,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Drop a config path's cached text after a create, change or delete, so
+    /// the next completion re-reads it.
+    ///
+    /// The counterpart to the cache added in #349: completion resolves the
+    /// preview locale from `config/app.php` once per session, which without
+    /// this call would keep answering with the pre-edit locale.
+    pub async fn invalidate_config_path(&self, path: PathBuf) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::InvalidateConfigPath {
                 path,
                 reply: reply_tx,
             })
@@ -8111,24 +8616,6 @@ impl SalsaHandle {
             .await
             .map_err(|_| "Salsa actor dropped reply channel")
     }
-
-    /// Register env variables from disk cache (bypasses parsing)
-    pub async fn register_cached_env_vars(
-        &self,
-        variables: std::collections::HashMap<String, String>,
-    ) -> Result<(), &'static str> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(SalsaRequest::RegisterCachedEnvVars {
-                variables,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| "Salsa actor disconnected")?;
-        reply_rx
-            .await
-            .map_err(|_| "Salsa actor dropped reply channel")
-    }
 }
 
 /// Absolute root directories captured at `register_project_files` time.
@@ -8223,6 +8710,36 @@ pub enum FileListOp {
     Remove,
 }
 
+/// Where the text currently installed in `files[path]` came from, and
+/// therefore who is responsible for replacing it.
+///
+/// The backing-class loader ([`SalsaActor::ensure_external_php_source_loaded`])
+/// reads a file from disk whenever a Blade template resolves `$this->member`,
+/// which is a request-path read of a file somebody may be editing. The rule
+/// this enum encodes is the narrowest one that keeps that safe: **the loader
+/// only ever overwrites text it loaded itself.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalPhpText {
+    /// The loader read it from disk, at this mtime. It is the owner, so it
+    /// re-reads once the mtime advances.
+    LoadedFromDisk(std::time::SystemTime),
+    /// A client push installed it — `textDocument/didOpen`/`didChange` with an
+    /// editor buffer, or `workspace/didChangeWatchedFiles` with the watcher's
+    /// own fresh read. Both push again when their source changes, so the
+    /// pusher owns invalidation for this path and the loader must not read
+    /// disk over it: a live buffer would lose the user's unsaved edits, and a
+    /// watched file is already being kept current by the watcher.
+    ///
+    /// The promise to push again lasts exactly as long as the pusher does.
+    /// The watcher never goes away, so a watched file holds this state for the
+    /// session; an editor buffer does, so `textDocument/didClose` hands the
+    /// path back via [`SalsaActor::release_external_php_ownership`] once the
+    /// path's last open buffer goes. Closing a buffer whose edits were
+    /// DISCARDED writes nothing to disk and fires no watcher event, so without
+    /// that release this state would outlive every source able to correct it.
+    PushedByClient,
+}
+
 /// The Salsa actor that owns the database and runs on a dedicated thread
 pub struct SalsaActor {
     db: LaravelDatabase,
@@ -8277,23 +8794,62 @@ pub struct SalsaActor {
     /// tokio runtime, so a blocking read is the correct (and only
     /// available) primitive here.
     documents: Arc<OnceLock<Arc<RwLock<HashMap<Url, (String, i32)>>>>>,
-    /// LRU cache of parsed Blade loop blocks, keyed by file path + version.
-    /// Salsa already memoizes the underlying query, but caching the Arc avoids
-    /// re-walking the query graph on every diagnostic / completion request.
-    loop_blocks_cache: LruCache<PathBuf, (i32, Arc<Vec<crate::blade_loops::BladeLoopBlock>>)>,
-    /// LRU cache of parsed `@php ... @endphp` block assignments, keyed by file path + version.
-    php_assignments_cache: LruCache<PathBuf, (i32, Arc<Vec<(String, String)>>)>,
-    /// LRU cache of document-symbol trees keyed by file path. Stores file
-    /// version alongside the cached Arc so a version mismatch triggers a
-    /// recompute via the memoized Salsa query.
+    /// LRU cache of parsed Blade loop blocks, keyed by file path + text
+    /// revision ([`SalsaActor::text_revision`]). Salsa already memoizes the
+    /// underlying query, but caching the Arc avoids re-walking the query graph
+    /// on every diagnostic / completion request.
+    loop_blocks_cache: LruCache<PathBuf, (u64, Arc<Vec<crate::blade_loops::BladeLoopBlock>>)>,
+    /// LRU cache of parsed `@php ... @endphp` block assignments, keyed by file
+    /// path + text revision.
+    php_assignments_cache: LruCache<PathBuf, (u64, Arc<Vec<(String, String)>>)>,
+    /// LRU cache of document-symbol trees keyed by file path. Stores the text
+    /// revision alongside the cached Arc so a mismatch triggers a recompute
+    /// via the memoized Salsa query.
     document_symbols_cache:
-        LruCache<PathBuf, (i32, Arc<Vec<crate::document_symbols::SymbolEntry>>)>,
-    /// Tracks the on-disk mtime of Livewire component PHP files registered as Salsa inputs.
-    /// These files are not opened in the editor (no `did_open`/`did_change` events), so we
-    /// invalidate by comparing filesystem mtime on each access.
-    livewire_mtimes: HashMap<PathBuf, std::time::SystemTime>,
-    /// Monotonic version counter for Livewire component SourceFiles (incremented per disk re-read).
-    livewire_version_counter: i32,
+        LruCache<PathBuf, (u64, Arc<Vec<crate::document_symbols::SymbolEntry>>)>,
+    /// Records where the text currently installed in `files[path]` came from,
+    /// for external PHP files registered as Salsa inputs — Livewire component
+    /// classes, and the backing classes of a Blade template (#339, item 7).
+    ///
+    /// [`SalsaActor::ensure_external_php_source_loaded`] reads this to decide
+    /// whether a disk re-read is due. An absent entry means "this actor never
+    /// installed text for that path", which is the only state that permits an
+    /// unconditional read.
+    external_php_text: HashMap<PathBuf, ExternalPhpText>,
+    /// How many open editor buffers currently claim each path. Incremented by
+    /// `textDocument/didOpen` and decremented by `didClose`; the
+    /// `PushedByClient` stamp above is handed back only when the count reaches
+    /// zero. Absent means zero.
+    ///
+    /// Counting — rather than one flag per path — is what makes the release
+    /// safe against out-of-order handlers. tower-lsp drives up to four
+    /// notification handlers concurrently, so the `didOpen` of a REOPENED
+    /// buffer can reach this actor before the `didClose` that preceded it at
+    /// the client. Increments and decrements commute, so the pair settles at
+    /// one whichever order it arrives in, and the live buffer keeps its
+    /// ownership; a flag would read "closed" and hand a live buffer back to
+    /// the loader, which then overwrites the shared `SourceFile` text every
+    /// other query reads.
+    ///
+    /// Kept by the open/close edges alone: `RemoveFile` deliberately does not
+    /// clear it, because deleting a path on disk does not close its buffer.
+    external_php_open_buffers: HashMap<PathBuf, u32>,
+    /// Monotonic version counter for external PHP SourceFiles (incremented per disk re-read).
+    /// Monotonic stamp for the text currently installed in `files[path]`,
+    /// bumped by EVERY writer, and the key the three per-file LRU caches
+    /// below compare on.
+    ///
+    /// `SourceFile::version` cannot serve that purpose: `handle_update_file`
+    /// stamps the LSP document version onto it while the backing-class loader
+    /// stamped a counter of its own, so two independent sequences — both
+    /// starting near zero, both climbing — wrote one field. Where they
+    /// collided, a cache hit returned blocks parsed from the other writer's
+    /// text: same number, different source. One counter, one namespace, no
+    /// collision possible.
+    text_revision: u64,
+    /// Per-file view of [`Self::text_revision`]. Absent means "never written
+    /// through a bumping site", which reads as revision 0.
+    file_text_revisions: HashMap<PathBuf, u64>,
 
     // === Config Management ===
     /// Project root path
@@ -8314,6 +8870,13 @@ pub struct SalsaActor {
     registration_baselines: HashMap<PathBuf, ProviderRegistrationsData>,
 
     // === Reference Finding ===
+    /// The render index as a Salsa input, created on first use (#339, item 7).
+    render_index: Option<RenderIndex>,
+    /// Monotonic version for the render-index input.
+    render_index_version: i32,
+    /// The `ViewVarIndex` generation the installed render index was built from.
+    /// Guards `handle_set_render_index` against an out-of-order push.
+    render_index_generation: u64,
     /// Project files input for reference finding
     project_files: Option<ProjectFiles>,
     /// Version counter for project files
@@ -8357,6 +8920,13 @@ pub struct SalsaActor {
     /// `mark_dirty` / `take_dirty` pattern (see `symbol_index.rs`).
     symbol_index: crate::symbol_index::SymbolIndex,
 
+    /// Reverse "which Blade files render component X" index, over the same
+    /// `ParsedPatternsData` the pattern cache already holds. Kept fresh with
+    /// the same deferred `mark_dirty` / drain shape as `symbol_index`; see
+    /// `component_usage_index.rs` for why the ancestor walk cannot afford the
+    /// linear scan it replaces.
+    component_usage_index: crate::component_usage_index::ComponentUsageIndex,
+
     /// Project-wide class-hierarchy + member index. Populated at warming from
     /// the same parse that feeds the pattern cache; powers structural code
     /// lenses (implementations / usages / overrides / parent) and cross-file
@@ -8383,10 +8953,6 @@ pub struct SalsaActor {
     /// Cached component namespace registrations from Blade::componentNamespace() calls
     sp_component_namespaces: HashMap<String, ComponentNamespaceData>,
 
-    // === Environment Variables ===
-    /// Cached environment variables
-    env_variables: HashMap<String, EnvVariableData>,
-
     // === Salsa-based Environment Variable Tracking (New) ===
     /// Env files registered with Salsa for incremental parsing
     salsa_env_files: HashMap<PathBuf, EnvFile>,
@@ -8400,6 +8966,11 @@ pub struct SalsaActor {
     // === Salsa-based Service Provider Tracking (New) ===
     /// Service provider files registered with Salsa for incremental parsing
     salsa_sp_files: HashMap<PathBuf, ServiceProviderFile>,
+
+    /// Configured module directories in `modules.paths` glob-match order —
+    /// the rank the registration merge breaks equal-priority ties on. Empty
+    /// when the modular-monolith feature is off.
+    module_dirs: Vec<PathBuf>,
     /// Version counter for service provider files
     salsa_sp_version: i32,
     /// Project root for service provider resolution
@@ -8416,6 +8987,13 @@ const PATTERN_CACHE_INITIAL_CAPACITY: usize = 1024;
 /// covers files that appear afterwards without forcing an immediate rehash
 /// (a `composer update`, new app files created mid-session).
 const PATTERN_CACHE_CAPACITY_PADDING: usize = 1000;
+
+/// One provider registration's standing in the merge performed by
+/// [`SalsaActor::handle_get_laravel_config`]: its tier priority
+/// (`0=framework, 1=package, 2=module, 3=app`) and, for a module provider,
+/// its 1-based rank in `modules.paths` order (`0` = not a module provider).
+/// Ordered as a plain tuple, which IS the documented rule.
+type MergeRank = (u8, usize);
 
 impl SalsaActor {
     /// Spawn the actor on a dedicated thread and return a handle for communication
@@ -8444,63 +9022,7 @@ impl SalsaActor {
         let documents_for_actor = documents.clone();
 
         std::thread::spawn(move || {
-            let mut actor = SalsaActor {
-                db: LaravelDatabase::new(),
-                receiver: rx,
-                // Pre-allocate with reasonable capacity to avoid early reallocations
-                files: HashMap::with_capacity(64),
-                // Bootstrap table, big enough for the handful of `didOpen`
-                // buffers an editor may send before registration finishes.
-                // Replaced with a correctly-sized one — carrying those
-                // entries over — by `size_and_publish_pattern_cache`.
-                pattern_cache: Arc::new(dashmap::DashMap::with_capacity(
-                    PATTERN_CACHE_INITIAL_CAPACITY,
-                )),
-                pattern_cache_slot: pattern_cache_slot_for_actor,
-                documents: documents_for_actor,
-                loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
-                php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
-                document_symbols_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
-                livewire_mtimes: HashMap::with_capacity(64),
-                livewire_version_counter: 0,
-                // Config management
-                config_root: None,
-                config_files: HashMap::with_capacity(4),
-                config_version: 0,
-                config_cache: None,
-                registration_baselines: HashMap::new(),
-                // Reference finding
-                project_files: None,
-                project_files_version: 0,
-                controller_files: Vec::new(),
-                view_files: Vec::new(),
-                livewire_files: Vec::new(),
-                route_files: Vec::new(),
-                vendor_files: Vec::new(),
-                source_files: Vec::new(),
-                project_root_paths: ProjectRootPaths::default(),
-                symbol_index: crate::symbol_index::SymbolIndex::default(),
-                class_hierarchy_index: crate::class_hierarchy_index::ClassHierarchyIndex::default(),
-                class_files_snapshot: None,
-                // Service provider registry
-                sp_middleware_aliases: HashMap::new(),
-                sp_bindings: HashMap::new(),
-                sp_singletons: HashMap::new(),
-                sp_view_namespaces: HashMap::new(),
-                sp_blade_components: HashMap::new(),
-                sp_component_namespaces: HashMap::new(),
-                // Environment variables
-                env_variables: HashMap::new(),
-                // Salsa-based env tracking
-                salsa_env_files: HashMap::with_capacity(4),
-                salsa_env_version: 0,
-                // Salsa-based translation tracking (issue #293)
-                translations: TranslationCache::default(),
-                // Salsa-based service provider tracking
-                salsa_sp_files: HashMap::with_capacity(32),
-                salsa_sp_version: 0,
-                salsa_sp_root: None,
-            };
+            let mut actor = SalsaActor::new(rx, pattern_cache_slot_for_actor, documents_for_actor);
 
             // Pre-warm query cache on actor thread (background)
             // This runs before any file parsing requests arrive,
@@ -8514,6 +9036,84 @@ impl SalsaActor {
             sender: tx,
             pattern_cache: pattern_cache_slot,
             documents,
+        }
+    }
+
+    /// Build the actor's initial state.
+    ///
+    /// Extracted from [`Self::spawn`] so the struct literal has exactly one
+    /// home and the in-crate test module can construct an actor to drive
+    /// `&mut self` methods directly — the only way to assert on `files` and
+    /// `external_php_text`, which no `SalsaHandle` message exposes (#364).
+    /// `spawn` still owns the threading; this owns the fields.
+    fn new(
+        receiver: mpsc::Receiver<SalsaRequest>,
+        pattern_cache_slot: Arc<
+            std::sync::OnceLock<Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>>,
+        >,
+        documents: Arc<OnceLock<Arc<RwLock<HashMap<Url, (String, i32)>>>>>,
+    ) -> Self {
+        SalsaActor {
+            db: LaravelDatabase::new(),
+            receiver,
+            // Pre-allocate with reasonable capacity to avoid early reallocations
+            files: HashMap::with_capacity(64),
+            // Bootstrap table, big enough for the handful of `didOpen`
+            // buffers an editor may send before registration finishes.
+            // Replaced with a correctly-sized one — carrying those
+            // entries over — by `size_and_publish_pattern_cache`.
+            pattern_cache: Arc::new(dashmap::DashMap::with_capacity(
+                PATTERN_CACHE_INITIAL_CAPACITY,
+            )),
+            pattern_cache_slot,
+            documents,
+            loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
+            php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
+            document_symbols_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
+            external_php_text: HashMap::with_capacity(64),
+            external_php_open_buffers: HashMap::with_capacity(64),
+            text_revision: 0,
+            file_text_revisions: HashMap::with_capacity(64),
+            // Config management
+            config_root: None,
+            config_files: HashMap::with_capacity(4),
+            config_version: 0,
+            config_cache: None,
+            registration_baselines: HashMap::new(),
+            // Reference finding
+            render_index: None,
+            render_index_version: 0,
+            render_index_generation: 0,
+            project_files: None,
+            project_files_version: 0,
+            controller_files: Vec::new(),
+            view_files: Vec::new(),
+            livewire_files: Vec::new(),
+            route_files: Vec::new(),
+            vendor_files: Vec::new(),
+            source_files: Vec::new(),
+            project_root_paths: ProjectRootPaths::default(),
+            symbol_index: crate::symbol_index::SymbolIndex::default(),
+            component_usage_index: crate::component_usage_index::ComponentUsageIndex::default(),
+            class_hierarchy_index: crate::class_hierarchy_index::ClassHierarchyIndex::default(),
+            class_files_snapshot: None,
+            // Service provider registry
+            sp_middleware_aliases: HashMap::new(),
+            sp_bindings: HashMap::new(),
+            sp_singletons: HashMap::new(),
+            sp_view_namespaces: HashMap::new(),
+            sp_blade_components: HashMap::new(),
+            sp_component_namespaces: HashMap::new(),
+            // Salsa-based env tracking
+            salsa_env_files: HashMap::with_capacity(4),
+            salsa_env_version: 0,
+            // Salsa-based translation tracking (issue #293)
+            translations: TranslationCache::default(),
+            // Salsa-based service provider tracking
+            salsa_sp_files: HashMap::with_capacity(32),
+            module_dirs: Vec::new(),
+            salsa_sp_version: 0,
+            salsa_sp_root: None,
         }
     }
 
@@ -8564,6 +9164,32 @@ impl SalsaActor {
                     let result = self.handle_get_document_symbols(&path);
                     let _ = reply.send(result);
                 }
+                SalsaRequest::QueryRunCounts { reply } => {
+                    let _ = reply.send(self.db.query_run_counts().snapshot());
+                }
+                SalsaRequest::SetRenderIndex {
+                    generation,
+                    entries,
+                    reply,
+                } => {
+                    self.handle_set_render_index(generation, entries);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::BladeBackingClassResolution {
+                    blade_path,
+                    view_name,
+                    livewire_paths,
+                    live_blade_text,
+                    reply,
+                } => {
+                    let result = self.handle_blade_backing_class_resolution(
+                        &blade_path,
+                        view_name,
+                        livewire_paths,
+                        live_blade_text,
+                    );
+                    let _ = reply.send(result);
+                }
                 SalsaRequest::ResolveLivewireMember {
                     path,
                     member,
@@ -8574,19 +9200,27 @@ impl SalsaActor {
                 }
                 SalsaRequest::RemoveFile { path, reply } => {
                     self.files.remove(&path);
-                    self.pattern_cache.remove(&path);
-                    self.loop_blocks_cache.pop(&path);
-                    self.php_assignments_cache.pop(&path);
-                    self.document_symbols_cache.pop(&path);
+                    self.invalidate_file_caches(&path);
+                    self.file_text_revisions.remove(&path);
+                    self.external_php_text.remove(&path);
                     // Drop from the inverted index too. Doing this
                     // synchronously (rather than via mark_dirty) is
                     // correct: there's no future state to refresh
                     // to — the file is gone.
                     self.symbol_index.remove_file(&path);
+                    self.component_usage_index.remove_file(&path);
                     if self.class_hierarchy_index.contains_file(&path) {
                         self.class_hierarchy_index.remove_file(&path);
                         self.class_files_snapshot = None; // hierarchy changed
                     }
+                    let _ = reply.send(());
+                }
+                SalsaRequest::AcquireExternalPhpOwnership { path, reply } => {
+                    self.acquire_external_php_ownership(&path);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::ReleaseExternalPhpOwnership { path, reply } => {
+                    self.release_external_php_ownership(&path);
                     let _ = reply.send(());
                 }
 
@@ -8622,6 +9256,13 @@ impl SalsaActor {
                     // hierarchy node, or cached parse can survive the rebuild.
                     self.pattern_cache.clear();
                     self.symbol_index.clear();
+                    // Re-queued rather than merely cleared: the view files
+                    // still exist, and an emptied index that nothing refills
+                    // would answer every ancestor walk with silence.
+                    self.component_usage_index.clear();
+                    for path in &self.view_files.clone() {
+                        self.component_usage_index.mark_dirty(path);
+                    }
                     self.class_hierarchy_index.clear();
                     self.loop_blocks_cache.clear();
                     self.php_assignments_cache.clear();
@@ -8636,6 +9277,7 @@ impl SalsaActor {
                     composer_json,
                     view_config,
                     livewire_config,
+                    composer_lock,
                     reply,
                 } => {
                     self.handle_register_config_files(
@@ -8643,6 +9285,7 @@ impl SalsaActor {
                         composer_json,
                         view_config,
                         livewire_config,
+                        composer_lock,
                     );
                     let _ = reply.send(());
                 }
@@ -8662,6 +9305,7 @@ impl SalsaActor {
                     view_paths,
                     livewire_path,
                     routes_path,
+                    vendor_files,
                     reply,
                 } => {
                     self.handle_register_project_files(
@@ -8670,11 +9314,21 @@ impl SalsaActor {
                         view_paths,
                         livewire_path,
                         routes_path,
+                        vendor_files,
                     );
                     let _ = reply.send(());
                 }
                 SalsaRequest::FindViewReferences { view_name, reply } => {
                     let result = self.handle_find_view_references(&view_name);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::FilesRenderingComponent {
+                    component_names,
+                    livewire_names,
+                    reply,
+                } => {
+                    let result =
+                        self.handle_files_rendering_component(&component_names, &livewire_names);
                     let _ = reply.send(result);
                 }
                 SalsaRequest::FindReferences {
@@ -8993,20 +9647,6 @@ impl SalsaActor {
                     let _ = reply.send(result);
                 }
 
-                // === Environment Variable Handlers ===
-                SalsaRequest::RegisterEnvVariables { variables, reply } => {
-                    self.handle_register_env_variables(variables);
-                    let _ = reply.send(());
-                }
-                SalsaRequest::GetEnvVariable { name, reply } => {
-                    let result = self.handle_get_env_variable(&name);
-                    let _ = reply.send(result);
-                }
-                SalsaRequest::GetEnvVariableNames { reply } => {
-                    let result = self.handle_get_env_variable_names();
-                    let _ = reply.send(result);
-                }
-
                 // === Salsa-based Environment Variable Handlers (New) ===
                 SalsaRequest::RegisterEnvSource {
                     path,
@@ -9057,6 +9697,10 @@ impl SalsaActor {
                     self.handle_invalidate_lang_path(&path);
                     let _ = reply.send(());
                 }
+                SalsaRequest::InvalidateConfigPath { path, reply } => {
+                    self.handle_invalidate_config_path(&path);
+                    let _ = reply.send(());
+                }
                 SalsaRequest::LocateTranslationKey {
                     root,
                     path,
@@ -9090,6 +9734,17 @@ impl SalsaActor {
                 }
                 SalsaRequest::InvalidateTranslationProviders { reply } => {
                     self.translations.invalidate_providers();
+                    let _ = reply.send(());
+                }
+                SalsaRequest::SetTranslationProviderExtras { files, reply } => {
+                    self.translations.set_extra_provider_files(files);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::SetModuleDirs { dirs, reply } => {
+                    // The merge tie-break reads these, and the merged config
+                    // is memoized — a changed module list has to invalidate it.
+                    self.module_dirs = dirs;
+                    self.config_cache = None;
                     let _ = reply.send(());
                 }
                 SalsaRequest::LangDiskReads { reply } => {
@@ -9193,26 +9848,6 @@ impl SalsaActor {
                     tracing::info!("📋 Registered cached Laravel config");
                     let _ = reply.send(());
                 }
-                SalsaRequest::RegisterCachedEnvVars { variables, reply } => {
-                    // Set env vars directly from cache
-                    let count = variables.len();
-                    for (name, value) in variables {
-                        self.env_variables.insert(
-                            name.clone(),
-                            EnvVariableData {
-                                name,
-                                value,
-                                file_path: PathBuf::from(".env"), // Placeholder
-                                line: 0,
-                                column: 0,
-                                value_column: 0,
-                                is_commented: false,
-                            },
-                        );
-                    }
-                    tracing::debug!("Registered {} cached env variables", count);
-                    let _ = reply.send(());
-                }
 
                 SalsaRequest::Shutdown => {
                     break;
@@ -9224,17 +9859,26 @@ impl SalsaActor {
     /// Handle file update - create or update the SourceFile
     fn handle_update_file(&mut self, path: PathBuf, version: i32, text: String) {
         // Invalidate caches for this file - will be recomputed on next request
-        self.pattern_cache.remove(&path);
-        self.loop_blocks_cache.pop(&path);
-        self.php_assignments_cache.pop(&path);
-        self.document_symbols_cache.pop(&path);
+        self.invalidate_file_caches(&path);
         // Mark for re-indexing on next find-references query. We don't
         // re-index eagerly here because (a) most file edits are
         // followed by more edits before any query runs, and (b) the
         // new patterns aren't parsed until something asks for them
         // via get_patterns anyway. Lazy refresh amortizes both costs.
         self.symbol_index.mark_dirty(&path);
-        self.class_hierarchy_index.mark_dirty(&path);
+        // A Blade edit can add or delete an `<x-…>` / `<livewire:…>` tag, so
+        // the reverse usage index has to re-read this file before its next
+        // answer (no-op for non-Blade paths).
+        self.component_usage_index.mark_dirty(&path);
+
+        self.bump_text_revision(&path);
+        // Hand ownership of this path's text to the pusher. Without it
+        // `ensure_external_php_source_loaded` sees no entry, decides a reload
+        // is due, and overwrites an unsaved buffer with the last-saved bytes
+        // the moment a Blade hover resolves its backing class. Same rule
+        // `did_change_watched_files` already applies from the other side: the
+        // buffer wins over disk.
+        self.mark_pushed_by_client(&path);
 
         if let Some(file) = self.files.get(&path) {
             // Update existing file
@@ -9247,15 +9891,170 @@ impl SalsaActor {
         }
     }
 
+    /// Stamp a new revision for `path`'s text and return it. Every write into
+    /// `self.files` calls this; see [`SalsaActor::text_revision`] for why the
+    /// caches cannot key on `SourceFile::version` instead.
+    fn bump_text_revision(&mut self, path: &Path) -> u64 {
+        self.text_revision = self.text_revision.wrapping_add(1);
+        self.file_text_revisions
+            .insert(path.to_path_buf(), self.text_revision);
+        self.text_revision
+    }
+
+    /// The revision of the text currently installed for `path`. Zero for a
+    /// file no bumping writer has touched.
+    fn text_revision_of(&self, path: &Path) -> u64 {
+        self.file_text_revisions.get(path).copied().unwrap_or(0)
+    }
+
+    /// Drop every per-file actor cache entry for `path`. Called by every
+    /// writer of `files[path]`'s text — `pattern_cache` in particular is
+    /// checked without any version comparison, so a stale entry there is
+    /// served forever rather than merely once.
+    fn invalidate_file_caches(&mut self, path: &Path) {
+        self.pattern_cache.remove(path);
+        self.loop_blocks_cache.pop(path);
+        self.php_assignments_cache.pop(path);
+        self.document_symbols_cache.pop(path);
+    }
+
+    /// Record that `path`'s Salsa text was installed by a client push, so the
+    /// backing-class loader never reads disk over it.
+    ///
+    /// Deliberately infallible. The predecessor stamped `path`'s disk mtime
+    /// and silently did nothing when `metadata()` failed — leaving a pushed
+    /// (possibly unsaved) buffer with no entry at all, which the loader reads
+    /// as "never loaded, read disk unconditionally": precisely the clobber the
+    /// stamp exists to prevent. Ownership is not a fact about the filesystem,
+    /// so it must not be recorded through a fallible filesystem call.
+    fn mark_pushed_by_client(&mut self, path: &Path) {
+        self.external_php_text
+            .insert(path.to_path_buf(), ExternalPhpText::PushedByClient);
+    }
+
+    /// Count one more open editor buffer for `path`, driven by
+    /// `textDocument/didOpen`. Nothing else: the text and its
+    /// `PushedByClient` stamp arrive with the buffer's own `update_file`
+    /// push, and this only records that a buffer is holding the path so
+    /// [`SalsaActor::release_external_php_ownership`] knows when the last one
+    /// lets go.
+    ///
+    /// **`did_open` must enqueue this BEFORE its `update_file` push.** A
+    /// `didClose` for a previous buffer of the same path can be in flight
+    /// concurrently and lands somewhere in this sequence. Acquire-first leaves
+    /// every landing point safe: before the acquire it releases the earlier
+    /// buffer's stamp, which the push then re-installs; between or after, it
+    /// decrements to a non-zero count and drops nothing. Push-first opens one
+    /// window where the release lands after the stamp with the count still at
+    /// zero — a live buffer left unowned, which is the defect the release
+    /// exists to prevent, reached from the other side.
+    fn acquire_external_php_ownership(&mut self, path: &Path) {
+        *self
+            .external_php_open_buffers
+            .entry(path.to_path_buf())
+            .or_insert(0) += 1;
+    }
+
+    /// Hand `path`'s text back to the loader once its LAST open buffer goes —
+    /// the release edge matching [`SalsaActor::mark_pushed_by_client`]'s
+    /// acquire, driven by `textDocument/didClose`.
+    ///
+    /// Dropping the entry restores the "nobody installed text here" state,
+    /// the one [`SalsaActor::ensure_external_php_source_loaded`] reads as
+    /// "read disk unconditionally". That is the whole point: a buffer can be
+    /// closed with its edits DISCARDED, which writes nothing to disk and so
+    /// fires no `did_change_watched_files`. Without a release the pusher's
+    /// promise to push again outlives the pusher, and the loader keeps
+    /// serving text that exists neither on disk nor in any open buffer.
+    ///
+    /// A path with buffers left is NOT handed back. tower-lsp runs
+    /// notification handlers concurrently, so this close can arrive after the
+    /// `didOpen` of a buffer that reopened the same path — a revert, or Zed's
+    /// multibuffer lifecycle. The count is what distinguishes the two: it
+    /// still reads one, so the reopened buffer keeps its stamp. Releasing
+    /// there would leave a live buffer unowned, and the loader's next read
+    /// does not merely answer from disk — it writes disk text into the shared
+    /// `SourceFile` every per-file query reads, so a hover in one file would
+    /// silently revert another file's buffer text.
+    ///
+    /// With no count at all the stamp goes. That is the state a
+    /// `didChangeWatchedFiles` push leaves behind — ownership with no buffer
+    /// to close it — and the safe direction besides: every divergence falls
+    /// toward consulting disk, never toward serving a buffer nobody holds.
+    ///
+    /// Infallible and idempotent: `didClose` fires for every closed document,
+    /// most of which never enter either map, and removing an absent key is a
+    /// no-op.
+    ///
+    /// Deliberately NOT `RemoveFile`. The `SourceFile` input, the per-file
+    /// caches and the resolved magic-member entries all stay; only ownership
+    /// changes, and the next loader read replaces the text. See the comment in
+    /// `Backend::did_close` for why eviction on close is the wrong tool.
+    fn release_external_php_ownership(&mut self, path: &Path) {
+        if let Some(open_buffers) = self.external_php_open_buffers.get_mut(path) {
+            // A present key is always at least one: the acquire inserts at
+            // one, and the branch below removes the key rather than leaving a
+            // zero behind. So this cannot underflow.
+            *open_buffers -= 1;
+            if *open_buffers > 0 {
+                return;
+            }
+            self.external_php_open_buffers.remove(path);
+        }
+        self.external_php_text.remove(path);
+
+        // Drop the TEXT that stamp was protecting, not merely the claim on it.
+        // Releasing ownership alone un-blocks the LOADER, and the loader is not
+        // the only reader: `handle_get_patterns`, `handle_get_document_symbols`,
+        // `handle_get_loop_blocks` and `handle_get_php_assignments` all read
+        // `files[path]` directly, and `pattern_cache` is checked with NO version
+        // comparison — so an entry derived from the discarded buffer is served
+        // forever rather than merely once. Find-references answering out of it
+        // names a symbol that exists in no file at all.
+        //
+        // Removing the input restores the same "nobody installed text here"
+        // state the line above restores for ownership, for every reader at
+        // once: `ensure_file_registered` finds the slot vacant and reads disk,
+        // and `ensure_external_php_source_loaded` reloads through its own
+        // containment guard. This stays LAZY — nothing is read at close time;
+        // the re-read lands on whichever query asks first.
+        //
+        // Deliberately NOT `RemoveFile`: the symbol index, the reverse
+        // component-usage index, the class-hierarchy index and the resolved
+        // magic-member entries are all left standing. Those are what `did_close`
+        // refuses to evict, and nothing here touches them.
+        self.files.remove(path);
+        self.invalidate_file_caches(path);
+
+        // The three deferred indexes are readers too, and neither of the lines
+        // above reaches them: they answer `find_references` and the code lenses
+        // out of their own maps, refreshed lazily from whatever `mark_dirty`
+        // queued. A query run WHILE the buffer was open drains that queue, so
+        // the index is left holding the buffer's literals with the flag already
+        // cleared — a `view('…')` the discarded buffer introduced would keep
+        // answering find-references forever, pointing at a file that never
+        // contained it.
+        //
+        // Re-queueing is what `handle_update_file` does for any other change of
+        // a path's text, and this is one: the text just went from the buffer's
+        // back to disk's. It is NOT eviction — the drain runs
+        // `remove_literal_entries` + `insert_file`, which deliberately keeps
+        // the resolved magic-member entries that only a warm or save pass can
+        // rebuild, and which are the whole reason `did_close` refuses
+        // `RemoveFile`.
+        self.symbol_index.mark_dirty(path);
+        self.component_usage_index.mark_dirty(path);
+    }
+
     /// Handle a Blade loop-blocks query. Memoized via Salsa + actor LRU.
     fn handle_get_loop_blocks(
         &mut self,
         path: &PathBuf,
     ) -> Option<Arc<Vec<crate::blade_loops::BladeLoopBlock>>> {
         let file = self.files.get(path)?;
-        let version = file.version(&self.db);
+        let version = self.text_revision_of(path);
 
-        // Cache hit on matching version
+        // Cache hit on matching revision
         if let Some((cached_version, cached)) = self.loop_blocks_cache.get(path) {
             if *cached_version == version {
                 return Some(Arc::clone(cached));
@@ -9272,34 +10071,265 @@ impl SalsaActor {
 
     /// Handle resolving a `$this->X` member access in a Livewire component PHP file.
     /// Auto-registers the file in Salsa, invalidates on mtime change.
+    /// Replace the render-index snapshot, unless it is older than the one
+    /// already held.
+    ///
+    /// Every call bumps the Salsa revision, which invalidates the
+    /// backing-class memo — so the caller must not push a snapshot the actor
+    /// already holds. `Backend::pending_render_index_snapshot` is that gate,
+    /// and skipping there saves the round-trip as well as the write.
+    ///
+    /// **The generation check is what makes concurrent pushes safe.** Two
+    /// tasks can snapshot generations 5 and 6 and then reach this actor in
+    /// either order, because each awaits a channel round-trip in between. The
+    /// caller's own gate cannot fix that — it only advances a counter, while
+    /// the data that ends up installed is decided here. So ordering is the
+    /// actor's problem, and the actor solves it by refusing to go backwards:
+    /// the winner is always the newest generation, whatever order they arrive
+    /// in. `>=` rather than `>` because an equal generation carries identical
+    /// entries, and re-installing them would drop the memo for nothing.
+    fn handle_set_render_index(&mut self, generation: u64, entries: Vec<(String, PathBuf)>) {
+        if self.render_index.is_some() && generation <= self.render_index_generation {
+            return;
+        }
+        self.render_index_generation = generation;
+        self.render_index_version = self.render_index_version.wrapping_add(1);
+        match self.render_index {
+            Some(index) => {
+                index
+                    .set_version(&mut self.db)
+                    .to(self.render_index_version);
+                index.set_entries(&mut self.db).to(entries);
+            }
+            None => {
+                self.render_index = Some(RenderIndex::new(
+                    &self.db,
+                    self.render_index_version,
+                    entries,
+                ));
+            }
+        }
+    }
+
+    /// The render-index input, created empty on first use so a resolution that
+    /// runs before any snapshot arrives still answers (with no contributors)
+    /// instead of failing.
+    fn render_index_input(&mut self) -> RenderIndex {
+        match self.render_index {
+            Some(index) => index,
+            None => {
+                let index = RenderIndex::new(&self.db, self.render_index_version, Vec::new());
+                self.render_index = Some(index);
+                index
+            }
+        }
+    }
+
+    /// Resolve the PHP class(es) backing a Blade template (#339, item 7).
+    ///
+    /// The two memoized queries do the work; this handler only supplies their
+    /// inputs. That split is deliberate: registering a `SourceFile` reads the
+    /// filesystem, and a tracked query must stay pure.
+    fn handle_blade_backing_class_resolution(
+        &mut self,
+        blade_path: &PathBuf,
+        view_name: Option<String>,
+        livewire_paths: Vec<PathBuf>,
+        live_blade_text: Option<String>,
+    ) -> BladeBackingResolutionData {
+        let index = self.render_index_input();
+        let candidates = blade_backing_class_files(&self.db, index, view_name, livewire_paths);
+
+        // Existence filtering happens HERE, not in the query: a candidate that
+        // cannot be read as a Salsa input (absent file, or an MFC component
+        // directory) contributes nothing and is dropped, exactly as the old
+        // `is_file()` guard dropped it.
+        let inputs: Vec<SourceFile> = candidates
+            .iter()
+            .filter_map(|path| self.ensure_external_php_source_loaded(path))
+            .collect();
+        let files: Vec<PathBuf> = inputs
+            .iter()
+            .map(|file| file.path(&self.db).clone())
+            .collect();
+
+        let inline = self.ensure_blade_source_registered(blade_path, live_blade_text);
+        let sources = blade_backing_class_sources(&self.db, inputs, inline);
+        BladeBackingResolutionData { files, sources }
+    }
+
+    /// Register the Blade template itself as a Salsa input so the inline
+    /// SFC / Volt arm of [`blade_backing_class_sources`] reads it through the
+    /// same memoized path as the backing classes.
+    ///
+    /// `live_text` (the open editor buffer) wins over disk, because the
+    /// `did_change` → Salsa hop is debounced and an inline component's members
+    /// must resolve against what the user is typing right now, not what landed
+    /// 250 ms ago. The text is only written when it actually differs, so a
+    /// resolution on an unedited buffer leaves the memo intact.
+    fn ensure_blade_source_registered(
+        &mut self,
+        path: &PathBuf,
+        live_text: Option<String>,
+    ) -> Option<SourceFile> {
+        let Some(text) = live_text else {
+            return self.ensure_external_php_source_loaded(path);
+        };
+        match self.files.get(path).copied() {
+            Some(file) => {
+                if *file.text(&self.db) != text {
+                    self.bump_text_revision(path);
+                    // The live buffer supersedes disk for this file too, so
+                    // the loader must not read it back out from under us.
+                    self.mark_pushed_by_client(path);
+                    self.invalidate_file_caches(path);
+                    file.set_text(&mut self.db).to(text);
+                }
+                Some(file)
+            }
+            None => {
+                self.bump_text_revision(path);
+                self.mark_pushed_by_client(path);
+                let file = SourceFile::new(&self.db, path.clone(), 0, text);
+                self.files.insert(path.clone(), file);
+                Some(file)
+            }
+        }
+    }
+
     fn handle_resolve_livewire_member(&mut self, path: &PathBuf, member: &str) -> Option<String> {
-        let file = self.ensure_livewire_source_loaded(path)?;
+        let file = self.ensure_external_php_source_loaded(path)?;
         resolve_livewire_member_type(&self.db, file, member.to_string())
     }
 
-    /// Register an external component PHP file as a Salsa input, reloading from
-    /// disk whenever its mtime advances. Returns the cached `SourceFile` handle.
-    fn ensure_livewire_source_loaded(&mut self, path: &PathBuf) -> Option<SourceFile> {
-        let current_mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    /// Register an external PHP file as a Salsa input, reloading it from disk
+    /// whenever its mtime advances — but only while this loader owns the
+    /// path's text. A path a client pushed (see [`ExternalPhpText`]) is served
+    /// from Salsa untouched, so an unsaved buffer is never overwritten with
+    /// its last-saved bytes.
+    ///
+    /// Returns the cached `SourceFile` handle, or `None` when an unowned path
+    /// is unreadable — which is also how a non-existent path and a directory
+    /// (a Livewire v4 MFC's component dir) are dropped from backing-class
+    /// resolution.
+    ///
+    /// **Containment (issue #364).** Every path reaching here is contained by
+    /// construction today — render-index candidates come from the project's
+    /// own directory walk, Livewire candidates from a resolver that gates each
+    /// segment through `naming::is_safe_path_segment` — but this function is a
+    /// read primitive whose result is *emitted* as a goto-definition target
+    /// (`handle_blade_backing_class_resolution` maps it into
+    /// `BladeBackingResolutionData::files`). A guard that lives only in the
+    /// callers is a guard a future caller can forget, which is how #294 and
+    /// both rounds of #348 happened. The guard therefore lives at the
+    /// primitive, and it is split across the two branches because they ask
+    /// different questions — see the comments on each. Both branches gate
+    /// against the candidate's owning module where it has one, so a module
+    /// symlinked in from a composer path repository keeps resolving.
+    fn ensure_external_php_source_loaded(&mut self, path: &PathBuf) -> Option<SourceFile> {
+        // Root unknown: refuse before any state is read, mutated, or stat'd.
+        // Containment cannot be decided without a root, and this function's
+        // failure mode must be closed.
+        let root = self.config_root.clone()?;
 
-        let needs_reload = match self.livewire_mtimes.get(path) {
-            Some(prev_mtime) => *prev_mtime != current_mtime || !self.files.contains_key(path),
-            None => true,
+        // Gate against the candidate's OWNING MODULE where it has one, falling
+        // back to the project root — the same choice
+        // `livewire_namespaces::contained_class_path` makes for the
+        // registrations that MINT these paths, and the same
+        // `config::owning_module` lookup this file already uses for provider
+        // rank.
+        //
+        // `config::expand_module_dirs` admits a module directory whose real
+        // target sits outside the project ON PURPOSE: that is the composer
+        // path-repository layout. Gating this read against the root alone
+        // dropped every backing class inside such a module — silently, since
+        // there is no "component not found" diagnostic and the only symptom is
+        // goto and hover quietly doing nothing.
+        //
+        // The swap does not loosen the guard, and for a module path it
+        // TIGHTENS it: a candidate lexically under a module must canonicalize
+        // inside that module, so one reaching into a sibling module or into
+        // bare `app/` is refused even though it is inside the root.
+        // `owning_module` collapses `..` before its prefix test, so a
+        // traversing path cannot elect itself a laxer gate.
+        let gate = crate::config::owning_module(&self.module_dirs, path)
+            .map(|(_, dir)| dir.to_path_buf())
+            .unwrap_or(root);
+
+        // Ownership is checked BEFORE the filesystem, so a client-pushed path
+        // is served from Salsa whether or not it can be stat'd at this instant.
+        // Ordering the stat first would drop an unsaved buffer out of
+        // backing-class resolution whenever its file is momentarily absent —
+        // a branch switch, a stash, an `artisan make:*` regeneration.
+        if self.external_php_text.get(path) == Some(&ExternalPhpText::PushedByClient) {
+            // This branch reads no disk — but the path it hands back is emitted
+            // to the client as a location to open, so containment still has to
+            // hold. `path_within_root_emit_safe` is the guard shaped for that:
+            // its lexical pre-gate refuses an out-of-root candidate with no
+            // `stat` probe (#145), and its `None` arm admits a *genuinely
+            // absent* in-root path — precisely the unsaved-buffer case this
+            // branch exists to protect (#361) — while refusing a dangling
+            // under-root symlink and every non-`NotFound` lstat error.
+            //
+            // The fail-closed read guard below cannot serve this branch: it
+            // refuses anything it cannot canonicalize, which is exactly the
+            // momentarily-absent buffer, so using it here would reintroduce
+            // #361. The read branch keeps the full fail-closed guard; this is
+            // an addition to a branch that guard never covered, not a
+            // substitution for it.
+            if !path_within_root_emit_safe(path, &gate) {
+                return None;
+            }
+            if let Some(file) = self.files.get(path).copied() {
+                return Some(file);
+            }
+            // Marked as pushed, yet the input is gone. Nothing is left to
+            // protect, so fall through and load from disk rather than answer
+            // `None`. `RemoveFile` clears both together, so this is a
+            // belt-and-braces arm, not a reachable steady state.
+        }
+
+        // The disk branch reads real bytes, so containment must be PROVEN.
+        // `canonical_within_root_registration` is documented for exactly this
+        // shape — a path minted from discovered source data and then read: it
+        // keeps the lexical pre-gate (no out-of-root existence oracle, #145)
+        // and fails closed on anything it cannot canonicalize, including a
+        // dangling under-root symlink (#134/#155).
+        //
+        // Both filesystem calls below go through `real`, the VERIFIED canonical
+        // path the guard returns. Re-deriving it from `path` would let a
+        // symlink swapped between guard and read hand back a target the guard
+        // never approved. `path` stays the key for `self.files` and
+        // `external_php_text`, so the callers' own lookups still resolve.
+        let real = canonical_within_root_registration(path, &gate)?;
+
+        let current_mtime = std::fs::metadata(&real).ok()?.modified().ok()?;
+
+        let needs_reload = match self.external_php_text.get(path) {
+            Some(ExternalPhpText::LoadedFromDisk(prev_mtime)) => {
+                *prev_mtime != current_mtime || !self.files.contains_key(path)
+            }
+            // Either never loaded, or the pushed-but-vanished case above.
+            _ => true,
         };
 
         if needs_reload {
-            let text = std::fs::read_to_string(path).ok()?;
-            self.livewire_version_counter = self.livewire_version_counter.wrapping_add(1);
-            let version = self.livewire_version_counter;
+            let text = std::fs::read_to_string(&real).ok()?;
+            self.bump_text_revision(path);
+            // This write replaces the text every per-file cache was populated
+            // from. `pattern_cache` compares nothing on lookup — a hit is
+            // assumed current — so an entry left behind here would answer
+            // goto and completion out of the previous text indefinitely.
+            self.invalidate_file_caches(path);
 
             if let Some(existing) = self.files.get(path) {
-                existing.set_version(&mut self.db).to(version);
                 existing.set_text(&mut self.db).to(text);
             } else {
-                let file = SourceFile::new(&self.db, path.clone(), version, text);
+                let file = SourceFile::new(&self.db, path.clone(), 0, text);
                 self.files.insert(path.clone(), file);
             }
-            self.livewire_mtimes.insert(path.clone(), current_mtime);
+            self.external_php_text
+                .insert(path.clone(), ExternalPhpText::LoadedFromDisk(current_mtime));
         }
 
         self.files.get(path).copied()
@@ -9308,7 +10338,7 @@ impl SalsaActor {
     /// Handle a Blade @php-assignments query. Memoized via Salsa + actor LRU.
     fn handle_get_php_assignments(&mut self, path: &PathBuf) -> Option<Arc<Vec<(String, String)>>> {
         let file = self.files.get(path)?;
-        let version = file.version(&self.db);
+        let version = self.text_revision_of(path);
 
         if let Some((cached_version, cached)) = self.php_assignments_cache.get(path) {
             if *cached_version == version {
@@ -9329,7 +10359,7 @@ impl SalsaActor {
         path: &PathBuf,
     ) -> Option<Arc<Vec<crate::document_symbols::SymbolEntry>>> {
         let file = self.files.get(path)?;
-        let version = file.version(&self.db);
+        let version = self.text_revision_of(path);
 
         if let Some((cached_version, cached)) = self.document_symbols_cache.get(path) {
             if *cached_version == version {
@@ -9981,6 +11011,7 @@ impl SalsaActor {
         composer_json: Option<String>,
         view_config: Option<String>,
         livewire_config: Option<String>,
+        composer_lock: Option<String>,
     ) {
         self.config_root = Some(root_path.clone());
         self.config_version += 1;
@@ -10003,6 +11034,13 @@ impl SalsaActor {
         // Register config/livewire.php
         if let Some(text) = livewire_config {
             let path = root_path.join("config/livewire.php");
+            let file = ConfigFile::new(&self.db, path.clone(), self.config_version, text);
+            self.config_files.insert(path, file);
+        }
+
+        // Register composer.lock — the Livewire installation authority.
+        if let Some(text) = composer_lock {
+            let path = root_path.join("composer.lock");
             let file = ConfigFile::new(&self.db, path.clone(), self.config_version, text);
             self.config_files.insert(path, file);
         }
@@ -10045,6 +11083,7 @@ impl SalsaActor {
             .config_files
             .get(&root.join("config/livewire.php"))
             .copied();
+        let composer_lock = self.config_files.get(&root.join("composer.lock")).copied();
 
         // Use Salsa query to build config
         let config_ref = build_laravel_config(
@@ -10053,101 +11092,118 @@ impl SalsaActor {
             composer,
             view_config,
             livewire_config,
+            composer_lock,
         );
 
-        // Collect view namespaces from all parsed service providers
-        let mut view_namespaces: HashMap<String, PathBuf> = HashMap::new();
-        let mut component_namespaces: HashMap<String, String> = HashMap::new();
-        let mut anonymous_component_paths: HashMap<String, PathBuf> = HashMap::new();
-        let mut anonymous_component_namespaces: HashMap<String, String> = HashMap::new();
-        // tag → (priority, class file); higher priority (app > package >
-        // framework) wins since sp-file iteration order is arbitrary.
-        let mut class_component_files: HashMap<String, (u8, PathBuf)> = HashMap::new();
+        // THE MERGE RULE, for all five registries below: the highest
+        // [`MergeRank`] wins — tier priority first (the app boots last, so
+        // app > module > package > framework), then `modules.paths` rank, and
+        // a full tie goes to the later provider in the deterministic
+        // lexicographic order (last-wins). Every map carries its winner's
+        // rank while merging and drops it once the winner is settled; none of
+        // them restates the rule locally.
+        let mut view_namespaces: HashMap<String, (MergeRank, PathBuf)> = HashMap::new();
+        let mut component_namespaces: HashMap<String, (MergeRank, String)> = HashMap::new();
+        let mut anonymous_component_paths: HashMap<String, (MergeRank, PathBuf)> = HashMap::new();
+        let mut anonymous_component_namespaces: HashMap<String, (MergeRank, String)> =
+            HashMap::new();
+        let mut class_component_files: HashMap<String, (MergeRank, PathBuf)> = HashMap::new();
+
+        /// Does `candidate` take the key from the current holder? The single
+        /// comparison every merge below routes through, so the five registries
+        /// cannot drift into five rules again (#354 item 4).
+        fn wins(existing: Option<&MergeRank>, candidate: MergeRank) -> bool {
+            existing.is_none_or(|held| candidate >= *held)
+        }
 
         if let Some(sp_root) = self.salsa_sp_root.as_ref() {
             // Lexicographic provider order (`sorted_sp_files`) so the
-            // first-wins / priority tiebreaks below are deterministic (#255).
+            // last-wins tie-break below is deterministic (#255).
             for sp_file in self.sorted_sp_files() {
+                // `modules.paths` rank of the module that owns this provider,
+                // read through the one shared ownership lookup — a module's
+                // provider path sorts lexicographically, which is NOT the
+                // configured order the docs promise (#354 item 3).
+                let module_rank =
+                    crate::config::owning_module(&self.module_dirs, sp_file.path(&self.db))
+                        .map_or(0, |(rank, _)| rank);
                 let parsed = parse_service_provider_source(&self.db, sp_file, sp_root.clone());
 
-                // Collect view namespaces
                 for vn in parsed.view_namespaces(&self.db) {
                     let ns = vn.namespace(&self.db).namespace(&self.db).clone();
+                    let rank = (vn.priority(&self.db), module_rank);
                     if let Some(path) = vn.view_path(&self.db).clone() {
-                        // Higher priority wins
-                        match view_namespaces.get(&ns) {
-                            Some(_) => {} // Keep existing (first wins for now)
-                            None => {
-                                view_namespaces.insert(ns, path);
-                            }
+                        if wins(view_namespaces.get(&ns).map(|(r, _)| r), rank) {
+                            view_namespaces.insert(ns, (rank, path));
                         }
                     }
                 }
 
-                // Collect component namespaces
                 for cn in parsed.component_namespaces(&self.db) {
                     let prefix = cn.prefix(&self.db).namespace(&self.db).clone();
-                    let php_ns = cn.php_namespace(&self.db).clone();
-                    match component_namespaces.get(&prefix) {
-                        Some(_) => {} // Keep existing (first wins for now)
-                        None => {
-                            component_namespaces.insert(prefix, php_ns);
-                        }
+                    let rank = (cn.priority(&self.db), module_rank);
+                    if wins(component_namespaces.get(&prefix).map(|(r, _)| r), rank) {
+                        component_namespaces
+                            .insert(prefix, (rank, cn.php_namespace(&self.db).clone()));
                     }
                 }
 
-                // Collect anonymous component paths (Blade::anonymousComponentPath)
+                // Blade::anonymousComponentPath
                 for acp in parsed.anonymous_component_paths(&self.db) {
                     let prefix = acp.prefix(&self.db).namespace(&self.db).clone();
-                    let directory = acp.directory(&self.db).clone();
-                    anonymous_component_paths.entry(prefix).or_insert(directory);
+                    let rank = (acp.priority(&self.db), module_rank);
+                    if wins(anonymous_component_paths.get(&prefix).map(|(r, _)| r), rank) {
+                        anonymous_component_paths
+                            .insert(prefix, (rank, acp.directory(&self.db).clone()));
+                    }
                 }
 
-                // Collect anonymous component namespaces (Blade::anonymousComponentNamespace)
+                // Blade::anonymousComponentNamespace
                 for acn in parsed.anonymous_component_namespaces(&self.db) {
                     let prefix = acn.prefix(&self.db).namespace(&self.db).clone();
-                    let directory = acn.directory(&self.db).clone();
-                    anonymous_component_namespaces
-                        .entry(prefix)
-                        .or_insert(directory);
+                    let rank = (acn.priority(&self.db), module_rank);
+                    if wins(
+                        anonymous_component_namespaces.get(&prefix).map(|(r, _)| r),
+                        rank,
+                    ) {
+                        anonymous_component_namespaces
+                            .insert(prefix, (rank, acn.directory(&self.db).clone()));
+                    }
                 }
 
-                // Collect class-backed component registrations
-                // (Blade::component('tag', Class::class), either form/order)
+                // Blade::component('tag', Class::class), either form/order
                 for bc in parsed.blade_components(&self.db) {
                     let Some(file) = bc.file_path(&self.db).clone() else {
                         continue;
                     };
                     let tag = bc.tag_name(&self.db).name(&self.db).clone();
-                    let prio = bc.priority(&self.db);
-                    match class_component_files.get(&tag) {
-                        Some((existing_prio, _)) if *existing_prio >= prio => {}
-                        _ => {
-                            class_component_files.insert(tag, (prio, file));
-                        }
+                    let rank = (bc.priority(&self.db), module_rank);
+                    if wins(class_component_files.get(&tag).map(|(r, _)| r), rank) {
+                        class_component_files.insert(tag, (rank, file));
                     }
                 }
             }
         }
 
-        // Also include any from the legacy cache
+        // Also include any from the legacy cache — fallback-only, so it
+        // never displaces a live parse (priority 0 on insert).
         for (ns, data) in &self.sp_view_namespaces {
             if let Some(path) = &data.view_path {
                 view_namespaces
                     .entry(ns.clone())
-                    .or_insert_with(|| path.clone());
+                    .or_insert_with(|| ((0, 0), path.clone()));
             }
         }
         for (prefix, data) in &self.sp_component_namespaces {
             component_namespaces
                 .entry(prefix.clone())
-                .or_insert_with(|| data.php_namespace.clone());
+                .or_insert_with(|| ((0, 0), data.php_namespace.clone()));
         }
         for (tag, data) in &self.sp_blade_components {
             if let Some(file) = &data.file_path {
                 class_component_files
                     .entry(tag.clone())
-                    .or_insert_with(|| (data.priority, file.clone()));
+                    .or_insert_with(|| ((data.priority, 0), file.clone()));
             }
         }
 
@@ -10160,7 +11216,7 @@ impl SalsaActor {
         // arrives transitively (Flux, Filament, MaryUI); the loader
         // self-gates on the config files existing.
         for (ns, dir) in crate::config::livewire_component_namespaces(&root) {
-            anonymous_component_paths.entry(ns).or_insert(dir);
+            anonymous_component_paths.entry(ns).or_insert(((0, 0), dir));
         }
 
         // Convert to data transfer type
@@ -10173,15 +11229,27 @@ impl SalsaActor {
             component_paths: config_ref.component_paths(&self.db).clone(),
             livewire_path: config_ref.livewire_path(&self.db).clone(),
             has_livewire: config_ref.has_livewire(&self.db),
-            view_namespaces,
-            component_namespaces,
-            anonymous_component_paths,
-            anonymous_component_namespaces,
+            view_namespaces: view_namespaces
+                .into_iter()
+                .map(|(ns, (_rank, path))| (ns, path))
+                .collect(),
+            component_namespaces: component_namespaces
+                .into_iter()
+                .map(|(prefix, (_rank, php_ns))| (prefix, php_ns))
+                .collect(),
+            anonymous_component_paths: anonymous_component_paths
+                .into_iter()
+                .map(|(prefix, (_rank, dir))| (prefix, dir))
+                .collect(),
+            anonymous_component_namespaces: anonymous_component_namespaces
+                .into_iter()
+                .map(|(prefix, (_rank, dir))| (prefix, dir))
+                .collect(),
             component_aliases,
             icon_aliases,
             class_component_files: class_component_files
                 .into_iter()
-                .map(|(tag, (_prio, file))| (tag, file))
+                .map(|(tag, (_rank, file))| (tag, file))
                 .collect(),
         };
 
@@ -10220,11 +11288,15 @@ impl SalsaActor {
         match op {
             FileListOp::Add => {
                 if !list.contains(&path) {
-                    list.push(path);
+                    list.push(path.clone());
                 }
+                // Invariant 3 of `component_usage_index`: every `view_files`
+                // mutation queues or drops the path, or the walk cannot see it.
+                self.component_usage_index.mark_dirty(&path);
             }
             FileListOp::Remove => {
                 list.retain(|p| p != &path);
+                self.component_usage_index.remove_file(&path);
             }
         }
         Some(category.label())
@@ -10239,6 +11311,7 @@ impl SalsaActor {
         view_paths: Vec<PathBuf>,
         livewire_path: Option<PathBuf>,
         routes_path: PathBuf,
+        vendor_files: Vec<PathBuf>,
     ) {
         use walkdir::WalkDir;
 
@@ -10247,6 +11320,8 @@ impl SalsaActor {
         // Clear existing file lists
         self.controller_files.clear();
         self.view_files.clear();
+        // Rebuilt below as the walk re-discovers each view file.
+        self.component_usage_index.clear();
         self.livewire_files.clear();
         self.route_files.clear();
         self.vendor_files.clear();
@@ -10308,6 +11383,7 @@ impl SalsaActor {
                         if let Some(file_name) = entry.path().file_name() {
                             if file_name.to_string_lossy().ends_with(".blade.php") {
                                 let path = entry.path().to_path_buf();
+                                self.component_usage_index.mark_dirty(&path);
                                 self.view_files.push(path);
                                 // Salsa input deferred to first cache miss.
                             }
@@ -10359,43 +11435,20 @@ impl SalsaActor {
             }
         }
 
-        // Scan vendor/ — Composer packages can declare Livewire,
-        // routes, controllers, views, translations. We index every
-        // `*.php` and `*.blade.php` under vendor/ and rely on the
-        // warming-stage filters (skip `*.json.php` data files, drop
-        // anything >256KB) to keep tree-sitter away from pathological
-        // auto-generated content.
+        // Vendor files come from the shared vendor walk (issue #371) instead
+        // of a fifth independent `WalkDir` over the Composer tree. The caller
+        // filters `.git` out for us — this pass never descended into it — and
+        // the set is otherwise identical: every `*.php` and `*.blade.php`,
+        // unbounded depth. `.blade.php` needs no separate test because its
+        // extension is already `php`.
         //
-        // Yes, this reads ~21k file contents on a real-world project,
-        // which adds a few seconds to first registration. Subsequent
-        // startups load most of those entries from the disk cache
-        // (see pattern_disk_cache.rs), so the cost is bounded and
-        // one-time per `composer install`.
-        let vendor_dir = root_path.join("vendor");
-        if vendor_dir.is_dir() {
-            for entry in WalkDir::new(&vendor_dir)
-                .into_iter()
-                .filter_entry(|e| e.file_name().to_str().map(|s| s != ".git").unwrap_or(true))
-                .filter_map(|e| e.ok())
-            {
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy();
-                // Match both `*.php` and `*.blade.php` in one pass. The
-                // `.blade.php` test must come first because a file
-                // ending in `.blade.php` also satisfies `.php`.
-                let is_blade = name.ends_with(".blade.php");
-                let is_php = !is_blade && name.ends_with(".php");
-                if !(is_php || is_blade) {
-                    continue;
-                }
-                let path = entry.path().to_path_buf();
-                self.vendor_files.push(path);
-                // Salsa input deferred to first cache miss — see
-                // handle_get_patterns for the architectural why.
-            }
-        }
+        // Composer packages can declare Livewire components, routes,
+        // controllers, views and translations, so all of them are indexed; the
+        // warming-stage filters (skip `*.json.php` data files, drop anything
+        // >256KB) keep tree-sitter away from pathological auto-generated
+        // content. Salsa inputs are deferred to the first cache miss — see
+        // `handle_get_patterns` for the architectural why.
+        self.vendor_files = vendor_files;
 
         // Scan the whole project (minus vendor + noise dirs) for every
         // `*.php` / `*.blade.php`. The categorized scans above cover the
@@ -10477,6 +11530,24 @@ impl SalsaActor {
     }
 
     /// Ensure a file is registered with Salsa (read from disk if needed)
+    ///
+    /// **No containment guard here, deliberately** (#364 sibling-site audit),
+    /// and the reason differs from [`Self::ensure_external_php_source_loaded`]
+    /// next door. Every call site passes the *request's own*
+    /// `textDocument.uri` — the document the client already has open and is
+    /// asking about (`handle_get_patterns`,
+    /// `handle_find_magic_member_references`, `hover_for_magic_member`,
+    /// `handle_resolve_facade_receiver_at`, `handle_magic_member_rename_data`).
+    /// That is not a path minted by joining project-derived text onto a
+    /// directory, so there is no traversal to fence: the client supplied the
+    /// path, holds the file open, and `did_open`/`did_change` already register
+    /// arbitrary client paths through `handle_update_file`. The text read here
+    /// is parsed for the answer and the path itself is never emitted as a new
+    /// navigation target.
+    ///
+    /// Gating it on the project root would also be a behaviour change, not a
+    /// hardening: a file legitimately open outside the workspace root would
+    /// stop answering hover and goto entirely.
     fn ensure_file_registered(&mut self, path: &PathBuf) {
         use std::collections::hash_map::Entry;
         // Use entry API to avoid double lookup
@@ -10484,6 +11555,57 @@ impl SalsaActor {
             if let Ok(text) = std::fs::read_to_string(path) {
                 let file = SourceFile::new(&self.db, path.clone(), 0, text);
                 entry.insert(file);
+            }
+        }
+    }
+
+    /// The Blade templates that render any of `component_names` (`<x-…>`) or
+    /// `livewire_names` (`<livewire:…>`) — one step UP the usage graph, for the
+    /// item-1 walk from an anonymous partial to the Livewire component that
+    /// rendered it (#339).
+    ///
+    /// Both tag families are read, from the per-file `ParsedPatternsData` the
+    /// parse pass already produced: `<x-save-button>` lands in `components` and
+    /// `<livewire:save-button>` in `livewire_refs`, and a partial is reachable
+    /// through either. Matching is on the parser-classified NAME, never on raw
+    /// text, exactly as [`Self::handle_find_view_references`] matches its
+    /// directives.
+    ///
+    /// Only `.blade.php` files are returned. A plain `.php` parent (a class
+    /// rendering a tag from a heredoc) is not a rendering ancestor for this
+    /// purpose: the `$this` inside the partial belongs to the component whose
+    /// TEMPLATE contains the tag, and that template is what the walk needs.
+    ///
+    /// Sorted and deduped, because the walk takes the first match and an
+    /// unsorted result would flap between two parents that both qualify.
+    fn handle_files_rendering_component(
+        &mut self,
+        component_names: &[String],
+        livewire_names: &[String],
+    ) -> Vec<PathBuf> {
+        if component_names.is_empty() && livewire_names.is_empty() {
+            return Vec::new();
+        }
+        self.refresh_component_usage_index();
+        self.component_usage_index
+            .find(component_names, livewire_names)
+    }
+
+    /// Fold every queued Blade file into the reverse component-usage index.
+    ///
+    /// Empty on the hot path, which is the entire point: only project
+    /// registration, an edit, or a watcher event queues anything, so an
+    /// ancestor walk visiting a hundred nodes drains once and then answers
+    /// each of the hundred lookups out of a `HashMap`. The drain itself reads
+    /// through `handle_get_patterns`, so a warmed file costs a cache hit
+    /// rather than a parse.
+    fn refresh_component_usage_index(&mut self) {
+        for path in self.component_usage_index.take_pending() {
+            match self.handle_get_patterns(&path) {
+                Some(patterns) => self.component_usage_index.insert_file(&path, &patterns),
+                // Unreadable now — drop whatever it contributed before rather
+                // than serving entries for a file we can no longer confirm.
+                None => self.component_usage_index.remove_file(&path),
             }
         }
     }
@@ -11247,7 +12369,8 @@ impl SalsaActor {
 
     /// Build the macro registry — `(receiver_fqcn, macro_name)` → registration —
     /// by merging every Salsa-parsed service provider's `macros`, highest
-    /// priority winning on key collision (framework=0 < package=1 < app=2). Built
+    /// priority winning on key collision (framework=0 < package=1 < module=2 <
+    /// app=3). Built
     /// fresh each call from the tracked-query outputs (mirrors
     /// [`Self::build_facade_alias_snapshot`]); macros number in the dozens-to-
     /// hundreds, with no cache to invalidate on a provider edit.
@@ -11578,23 +12701,6 @@ impl SalsaActor {
         merged.into_values().collect()
     }
 
-    // === Environment Variable Handlers ===
-
-    /// Handle env variables registration
-    fn handle_register_env_variables(&mut self, variables: HashMap<String, EnvVariableData>) {
-        self.env_variables = variables;
-    }
-
-    /// Handle get env variable by name
-    fn handle_get_env_variable(&self, name: &str) -> Option<EnvVariableData> {
-        self.env_variables.get(name).cloned()
-    }
-
-    /// Handle get all env variable names
-    fn handle_get_env_variable_names(&self) -> Vec<String> {
-        self.env_variables.keys().cloned().collect()
-    }
-
     // === Salsa-based Environment Variable Handlers (New) ===
 
     /// Handle registering a raw env file for Salsa to parse
@@ -11671,6 +12777,33 @@ impl SalsaActor {
         self.translations.invalidate(path);
     }
 
+    /// Drop a config path's cached text so the next completion re-reads disk.
+    fn handle_invalidate_config_path(&mut self, path: &Path) {
+        self.translations.invalidate_config(path);
+    }
+
+    /// Whether `candidate` replaces `current` as the merged declaration of a
+    /// key. The one rule both env merges below resolve ties with.
+    ///
+    /// The file-priority ladder decides first: `.env` (2) outranks
+    /// `.env.local` (1) outranks `.env.example` (0). Every declaration *inside*
+    /// one file carries that file's priority and so always ties, and there an
+    /// active declaration outranks a commented one — `# KEY=old` above
+    /// `KEY=new` is one declaration and one comment, not two candidates, and
+    /// keeping the first line seen let the comment answer for the key. Beyond
+    /// that the first line seen still wins.
+    ///
+    /// A commented declaration in a higher-priority file still outranks an
+    /// active one below it: commenting a key out in `.env` is how a project
+    /// turns it off, and the ladder is what gives `.env` the last word.
+    fn env_var_supersedes(candidate: &ParsedEnvVarData, current: &ParsedEnvVarData) -> bool {
+        match candidate.priority.cmp(&current.priority) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => current.is_commented && !candidate.is_commented,
+            std::cmp::Ordering::Less => false,
+        }
+    }
+
     /// Handle getting a parsed env variable by name from Salsa
     fn handle_get_parsed_env_var(&self, name: &str) -> Option<ParsedEnvVarData> {
         // Find the variable with the highest priority
@@ -11692,7 +12825,7 @@ impl SalsaActor {
                     };
                     // Keep the one with highest priority
                     match &best {
-                        Some(existing) if existing.priority >= data.priority => {}
+                        Some(existing) if !Self::env_var_supersedes(&data, existing) => {}
                         _ => best = Some(data),
                     }
                 }
@@ -11725,7 +12858,7 @@ impl SalsaActor {
                 };
 
                 match merged.get(&name) {
-                    Some(existing) if existing.priority >= data.priority => {}
+                    Some(existing) if !Self::env_var_supersedes(&data, existing) => {}
                     _ => {
                         merged.insert(name, data);
                     }
@@ -11938,7 +13071,7 @@ impl SalsaActor {
                 file_path: class_file.map(PathBuf::from),
                 source_file: source_file.map(PathBuf::from),
                 source_line: Some(line as usize),
-                priority: 2, // Cache entries have highest priority (app level)
+                priority: 3, // Cache entries are app tier — the highest
             },
         );
     }
@@ -11970,7 +13103,7 @@ impl SalsaActor {
                 binding_type: bt,
                 source_file: source_file.map(PathBuf::from),
                 source_line: Some(line as usize),
-                priority: 2, // Cache entries have highest priority (app level)
+                priority: 3, // Cache entries are app tier — the highest
             },
         );
     }

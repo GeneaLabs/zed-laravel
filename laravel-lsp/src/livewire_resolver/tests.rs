@@ -826,6 +826,248 @@ fn cursor_past_end_of_line_does_not_panic() {
 }
 
 #[test]
+fn namespaced_component_resolution_with_negative_controls() {
+    // The AC trio for `<livewire:ns::component>`: a component reachable
+    // ONLY through a registered namespace resolves; the same lookup with
+    // the namespace registration removed fails (negative control); a
+    // genuinely missing component under the valid namespace still fails
+    // (true negative).
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    // Outside every default component-discovery root:
+    let ns_dir = root.join("app/Common/Ui/app/Livewire");
+    std::fs::create_dir_all(&ns_dir).unwrap();
+    write(
+        &ns_dir.join("Badge.php"),
+        "<?php namespace App\\Common\\Ui\\Livewire; use Livewire\\Component; class Badge extends Component {}",
+    );
+
+    let mut with_ns = config_for(&root);
+    with_ns.class_namespaces.insert(
+        "common-ui".to_string(),
+        crate::livewire_namespaces::LivewireClassNamespace {
+            class_path: ns_dir.clone(),
+            class_namespace: "App\\Common\\Ui\\Livewire".to_string(),
+        },
+    );
+
+    let resolved = resolve_component("common-ui::badge", &with_ns, LivewireVersion::V4)
+        .expect("namespace-only component resolves");
+    assert!(resolved.paths.contains(&ns_dir.join("Badge.php")));
+
+    let without_ns = config_for(&root);
+    assert!(
+        resolve_component("common-ui::badge", &without_ns, LivewireVersion::V4).is_none(),
+        "negative control: registration removed, resolution fails again"
+    );
+
+    assert!(
+        resolve_component("common-ui::missing", &with_ns, LivewireVersion::V4).is_none(),
+        "true negative: a missing component under the valid namespace stays missing"
+    );
+}
+
+// ---- @props / @aware bind KEYS, never default values (issue #339, item 8) --
+
+#[test]
+fn props_binds_the_key_and_not_its_default_value() {
+    let content = "@props(['color' => 'blue'])\n<div>{{ $color }} {{ $blue }}</div>\n";
+    assert!(
+        is_template_local_binding(content, 1, "color"),
+        "the declared prop is locally bound"
+    );
+    assert!(
+        !is_template_local_binding(content, 1, "blue"),
+        "a default VALUE is not a prop name"
+    );
+}
+
+#[test]
+fn props_ignores_unrelated_quoted_text_later_on_the_same_line() {
+    let content = "@props(['color' => 'blue']) <div title=\"literal\">\n{{ $literal }}\n";
+    assert!(is_template_local_binding(content, 1, "color"));
+    assert!(
+        !is_template_local_binding(content, 1, "blue"),
+        "the default value is still excluded"
+    );
+    assert!(
+        !is_template_local_binding(content, 1, "literal"),
+        "scanning stops at the directive's closing paren"
+    );
+}
+
+#[test]
+fn props_parses_the_multiline_array_form() {
+    let content = "@props([\n    'color' => 'blue',\n    'size',\n])\n<div>{{ $color }}</div>\n";
+    assert!(
+        is_template_local_binding(content, 4, "color"),
+        "a key on a continuation line still binds"
+    );
+    assert!(
+        is_template_local_binding(content, 4, "size"),
+        "a bare entry declares a prop with no default"
+    );
+    assert!(
+        !is_template_local_binding(content, 4, "blue"),
+        "its default value does not"
+    );
+}
+
+#[test]
+fn aware_binds_keys_the_same_way_as_props() {
+    let content = "@aware(['variant' => 'primary'])\n<div>{{ $variant }}</div>\n";
+    assert!(is_template_local_binding(content, 1, "variant"));
+    assert!(!is_template_local_binding(content, 1, "primary"));
+}
+
+#[test]
+fn props_with_a_nested_default_array_keeps_the_nesting_out_of_the_names() {
+    let content = "@props(['options' => ['a' => 'b'], 'label'])\n<div></div>\n";
+    assert!(is_template_local_binding(content, 1, "options"));
+    assert!(is_template_local_binding(content, 1, "label"));
+    assert!(
+        !is_template_local_binding(content, 1, "a"),
+        "a nested array's own keys are not props"
+    );
+    assert!(!is_template_local_binding(content, 1, "b"));
+}
+
+// ---- wire:target navigates (issue #339, item 4) ---------------------------
+
+#[test]
+fn wire_target_resolves_the_segment_under_the_cursor() {
+    let line = r#"<div wire:target="save, delete">"#;
+    let save_col = line.find("save").unwrap() as u32;
+    let delete_col = line.find("delete").unwrap() as u32;
+    assert_eq!(
+        wire_attribute_target_at(line, save_col),
+        Some(WireTarget::Member("save".to_string())),
+        "cursor on the first entry"
+    );
+    assert_eq!(
+        wire_attribute_target_at(line, delete_col),
+        Some(WireTarget::Member("delete".to_string())),
+        "cursor on the second entry"
+    );
+}
+
+#[test]
+fn wire_target_single_value_is_still_a_member() {
+    let line = r#"<div wire:target="save">"#;
+    let col = line.find("save").unwrap() as u32;
+    assert_eq!(
+        wire_attribute_target_at(line, col),
+        Some(WireTarget::Member("save".to_string()))
+    );
+}
+
+#[test]
+fn wire_target_completion_prefix_is_the_current_entry() {
+    let line = r#"<div wire:target="save, del">"#;
+    let cursor = (line.find("del").unwrap() + 3) as u32;
+    assert_eq!(
+        wire_attribute_completion_context(line, cursor),
+        Some((WireValueKind::Member, "del".to_string())),
+        "a list completes per entry, not across the whole value"
+    );
+}
+
+#[test]
+fn attributes_that_name_no_member_still_resolve_to_nothing() {
+    let line = r#"<div wire:key="row-{{ $id }}" wire:ignore>"#;
+    let col = line.find("row-").unwrap() as u32;
+    assert_eq!(wire_attribute_target_at(line, col), None);
+}
+
+#[test]
+fn an_absolute_component_name_cannot_escape_the_class_path() {
+    // Regression: `bare` is discovered data — whatever follows `::` in a
+    // `<livewire:…>` tag or an `@livewire('…')` literal. Because
+    // `Path::join` replaces the base on an absolute right-hand side, an
+    // absolute name resolved to a file completely outside the registered
+    // class directory and was handed back as a goto-definition target.
+    // A dot-free temp prefix matters: `TempDir::new()` names its directory
+    // `.tmpXXXX`, and splitting the name on `.` would mangle the probe path
+    // before it could escape — making this test pass for the wrong reason.
+    let tmp = tempfile::Builder::new().prefix("zz").tempdir().unwrap();
+    let root = tmp.path();
+    let mut cfg = config_for(root);
+
+    // A decoy outside every configured location.
+    let outside = tmp.path().join("outside");
+    let decoy = outside.join("Secret.php");
+    write(&decoy, "<?php // not yours");
+
+    cfg.class_namespaces.insert(
+        "ui".to_string(),
+        crate::livewire_namespaces::LivewireClassNamespace {
+            class_namespace: "App\\UiKit\\Livewire".to_string(),
+            class_path: root.join("app/UiKit/Livewire"),
+        },
+    );
+
+    let absolute = outside.join("Secret");
+    let absolute = absolute.to_string_lossy();
+
+    assert!(
+        decoy.is_file(),
+        "precondition: the decoy exists, so only the guard can refuse it"
+    );
+    assert!(
+        !absolute.contains('.'),
+        "precondition: the probe name must be dot-free, or `split_dotted` mangles \
+         it and this test passes without exercising the guard at all"
+    );
+    assert!(
+        resolve_component(&format!("ui::{absolute}"), &cfg, LivewireVersion::V3).is_none(),
+        "a namespaced absolute name must not resolve outside the class path"
+    );
+    assert!(
+        resolve_component(&absolute, &cfg, LivewireVersion::V3).is_none(),
+        "an un-namespaced absolute name must not resolve outside the class path"
+    );
+}
+
+#[test]
+fn absolute_parent_segments_cannot_escape_via_the_v4_branch() {
+    // The V4 SFC/MFC/Volt branch runs BEFORE the class branch and builds its
+    // search directory with `parents_to_path`, which uses `PathBuf::push` —
+    // and an ABSOLUTE segment replaces the whole path. So gating only the
+    // class branch left the first branch wide open: the parent segments of a
+    // dotted name could name any directory on disk.
+    let proj = tempfile::Builder::new().prefix("zzproj").tempdir().unwrap();
+    let ext = tempfile::Builder::new().prefix("zzext").tempdir().unwrap();
+    let root = proj.path();
+    fs::create_dir_all(root.join("resources/views/livewire")).unwrap();
+
+    // A real V4 SFC sitting entirely outside the project root.
+    let outside = ext.path().join("resources/views/livewire");
+    let decoy = outside.join(format!("{}secret.blade.php", naming::LIVEWIRE_EMOJI));
+    write(
+        &decoy,
+        "<?php new class extends Component {}; ?><div></div>",
+    );
+
+    let cfg = config_for(root);
+    let name = format!("{}.secret", outside.display());
+
+    assert!(
+        decoy.is_file(),
+        "precondition: the decoy resolves if the guard is absent"
+    );
+    assert!(
+        !name.contains(char::is_whitespace),
+        "precondition: the probe name is a single component name"
+    );
+    assert!(
+        resolve_component(&name, &cfg, LivewireVersion::V4).is_none(),
+        "absolute parent segments must not re-root the V4 component search"
+    );
+}
+
+// ---- comments never execute, so they bind nothing (issue #351 item 2) -----
+
+#[test]
 fn commented_out_foreach_binds_nothing() {
     // Commenting out a loop while debugging is routine — a single-line
     // Blade comment leaves no @endforeach, so without comment-blanking the
@@ -868,16 +1110,4 @@ fn uncommented_directives_still_bind_next_to_commented_ones() {
     {{ $item }}
 @endforeach";
     assert!(is_template_local_binding(content, 2, "item"));
-}
-
-#[test]
-fn props_default_values_are_not_bindings() {
-    // #339 item 8: `['size' => 'md']` declares $size — 'md' is its default
-    // VALUE and must not shadow a class property named $md.
-    let content = "\
-@props(['variant', 'size' => 'md'])
-<span>{{ $md }} {{ $size }} {{ $variant }}</span>";
-    assert!(is_template_local_binding(content, 1, "variant"));
-    assert!(is_template_local_binding(content, 1, "size"));
-    assert!(!is_template_local_binding(content, 1, "md"));
 }

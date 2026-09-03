@@ -150,6 +150,12 @@ pub enum WireTarget {
     /// target is the first dot-segment of the value (`contractData.title`
     /// → `contractData`).
     Property(String),
+    /// `wire:target` names EITHER an action method (`wire:target="save"`)
+    /// or, paired with `wire:model`'s loading states, a property. Livewire
+    /// accepts both spellings for the same attribute, so the kind cannot be
+    /// decided from the attribute alone and the member lookup must accept
+    /// either declaration.
+    Member(String),
 }
 
 /// If the cursor sits inside a `wire:*="value"` attribute's quoted value on
@@ -223,6 +229,10 @@ pub fn wire_attribute_target_at(line: &str, cursor_col: u32) -> Option<WireTarge
                 let ident = value.split('(').next().unwrap_or("").trim();
                 is_php_identifier(ident).then(|| WireTarget::Method(ident.to_string()))
             }
+            Some(WireValueKind::Member) => {
+                let ident = comma_segment_at(value, cursor - value_start)?.trim();
+                is_php_identifier(ident).then(|| WireTarget::Member(ident.to_string()))
+            }
             None => None,
         };
     }
@@ -239,20 +249,50 @@ pub enum WireValueKind {
     /// The value binds a public property (`wire:model`, `wire:show`,
     /// `wire:text`).
     Property,
+    /// The value names a member of EITHER kind — `wire:target`, which takes
+    /// an action name or a `wire:model` property depending on the loading
+    /// state it scopes.
+    Member,
 }
 
 /// Classify a `wire:` attribute's base name (modifiers stripped) by what its
 /// value names. `None` for attributes whose value is not a component member
-/// at all (`wire:key`, `wire:target`, `wire:ignore`, ...). Everything not
-/// explicitly listed is treated as a DOM-event action binding, since Livewire
-/// accepts `wire:{any-dom-event}`.
+/// at all (`wire:key`, `wire:ignore`, ...). Everything not explicitly listed
+/// is treated as a DOM-event action binding, since Livewire accepts
+/// `wire:{any-dom-event}`.
+///
+/// `target` is [`WireValueKind::Member`], not `None`: its value names the
+/// action(s) or property a loading state is scoped to, and both are
+/// navigable members of the component.
 fn wire_value_kind(base: &str) -> Option<WireValueKind> {
     match base {
         "model" | "show" | "text" => Some(WireValueKind::Property),
-        "key" | "id" | "ignore" | "loading" | "dirty" | "offline" | "target" | "stream"
-        | "replace" | "transition" | "navigate" | "cloak" | "current" | "confirm" => None,
+        "target" => Some(WireValueKind::Member),
+        "key" | "id" | "ignore" | "loading" | "dirty" | "offline" | "stream" | "replace"
+        | "transition" | "navigate" | "cloak" | "current" | "confirm" => None,
         _ => Some(WireValueKind::Method),
     }
+}
+
+/// The comma-separated segment of `value` that contains byte offset `at`.
+///
+/// `wire:target="save, delete"` is a legal Livewire list, so the cursor
+/// decides which entry goto resolves. A cursor on the comma itself belongs
+/// to the segment on its left. `None` when `at` is past the value.
+fn comma_segment_at(value: &str, at: usize) -> Option<&str> {
+    if at > value.len() {
+        return None;
+    }
+    let mut start = 0usize;
+    for (i, b) in value.bytes().enumerate() {
+        if b == b',' {
+            if at <= i {
+                return Some(&value[start..i]);
+            }
+            start = i + 1;
+        }
+    }
+    Some(&value[start..])
 }
 
 /// If the cursor sits inside a `wire:*="…"` quoted value on `line`, return
@@ -319,11 +359,23 @@ pub fn wire_attribute_completion_context(
         if cursor < value_start || cursor > value_end {
             continue;
         }
-        let typed = line[value_start..cursor].trim();
         let kind = wire_value_kind(attr_name.strip_prefix("wire:")?.split('.').next()?)?;
+        // A `wire:target` list completes per entry, so only the segment the
+        // cursor sits in is the typed prefix — `save, del|` offers `delete`,
+        // not nothing.
+        let typed = match kind {
+            WireValueKind::Member => line[value_start..cursor]
+                .rsplit(',')
+                .next()
+                .unwrap_or("")
+                .trim(),
+            _ => line[value_start..cursor].trim(),
+        };
         let acceptable = match kind {
-            // Actions are a single identifier.
-            WireValueKind::Method => typed.is_empty() || is_php_identifier(typed),
+            // Actions are a single identifier; a `wire:target` entry is too.
+            WireValueKind::Method | WireValueKind::Member => {
+                typed.is_empty() || is_php_identifier(typed)
+            }
             // Bindings may be a dotted path into a nested object
             // (`wire:model="contractData.title"`): every completed segment
             // must be an identifier, the segment under the cursor may be
@@ -429,11 +481,34 @@ pub fn resolve_component(
     if leaf.is_empty() {
         return None;
     }
+    // Every segment becomes a path component: the parents through
+    // `parents_to_path` (which uses `PathBuf::push`, and an ABSOLUTE segment
+    // replaces the whole path), the leaf as a file stem. A name is discovered
+    // data — it comes from a `<livewire:…>` tag or an `@livewire('…')`
+    // literal — so one carrying its own path syntax must not become a path.
+    // This gate covers every branch below; the class branch is additionally
+    // gated by `dotted_to_class_path`, which checks the CONVERTED segments.
+    if !segments
+        .iter()
+        .all(|seg| crate::naming::is_safe_path_segment(seg))
+    {
+        return None;
+    }
     let parents = &segments[..segments.len() - 1];
     let sub = parents_to_path(parents);
 
     let base_dirs: Vec<&PathBuf> = match namespace {
-        Some(ns) => vec![config.component_namespaces.get(ns)?],
+        Some(ns) => {
+            // A namespace may map to a view directory (config
+            // `component_namespaces`), a registered class namespace
+            // (`Livewire::addNamespace` — checked in the class fallback
+            // below), or both. Unknown namespaces resolve to nothing.
+            let view_dir = config.component_namespaces.get(ns);
+            if view_dir.is_none() && !config.class_namespaces.contains_key(ns) {
+                return None;
+            }
+            view_dir.into_iter().collect()
+        }
         None => config.component_locations.iter().collect(),
     };
 
@@ -464,12 +539,22 @@ pub fn resolve_component(
         }
     }
 
-    // V3 class-based fallback. Class lookups don't go through namespaces —
-    // those are a view-co-located concept. So only the un-namespaced names
-    // ever fall through here.
-    if namespace.is_none() {
-        if let Some(c) = try_v3_class(bare, config) {
-            return Some(c);
+    // Class-based fallback. Un-namespaced names use the global class_path;
+    // a namespaced name resolves through a class namespace registered via
+    // `Livewire::addNamespace(...)` when one exists (see
+    // [`crate::livewire_namespaces`]).
+    match namespace {
+        None => {
+            if let Some(c) = try_v3_class(bare, config) {
+                return Some(c);
+            }
+        }
+        Some(ns) => {
+            if let Some(reg) = config.class_namespaces.get(ns) {
+                if let Some(c) = try_namespaced_class(bare, reg) {
+                    return Some(c);
+                }
+            }
         }
     }
 
@@ -540,6 +625,17 @@ fn candidate_livewire_names(path: &Path, config: &LivewireConfig) -> Vec<String>
             if let Some(stem) = rel.to_str().and_then(|s| s.strip_suffix(".php")) {
                 if let Some(name) = kebab_dotted(stem.split(['/', '\\']), "") {
                     out.push(name);
+                }
+            }
+        }
+        // Registered class namespaces (`Livewire::addNamespace`) — same
+        // shape, prefixed with the namespace.
+        for (ns, reg) in &config.class_namespaces {
+            if let Ok(rel) = path.strip_prefix(&reg.class_path) {
+                if let Some(stem) = rel.to_str().and_then(|s| s.strip_suffix(".php")) {
+                    if let Some(name) = kebab_dotted(stem.split(['/', '\\']), "") {
+                        out.push(format!("{ns}::{name}"));
+                    }
                 }
             }
         }
@@ -653,10 +749,30 @@ fn try_volt(parent_dir: &Path, leaf: &str, require_signature: bool) -> Option<Li
     })
 }
 
+/// Class lookup for a namespaced name registered via
+/// `Livewire::addNamespace` — `{class_path}/{Pascal}.php`, dotted parents
+/// mapping to subdirectories exactly like the global class path.
+fn try_namespaced_class(
+    bare: &str,
+    reg: &crate::livewire_namespaces::LivewireClassNamespace,
+) -> Option<LivewireComponent> {
+    let class_file = reg
+        .class_path
+        .join(naming::dotted_to_class_path(bare)?)
+        .with_extension("php");
+    if !class_file.is_file() {
+        return None;
+    }
+    Some(LivewireComponent {
+        kind: LivewireComponentKind::V3Class,
+        paths: vec![class_file],
+    })
+}
+
 fn try_v3_class(bare: &str, config: &LivewireConfig) -> Option<LivewireComponent> {
     let class_path = config
         .class_path
-        .join(naming::dotted_to_class_path(bare))
+        .join(naming::dotted_to_class_path(bare)?)
         .with_extension("php");
     if !class_path.is_file() {
         return None;
@@ -787,7 +903,20 @@ pub fn is_template_local_binding(content: &str, line: u32, var: &str) -> bool {
     let mut persistent: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut in_php_block = false;
 
+    let mut line_start = 0usize;
     for (idx, text) in content.lines().enumerate() {
+        // Byte offset of this line inside `content`. `lines()` strips the
+        // terminator, so step over whichever of `\n` / `\r\n` follows.
+        // `@props`/`@aware` need it: their array literal may run past the end
+        // of this line, and the directive's arguments are read from `content`
+        // rather than from `text` alone.
+        let this_line_start = line_start;
+        line_start += text.len();
+        if content[line_start..].starts_with("\r\n") {
+            line_start += 2;
+        } else if content[line_start..].starts_with('\n') {
+            line_start += 1;
+        }
         if idx > line as usize {
             break;
         }
@@ -812,7 +941,12 @@ pub fn is_template_local_binding(content: &str, line: u32, var: &str) -> bool {
         if let Some(rest) =
             find_directive(text, "@props").or_else(|| find_directive(text, "@aware"))
         {
-            collect_quoted_names(rest, &mut persistent);
+            // `rest` is a suffix of `text`, and `text` is a slice of
+            // `content`, so the directive's argument list starts here in the
+            // whole document — which is what lets a multi-line
+            // `@props([\n    'color' => 'blue',\n])` be read to its close.
+            let args_at = this_line_start + (text.len() - rest.len());
+            collect_prop_names(&content[args_at..], &mut persistent);
         }
 
         if let Some(rest) =
@@ -967,50 +1101,176 @@ fn collect_assignments(s: &str, out: &mut std::collections::HashSet<String>) {
     out.extend(names);
 }
 
-/// Every `'name'` / `"name"` string KEY or bare entry in a `@props([...])` /
-/// `@aware([...])` argument on this line. A quoted string right after `=>`
-/// is a prop's default VALUE (`['size' => 'md']` declares `$size`, never
-/// `$md`) and binds nothing.
-fn collect_quoted_names(s: &str, out: &mut std::collections::HashSet<String>) {
-    let mut chars = s.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        if c == '\'' || c == '"' {
-            if s[..i].trim_end().ends_with("=>") {
-                // Skip the whole default-value string.
-                if let Some(rel) = s[i + c.len_utf8()..].find(c) {
-                    let end = i + c.len_utf8() + rel;
-                    while let Some(&(j, _)) = chars.peek() {
-                        if j <= end {
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    continue;
-                } else {
-                    break;
-                }
-            }
-            if let Some(rel) = s[i + 1..].find(c) {
-                let name = &s[i + 1..i + 1 + rel];
-                if !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-                {
-                    out.insert(name.to_string());
-                }
-                // skip past the closing quote
-                while let Some(&(j, _)) = chars.peek() {
-                    if j <= i + 1 + rel {
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-            }
+/// Every prop NAME declared by a `@props([...])` / `@aware([...])`
+/// directive whose argument list starts at `after_directive` (the text
+/// immediately after the directive name, in the whole document — the list
+/// may span several lines).
+///
+/// Only array KEYS are prop names: `@props(['color' => 'blue'])` declares
+/// `$color`, never `$blue`. An entry with no `=>` is a prop declared without
+/// a default (`@props(['color'])`), so its own value is the name. Scanning
+/// ends at the directive's closing `)`, so unrelated quoted text later on the
+/// same line (`@props([...]) <div title="literal">`) contributes nothing.
+fn collect_prop_names(after_directive: &str, out: &mut std::collections::HashSet<String>) {
+    let Some(args) = balanced_call_args(after_directive) else {
+        return;
+    };
+    for entry in top_level_entries(array_body(args)) {
+        if let Some(name) = entry_key_name(entry) {
+            out.insert(name);
         }
     }
+}
+
+/// The text between the outer parentheses of the call that starts at the
+/// first non-whitespace character of `s`, which must be `(`. Quoted runs are
+/// skipped, so a `)` inside a string does not close the list. `None` when `s`
+/// does not open a call, or the parentheses never balance.
+fn balanced_call_args(s: &str) -> Option<&str> {
+    let open = s.find(|c: char| !c.is_whitespace())?;
+    let bytes = s.as_bytes();
+    if bytes[open] != b'(' {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = open;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' {
+                    // Skip the escaped byte; every byte compared here is
+                    // ASCII, so landing inside a multi-byte codepoint is
+                    // harmless (continuation bytes are >= 0x80).
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&s[open + 1..i]);
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The element list inside an array literal argument: the body of `[...]` or
+/// of `array(...)`. Anything else is returned unchanged, so a non-array
+/// argument simply yields one entry.
+fn array_body(args: &str) -> &str {
+    let t = args.trim();
+    if let Some(inner) = t.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        return inner;
+    }
+    if let Some(rest) = t.strip_prefix("array") {
+        let r = rest.trim_start();
+        if let Some(inner) = r.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+            return inner;
+        }
+    }
+    t
+}
+
+/// Split `body` on its TOP-LEVEL commas — commas nested in a sub-array, a
+/// call, or a quoted string stay inside their entry.
+fn top_level_entries(body: &str) -> Vec<&str> {
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    out.push(&body[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    out.push(&body[start..]);
+    out
+}
+
+/// The prop name an array entry declares: the quoted key before a top-level
+/// `=>`, or the entry itself when it has no `=>`. `None` for an entry that is
+/// not a quoted identifier (a numeric key, a constant, a spread).
+fn entry_key_name(entry: &str) -> Option<String> {
+    let key = match top_level_arrow(entry) {
+        Some(at) => &entry[..at],
+        None => entry,
+    };
+    let key = key.trim();
+    let mut chars = key.chars();
+    let quote = chars.next().filter(|c| *c == '\'' || *c == '"')?;
+    let inner = key.strip_prefix(quote)?.strip_suffix(quote)?;
+    let mut inner_chars = inner.chars();
+    let first = inner_chars.next()?;
+    (first.is_ascii_alphabetic() || first == '_')
+        .then(|| inner.to_string())
+        .filter(|_| inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// The byte offset of a top-level `=>` in `entry`, skipping quoted runs and
+/// nested brackets.
+fn top_level_arrow(entry: &str) -> Option<usize> {
+    let bytes = entry.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                b'=' if depth == 0 && bytes.get(i + 1) == Some(&b'>') => return Some(i),
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
 }
 
 const VOLT_FUNCTIONAL_CALLS: &[&str] = &[

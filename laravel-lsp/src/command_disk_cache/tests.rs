@@ -32,6 +32,29 @@ fn entry(name: &str, class: &str, file: PathBuf, priority: CommandPriority) -> C
     }
 }
 
+/// Save an index the way the pre-#371 `save_index` did: stat each declaring
+/// file now and write one verdict per declaration.
+///
+/// Kept as a test helper rather than as production API. Production always
+/// saves a whole scan (`save_scan`), including the "declares nothing" verdicts
+/// that make the skip possible; this shim exists only so the round-trip and
+/// mtime-invalidation properties below stay pinned exactly as they were.
+fn save_index_for_test(index: &CommandIndex, root: &Path) -> anyhow::Result<usize> {
+    let mut files = Vec::new();
+    for entry in index.entries() {
+        let Some((secs, nanos)) = read_mtime(&entry.file) else {
+            continue;
+        };
+        files.push(ScannedFile {
+            mtime_secs: secs,
+            mtime_nanos: nanos,
+            path: entry.file.clone(),
+            entry: Some(entry.clone()),
+        });
+    }
+    save_scan(&files, root)
+}
+
 #[test]
 fn save_then_load_restores_entries() {
     let project = tempfile::TempDir::new().unwrap();
@@ -49,7 +72,7 @@ fn save_then_load_restores_entries() {
         CommandPriority::App,
     ));
 
-    let saved = save_index(&index, project.path()).unwrap();
+    let saved = save_index_for_test(&index, project.path()).unwrap();
     assert_eq!(saved, 1, "save should report one entry written");
 
     let restored = load_index(project.path()).expect("cache should load");
@@ -76,7 +99,7 @@ fn load_drops_entry_whose_file_was_deleted() {
 
     let mut index = CommandIndex::default();
     index.insert_entry(entry("a:gone", "Gone", file.clone(), CommandPriority::App));
-    save_index(&index, project.path()).unwrap();
+    save_index_for_test(&index, project.path()).unwrap();
 
     std::fs::remove_file(&file).unwrap();
 
@@ -100,7 +123,7 @@ fn load_drops_entry_whose_file_changed() {
         file.clone(),
         CommandPriority::App,
     ));
-    save_index(&index, project.path()).unwrap();
+    save_index_for_test(&index, project.path()).unwrap();
 
     // Sleep just long enough that the OS records a different mtime, then
     // rewrite the file. 50ms is enough for APFS / ext4 / NTFS (matches the
@@ -139,7 +162,7 @@ fn load_reapplies_priority_merge() {
     // Sanity: the in-memory merge already kept the App entry.
     assert_eq!(index.resolve("queue:work").unwrap().class_name, "AppQueue");
 
-    save_index(&index, project.path()).unwrap();
+    save_index_for_test(&index, project.path()).unwrap();
     let restored = load_index(project.path()).expect("cache should load");
     assert_eq!(restored.len(), 1, "same name collapses to one entry");
     assert_eq!(
@@ -149,8 +172,14 @@ fn load_reapplies_priority_merge() {
     );
 }
 
+/// The invariant this guards moved (issue #371): `save_scan` no longer
+/// re-stats at save time, because doing so would stamp a file modified DURING
+/// the scan as clean and let the next run trust a verdict derived from its
+/// pre-edit contents. A dangling entry is instead dropped on load, where the
+/// mtime read fails. The user-visible property — a command whose file is gone
+/// never resolves — is unchanged, so it is asserted here at its new location.
 #[test]
-fn save_skips_entry_whose_file_vanished() {
+fn an_entry_whose_file_vanished_never_resolves() {
     let project = tempfile::TempDir::new().unwrap();
     let present = touch(project.path(), "Here.php", "<?php class Here {}");
 
@@ -163,8 +192,11 @@ fn save_skips_entry_whose_file_vanished() {
         CommandPriority::App,
     ));
 
-    let saved = save_index(&index, project.path()).unwrap();
-    assert_eq!(saved, 1, "the entry with no file on disk is skipped");
+    let saved = save_index_for_test(&index, project.path()).unwrap();
+    assert_eq!(
+        saved, 1,
+        "only the present file has a stattable mtime to record"
+    );
 
     let restored = load_index(project.path()).unwrap();
     assert!(restored.resolve("a:here").is_some());

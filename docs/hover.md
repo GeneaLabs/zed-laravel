@@ -22,7 +22,7 @@ $tz = config('app.timezone');
 {{-- ^^^^^ hover →  App\Models\User::$email, its PHPDoc summary, and the declaration --}}
 ```
 
-**Component members in Blade** — `$this->member` in a template backed by a component class (Livewire in any format, class-based Volt, a Filament `$view`-property page) gets a card with the member's kind, the backing class, the full declaration header, and a click-to-open link. This card is emitted unconditionally in Blade: Intelephense cannot resolve `$this` inside a template's PHP context, so there is no PHP-tooling card to defer to.
+**Component members in Blade** — `$this->member` in a template backed by a Livewire component in any format — including a functional Volt file, which declares no class at all — or by a Filament `$view`-property page gets a card with the member's kind, the backing class, the full declaration header, and a click-to-open link. Inside an anonymous partial (`<x-save-button />`), which has no backing class of its own, the card resolves against the nearest component that renders it. This card is emitted unconditionally in Blade: Intelephense cannot resolve `$this` inside a template's PHP context, so there is no PHP-tooling card to defer to.
 
 ```blade
 {{ $this->getCalculatedEndDateForDisplay() }}
@@ -77,6 +77,29 @@ config('app.name');
 ```
 
 This is a deliberately **curated allow-list** of seven helpers — `route`, `view`, `config`, `auth`, `app`, `session`, `cache` — chosen because their framework docblock is thin or generic, so a Laravel-aware synopsis adds value over what Intelephense already shows. That narrow set *is* the dedup policy: every other helper (`bcrypt`, `abort`, `collect`, `str`, …) is simply never indexed, so we never emit a duplicate card next to Intelephense's — no runtime detection needed. The source link points into the vendored framework `helpers.php` when it's present under the workspace root, and falls back to the canonical `laravel.com/docs/helpers` anchor otherwise. (The string *argument* still hovers as before — `route('home')`'s `'home'` resolves to the route definition; the two spans are independent.)
+
+Hover also works the other way round, inside a `.env*` buffer: put the cursor
+on a key's name and the card shows its effective value, the file that
+declaration won from (`.env` outranks `.env.local`, which outranks
+`.env.example`), and how many `env('KEY')` call sites consume it. A key nothing
+consumes still gets a card, reading `0 references`. A commented-out declaration
+says so, as does a key no `.env*` file defines — and that one keeps its
+consumer count, since a stale or mistyped key is exactly when the call sites
+matter.
+
+The card always describes **the line the cursor is on**, so the ordinary habit
+of commenting an old value out above the live one reads correctly from either
+line: the live one shows its value, the comment says it is commented. A key the
+winning file comments out has no value in effect at all, and the card says so
+rather than quoting an outranked one.
+
+```
+APP_NAME=Acme
+^^^^^^^^ hover →  APP_NAME
+                  Acme
+                  .env
+                  3 references
+```
 
 **Hovered patterns:** views, Blade components (anonymous *and* class-backed), Livewire components, routes, config keys, env vars, translations (including `vendor::namespace.key`), middleware aliases, container bindings, assets (`asset()`, `Vite::asset()`, `mix()`, `public_path()`, …), `url()`, Blade variables, Eloquent magic members, Artisan command strings, and curated Laravel helper-function identifiers. The bottom-line source path renders as a `file://` link, so the whole card is click-to-open in any LSP client that supports markdown links.
 

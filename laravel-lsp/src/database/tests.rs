@@ -176,40 +176,6 @@ fn host_candidates_empty_no_fallback() {
     );
 }
 
-// ---- mask_url_password ----
-
-#[test]
-fn mask_url_password_with_credentials() {
-    use super::mask_url_password;
-    assert_eq!(
-        mask_url_password("mysql://sail:secret@127.0.0.1:3306/db"),
-        "mysql://sail:***@127.0.0.1:3306/db"
-    );
-    assert_eq!(
-        mask_url_password("postgres://user:p@ssw0rd@host/db"),
-        // Only the first `@` after creds is treated as the host separator —
-        // best-effort. Any `@` in the password trips this, but it's a
-        // diagnostic helper, not security-critical.
-        "postgres://user:***@ssw0rd@host/db"
-    );
-}
-
-#[test]
-fn mask_url_password_no_password_no_change() {
-    use super::mask_url_password;
-    // No `:` in creds → no password to mask.
-    assert_eq!(
-        mask_url_password("mysql://sail@127.0.0.1/db"),
-        "mysql://sail@127.0.0.1/db"
-    );
-}
-
-#[test]
-fn mask_url_password_no_scheme_returns_input() {
-    use super::mask_url_password;
-    assert_eq!(mask_url_password("not a url"), "not a url");
-}
-
 // ---- build_*_candidates (DB_URL / unix_socket / TCP priority) ----
 
 fn make_config_with(url: Option<&str>, socket: Option<&str>, host: &str) -> super::DatabaseConfig {
@@ -318,6 +284,34 @@ fn postgres_candidates_socket_uses_libpq_style_url() {
         "got URL: {}",
         socket.url
     );
+}
+
+#[test]
+fn postgres_socket_candidate_url_actually_parses() {
+    use sqlx::postgres::PgConnectOptions;
+    use std::str::FromStr;
+
+    // `postgres_candidates_socket_uses_libpq_style_url` above pins the `?host=`
+    // shape by string match, which a URL the driver cannot parse satisfies just
+    // as well — and the authority this branch emitted did exactly that. Hand the
+    // candidate to the parser sqlx will actually use.
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = make_config_with(None, Some("/tmp/.s.PGSQL.5432"), "localhost");
+    cfg.driver = "pgsql".to_string();
+    cfg.port = 5432;
+    let socket = provider
+        .build_postgres_candidates(&cfg)
+        .into_iter()
+        .find(|c| c.label.starts_with("unix_socket"))
+        .expect("socket candidate");
+    let opts = PgConnectOptions::from_str(&socket.url)
+        .unwrap_or_else(|e| panic!("`{}` should parse: {e}", socket.url));
+    assert_eq!(
+        opts.get_socket().map(|p| p.to_string_lossy().into_owned()),
+        Some("/tmp/.s.PGSQL.5432".to_string()),
+        "the `host=` parameter must still reach sqlx as the socket path"
+    );
+    assert_eq!(opts.get_username(), "u");
 }
 
 // ---- classify_mysql_error: actionable per-error-code toasts (Phase 5.8b) ---
@@ -488,6 +482,261 @@ fn mysql_candidates_non_empty_password_keeps_colon() {
         "non-empty password should use the user:pass@ shape; got: {}",
         tcp.url
     );
+}
+
+// ---- userinfo percent-encoding (issue #362) ------------------------------
+//
+// Every assertion below is settled by the real driver's own connection-string
+// parser rather than by string comparison against a hand-written expectation:
+// the defect these tests pin is that `Url::parse` reads a raw delimiter as
+// structure, so only a parse can prove the credential survives.
+
+/// Parse `url` with the driver sqlx will actually use, and assert it yields
+/// exactly `user` and `password`.
+///
+/// `MySqlConnectOptions` exposes `get_username()` but no password accessor, so
+/// the password is pinned differentially: `to_url_lossy()` of the parsed
+/// options against `to_url_lossy()` of the *same* options with the expected
+/// password set. Every other field is identical by construction (it is a clone
+/// of the parsed value), so the two URLs are equal exactly when the parsed
+/// password is the expected one.
+fn assert_mysql_credentials(url: &str, user: &str, password: &str) {
+    use sqlx::mysql::MySqlConnectOptions;
+    use sqlx::ConnectOptions;
+    use std::str::FromStr;
+
+    let parsed = MySqlConnectOptions::from_str(url)
+        .unwrap_or_else(|e| panic!("`{url}` should parse as a MySQL connection string: {e}"));
+    assert_eq!(parsed.get_username(), user, "username parsed from `{url}`");
+    assert_eq!(
+        parsed.to_url_lossy(),
+        parsed.clone().password(password).to_url_lossy(),
+        "password parsed from `{url}` is not `{password}`"
+    );
+}
+
+/// Postgres twin of [`assert_mysql_credentials`], same differential technique.
+fn assert_postgres_credentials(url: &str, user: &str, password: &str) {
+    use sqlx::postgres::PgConnectOptions;
+    use sqlx::ConnectOptions;
+    use std::str::FromStr;
+
+    let parsed = PgConnectOptions::from_str(url)
+        .unwrap_or_else(|e| panic!("`{url}` should parse as a Postgres connection string: {e}"));
+    assert_eq!(parsed.get_username(), user, "username parsed from `{url}`");
+    assert_eq!(
+        parsed.to_url_lossy(),
+        parsed.clone().password(password).to_url_lossy(),
+        "password parsed from `{url}` is not `{password}`"
+    );
+}
+
+/// A config carrying the given credentials, on the loopback host. Defaults to
+/// MySQL; the Postgres cases override `driver` and `port`.
+fn creds_config(username: &str, password: &str) -> super::DatabaseConfig {
+    let mut cfg = make_config_with(None, None, "127.0.0.1");
+    cfg.username = username.to_string();
+    cfg.password = password.to_string();
+    cfg
+}
+
+fn mysql_tcp_url(username: &str, password: &str) -> String {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    provider
+        .build_mysql_candidates(&creds_config(username, password))
+        .into_iter()
+        .find(|c| c.label.starts_with("tcp "))
+        .expect("tcp candidate")
+        .url
+}
+
+#[test]
+fn userinfo_encodes_reserved_delimiters_in_password() {
+    use super::userinfo;
+    // The four delimiters issue #362 names: each one ends the authority (or
+    // begins the credential) when `Url::parse` meets it unencoded.
+    assert_eq!(userinfo("u", "p/ss"), "u:p%2Fss");
+    assert_eq!(userinfo("u", "p?ss"), "u:p%3Fss");
+    assert_eq!(userinfo("u", "p#ss"), "u:p%23ss");
+    assert_eq!(userinfo("u", "p@ss"), "u:p%40ss");
+}
+
+#[test]
+fn userinfo_encodes_username_symmetrically() {
+    use super::userinfo;
+    // A username is spliced into the same slot and needs the same treatment.
+    // `:` is encoded there too: `userinfo` uses it as its own separator, so a
+    // raw one would mis-split the credential.
+    assert_eq!(userinfo("foo@bar", "pw"), "foo%40bar:pw");
+    assert_eq!(userinfo("a:b", "pw"), "a%3Ab:pw");
+    assert_eq!(userinfo("a/b", "pw"), "a%2Fb:pw");
+}
+
+#[test]
+fn userinfo_leaves_legal_characters_byte_for_byte() {
+    use super::userinfo;
+    // RFC 3986 `unreserved` + `sub-delims` pass through untouched, so the URLs
+    // this server has always built for ordinary credentials do not move.
+    let legal = "aZ09-._~!$&'()*+,;=";
+    assert_eq!(userinfo(legal, legal), format!("{legal}:{legal}"));
+    assert_eq!(userinfo("sail", "password"), "sail:password");
+    // …and the assembled URL is byte-for-byte what this server built before.
+    assert_eq!(
+        mysql_tcp_url("sail", "password"),
+        "mysql://sail:password@127.0.0.1:3306/testdb"
+    );
+    assert_eq!(
+        mysql_tcp_url(legal, legal),
+        format!("mysql://{legal}:{legal}@127.0.0.1:3306/testdb")
+    );
+}
+
+#[test]
+fn userinfo_encodes_space_control_and_non_ascii_bytes() {
+    use super::userinfo;
+    assert_eq!(userinfo("u", "a b"), "u:a%20b");
+    assert_eq!(userinfo("u", "a\tb"), "u:a%09b");
+    assert_eq!(userinfo("u", "a\nb"), "u:a%0Ab");
+    assert_eq!(userinfo("u", "[::1]"), "u:%5B%3A%3A1%5D");
+    // Each byte of a multi-byte UTF-8 sequence is encoded on its own; sqlx
+    // percent-decodes back to the original string.
+    assert_eq!(userinfo("u", "pä"), "u:p%C3%A4");
+}
+
+#[test]
+fn userinfo_encodes_percent_so_hex_pairs_do_not_decode() {
+    use super::userinfo;
+    // A literal `%` must become `%25`, otherwise `sec%3Dret` would round-trip
+    // through sqlx's percent-decode as `sec=ret` — a different password.
+    assert_eq!(userinfo("u", "sec%3Dret"), "u:sec%253Dret");
+    assert_eq!(userinfo("u", "100%"), "u:100%25");
+    assert_mysql_credentials(&mysql_tcp_url("u", "sec%3Dret"), "u", "sec%3Dret");
+}
+
+#[test]
+fn userinfo_empty_password_still_omits_the_colon() {
+    use super::userinfo;
+    // Encoding must not disturb the "no password" shape: `root:` tells sqlx an
+    // empty password *was* supplied and MySQL answers `using password: YES`.
+    assert_eq!(userinfo("root", ""), "root");
+    assert_eq!(userinfo("ro@ot", ""), "ro%40ot");
+}
+
+#[test]
+fn mysql_url_round_trips_reserved_password_characters() {
+    for password in ["p/ss", "p?ss", "p#ss", "p@ss", "pa:ss", "p ss", "p%ss"] {
+        assert_mysql_credentials(&mysql_tcp_url("sail", password), "sail", password);
+    }
+}
+
+#[test]
+fn mysql_url_round_trips_digit_run_before_a_delimiter() {
+    // The silent class from issue #362. The leading run before the delimiter is
+    // all digits and fits a `u16`, so the authority parses instead of erroring:
+    // every shape below resolved to host `sail`, the digits as the port, and
+    // the default `root` user, with no password at all. Nothing surfaces — the
+    // connection just goes somewhere else, and a redactor that locates the
+    // credential by parsing the URL is told there is nothing to mask.
+    for password in [
+        "12/34",
+        "1234/56",
+        "012345/aG9zdG5hbWU=",
+        "12?34",
+        "1234?56",
+        "12#34",
+        "1234#56",
+    ] {
+        assert_mysql_credentials(&mysql_tcp_url("sail", password), "sail", password);
+    }
+}
+
+#[test]
+fn mysql_url_round_trips_reserved_username_characters() {
+    for username in ["foo@bar", "a:b", "a/b", "a?b", "a#b"] {
+        assert_mysql_credentials(&mysql_tcp_url(username, "pw"), username, "pw");
+    }
+}
+
+#[test]
+fn mysql_socket_candidate_round_trips_credentials_and_socket() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = make_config_with(None, Some("/tmp/mysql.sock"), "localhost");
+    cfg.username = "sa/il".to_string();
+    cfg.password = "012345/aG9zdG5hbWU=".to_string();
+    let socket = provider
+        .build_mysql_candidates(&cfg)
+        .into_iter()
+        .find(|c| c.label.starts_with("unix_socket"))
+        .expect("socket candidate");
+    assert_mysql_credentials(&socket.url, "sa/il", "012345/aG9zdG5hbWU=");
+    // The encoded credential must not disturb the trailing `socket=` param.
+    let opts = <sqlx::mysql::MySqlConnectOptions as std::str::FromStr>::from_str(&socket.url)
+        .expect("socket URL should parse");
+    assert_eq!(
+        opts.get_socket().map(|p| p.to_string_lossy().into_owned()),
+        Some("/tmp/mysql.sock".to_string())
+    );
+}
+
+#[test]
+fn postgres_tcp_candidate_round_trips_credentials() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = creds_config("fo@o", "012345/aG9zdG5hbWU=");
+    cfg.driver = "pgsql".to_string();
+    cfg.port = 5432;
+    let tcp = provider
+        .build_postgres_candidates(&cfg)
+        .into_iter()
+        .find(|c| c.label.starts_with("tcp "))
+        .expect("tcp candidate");
+    assert_postgres_credentials(&tcp.url, "fo@o", "012345/aG9zdG5hbWU=");
+}
+
+#[test]
+fn postgres_socket_candidate_round_trips_credentials_and_socket() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = make_config_with(None, Some("/tmp/.s.PGSQL.5432"), "localhost");
+    cfg.driver = "pgsql".to_string();
+    cfg.port = 5432;
+    cfg.username = "fo@o".to_string();
+    cfg.password = "12/34".to_string();
+    let socket = provider
+        .build_postgres_candidates(&cfg)
+        .into_iter()
+        .find(|c| c.label.starts_with("unix_socket"))
+        .expect("socket candidate");
+    assert_postgres_credentials(&socket.url, "fo@o", "12/34");
+    // The encoded credential must not disturb the trailing `host=` param.
+    let opts = <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(&socket.url)
+        .expect("socket URL should parse");
+    assert_eq!(
+        opts.get_socket().map(|p| p.to_string_lossy().into_owned()),
+        Some("/tmp/.s.PGSQL.5432".to_string())
+    );
+}
+
+#[test]
+fn db_url_passthrough_is_never_re_encoded() {
+    // `config.url` is a full connection string the user supplied verbatim. It
+    // never goes through `userinfo`, and encoding it would corrupt credentials
+    // the user already encoded themselves.
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let raw = "mysql://heroku:ab%2Fc@db.heroku.com/x";
+    let mut cfg = make_config_with(Some(raw), None, "mysql");
+    cfg.username = "ignored@me".to_string();
+    cfg.password = "ignored/me".to_string();
+    let mysql = provider.build_mysql_candidates(&cfg);
+    assert_eq!(mysql[0].label, "DB_URL");
+    assert_eq!(mysql[0].url, raw);
+
+    let pg_raw = "postgres://heroku:ab%2Fc@db.heroku.com/x";
+    let mut pg_cfg = make_config_with(Some(pg_raw), None, "postgres");
+    pg_cfg.driver = "pgsql".to_string();
+    pg_cfg.username = "ignored@me".to_string();
+    pg_cfg.password = "ignored/me".to_string();
+    let pg = provider.build_postgres_candidates(&pg_cfg);
+    assert_eq!(pg[0].label, "DB_URL");
+    assert_eq!(pg[0].url, pg_raw);
 }
 
 // ---- resolve_env: empty value should NOT swallow next line (Phase 5.5) ----
@@ -1801,5 +2050,378 @@ async fn decision_cloud_end_to_end_variable_config_plus_sail_override() {
     assert!(
         labels.contains(&"tcp 127.0.0.2:3306".to_string()),
         "Sail override 127.0.0.2 detected once the host is correct: {labels:?}"
+    );
+}
+
+// ---- logs are a display surface (issue #344) ----
+//
+// The four surfaces #344 enumerated all render into the client. Logs are the
+// fifth: with `RUST_LOG` unset the server logs at `info` to stderr, which Zed
+// shows in a visible panel, and `docs/troubleshooting.md` asks users to paste
+// that panel into bug reports. A `.env` value read under a secret-bearing name
+// must therefore be masked there too, by the same predicate the other four use.
+
+/// A plaintext distinctive enough that finding it in a log cannot be a
+/// coincidence.
+const LOG_SECRET: &str = "hunter2-log-issue-344";
+/// A second matched keyword category. One category alone cannot tell the shared
+/// predicate from a hard-coded `contains("PASSWORD")`.
+const LOG_TOKEN: &str = "tok-log-issue-344";
+/// The unmatched control: an ordinary setting whose value must still be logged
+/// in full, or the masking has bought security by deleting the diagnostic.
+const LOG_PLAIN_HOST: &str = "db.internal.example";
+
+/// The credential the *name* gate cannot see. `DATABASE_URL` matches no
+/// segment of `SENSITIVE_ENV_SEGMENTS`, and Laravel's stock
+/// `config/database.php` ships `'url' => env('DATABASE_URL')`, so this value
+/// reaches the log on the default configuration of an ordinary project.
+const LOG_URL_SECRET: &str = "url-hunter2@tail-355";
+/// The half of `LOG_URL_SECRET` the old first-`@` parse left in the log
+/// (issue #355). Asserted on its own: a whole-secret check passes vacuously on
+/// a partially masked line, which is the defect this fixture now pins.
+const LOG_URL_SECRET_TAIL: &str = "tail-355";
+
+/// The credential *neither* gate could see. `JDBC_URL` matches no sensitive
+/// segment, and a `jdbc:` value parses to an opaque path with no authority, so
+/// `url` reports no password and the shape gate returned the whole line
+/// untouched — into an `info!` that renders in Zed's log panel by default.
+const LOG_JDBC_SECRET: &str = "jdbc-hunter2@tail-358";
+/// `LOG_JDBC_SECRET`'s surviving half, for the same reason as
+/// `LOG_URL_SECRET_TAIL`.
+const LOG_JDBC_SECRET_TAIL: &str = "tail-358";
+
+fn log_fixture_db_url() -> String {
+    format!("mysql://sail:{LOG_URL_SECRET}@{LOG_PLAIN_HOST}:3306/laravel")
+}
+
+/// The same fixture with the credential masked — the positive control. Without
+/// it the leak assertion would also pass on a log line that dropped the URL
+/// altogether, which would be a lost diagnostic rather than a fix.
+fn log_fixture_db_url_masked() -> String {
+    format!("mysql://sail:***@{LOG_PLAIN_HOST}:3306/laravel")
+}
+
+fn log_fixture_jdbc_url() -> String {
+    format!("jdbc:mysql://sail:{LOG_JDBC_SECRET}@{LOG_PLAIN_HOST}:3306/laravel")
+}
+
+fn log_fixture_jdbc_url_masked() -> String {
+    format!("jdbc:mysql://sail:***@{LOG_PLAIN_HOST}:3306/laravel")
+}
+
+/// `config/database.php` with the `url` setting Laravel ships by default.
+const CONFIG_WITH_URL: &str = r#"<?php
+return [
+    'default' => env('DB_CONNECTION', 'mysql'),
+    'connections' => [
+        'mysql' => [
+            'driver' => 'mysql',
+            'url' => env('DATABASE_URL'),
+            'host' => env('DB_HOST', '127.0.0.1'),
+            'port' => env('DB_PORT', '3306'),
+            'database' => env('DB_DATABASE', 'laravel'),
+            'username' => env('DB_USERNAME', 'root'),
+            'password' => env('DB_PASSWORD', ''),
+        ],
+    ],
+];
+"#;
+
+fn log_fixture_env() -> String {
+    format!(
+        "DB_CONNECTION=mysql\nDB_HOST={LOG_PLAIN_HOST}\nDB_DATABASE=laravel\n\
+         DB_USERNAME=sail\nDB_PASSWORD={LOG_SECRET}\nMAIL_API_TOKEN={LOG_TOKEN}\n"
+    )
+}
+
+thread_local! {
+    /// Everything logged on this thread while a capture is running. `None`
+    /// means this thread is not capturing, and the subscriber's output is
+    /// dropped — which is what every other test in the binary wants.
+    static CAPTURED_LOG: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The writer behind the one subscriber the test binary installs. It routes
+/// each event to the capturing thread's buffer, or to nowhere.
+#[derive(Clone, Copy, Default)]
+struct ThreadLocalLogWriter;
+
+impl std::io::Write for ThreadLocalLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        CAPTURED_LOG.with(|slot| {
+            if let Some(buffer) = slot.borrow_mut().as_mut() {
+                buffer.extend_from_slice(bytes);
+            }
+        });
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        *self
+    }
+}
+
+/// Run `f` and return its result plus everything it logged.
+///
+/// The subscriber is **global and installed once**, rather than scoped per
+/// call with `tracing::subscriber::with_default`. Scoping looks tidier and is
+/// wrong here: `tracing` caches each callsite's `Interest` the first time that
+/// callsite is reached, so an ordinary test touching `resolve_env` on another
+/// thread — with no subscriber in place — caches "never" for that macro and
+/// every later capture silently misses it. That is not theory: it turned this
+/// suite red on one CI runner out of three while passing locally, with the
+/// resolver's own lines absent from a capture that held its neighbours.
+///
+/// A global subscriber makes every callsite register against a real subscriber
+/// (and `set_global_default` rebuilds the interest cache), so the answer is
+/// "yes" for good. Isolation moves to the buffer, which is per-thread: a test
+/// that is not capturing writes into `None` and drops its output, exactly as it
+/// did when no subscriber existed at all.
+fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(ThreadLocalLogWriter)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other global subscriber in the test binary");
+    });
+
+    CAPTURED_LOG.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let result = f();
+    let captured = CAPTURED_LOG.with(|slot| {
+        String::from_utf8(slot.borrow_mut().take().unwrap_or_default())
+            .expect("log output is utf-8")
+    });
+    (result, captured)
+}
+
+#[test]
+fn parsing_the_database_config_never_logs_the_dotenv_password() {
+    let dir = TempDir::new().unwrap();
+    write_config_php(dir.path(), CONFIG_VAR_FORM);
+    write(dir.path(), ".env", &log_fixture_env());
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+
+    let (config, logs) = capture_logs(|| provider.parse_database_config().expect("config parsed"));
+
+    assert_eq!(
+        config.password, LOG_SECRET,
+        "the parse still resolves the real password — masking is a log concern only"
+    );
+    assert!(
+        !logs.contains(LOG_SECRET),
+        "the .env password reached the log in plaintext:\n{logs}"
+    );
+    // Pinned to the line that owns the value. A bare `(set)` search would pass
+    // on the neighbouring `password: (set)` summary, which was already masked
+    // before this change and proves nothing about these sites.
+    assert!(
+        logs.contains("resolved from .env: (set)"),
+        "the resolver's info line carries the masked rendering:\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"resolve_env(DB_PASSWORD): Some("(set)")"#),
+        "the reader's debug line carries the masked rendering:\n{logs}"
+    );
+    assert!(
+        logs.contains(LOG_PLAIN_HOST),
+        "an ordinary DB_HOST value is still logged in full:\n{logs}"
+    );
+}
+
+/// The name gate's blind spot, closed by the shape gate.
+///
+/// `DATABASE_URL` matches no sensitive segment, so `mask_env_value_for_log`
+/// takes its *unmatched* arm — which is why that arm is `mask_url_credentials`
+/// and not the raw value. The resolver's `info!` fires under the default
+/// `EnvFilter("info,salsa=warn")`, so an unmasked password here is on screen in
+/// Zed's log panel out of the box.
+#[test]
+fn parsing_the_database_config_never_logs_a_credential_inside_a_url_value() {
+    let dir = TempDir::new().unwrap();
+    write_config_php(dir.path(), CONFIG_WITH_URL);
+    write(
+        dir.path(),
+        ".env",
+        &format!(
+            "{}DATABASE_URL={}\n",
+            log_fixture_env(),
+            log_fixture_db_url()
+        ),
+    );
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+
+    let (config, logs) = capture_logs(|| provider.parse_database_config().expect("config parsed"));
+
+    assert_eq!(
+        config.url.as_deref(),
+        Some(log_fixture_db_url().as_str()),
+        "the parse still hands the driver the real URL — masking is a display concern only"
+    );
+    for secret in [LOG_URL_SECRET, LOG_URL_SECRET_TAIL] {
+        assert!(
+            !logs.contains(secret),
+            "the password inside DATABASE_URL reached the log in plaintext:\n{logs}"
+        );
+    }
+    // Two lines print this value, and both must mask it: the resolver's
+    // `resolved from .env:` line and the config summary's `url:` line. Pinned
+    // separately, because masking one and not its sibling is precisely the
+    // shape this fix exists to close.
+    assert!(
+        logs.contains(&format!(
+            "resolved from .env: {}",
+            log_fixture_db_url_masked()
+        )),
+        "the resolver's line must carry the masked URL, not nothing and not the secret:\n{logs}"
+    );
+    assert!(
+        logs.contains(&format!("url: {}", log_fixture_db_url_masked())),
+        "the config summary's url line must carry the masked URL:\n{logs}"
+    );
+    // The unmatched control still logs in full, so the fix did not buy safety
+    // by blanking the diagnostic.
+    assert!(
+        logs.contains(&format!("host: {LOG_PLAIN_HOST}")),
+        "an ordinary DB_HOST value is still logged in full:\n{logs}"
+    );
+}
+
+/// The same gate on the reader itself, one `RUST_LOG=debug` away from the
+/// default filter — the level an ordinary troubleshooting session turns on, and
+/// whose output gets pasted into bug reports.
+#[test]
+fn resolve_env_masks_a_credential_inside_a_url_value_in_its_debug_log() {
+    // Both routes through the shape gate. `DATABASE_URL` parses with an
+    // authority and `url` reports its password; `JDBC_URL` parses to an opaque
+    // path with no authority, where `url` reports none however many the value
+    // holds. Masking the first says nothing about the second.
+    for (name, value, masked, secrets) in [
+        (
+            "DATABASE_URL",
+            log_fixture_db_url(),
+            log_fixture_db_url_masked(),
+            [LOG_URL_SECRET, LOG_URL_SECRET_TAIL],
+        ),
+        (
+            "JDBC_URL",
+            log_fixture_jdbc_url(),
+            log_fixture_jdbc_url_masked(),
+            [LOG_JDBC_SECRET, LOG_JDBC_SECRET_TAIL],
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".env", &format!("{name}={value}\n"));
+        let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+
+        let (resolved, logs) = capture_logs(|| provider.resolve_env(name));
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(value.as_str()),
+            "caller still gets the real URL"
+        );
+        for secret in secrets {
+            assert!(
+                !logs.contains(secret),
+                "the password inside {name} reached the debug log in plaintext:\n{logs}"
+            );
+        }
+        assert!(
+            logs.contains(&format!(r#"resolve_env({name}): Some("{masked}")"#)),
+            "the debug line must carry the masked URL:\n{logs}"
+        );
+    }
+}
+
+#[test]
+fn resolve_env_masks_every_matched_keyword_category_in_its_debug_log() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", &log_fixture_env());
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+
+    let ((password, token, host), logs) = capture_logs(|| {
+        (
+            provider.resolve_env("DB_PASSWORD"),
+            provider.resolve_env("MAIL_API_TOKEN"),
+            provider.resolve_env("DB_HOST"),
+        )
+    });
+
+    assert_eq!(
+        password.as_deref(),
+        Some(LOG_SECRET),
+        "caller still gets it"
+    );
+    assert_eq!(token.as_deref(), Some(LOG_TOKEN), "caller still gets it");
+    assert_eq!(
+        host.as_deref(),
+        Some(LOG_PLAIN_HOST),
+        "caller still gets it"
+    );
+
+    assert!(
+        !logs.contains(LOG_SECRET) && !logs.contains(LOG_TOKEN),
+        "a secret-named value reached the debug log in plaintext:\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"resolve_env(DB_PASSWORD): Some("(set)")"#),
+        "PASSWORD is masked:\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"resolve_env(MAIL_API_TOKEN): Some("(set)")"#),
+        "TOKEN is masked by the same gate, not by a PASSWORD-only check:\n{logs}"
+    );
+    assert!(
+        logs.contains(&format!(
+            r#"resolve_env(DB_HOST): Some("{LOG_PLAIN_HOST}")"#
+        )),
+        "an unmatched name still logs its value in full:\n{logs}"
+    );
+}
+
+#[test]
+fn parse_env_setting_masks_by_the_env_var_name_not_the_config_key() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), ".env", &log_fixture_env());
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    // `host` is an innocuous config key fed by a secret-named variable, and
+    // `password` a secret-sounding key fed by an ordinary one: the gate reads
+    // the env var's name, which is the only name the policy is defined over.
+    let block = "'host' => env('MAIL_API_TOKEN', '127.0.0.1'),\n\
+                 'password' => env('DB_HOST', ''),";
+
+    let ((host, password), logs) = capture_logs(|| {
+        (
+            provider.parse_env_setting(block, "host", "127.0.0.1"),
+            provider.parse_env_setting(block, "password", ""),
+        )
+    });
+
+    assert_eq!(host, LOG_TOKEN, "the resolved value is unchanged");
+    assert_eq!(password, LOG_PLAIN_HOST, "the resolved value is unchanged");
+    assert!(
+        !logs.contains(LOG_TOKEN),
+        "the secret-named value leaked through an innocuous config key:\n{logs}"
+    );
+    assert!(
+        logs.contains("resolved from .env: (set)"),
+        "the secret-named value is masked:\n{logs}"
+    );
+    assert!(
+        logs.contains(&format!("resolved from .env: {LOG_PLAIN_HOST}")),
+        "the ordinary value is logged in full even under a `password` key:\n{logs}"
     );
 }

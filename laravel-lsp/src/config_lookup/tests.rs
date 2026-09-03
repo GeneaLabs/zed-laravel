@@ -161,3 +161,73 @@ return [
         Some("'matched'")
     );
 }
+
+// ── #369: navigation and value resolution must agree ──────────────────────
+
+/// Every key the enumerator offers must also resolve to a value here.
+///
+/// These two paths used to be different implementations over the same file:
+/// completion and goto walked the AST, hover and the "not found" diagnostic
+/// counted brackets. The scanner stopped at the first entry it could not
+/// parse, so it disagreed exactly where list entries appear — and #369 made
+/// those keys reachable, turning a latent split into a visible one.
+#[test]
+fn every_enumerated_key_also_resolves_to_a_value() {
+    let src = r#"<?php
+return [
+    'options' => ['a', 'b'],
+    'after' => 'sibling',
+    404 => 'Not found',
+    'nested' => [
+        ['deep' => 'value'],
+    ],
+];
+"#;
+    let entries = crate::config_key_locator::enumerate_entries_in_source(src);
+    // Without this the test is vacuous: an enumerator returning nothing
+    // trivially satisfies "every enumerated key resolves".
+    assert!(
+        entries.len() >= 6,
+        "the fixture must actually enumerate, got {entries:?}"
+    );
+    let mut unresolved = Vec::new();
+    for (key, _, _) in entries {
+        let path: Vec<&str> = key.split('.').collect();
+        if resolve_in_source(src, &path).is_none() {
+            unresolved.push(key);
+        }
+    }
+    assert!(
+        unresolved.is_empty(),
+        "these keys are offered but resolve to nothing: {unresolved:?}"
+    );
+}
+
+#[test]
+fn a_key_after_a_non_string_key_resolves() {
+    // The retired byte scanner skipped a LIST value by counting balanced
+    // brackets, so a list before the target was survivable. What actually
+    // aborted its walk was a non-string KEY at the target's own nesting
+    // level: `read_string_key` required a quote, found a digit, and gave up
+    // on the rest of the array. Everything declared after `404 =>` was
+    // unreachable.
+    let src = "<?php\nreturn [\n    404 => 'Not found',\n    'after' => 'sibling',\n];\n";
+    assert_eq!(
+        resolve_in_source(src, &["after"]).as_deref(),
+        Some("'sibling'")
+    );
+    assert_eq!(
+        resolve_in_source(src, &["404"]).as_deref(),
+        Some("'Not found'")
+    );
+}
+
+#[test]
+fn a_list_index_resolves_to_its_element() {
+    // The scanner could never resolve a bare list index, for any array.
+    let src = "<?php\nreturn [\n    'options' => ['a', 'b'],\n];\n";
+    assert_eq!(
+        resolve_in_source(src, &["options", "1"]).as_deref(),
+        Some("'b'")
+    );
+}

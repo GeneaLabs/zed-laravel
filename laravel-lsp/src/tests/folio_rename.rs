@@ -224,7 +224,6 @@ async fn decl_range_at_returns_the_page_name_span_for_a_folio_cursor() {
 
     let range = decl_range_at(
         &server,
-        Some(root.path()),
         &page,
         CURSOR,
         &SymbolRef::Route("contact".to_string()),
@@ -265,7 +264,6 @@ async fn decl_range_at_returns_the_page_name_span_for_a_non_contact_length_leaf(
 
     let range = decl_range_at(
         &server,
-        Some(root.path()),
         &page,
         CURSOR,
         &SymbolRef::Route("dashboard".to_string()),
@@ -299,7 +297,6 @@ async fn decl_range_at_returns_none_when_cursor_off_the_name_call() {
 
     let range = decl_range_at(
         &server,
-        Some(root.path()),
         &page,
         Position {
             line: 0,

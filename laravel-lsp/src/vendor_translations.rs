@@ -239,7 +239,7 @@ fn classify_load_translations_call(
 /// `dirname(__DIR__).'/rel'`, `lang_path('…')`, and `base_path('…')`, plus a
 /// bare `__DIR__`. Anything else (a variable, an unrecognized helper) yields
 /// `None` and the registration is skipped.
-fn resolve_path_arg(
+pub(crate) fn resolve_path_arg(
     node: tree_sitter::Node,
     bytes: &[u8],
     provider_dir: &Path,
@@ -322,7 +322,7 @@ fn first_argument(call: tree_sitter::Node) -> Option<tree_sitter::Node> {
 /// The value expression of a call argument. tree-sitter-php wraps each argument
 /// in an `argument` node; for a named argument the parameter label is the
 /// `name` field, so the value is the other child.
-fn argument_value(arg: tree_sitter::Node) -> Option<tree_sitter::Node> {
+pub(crate) fn argument_value(arg: tree_sitter::Node) -> Option<tree_sitter::Node> {
     if arg.kind() != "argument" {
         return Some(arg);
     }
@@ -333,7 +333,7 @@ fn argument_value(arg: tree_sitter::Node) -> Option<tree_sitter::Node> {
 }
 
 /// Whether `object` is the `$this` receiver of a `$this->method(...)` call.
-fn is_this_receiver(object: tree_sitter::Node, bytes: &[u8]) -> bool {
+pub(crate) fn is_this_receiver(object: tree_sitter::Node, bytes: &[u8]) -> bool {
     object.utf8_text(bytes).ok() == Some("$this")
 }
 
@@ -341,7 +341,7 @@ fn is_this_receiver(object: tree_sitter::Node, bytes: &[u8]) -> bool {
 /// Descends to the `string_content` child, matching the rest of the LSP; an
 /// empty literal has no such child, so fall back to stripping a surrounding
 /// quote pair.
-fn string_literal_text(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+pub(crate) fn string_literal_text(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
     if !matches!(node.kind(), "string" | "encapsed_string") {
         return None;
     }

@@ -131,6 +131,7 @@ pub fn locate_in_source(source: &str, key: &str) -> Option<KeyPosition> {
             line: line_idx as u32,
             start_column: start_col,
             end_column: end_col,
+            kind: crate::config_key_locator::KeyKind::Quoted,
         });
     }
     None
@@ -157,6 +158,70 @@ pub fn enumerate_keys_in_source(source: &str) -> Vec<(String, KeyPosition)> {
                 line: line_idx as u32,
                 start_column: start_col,
                 end_column: end_col,
+                kind: crate::config_key_locator::KeyKind::Quoted,
+            },
+        ));
+    }
+    out
+}
+
+/// The declaration a `#` comment hides, or `None` when `line` is not a
+/// whole-line comment.
+///
+/// The single definition of "commented" for `.env` text: a line is commented
+/// when its first non-blank character is `#`, the whole `#` run is the marker
+/// (so `## KEY=value` is a commented declaration), and the body begins after
+/// the whitespace that follows it. Every reader of `.env` lines classifies
+/// through this one function — Salsa's `parse_env_source`, the declaration
+/// parser that must reject exactly these lines, the commented-key enumeration
+/// that parses what they hide, and the inline-comment tokenizer — so the
+/// buffer-local and Salsa views of "commented" cannot drift apart.
+///
+/// The body is always a suffix of `line`, so `line.len() - body.len()` is the
+/// column it starts at.
+pub fn commented_declaration_body(line: &str) -> Option<&str> {
+    line.trim_start()
+        .strip_prefix('#')
+        .map(|rest| rest.trim_start_matches('#').trim_start())
+}
+
+/// Enumerate every *commented-out* key declaration (`# KEY=value`) in a
+/// `.env`-format source, in file order, with column-accurate positions
+/// relative to the whole line. First declaration wins per key, matching
+/// [`enumerate_keys_in_source`].
+///
+/// The companion to [`enumerate_keys_in_source`], which classifies a `#` line
+/// as "not a declaration" and so can never see these. Both classify through
+/// [`commented_declaration_body`] and parse through [`parse_key_declaration`],
+/// so a commented key is parsed exactly as its active twin would be — only the
+/// `#` run and the whitespace after it are removed first, and the resulting
+/// columns shifted back by that offset.
+///
+/// The two enumerations are kept separate rather than merged behind a flag:
+/// merging would let a commented `# KEY=` earlier in the file win the
+/// first-match-wins race against an active `KEY=` below it, which would change
+/// what the env code lens anchors on.
+pub fn enumerate_commented_keys_in_source(source: &str) -> Vec<(String, KeyPosition)> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (line_idx, line) in source.lines().enumerate() {
+        let Some(body) = commented_declaration_body(line) else {
+            continue;
+        };
+        let offset = (line.len() - body.len()) as u32;
+        let Some((key, start_col, end_col)) = parse_key_declaration(body) else {
+            continue;
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push((
+            key.to_string(),
+            KeyPosition {
+                line: line_idx as u32,
+                start_column: start_col + offset,
+                end_column: end_col + offset,
+                kind: crate::config_key_locator::KeyKind::Quoted,
             },
         ));
     }
@@ -167,10 +232,12 @@ pub fn enumerate_keys_in_source(source: &str) -> Vec<(String, KeyPosition)> {
 /// (everything before the first `=`, whitespace-trimmed) and its column span.
 /// Returns `None` for blank lines, `#` comments, lines without `=`, and lines
 /// whose key is empty. Shared by [`locate_in_source`] and
-/// [`enumerate_keys_in_source`] so both classify lines identically.
+/// [`enumerate_keys_in_source`] so both classify lines identically, and
+/// rejecting the comments [`commented_declaration_body`] admits — the two
+/// sides of one rule, read from one place.
 fn parse_key_declaration(line: &str) -> Option<(&str, u32, u32)> {
     let trimmed = line.trim_start();
-    if trimmed.is_empty() || trimmed.starts_with('#') {
+    if trimmed.is_empty() || commented_declaration_body(line).is_some() {
         return None;
     }
     let eq_pos = line.find('=')?;

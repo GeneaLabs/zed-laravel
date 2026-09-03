@@ -1,6 +1,6 @@
 [package]
 name = "laravel-lsp"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2021"
 authors = ["Mike Bronner <mike.bronner@icloud.com>"]
 description = "Language Server Protocol implementation for Laravel development"
@@ -54,6 +54,14 @@ thiserror = "2.0"
 sqlx = { version = "0.9", features = ["runtime-tokio", "mysql", "postgres", "sqlite"], default-features = false }
 tiberius = { version = "0.12", default-features = false, features = ["tokio", "rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+
+# RFC 3986 URL parsing for credential redaction. `mask_url_credentials` has to
+# know where a URL's authority ends before it can tell a password's `@` from a
+# path's, and a hand-rolled scan cannot: `mysql://host:3306/db@x` and
+# `postgres://user:p/ss@host/db` are the same shape to a scanner and different
+# URLs to a parser (issue #355). Already compiled transitively (sqlx parses its
+# connection strings with it), so this direct dep adds no new crate to the build.
+url = "2.5"
 
 # Tree-sitter parsers
 # Using latest version to match the Blade grammar from GitHub
@@ -112,6 +120,16 @@ harness = false
 # `cargo bench --bench magic_members`.
 [[bench]]
 name = "magic_members"
+harness = false
+
+# Step-0 measurement for issue #373 — splits the shared vendor pass into walk /
+# stat / read / classify so the parallelizable fraction is measured rather than
+# assumed, and times the single-threaded Salsa parse funnel a dependency change
+# drives. Unlike the two benches above it needs a REAL `vendor/` tree (it skips
+# cleanly without one). Same custom timing harness; run with
+# `cargo bench --bench vendor_parallelism`.
+[[bench]]
+name = "vendor_parallelism"
 harness = false
 
 [profile.release]

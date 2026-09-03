@@ -777,6 +777,169 @@ fn external_prefixes_for_file_transitive_chain_accumulates() {
 }
 
 #[test]
+fn external_prefixes_for_file_agrees_with_the_built_index() {
+    // The premise the whole of issue #80 rests on: every request handler now
+    // answers external-prefix questions from `RouteIndex::external_prefixes`
+    // instead of calling `external_prefixes_for_file`. That is only sound if
+    // the two agree — so compare them directly, file by file, on a project
+    // exercising the shapes the propagation has to get right:
+    //
+    //   a.php   — loader, inherits nothing
+    //   b.php   — loaded with `admin.`, and itself a loader
+    //   c.php   — loaded transitively, inherits the accumulated `admin.blog.`
+    //   solo.php — a route file no load edge ever reaches
+    //
+    // Comparing only the prefixed files would pass for a cache that returned
+    // `[""]` for everything reachable *and* everything else, so the unprefixed
+    // files are part of the comparison too.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let routes = root.join("routes");
+    std::fs::create_dir_all(&routes).unwrap();
+    std::fs::write(
+        routes.join("a.php"),
+        "<?php\nRoute::as('admin.')->group(base_path('routes/b.php'));\n",
+    )
+    .unwrap();
+    std::fs::write(
+        routes.join("b.php"),
+        "<?php\nRoute::get('/dash', fn () => 'ok')->name('dash');\n\
+         Route::as('blog.')->group(base_path('routes/c.php'));\n",
+    )
+    .unwrap();
+    std::fs::write(
+        routes.join("c.php"),
+        "<?php\nRoute::get('/posts', fn () => 'ok')->name('posts.index');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        routes.join("solo.php"),
+        "<?php\nRoute::get('/solo', fn () => 'ok')->name('solo');\n",
+    )
+    .unwrap();
+
+    let index = build_route_index(root, &discover_route_files(root));
+
+    // Compared as SEQUENCES, not as sets: `compute_effective_prefixes` sorts,
+    // so the two sides must agree element for element, in order. (Before that
+    // sort this comparison was flaky — see
+    // `external_prefixes_are_ordered_deterministically`.)
+    for leaf in ["a.php", "b.php", "c.php", "solo.php"] {
+        let file = routes.join(leaf);
+        assert_eq!(
+            index.external_prefixes_for(&file),
+            external_prefixes_for_file(root, &file),
+            "the cached index and the uncached walk must agree for {leaf}"
+        );
+    }
+
+    // Pin what "agree" is worth here: the comparison above would be vacuously
+    // true if both sides answered `[""]` everywhere, so assert the fixture
+    // really does carry an accumulated prefix through the index.
+    assert!(
+        index
+            .external_prefixes_for(&routes.join("c.php"))
+            .contains(&"admin.blog.".to_string()),
+        "fixture check — the index must carry the transitive `admin.blog.` \
+         prefix, otherwise the equality above proves nothing: {:?}",
+        index.external_prefixes_for(&routes.join("c.php"))
+    );
+}
+
+/// `admin.php` and `blog.php` both load `shared.php`, under different name
+/// prefixes. That is the shape whose prefix order used to vary run to run.
+fn seed_two_loader_project(root: &Path) -> PathBuf {
+    let routes = root.join("routes");
+    std::fs::create_dir_all(&routes).unwrap();
+    std::fs::write(
+        routes.join("admin.php"),
+        "<?php\nRoute::as('admin.')->group(base_path('routes/shared.php'));\n",
+    )
+    .unwrap();
+    std::fs::write(
+        routes.join("blog.php"),
+        "<?php\nRoute::as('blog.')->group(base_path('routes/shared.php'));\n",
+    )
+    .unwrap();
+    let shared = routes.join("shared.php");
+    std::fs::write(
+        &shared,
+        "<?php\nRoute::get('/posts', fn () => 'ok')->name('posts.index');\n",
+    )
+    .unwrap();
+    shared
+}
+
+#[test]
+fn external_prefixes_are_ordered_deterministically() {
+    // Regression: `compute_effective_prefixes` DFS'd a `HashSet` of start files
+    // and pushed each reached prefix in visit order, so a file reachable under
+    // two prefixes got them in an order set by the hasher's per-instance seed.
+    // Rust seeds each `HashMap`/`HashSet` instance differently, so the order
+    // changed between two calls *inside one process* — which is exactly what
+    // `classify_with_decl_fallback` reads when it takes the first non-empty
+    // prefix as a declaration's project-level name. Find-references and rename
+    // could therefore anchor to `admin.posts.index` on one invocation and
+    // `blog.posts.index` on the next, on an unedited project.
+    //
+    // Repeating the computation is the whole point: a single call cannot
+    // observe instability, and each iteration builds fresh maps with fresh
+    // seeds. 20 rounds made the unsorted version fail every time it was run.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let shared = seed_two_loader_project(root);
+
+    let expected = vec![String::new(), "admin.".to_string(), "blog.".to_string()];
+
+    for round in 0..20 {
+        let index = build_route_index(root, &discover_route_files(root));
+        assert_eq!(
+            index.external_prefixes_for(&shared),
+            expected,
+            "round {round}: the built index must order prefixes `\"\"` first, \
+             then lexicographically — an order that never varies between runs"
+        );
+        assert_eq!(
+            external_prefixes_for_file(root, &shared),
+            expected,
+            "round {round}: the uncached walk must produce the same stable order"
+        );
+    }
+}
+
+#[test]
+fn a_route_reachable_under_two_prefixes_resolves_to_a_stable_name() {
+    // The consequence the sort exists for, stated in the terms a user sees.
+    // `classify_with_decl_fallback` builds a declaration's project-level name
+    // as `<first non-empty prefix><in-file name>`; with two loaders that first
+    // element has to be the same on every call or find-references and rename
+    // silently target different symbols on successive invocations.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let shared = seed_two_loader_project(root);
+
+    let names: std::collections::HashSet<String> = (0..20)
+        .map(|_| {
+            let index = build_route_index(root, &discover_route_files(root));
+            let primary = index
+                .external_prefixes_for(&shared)
+                .into_iter()
+                .find(|p| !p.is_empty())
+                .expect("a doubly-loaded file must inherit at least one prefix");
+            format!("{primary}posts.index")
+        })
+        .collect();
+
+    assert_eq!(
+        names,
+        std::collections::HashSet::from(["admin.posts.index".to_string()]),
+        "20 rounds must all resolve to the one lexicographically-first name; \
+         more than one entry here means rename would rewrite a different symbol \
+         depending on when it ran: {names:?}"
+    );
+}
+
+#[test]
 fn external_group_cycle_is_guarded() {
     // a.php loads b.php; b.php loads a.php. Must terminate and still index
     // both files' bare names without blowing up.
@@ -1903,5 +2066,184 @@ $this->app->resource('photos', PhotoController::class);
             "photos.update",
         ],
         "resource() must keep its current receiver-agnostic behavior",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Shared vendor walk equivalence (issue #371)
+// ---------------------------------------------------------------------------
+
+/// Route-file discovery as it was before the shared vendor walk: the project
+/// legs, plus its OWN `WalkDir::new(vendor).max_depth(8)`.
+///
+/// An executable oracle, kept because the refactor's claim is about the old
+/// implementation and there is no other way to test such a claim.
+fn discover_route_files_own_walk(root: &Path) -> Vec<RouteFile> {
+    let mut seen: HashMap<PathBuf, u8> = HashMap::new();
+
+    let project_routes = root.join("routes");
+    if project_routes.exists() {
+        for path in walk_php_files(&project_routes, 6) {
+            promote(&mut seen, path, PRIORITY_APP);
+        }
+    }
+
+    let vendor = root.join("vendor");
+    if vendor.exists() {
+        for entry in WalkDir::new(&vendor)
+            .max_depth(8)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "php") {
+                continue;
+            }
+            if is_under_routes_dir(path) {
+                promote(
+                    &mut seen,
+                    path.to_path_buf(),
+                    priority_for_vendor_path(path),
+                );
+                continue;
+            }
+            if file_registers_named_routes(path) {
+                promote(
+                    &mut seen,
+                    path.to_path_buf(),
+                    priority_for_vendor_path(path),
+                );
+            }
+        }
+    }
+
+    for candidate in app_provider_candidates(root) {
+        if candidate.exists() && file_registers_named_routes(&candidate) {
+            promote(&mut seen, candidate, PRIORITY_APP);
+        }
+    }
+
+    seen.into_iter()
+        .map(|(path, priority)| RouteFile { path, priority })
+        .collect()
+}
+
+fn as_sorted_pairs(files: &[RouteFile]) -> Vec<(PathBuf, u8)> {
+    let mut v: Vec<_> = files.iter().map(|f| (f.path.clone(), f.priority)).collect();
+    v.sort();
+    v
+}
+
+/// A project holding every shape the vendor leg's rules key on: a package
+/// `routes/` file (accepted with no read), a provider that registers routes by
+/// content, a framework-tier file (different priority), a non-registering file,
+/// a registering file just inside the depth-8 budget, one just outside it, and
+/// one inside a `node_modules/` subtree the route walk has never pruned.
+fn seed_route_project(root: &Path) {
+    let route_src = "<?php\nRoute::get('/x', fn () => 'ok')->name('x');\n";
+    let write = |rel: &str, body: &str| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+    };
+    write("routes/web.php", route_src);
+    write("app/Providers/RouteServiceProvider.php", route_src);
+    write(
+        "vendor/acme/pkg/routes/web.php",
+        "<?php\n// no routes here\n",
+    );
+    write("vendor/acme/pkg/src/Provider.php", route_src);
+    write("vendor/acme/pkg/src/Plain.php", "<?php\nclass Plain {}\n");
+    write(
+        "vendor/laravel/framework/src/Illuminate/Foo/Bar.php",
+        route_src,
+    );
+    // depth 8 — the last depth the vendor leg considers.
+    write("vendor/acme/pkg/a/b/c/d/e/In.php", route_src);
+    // depth 9 — past it.
+    write("vendor/acme/pkg/a/b/c/d/e/f/Out.php", route_src);
+    write("vendor/acme/pkg/node_modules/Bundled.php", route_src);
+}
+
+#[test]
+fn shared_vendor_walk_discovers_the_same_route_files_as_its_own_walk() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    seed_route_project(root);
+
+    let shared =
+        discover_route_files_with_vendor(root, &crate::vendor_index::VendorIndex::build(root));
+    let oracle = discover_route_files_own_walk(root);
+
+    assert_eq!(
+        as_sorted_pairs(&shared),
+        as_sorted_pairs(&oracle),
+        "sharing the vendor walk must not change which files are discovered, \
+         nor their priorities"
+    );
+
+    // Fixture checks, so the equality above cannot pass vacuously.
+    let has = |rel: &str| shared.iter().any(|f| f.path == root.join(rel));
+    assert!(
+        has("vendor/acme/pkg/routes/web.php"),
+        "a package routes/ file is accepted by convention even though its \
+         content registers nothing — proving the no-read branch still runs"
+    );
+    assert!(
+        has("vendor/acme/pkg/src/Provider.php"),
+        "a content-matched vendor file is still discovered — proving the \
+         shared read pass reaches the classifier"
+    );
+    assert!(
+        !has("vendor/acme/pkg/src/Plain.php"),
+        "a vendor file registering no routes is still rejected"
+    );
+    assert!(
+        has("vendor/acme/pkg/a/b/c/d/e/In.php"),
+        "depth 8 is inside the vendor budget"
+    );
+    assert!(
+        !has("vendor/acme/pkg/a/b/c/d/e/f/Out.php"),
+        "depth 9 is outside it — the budget must still bind now that the \
+         shared walk itself is unbounded"
+    );
+    assert!(
+        has("vendor/acme/pkg/node_modules/Bundled.php"),
+        "route discovery never pruned node_modules, and must not start now \
+         just because another consumer of the shared walk does"
+    );
+    assert_eq!(
+        shared
+            .iter()
+            .find(|f| f.path == root.join("vendor/laravel/framework/src/Illuminate/Foo/Bar.php"))
+            .map(|f| f.priority),
+        Some(PRIORITY_FRAMEWORK),
+        "framework files keep their own tier"
+    );
+}
+
+#[test]
+fn shared_vendor_walk_matches_the_old_walk_without_a_vendor_dir() {
+    // The former code guarded the whole vendor leg on `vendor.exists()`. The
+    // shared index reports `is_empty()` instead; the project legs must still
+    // produce exactly what they did.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("routes")).unwrap();
+    std::fs::write(
+        root.join("routes/web.php"),
+        "<?php\nRoute::get('/x', fn () => 'ok')->name('x');\n",
+    )
+    .unwrap();
+
+    let shared =
+        discover_route_files_with_vendor(root, &crate::vendor_index::VendorIndex::build(root));
+    let oracle = discover_route_files_own_walk(root);
+
+    assert_eq!(as_sorted_pairs(&shared), as_sorted_pairs(&oracle));
+    assert_eq!(
+        shared.len(),
+        1,
+        "fixture check — the project leg found its file"
     );
 }

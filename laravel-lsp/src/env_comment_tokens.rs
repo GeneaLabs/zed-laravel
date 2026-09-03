@@ -66,7 +66,8 @@ pub fn inline_comment_start(line: &str) -> Option<usize> {
     // scan below, because a comment may itself contain an `=`
     // (`# set FOO=bar to enable`) and must not be read as an assignment.
     let trimmed_start = line.len() - line.trim_start().len();
-    if line.trim_start().starts_with('#') || line.trim().is_empty() {
+    if crate::env_key_locator::commented_declaration_body(line).is_some() || line.trim().is_empty()
+    {
         return None;
     }
 

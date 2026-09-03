@@ -93,6 +93,29 @@ jobs:
       - name: cargo test
         run: cargo test --all-features
 
+      - name: Perf measurement (issue #373)
+        # OUTPUT ONLY — this step is a debugging aid, not a gate. The bench
+        # asserts nothing about timings, so it can only fail on a genuine
+        # panic; a runner without a vendor/ tree prints a skip notice and
+        # exits 0. Read the numbers in the log, do not tune anything to them.
+        #
+        # It runs here, in the matrix, because this is the only place the
+        # project has Windows and Linux hardware, and the vendor pass's
+        # read-vs-CPU split is exactly what varies by platform: macOS pays far
+        # more per-file syscall overhead than Linux, and the Windows runner's
+        # filesystem is a third shape again. A parallelization decision made on
+        # one platform's ratio would be a guess on the other two.
+        #
+        # `--bench vendor_parallelism` builds only this target, not the two
+        # synthetic benches, which need no real project and gain nothing from
+        # running per-PR.
+        env:
+          # Trimmed from the local default (250,1000,4000) so a slow Windows
+          # runner does not spend a minute on the largest batch. The per-file
+          # column is what makes two runs comparable, and 250/1000 give it.
+          PARSE_BENCH_BATCHES: 250,1000
+        run: cargo bench --bench vendor_parallelism
+
   extension:
     name: Extension — wasm check, fmt, clippy
     runs-on: ubuntu-latest

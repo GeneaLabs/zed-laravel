@@ -61,6 +61,7 @@ pub mod completion_format;
 pub mod component_completion;
 pub mod component_declaration_locator;
 pub mod component_member_locator;
+pub mod component_usage_index;
 pub mod composer_autoload;
 pub mod config;
 pub mod config_key_locator;
@@ -81,6 +82,7 @@ pub mod inertia;
 pub mod laravel_introspector;
 pub mod livewire_config;
 pub mod livewire_declaration_locator;
+pub mod livewire_namespaces;
 pub mod livewire_resolver;
 pub mod livewire_version;
 pub mod method_name_completion;
@@ -91,7 +93,10 @@ pub mod migration_index;
 // Public API is re-exported as `laravel_introspector::ModelMetadata`.
 pub mod magic_dependency_index;
 pub mod magic_disk_cache;
+pub mod markdown_safety;
 pub mod naming;
+pub mod parallelism;
+pub mod parse_budget;
 pub mod parser;
 pub mod path_containment;
 pub mod path_join;
@@ -123,6 +128,8 @@ pub mod slot_navigation;
 pub mod translation_key_locator;
 pub mod translation_lookup;
 pub mod validation_rules;
+pub mod vendor_index;
+pub mod vendor_scan;
 pub mod vendor_translations;
 pub mod view_declaration_locator;
 
@@ -144,6 +151,7 @@ pub mod member_resolver;
 
 // Controller/Volt → Blade view-variable type inference (magic members in Blade)
 pub mod view_var_index;
+pub mod volt_functional;
 
 // M1 single-parse capture: compile a file's own-source resolution context at
 // parse so the magic-member resolve passes never re-read/re-parse it.

@@ -11,7 +11,7 @@ fn watchers_cover_all_four_indexed_directories() {
     let root = PathBuf::from("/projects/laravel-app");
     let view_paths = vec![root.join("resources/views")];
     let livewire = root.join("app/Livewire");
-    let watchers = build_watchers(&root, &view_paths, Some(&livewire), &[]);
+    let watchers = build_watchers(&root, &view_paths, Some(&livewire), &[], &[]);
 
     let globs: Vec<String> = watchers
         .iter()
@@ -56,7 +56,7 @@ fn watchers_cover_all_four_indexed_directories() {
 fn watchers_omit_livewire_when_not_configured() {
     let root = PathBuf::from("/projects/no-livewire-app");
     let view_paths = vec![root.join("resources/views")];
-    let watchers = build_watchers(&root, &view_paths, None, &[]);
+    let watchers = build_watchers(&root, &view_paths, None, &[], &[]);
 
     let has_livewire = watchers.iter().any(|w| match &w.glob_pattern {
         GlobPattern::String(s) => s.contains("Livewire"),
@@ -78,7 +78,7 @@ fn watchers_register_each_configured_view_path() {
         root.join("themes/dark/views"),
         root.join("themes/light/views"),
     ];
-    let watchers = build_watchers(&root, &view_paths, None, &[]);
+    let watchers = build_watchers(&root, &view_paths, None, &[], &[]);
 
     for view_path in &view_paths {
         // Compare against the same forward-slash rendering the watcher emits.
@@ -97,7 +97,7 @@ fn watchers_register_each_configured_view_path() {
 #[test]
 fn watchers_request_create_change_and_delete_events() {
     let root = PathBuf::from("/projects/test");
-    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &[]);
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &[], &[]);
 
     let all_three = WatchKind::Create | WatchKind::Change | WatchKind::Delete;
     for w in &watchers {
@@ -112,7 +112,7 @@ fn watchers_request_create_change_and_delete_events() {
 #[test]
 fn registration_has_correct_method_and_id() {
     let root = PathBuf::from("/projects/test");
-    let reg = build_registration(&root, &[root.join("resources/views")], None, &[]);
+    let reg = build_registration(&root, &[root.join("resources/views")], None, &[], &[]);
     assert_eq!(reg.method, METHOD);
     assert_eq!(reg.id, REGISTRATION_ID);
     assert!(reg.register_options.is_some(), "options must be serialized");
@@ -123,7 +123,7 @@ fn registration_options_round_trip_through_serde() {
     let root = PathBuf::from("/projects/test");
     let view_paths = vec![root.join("resources/views")];
     let livewire = root.join("app/Livewire");
-    let reg = build_registration(&root, &view_paths, Some(&livewire), &[]);
+    let reg = build_registration(&root, &view_paths, Some(&livewire), &[], &[]);
 
     // The client deserializes our register_options into
     // DidChangeWatchedFilesRegistrationOptions. Verify the value we
@@ -136,12 +136,12 @@ fn registration_options_round_trip_through_serde() {
     );
 
     // We constructed exactly 1 (controllers) + 1 (routes) + 1 (migrations)
-    // + 2 (view blade + php) + 1 (livewire) + 2 (vendor php + blade)
-    // + 4 (Inertia page extensions: vue/tsx/jsx/svelte)
+    // + 1 (config) + 2 (view blade + php) + 1 (livewire) + 2 (vendor php +
+    // blade) + 4 (Inertia page extensions: vue/tsx/jsx/svelte)
     // + 6 (lang catalogues: php/json/vendor-php across both lang roots,
-    //   issue #293) = 18 watchers. If the construction changes, this
+    //   issue #293) = 19 watchers. If the construction changes, this
     // assertion will flag it for review.
-    assert_eq!(parsed.watchers.len(), 18);
+    assert_eq!(parsed.watchers.len(), 19);
 }
 
 #[test]
@@ -150,7 +150,7 @@ fn watchers_include_inertia_page_globs() {
     // #10) — one watcher glob per supported extension so external page
     // create/delete invalidates the existence cache.
     let root = PathBuf::from("/projects/laravel-app");
-    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &[]);
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &[], &[]);
 
     let globs: Vec<String> = watchers
         .iter()
@@ -174,7 +174,7 @@ fn watchers_include_inertia_page_globs() {
 #[test]
 fn watchers_include_vendor_php_and_blade_globs() {
     let root = PathBuf::from("/projects/laravel-app");
-    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &[]);
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &[], &[]);
 
     let globs: Vec<String> = watchers
         .iter()
@@ -200,6 +200,31 @@ fn watchers_include_vendor_php_and_blade_globs() {
     );
 }
 
+#[test]
+fn watchers_include_the_config_tree() {
+    // The glob has been here since the config layer got its own cache, but
+    // nothing pinned it — and since #349 the translation cache reads
+    // `config/app.php` too, so an unwatched config tree would strand the
+    // previewed autocomplete locale at whatever it was when the LSP started.
+    // Deleting the watcher must redden something.
+    let root = PathBuf::from("/projects/laravel-app");
+    let globs = globs_of(&build_watchers(
+        &root,
+        &[root.join("resources/views")],
+        None,
+        &[],
+        &[],
+    ));
+
+    assert!(
+        globs
+            .iter()
+            .any(|g| g == "/projects/laravel-app/config/**/*.php"),
+        "missing config glob: {:?}",
+        globs
+    );
+}
+
 fn globs_of(watchers: &[FileSystemWatcher]) -> Vec<String> {
     watchers
         .iter()
@@ -216,7 +241,7 @@ fn watchers_include_a_recursive_glob_per_psr4_root() {
     // glob so an external edit anywhere under it converges the magic index.
     let root = PathBuf::from("/projects/laravel-app");
     let psr4 = vec![root.join("app"), root.join("src")];
-    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &psr4);
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &psr4, &[]);
 
     let globs = globs_of(&watchers);
     for src in &psr4 {
@@ -237,7 +262,7 @@ fn psr4_glob_that_exactly_duplicates_an_existing_one_is_skipped() {
     // we prove the dedup by counting: two identical roots yield one glob.
     let root = PathBuf::from("/projects/laravel-app");
     let psr4 = vec![root.join("app"), root.join("app")];
-    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &psr4);
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &psr4, &[]);
 
     let expected = format!("{}/app/**/*.php", super::glob_base(&root));
     let count = globs_of(&watchers)
@@ -256,7 +281,7 @@ fn overlapping_psr4_glob_coexists_with_fixed_controllers_glob() {
     // couldn't read.
     let root = PathBuf::from("/projects/laravel-app");
     let psr4 = vec![root.join("app")];
-    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &psr4);
+    let watchers = build_watchers(&root, &[root.join("resources/views")], None, &psr4, &[]);
 
     let globs = globs_of(&watchers);
     assert!(
@@ -270,5 +295,60 @@ fn overlapping_psr4_glob_coexists_with_fixed_controllers_glob() {
             .iter()
             .any(|g| g == &format!("{}/app/Http/Controllers/**/*.php", root.display())),
         "fixed controllers glob must survive alongside the widened app glob: {globs:?}"
+    );
+}
+
+#[test]
+fn module_dirs_get_their_own_watcher_pair() {
+    // A module tree outside every PSR-4 source root (the `Modules/*`
+    // shape) must still be watched: config, providers, views, and lang
+    // catalogues all live under it.
+    let root = std::path::PathBuf::from("/proj");
+    let module = root.join("Modules/Blog");
+    let watchers = build_watchers(
+        &root,
+        &[root.join("resources/views")],
+        None,
+        &[],
+        std::slice::from_ref(&module),
+    );
+    let globs: Vec<String> = watchers
+        .iter()
+        .filter_map(|w| match &w.glob_pattern {
+            GlobPattern::String(g) => Some(g.clone()),
+            GlobPattern::Relative(_) => None,
+        })
+        .collect();
+    // Expectations built the same way `build_watchers` builds its globs —
+    // `display()` yields backslashes on Windows, the glob base never does.
+    let base = module.display().to_string().replace('\\', "/");
+    assert!(
+        globs.contains(&format!("{base}/**/*.php")),
+        "php glob covers config/providers/lang: {globs:?}"
+    );
+    assert!(
+        globs.contains(&format!("{base}/**/*.blade.php")),
+        "blade glob covers the module views: {globs:?}"
+    );
+}
+
+#[test]
+fn module_dir_under_a_watched_source_root_adds_nothing() {
+    let root = std::path::PathBuf::from("/proj");
+    let app = root.join("app");
+    let module = root.join("app");
+    let base = build_watchers(&root, &[], None, std::slice::from_ref(&app), &[]).len();
+    let with_module = build_watchers(
+        &root,
+        &[],
+        None,
+        std::slice::from_ref(&app),
+        std::slice::from_ref(&module),
+    )
+    .len();
+    assert_eq!(
+        with_module,
+        base + 1,
+        "the php glob dedups against the PSR-4 watcher; only the blade glob is new"
     );
 }

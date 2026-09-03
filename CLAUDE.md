@@ -174,16 +174,19 @@ The LSP uses a dedicated thread for Salsa incremental computation to avoid lifet
 | Config | `ConfigFile` | `LaravelConfigData` | Project configuration |
 | Project Files | `ProjectFiles` | `ViewReferenceLocationData` | Reference finding across project |
 | Service Providers | `ServiceProviderFile` | `MiddlewareRegistrationData`, `BindingRegistrationData` | Middleware/binding lookups |
-| Env Variables | `EnvFile` | `EnvVariableData` | Environment variable lookups |
+| Env Variables | `EnvFile` | `ParsedEnvVarData` | Environment variable lookups |
+| Render Index | `RenderIndex` | `BladeBackingResolutionData` | Blade backing-class resolution (which PHP class backs a template) |
 | Translations | `LangFile`, `LangDir` | `ResolvedTranslationData` | Translation key resolution + locale discovery |
 
 ### Important Conventions
 
-- **Data transfer types**: Use `*Data` suffix (e.g., `EnvVariableData`) for types crossing async boundaries
+- **Data transfer types**: Use `*Data` suffix (e.g., `ParsedEnvVarData`) for types crossing async boundaries
 - **Salsa inputs**: Use `#[salsa::input]` for source data, store in `HashMap` for O(1) lookup
 - **Registration pattern**: Call `register_*_with_salsa()` after successful parsing
 - **Fallback pattern**: Use Salsa cache first, fall back to direct computation if unavailable
-- **Priority merging**: Framework=0, Package=1, App=2 (higher wins)
+- **Priority merging** (service providers): Framework=0, Package=1, Module=2, App=3 (higher wins).
+  On an equal-priority tie the module listed later in `modules.paths` wins, then the later
+  provider in lexicographic path order
 
 ### Position Indexing Convention
 

@@ -3,7 +3,9 @@
 //! Provides database schema information (tables and columns) for
 //! `exists:` and `unique:` validation rule autocomplete.
 
+use crate::completion_display::{is_sensitive_env_name, mask_url_credentials};
 use regex::Regex;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -460,45 +462,113 @@ pub enum DbBreakerEvent {
 /// the handshake skips the password packet entirely — accepted by more
 /// permissive MySQL configs.
 ///
-/// Special-character escaping is the caller's concern — Laravel's
-/// `.env` values don't typically need URL-encoding in production
-/// credentials, and adding it here would risk double-encoding.
+/// Both components are percent-encoded by [`encode_userinfo_component`], so a
+/// `.env` credential holding a delimiter cannot escape its own slot (issue
+/// #362). Splicing raw let it: sqlx routes every connection string through
+/// `Url::parse`, which ends the authority at the first `/`, `?` or `#`
+/// whether or not that character was meant as a delimiter. A password `p/ss`
+/// yields `mysql://user:p/ss@host:3306/db`, whose authority is `user:p` — host
+/// `user`, port `p` — and the connection fails with *invalid port number*.
+///
+/// Worse is the case that does not fail: when the run before the delimiter is
+/// all digits and fits a `u16`, the authority parses, so `mysql://user:12/34@host/db`
+/// connects to host `user` on port 12 and reports no password at all. Base64
+/// passwords (`openssl rand -base64`) mix digits and `/` routinely, so this is
+/// an ordinary shape, and any redactor that decides the credential span by
+/// parsing the URL is told there is nothing to mask.
 fn userinfo(user: &str, password: &str) -> String {
+    let user = encode_userinfo_component(user);
     if password.is_empty() {
-        user.to_string()
+        user
     } else {
-        format!("{user}:{password}")
+        format!("{user}:{}", encode_userinfo_component(password))
     }
 }
 
-/// Mask the password in a database URL for safe logging. Matches the
-/// standard shape `driver://user:pass@host:...` and replaces the password
-/// segment with `***`. If no password is present (or the URL doesn't match
-/// the expected shape), returns the input unchanged.
+/// Percent-encode one userinfo component (a username or a password) for
+/// splicing into a connection URL.
 ///
-/// This is best-effort — failing gracefully is safer than failing hard,
-/// since logging shouldn't crash the LSP.
-fn mask_url_password(url: &str) -> String {
-    // Find the `://` separator, then the `@` that ends the credentials.
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
-    };
-    let creds_start = scheme_end + 3;
-    let Some(at_offset) = url[creds_start..].find('@') else {
-        return url.to_string();
-    };
-    let creds_end = creds_start + at_offset;
-    let creds = &url[creds_start..creds_end];
-    // Credentials are `user[:password]`. Only mask if there's a `:`.
-    let Some(colon_offset) = creds.find(':') else {
-        return url.to_string();
-    };
-    let user_end = creds_start + colon_offset;
-    let mut masked = String::with_capacity(url.len());
-    masked.push_str(&url[..user_end + 1]); // up to and including the `:`
-    masked.push_str("***");
-    masked.push_str(&url[creds_end..]); // from `@` onwards
-    masked
+/// Passes through exactly RFC 3986's `unreserved` (`ALPHA DIGIT - . _ ~`) and
+/// `sub-delims` (`! $ & ' ( ) * + , ; =`) sets; every other byte becomes `%XX`,
+/// including `:`, `/`, `?`, `#`, `[`, `]`, `@`, `%`, space, control bytes, and
+/// each byte of a non-ASCII UTF-8 sequence. A credential built only from the
+/// pass-through sets is returned byte-for-byte unchanged, so the URLs this
+/// server has always produced for ordinary credentials do not move.
+///
+/// `:` is encoded even in the *username*, where RFC 3986's userinfo grammar
+/// permits it: [`userinfo`] overloads `:` as its own username/password
+/// separator, so an unencoded one there mis-splits the credential exactly as an
+/// unencoded `/` mis-splits the authority.
+///
+/// Encoding is safe against double-encoding because it is applied at the single
+/// point of construction and the value arrives raw from the `.env` file: `%` is
+/// itself encoded to `%25`, so `sec%3Dret` round-trips to the literal
+/// `sec%3Dret` rather than decoding to `sec=ret`. sqlx percent-decodes both
+/// components on the way back out (`sqlx-mysql/src/options/parse.rs`,
+/// `sqlx-postgres/src/options/parse.rs`), so the driver receives the original
+/// bytes.
+fn encode_userinfo_component(raw: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'=' => out.push(byte as char),
+            _ => {
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Render a `.env`-sourced value for a log line, through both redaction gates.
+///
+/// Logs are a display surface. With `RUST_LOG` unset the server installs
+/// `EnvFilter::new("info,salsa=warn")` over stderr, which Zed shows in a visible
+/// log panel — the same screen-share exposure the completion, hover, `config()`
+/// and warm-start-cache redaction closes (issue #344). A value read under a
+/// variable name that [`is_sensitive_env_name`] matches therefore never reaches a
+/// log in the clear.
+///
+/// Name-matched values render `(set)`, the spelling
+/// [`DatabaseSchemaProvider::parse_database_config`] already prints for the
+/// resolved DB password. There is no `(empty)` arm: every call site logs a value
+/// that came back from [`crate::config::read_env_value`], which filters an empty
+/// value to `None` before it can get here.
+///
+/// A name the predicate does not match is not therefore safe: Laravel's stock
+/// `config/database.php` reads `'url' => env('DATABASE_URL')`, and that value
+/// carries the password inside itself while its name matches no segment. So the
+/// unmatched arm is not the raw value — it is
+/// [`mask_url_credentials`], the same helper `parse_database_config` has always
+/// applied to the assembled `url` line. `DB_HOST` and `DB_DATABASE` still log in
+/// full: neither gate matches them, and redacting them would spend the whole
+/// diagnostic for nothing.
+fn mask_env_value_for_log<'a>(name: &str, value: &'a str) -> Cow<'a, str> {
+    if is_sensitive_env_name(name) {
+        Cow::Borrowed("(set)")
+    } else {
+        mask_url_credentials(value)
+    }
 }
 
 /// One thing the connector should attempt: a URL to connect with, a short
@@ -1118,7 +1188,7 @@ impl DatabaseSchemaProvider {
         if let Some(u) = &url {
             // Mask the password in the URL when logging — common shape is
             // `driver://user:pass@host:port/db`. Best-effort, fail-open.
-            info!("🗄️    url: {}", mask_url_password(u));
+            info!("🗄️    url: {}", mask_url_credentials(u));
         }
         if let Some(s) = &unix_socket {
             info!("🗄️    unix_socket: {}", s);
@@ -1255,7 +1325,10 @@ impl DatabaseSchemaProvider {
 
                     // Try to resolve from .env first
                     if let Some(env_value) = self.resolve_env(&env_var) {
-                        info!("🗄️      → resolved from .env: {}", env_value);
+                        info!(
+                            "🗄️      → resolved from .env: {}",
+                            mask_env_value_for_log(&env_var, &env_value)
+                        );
                         return env_value;
                     }
 
@@ -1420,7 +1493,13 @@ impl DatabaseSchemaProvider {
         // Delegates to the single hardened reader in `config` — see its doc
         // comment for why this logic must not be duplicated.
         let result = crate::config::read_env_value(&self.project_root, key);
-        debug!("🗄️  resolve_env({}): {:?}", key, result);
+        debug!(
+            "🗄️  resolve_env({}): {:?}",
+            key,
+            result
+                .as_deref()
+                .map(|value| mask_env_value_for_log(key, value))
+        );
         result
     }
 
@@ -1456,7 +1535,7 @@ impl DatabaseSchemaProvider {
             info!(
                 "MySQL: trying candidate '{}' with url={}",
                 cand.label,
-                mask_url_password(&cand.url)
+                mask_url_credentials(&cand.url)
             );
             match MySqlPoolOptions::new()
                 .max_connections(1)
@@ -2234,11 +2313,23 @@ impl DatabaseSchemaProvider {
         }
 
         if let Some(socket) = &config.unix_socket {
-            // libpq-style socket connection: `postgres://user[:pass]@/db?host=/path`.
+            // libpq-style socket connection: the socket path rides in a `host=`
+            // query parameter, not the authority.
+            //
+            // The authority still needs a literal `localhost`, the same
+            // placeholder the MySQL socket branch uses. The WHATWG URL rules
+            // sqlx's `Url::parse` implements reject an empty host that follows
+            // a userinfo component, so the shorter
+            // `postgres://user@/db?host=/path` this branch used to emit came
+            // back as *empty host* and the candidate could never connect —
+            // independent of the credential, and true for every username. sqlx
+            // reads `host=` after the authority and stores it as the socket, so
+            // `localhost` is inert: verified against sqlx 0.9, the parsed
+            // options carry socket `/tmp/.s.PGSQL.5432` with host `localhost`.
             out.push(ConnCandidate {
                 label: format!("unix_socket={socket}"),
                 url: format!(
-                    "postgres://{}@/{}?host={}",
+                    "postgres://{}@localhost/{}?host={}",
                     userinfo(&config.username, &config.password),
                     config.database,
                     socket

@@ -108,6 +108,20 @@ pub fn route_lens_targets(
     out
 }
 
+/// The lens/hover title for a reference count: `0 references`, `1 reference`,
+/// `{n} references`.
+///
+/// One spelling, shared by the code-lens `resolve` handler and the `.env`-key
+/// hover card, so a key's lens and its hover can never disagree about how the
+/// same number reads.
+pub fn reference_count_label(count: usize) -> String {
+    match count {
+        0 => "0 references".to_string(),
+        1 => "1 reference".to_string(),
+        n => format!("{n} references"),
+    }
+}
+
 /// Code-lens targets for the key declarations in an open `.env*` file.
 ///
 /// Each `KEY=value` line gets a lens whose count is the number of `env('KEY')`
@@ -138,6 +152,11 @@ fn dotted_key_lens_targets(
 ) -> Vec<CodeLensTarget> {
     crate::config_key_locator::enumerate_keys_in_source(source)
         .into_iter()
+        // A synthesized list index is written nowhere, so there is nothing to
+        // hang a lens on — `config/app.php` would otherwise carry a
+        // zero-width `providers.N` lens on every provider in the array. A
+        // bare `404 =>` IS written, and keeps its lens.
+        .filter(|(_, pos)| pos.kind != crate::config_key_locator::KeyKind::SynthesizedIndex)
         .map(|(path, pos)| CodeLensTarget {
             line: pos.line,
             column: pos.start_column,

@@ -1201,3 +1201,502 @@ fn outermost_project_fails_closed_outside_the_workspace() {
         "a directory outside the workspace is never outermost within it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// expand_module_dirs / config_group_files (`modules.paths`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn expand_module_dirs_matches_star_segments_in_pattern_order() {
+    let (_tmp, root, module) = modular_workspace();
+    let common = root.join("app/Common/UI");
+    fs::create_dir_all(common.join("config")).unwrap();
+
+    let patterns = vec!["app/Common/*".to_string(), "app/*/*".to_string()];
+    let dirs = expand_module_dirs(&root, &patterns);
+
+    let common_pos = dirs.iter().position(|d| d == &common).unwrap();
+    let module_pos = dirs.iter().position(|d| d == &module).unwrap();
+    assert!(
+        common_pos < module_pos,
+        "earlier pattern keeps its (lower-precedence) position"
+    );
+    // Dedup: Common/UI also matches app/*/* but must appear once.
+    assert_eq!(dirs.iter().filter(|d| *d == &common).count(), 1);
+}
+
+#[test]
+fn expand_module_dirs_empty_patterns_is_off() {
+    let (_tmp, root, _module) = modular_workspace();
+    assert!(expand_module_dirs(&root, &[]).is_empty());
+}
+
+#[test]
+fn expand_module_dirs_rejects_escaping_patterns() {
+    let (_tmp, root, _module) = modular_workspace();
+    let dirs = expand_module_dirs(&root, &["../*".to_string()]);
+    assert!(dirs.is_empty());
+}
+
+#[test]
+fn config_group_files_orders_by_descending_precedence() {
+    let (_tmp, root, module) = modular_workspace();
+    fs::write(root.join("config/app.php"), "<?php return [];").unwrap();
+    fs::write(module.join("config/app.php"), "<?php return [];").unwrap();
+    fs::write(
+        module.join("config/legal-guaranteelabel.php"),
+        "<?php return [];",
+    )
+    .unwrap();
+
+    let module_dirs = vec![module.clone()];
+    let app_files = config_group_files(&root, &module_dirs, "app");
+    assert_eq!(
+        app_files,
+        vec![module.join("config/app.php"), root.join("config/app.php")],
+        "the winning file (last-merged module) comes FIRST — the helper owns \
+         precedence, consumers take the first hit"
+    );
+
+    let module_only = config_group_files(&root, &module_dirs, "legal-guaranteelabel");
+    assert_eq!(
+        module_only,
+        vec![module.join("config/legal-guaranteelabel.php")]
+    );
+}
+
+// ---- composer-driven module provider discovery -----------------------------
+
+/// A module with a composer.json declaring one conventional and one
+/// non-conventional provider, plus a decoy `*ServiceProvider.php` the
+/// manifest does NOT name.
+fn module_with_manifest(root: &Path) -> PathBuf {
+    let module = root.join("app/Legal/ContractManagement");
+    let providers = module.join("app/Providers");
+    fs::create_dir_all(&providers).unwrap();
+    fs::write(
+        module.join("composer.json"),
+        r#"{
+    "name": "acme/legal-contractmanagement",
+    "autoload": {
+        "psr-4": {
+            "App\\Legal\\ContractManagement\\": "app/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "App\\Legal\\ContractManagement\\Providers\\ContractServiceProvider",
+                "App\\Legal\\ContractManagement\\Providers\\Bootstrap"
+            ]
+        }
+    }
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        providers.join("ContractServiceProvider.php"),
+        "<?php class ContractServiceProvider {}",
+    )
+    .unwrap();
+    fs::write(providers.join("Bootstrap.php"), "<?php class Bootstrap {}").unwrap();
+    fs::write(
+        providers.join("UnregisteredServiceProvider.php"),
+        "<?php class UnregisteredServiceProvider {}",
+    )
+    .unwrap();
+    module
+}
+
+#[test]
+fn module_providers_come_from_composer_extra_laravel_providers() {
+    let tmp = TempDir::new().unwrap();
+    let module = module_with_manifest(tmp.path());
+
+    let mut files = module_provider_files(std::slice::from_ref(&module));
+    files.sort();
+
+    // The manifest-listed providers are indexed — including `Bootstrap`,
+    // whose filename matches no `*ServiceProvider.php` convention…
+    assert_eq!(
+        files,
+        vec![
+            module.join("app/Providers/Bootstrap.php"),
+            module.join("app/Providers/ContractServiceProvider.php"),
+        ],
+        "…and the conventionally-named but UNLISTED provider is not: only \
+         what composer boots is a provider"
+    );
+}
+
+#[test]
+fn module_without_manifest_contributes_no_providers() {
+    let tmp = TempDir::new().unwrap();
+    let module = tmp.path().join("app/Legal/Bare");
+    let providers = module.join("app/Providers");
+    fs::create_dir_all(&providers).unwrap();
+    fs::write(
+        providers.join("BareServiceProvider.php"),
+        "<?php class BareServiceProvider {}",
+    )
+    .unwrap();
+
+    assert!(module_provider_files(&[module]).is_empty());
+}
+
+#[test]
+fn provider_fqcn_resolves_via_basename_walk_without_matching_psr4() {
+    let tmp = TempDir::new().unwrap();
+    let module = tmp.path().join("app/Common/Ui");
+    let src = module.join("src/Support");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        module.join("composer.json"),
+        r#"{
+    "extra": { "laravel": { "providers": ["Acme\\Ui\\Support\\UiServiceProvider"] } }
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        src.join("UiServiceProvider.php"),
+        "<?php class UiServiceProvider {}",
+    )
+    .unwrap();
+
+    assert_eq!(
+        module_provider_files(std::slice::from_ref(&module)),
+        vec![module.join("src/Support/UiServiceProvider.php")]
+    );
+}
+
+// ---- modules.paths glob behavior -------------------------------------------
+
+#[test]
+fn expand_module_dirs_single_and_double_wildcard_depths() {
+    let tmp = TempDir::new().unwrap();
+    // `app/Common/*` matches one level below Common…
+    fs::create_dir_all(tmp.path().join("app/Common/Ui")).unwrap();
+    fs::create_dir_all(tmp.path().join("app/Common/Billing")).unwrap();
+    // …while `app/*/*` matches two levels below app/ — a different depth.
+    fs::create_dir_all(tmp.path().join("app/Legal/ContractManagement")).unwrap();
+
+    let single = expand_module_dirs(tmp.path(), &["app/Common/*".to_string()]);
+    assert_eq!(
+        single,
+        vec![
+            tmp.path().join("app/Common/Billing"),
+            tmp.path().join("app/Common/Ui"),
+        ]
+    );
+
+    let double = expand_module_dirs(tmp.path(), &["app/*/*".to_string()]);
+    assert!(
+        double.contains(&tmp.path().join("app/Legal/ContractManagement")),
+        "double wildcard reaches two levels deep: {double:?}"
+    );
+    assert!(
+        double.contains(&tmp.path().join("app/Common/Ui")),
+        "double wildcard also spans the single-wildcard matches: {double:?}"
+    );
+}
+
+#[test]
+fn expand_module_dirs_stale_glob_matches_nothing() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("app/Common/Ui")).unwrap();
+    assert!(
+        expand_module_dirs(tmp.path(), &["app/Removed/*".to_string()]).is_empty(),
+        "a glob whose literal segments no longer exist is simply off"
+    );
+}
+
+#[test]
+fn expand_module_dirs_malformed_entries_are_a_no_op() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("app/Common/Ui")).unwrap();
+    // `**`, stray brackets, and an empty string are not crash inputs — each
+    // entry that matches no directory contributes nothing, while a valid
+    // entry in the same list still expands.
+    let dirs = expand_module_dirs(
+        tmp.path(),
+        &[
+            "**".to_string(),
+            "app/[oops".to_string(),
+            String::new(),
+            "app/Common/*".to_string(),
+        ],
+    );
+    assert_eq!(dirs, vec![tmp.path().join("app/Common/Ui")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn discovered_provider_walk_refuses_symlink_escapes_but_keeps_symlinked_modules() {
+    // The configured/discovered split: a module dir that IS a symlink
+    // (composer path repository) is trusted configuration and keeps
+    // working; a symlink INSIDE a module pointing outside it is a
+    // discovered path and is refused (#228 convention).
+    let tmp = TempDir::new().unwrap();
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(outside.join("Providers")).unwrap();
+    fs::write(
+        outside.join("Providers/EscapeServiceProvider.php"),
+        "<?php class EscapeServiceProvider {}",
+    )
+    .unwrap();
+
+    // Module with a composer manifest naming a provider that only exists
+    // BEHIND an escaping symlink.
+    let module = tmp.path().join("proj/app/Legal/Sneaky");
+    fs::create_dir_all(&module).unwrap();
+    fs::write(
+        module.join("composer.json"),
+        r#"{ "extra": { "laravel": { "providers": ["Acme\\EscapeServiceProvider"] } } }"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&outside, module.join("linked")).unwrap();
+    assert!(
+        module_provider_files(std::slice::from_ref(&module)).is_empty(),
+        "a symlink escaping the module must not become a provider source"
+    );
+
+    // The module dir itself being a symlink stays supported.
+    let real = tmp.path().join("packages/real-module");
+    fs::create_dir_all(real.join("Providers")).unwrap();
+    fs::write(
+        real.join("composer.json"),
+        r#"{ "extra": { "laravel": { "providers": ["Acme\\RealServiceProvider"] } } }"#,
+    )
+    .unwrap();
+    fs::write(
+        real.join("Providers/RealServiceProvider.php"),
+        "<?php class RealServiceProvider {}",
+    )
+    .unwrap();
+    let linked_module = tmp.path().join("proj/app/Legal/Linked");
+    fs::create_dir_all(linked_module.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &linked_module).unwrap();
+    let files = module_provider_files(std::slice::from_ref(&linked_module));
+    assert_eq!(files.len(), 1, "symlinked composer path repo keeps working");
+}
+
+#[test]
+fn psr4_entries_escaping_the_module_resolve_nothing() {
+    // `autoload.psr-4` values are manifest-derived — DISCOVERED data. An
+    // absolute value replaces `Path::join`'s base entirely, and `..`
+    // segments walk out lexically; both must be refused before the
+    // candidate is ever probed.
+    let tmp = TempDir::new().unwrap();
+    let outside = tmp.path().join("outside/Providers");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join("EscapeServiceProvider.php"),
+        "<?php class X {}",
+    )
+    .unwrap();
+
+    for psr4_dir in [
+        outside.to_string_lossy().to_string(), // absolute
+        // Four levels: `{n}` -> `Legal` -> `app` -> `proj` -> the temp dir,
+        // so the candidate lands ON the decoy written above. `../../outside`
+        // normalized to `proj/app/outside`, which holds nothing — the
+        // assertion then passed with or without the containment gate.
+        "../../../../outside".to_string(), // traversal
+    ] {
+        let module = tmp
+            .path()
+            .join(format!("proj/app/Legal/{}", psr4_dir.len()));
+        fs::create_dir_all(&module).unwrap();
+        fs::write(
+            module.join("composer.json"),
+            format!(
+                r#"{{
+    "autoload": {{ "psr-4": {{ "Acme\\": {} }} }},
+    "extra": {{ "laravel": {{ "providers": ["Acme\\Providers\\EscapeServiceProvider"] }} }}
+}}"#,
+                serde_json::to_string(&psr4_dir).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            module_provider_files(std::slice::from_ref(&module)).is_empty(),
+            "psr-4 value {psr4_dir:?} must not resolve outside the module"
+        );
+    }
+}
+
+#[test]
+fn psr4_prefix_matches_only_at_a_namespace_boundary() {
+    // Composer compares prefixes WITH their trailing separator, so
+    // `App\Legal\ContractManagement` must not match
+    // `App\Legal\ContractManagementSupport\…`. Without the boundary check
+    // the textual match wins the longest-prefix tie-break and resolves the
+    // wrong file.
+    let tmp = TempDir::new().unwrap();
+    let module = tmp.path().join("app/Legal/Suite");
+    fs::create_dir_all(module.join("support/Providers")).unwrap();
+    fs::create_dir_all(module.join("contract/Providers")).unwrap();
+    fs::write(
+        module.join("support/Providers/Registrar.php"),
+        "<?php class Support {}",
+    )
+    .unwrap();
+    // The decoy the bogus prefix match would resolve to.
+    fs::create_dir_all(module.join("contract/Support/Providers")).unwrap();
+    fs::write(
+        module.join("contract/Support/Providers/Registrar.php"),
+        "<?php class Decoy {}",
+    )
+    .unwrap();
+    fs::write(
+        module.join("composer.json"),
+        r#"{
+    "autoload": { "psr-4": {
+        "App\\Legal\\ContractManagement\\": "contract/",
+        "App\\Legal\\ContractManagementSupport\\": "support/"
+    } },
+    "extra": { "laravel": { "providers": [
+        "App\\Legal\\ContractManagementSupport\\Providers\\Registrar"
+    ] } }
+}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        module_provider_files(std::slice::from_ref(&module)),
+        vec![module.join("support/Providers/Registrar.php")],
+        "the true mapping wins; the overlapping-prefix decoy is not matched"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn expand_module_dirs_follows_a_symlinked_module_directory() {
+    // The documented configured-path behaviour, driven through the glob
+    // expansion itself rather than only through the provider walk: a
+    // composer path repository symlinked into the module tree expands like
+    // any real directory.
+    let tmp = TempDir::new().unwrap();
+    let real = tmp.path().join("packages/ui-kit");
+    fs::create_dir_all(&real).unwrap();
+    let modules = tmp.path().join("proj/app/Common");
+    fs::create_dir_all(&modules).unwrap();
+    std::os::unix::fs::symlink(&real, modules.join("Ui")).unwrap();
+
+    let dirs = expand_module_dirs(&tmp.path().join("proj"), &["app/Common/*".to_string()]);
+    assert_eq!(
+        dirs,
+        vec![modules.join("Ui")],
+        "a symlinked module expands (configured paths are trusted)"
+    );
+}
+
+// ============================================================================
+// owning_module — the shared module-ownership + `modules.paths` rank lookup
+// ============================================================================
+
+#[test]
+fn owning_module_ranks_by_configured_order_not_by_name() {
+    // The rank is the module's position in `modules.paths`, so it must be
+    // readable off a list whose order is neither alphabetical nor its
+    // reverse — the property both the containment gate and the merge
+    // tie-break depend on.
+    let root = Path::new("/proj");
+    let dirs = vec![
+        root.join("app/Legal/Alpha"),
+        root.join("app/Legal/Gamma"),
+        root.join("app/Legal/Beta"),
+    ];
+
+    for (name, rank) in [("Alpha", 1), ("Gamma", 2), ("Beta", 3)] {
+        let provider = root.join(format!("app/Legal/{name}/app/Providers/Registrar.php"));
+        assert_eq!(
+            owning_module(&dirs, &provider),
+            Some((rank, root.join(format!("app/Legal/{name}")).as_path())),
+            "{name} is owned by its own module at configured rank {rank}"
+        );
+    }
+}
+
+#[test]
+fn owning_module_is_none_outside_every_module() {
+    let root = Path::new("/proj");
+    let dirs = vec![root.join("app/Legal/Alpha")];
+
+    assert_eq!(
+        owning_module(&dirs, &root.join("app/Providers/AppServiceProvider.php")),
+        None,
+        "an app provider has no owning module — the caller falls back to the root"
+    );
+    assert_eq!(
+        owning_module(&[], &root.join("app/Legal/Alpha/app/Providers/X.php")),
+        None,
+        "no configured modules, no ownership"
+    );
+}
+
+#[test]
+fn owning_module_prefers_the_innermost_module_on_nesting() {
+    // A module nested inside another is booted by its own composer.json, so
+    // it owns its files — the longest match wins regardless of rank order.
+    let root = Path::new("/proj");
+    // The outer module is listed FIRST so that both modules match the inner
+    // file and only the longest-match rule can pick the inner one — a
+    // first-match implementation returns the outer module here.
+    let dirs = vec![
+        root.join("app/Legal/Suite"),
+        root.join("app/Legal/Suite/packages/Billing"),
+    ];
+
+    assert_eq!(
+        owning_module(
+            &dirs,
+            &root.join("app/Legal/Suite/packages/Billing/src/Provider.php")
+        ),
+        Some((2, root.join("app/Legal/Suite/packages/Billing").as_path())),
+        "the inner module owns its own file even though the outer one is listed first"
+    );
+    assert_eq!(
+        owning_module(&dirs, &root.join("app/Legal/Suite/src/Provider.php")),
+        Some((1, root.join("app/Legal/Suite").as_path())),
+        "a file only the outer module contains stays with the outer module"
+    );
+}
+
+#[test]
+fn owning_module_does_not_match_a_sibling_sharing_a_name_prefix() {
+    // `Path::starts_with` is component-wise, so this is a pin against a
+    // future string-prefix rewrite: `.../Contract` must not own
+    // `.../ContractSupport/…`.
+    let root = Path::new("/proj");
+    let dirs = vec![root.join("app/Legal/Contract")];
+
+    assert_eq!(
+        owning_module(
+            &dirs,
+            &root.join("app/Legal/ContractSupport/app/Providers/X.php")
+        ),
+        None,
+        "a name-prefix sibling is a different module"
+    );
+}
+
+#[test]
+fn owning_module_collapses_traversal_before_matching() {
+    // The gate reads ownership off provider paths that may still carry
+    // `..`/`.`; a raw component compare would call an escaping path in-module.
+    let root = Path::new("/proj");
+    let dirs = vec![root.join("app/Legal/Alpha")];
+
+    assert_eq!(
+        owning_module(&dirs, &root.join("app/Legal/Alpha/../Beta/src/X.php")),
+        None,
+        "a path that walks out of the module is not owned by it"
+    );
+    assert_eq!(
+        owning_module(&dirs, &root.join("app/Legal/./Alpha/src/X.php")),
+        Some((1, root.join("app/Legal/Alpha").as_path())),
+        "a `.` segment is noise, not an escape"
+    );
+}

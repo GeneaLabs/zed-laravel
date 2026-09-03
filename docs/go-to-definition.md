@@ -122,7 +122,7 @@ Two escape hatches cover what the heuristic can't infer — a directive that tak
 
 Names with dedicated handling (`@component`, `@livewire`, `@feature`, `@includeFirst`, `@extends`, `@include`, `@includeIf`, `@each`, `@includeWhen`, `@includeUnless`) ignore both lists — their own resolution always wins. See [Configuration](configuration.md).
 
-**Component members in Blade** — inside a template backed by a component class (a Livewire component in any format, a class-based Volt component, or a Filament `$view`-property page), `$this->member`, bare `$variable` references, and `wire:` attribute values all jump to the member's declaration in the backing class. For a Livewire v4 single-file component or a class-based Volt component the class lives in the template's own front matter, so the jump lands inside the `.blade.php` itself:
+**Component members in Blade** — inside a template backed by a Livewire component in any format — class-based or functional Volt included — or by a Filament `$view`-property page, `$this->member`, bare `$variable` references, and `wire:` attribute values all jump to the member's declaration in the backing class. For a Livewire v4 single-file component, a class-based Volt component, or a functional Volt file (`state([...])` keys are the properties, top-level `$name = fn () => …` assignments the actions), the member lives in the template's own front matter, so the jump lands inside the `.blade.php` itself:
 
 ```blade
 <button wire:click="enterEditMode">Edit</button>
@@ -141,7 +141,26 @@ Names with dedicated handling (`@component`, `@livewire`, `@feature`, `@includeF
 {{-- ^^^^^^^^^^^^ → public string $prefillStatus in the backing class --}}
 ```
 
-A `wire:` value that isn't a plain member reference (`$wire.count++`, `count++`, `open = true`) is left alone entirely, so nothing conflicts with Alpine. A bare `$variable` bound locally in the template first — an enclosing `@foreach`/`@for` loop variable, a `@php` assignment, a component `@props` entry, or Blade's own `$loop` — is NOT treated as a class member: local scope wins and no navigation is offered. Members inherited from traits or parent classes are a known limitation — only members declared in the component's own class file (or front matter) resolve.
+A `wire:` value that isn't a plain member reference (`$wire.count++`, `count++`, `open = true`) is left alone entirely, so nothing conflicts with Alpine. A bare `$variable` bound locally in the template first — an enclosing `@foreach`/`@for` loop variable, a `@php` assignment, a component `@props` entry, or Blade's own `$loop` — is NOT treated as a class member: local scope wins and no navigation is offered. Members declared in the component's own class file resolve (front matter included), as do those of a trait it `use`s in that same file. Traits declared in another file, and parent-class members, are a known limitation — they do not resolve.
+
+## Env keys, in reverse
+
+Go-to-definition on a key declaration inside a `.env*` buffer jumps *forwards*,
+to the `env('KEY')` call sites that consume it — the mirror of `env('APP_NAME')`
+in PHP jumping back to the declaring `.env` line. More than one consumer returns
+all of them and your editor offers a picker; a key nothing consumes has nowhere
+to jump, so nothing happens (its hover card still works, and still says
+`0 references`).
+
+```
+APP_NAME=Acme
+^^^^^^^^ go-to-definition → config/app.php  ('name' => env('APP_NAME', 'Laravel'))
+```
+
+Explicit *Find All References* stays a `.php`/`.blade.php` action. Inside a
+`.env*` buffer the reference [code lens](code-lens.md) above each key is the
+way to see every consumer at once — the same entry point config and translation
+keys use.
 
 **Supported patterns:**
 `view()` `View::make()` `@extends` `@include` `@includeIf` `@includeWhen` `@includeUnless` `@includeFirst` `@each` `@component` custom `Blade::directive()` view directives `@use` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` `Artisan::call()` `Artisan::queue()` `->command()` `->artisan()` · query-chain columns / relations / tables · magic members (relationships, scopes, accessors, columns, dynamic finders) · `wire:*` attribute values · `$this->member` / bare `$variable` in component-backed Blade
