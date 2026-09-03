@@ -86,6 +86,13 @@ lazy_static! {
 pub fn dead_region_spans(content: &str) -> Vec<(usize, usize)> {
     DEAD_REGION_RE
         .captures_iter(content)
+        .filter(|c| {
+            let whole = c.get(0).expect("group 0 always matches");
+            // `@@verbatim` is escaped: it renders as literal text and opens no
+            // region. Comments have no escape form, so this only ever applies
+            // to the `@verbatim` alternative, which is the one with a group 1.
+            !(c.get(1).is_some() && is_escaped_directive(content, whole.start()))
+        })
         .map(|c| {
             // Group 1 is present only for `@verbatim`, where the dead region
             // is the body between the directives rather than the whole match.
@@ -113,6 +120,31 @@ pub fn blank_dead_regions(content: &str) -> String {
     // Only non-newline bytes are replaced, and only with ASCII spaces, so this
     // cannot fail. Fall back to the original rather than panicking.
     String::from_utf8(out).unwrap_or_else(|_| content.to_string())
+}
+
+/// Whether the `@` at byte offset `at` in `content` is **escaped**, so Blade
+/// emits it as literal text instead of compiling a directive.
+///
+/// `@@foreach` renders the characters `@foreach` and executes nothing, so an
+/// escaped directive binds no variables, opens no block, declares no alias and
+/// is not a directive token.
+///
+/// # The rule, from Blade's own compiler
+///
+/// `BladeCompiler::compileStatements` matches
+/// `/\B@(@?\w+(?:::\w+)?)([ \t]*)(\( [\S\s]*? \))?/x`, and `compileStatement`
+/// begins `if (str_contains($match[1], '@'))` — when group 1 carries a leading
+/// `@`, the match is replaced by its own text rather than compiled.
+///
+/// So the test is simply **"is the preceding byte another `@`"**. A run of
+/// three or more behaves the same way: for `@@@foreach` the `\B` anchor makes
+/// the match start at the second `@`, group 1 is `@foreach`, and it is emitted
+/// literally. Two or more `@` never execute, so there is no parity rule to
+/// track.
+///
+/// `@` is ASCII, so indexing the previous byte cannot split a codepoint.
+pub fn is_escaped_directive(content: &str, at: usize) -> bool {
+    at > 0 && content.as_bytes()[at - 1] == b'@'
 }
 
 /// Whether byte offset `pos` falls inside any of the given dead-region spans.
@@ -167,6 +199,12 @@ pub fn directive_token_positions(content: &str, known: &HashSet<String>) -> Vec<
 
         // Skip directives sitting inside a Blade/HTML comment.
         if in_comment(start_byte, &comment_spans) {
+            continue;
+        }
+
+        // Skip an escaped directive: `@@csrf` renders the literal text
+        // `@csrf` and compiles nothing, so it is not a directive token.
+        if is_escaped_directive(content, start_byte) {
             continue;
         }
 

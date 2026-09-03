@@ -175,3 +175,56 @@ fn blanking_preserves_offsets_and_newlines() {
     assert!(!masked.contains("$foo"), "the verbatim body is blanked");
     assert!(masked.contains("@verbatim"), "its own directives are not");
 }
+
+// ---- `@@` escaping: Blade renders the text and compiles nothing -----------
+
+#[test]
+fn an_escaped_directive_is_not_a_token() {
+    // `BladeCompiler::compileStatement` starts `if (str_contains($match[1],
+    // '@'))` and replaces the match with its own text, so `@@csrf` renders the
+    // literal `@csrf` and executes nothing.
+    let set = known(&["csrf"]);
+    assert_eq!(
+        directive_token_positions("@csrf", &set),
+        vec![(0, 0, 5)],
+        "the live directive still tokenises"
+    );
+    assert!(
+        directive_token_positions("@@csrf", &set).is_empty(),
+        "the escaped one does not"
+    );
+    // Three or more behave the same way: `\B` makes the match start at the
+    // second `@`, group 1 is `@csrf`, and it is emitted literally. There is no
+    // parity rule — two or more `@` never execute.
+    assert!(
+        directive_token_positions("@@@csrf", &set).is_empty(),
+        "and neither does a longer run"
+    );
+}
+
+#[test]
+fn an_escaped_verbatim_opens_no_dead_region() {
+    assert_eq!(
+        dead_region_spans("@verbatim $x @endverbatim").len(),
+        1,
+        "a live @verbatim still marks its body dead"
+    );
+    assert!(
+        dead_region_spans("@@verbatim $x @endverbatim").is_empty(),
+        "an escaped one renders as text and opens nothing"
+    );
+}
+
+#[test]
+fn is_escaped_directive_reads_the_preceding_byte_only() {
+    assert!(
+        !is_escaped_directive("@csrf", 0),
+        "nothing precedes offset 0"
+    );
+    assert!(is_escaped_directive("@@csrf", 1));
+    assert!(is_escaped_directive("@@@csrf", 2));
+    assert!(
+        !is_escaped_directive("a@csrf", 1),
+        "an ordinary character before the @ is not an escape"
+    );
+}

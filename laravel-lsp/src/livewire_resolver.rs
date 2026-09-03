@@ -998,7 +998,10 @@ fn find_directive<'a>(line: &'a str, name: &str) -> Option<&'a str> {
             .chars()
             .next()
             .is_none_or(|c| !c.is_alphanumeric() && c != '_');
-        if boundary {
+        // `@@foreach` renders the literal text `@foreach` and executes
+        // nothing, so an escaped directive binds no variables.
+        let escaped = crate::blade_directive_tokens::is_escaped_directive(line, at);
+        if boundary && !escaped {
             return Some(&line[after..]);
         }
         from = after;

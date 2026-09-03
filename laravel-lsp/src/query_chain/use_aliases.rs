@@ -289,6 +289,11 @@ pub fn blade_use_sites(source: &str) -> Vec<BladeUseSite> {
         if comments.iter().any(|&(s, e)| at >= s && at < e) {
             continue;
         }
+        // `@@use('App\Models\Flight')` renders the literal text `@use(...)`
+        // and compiles nothing, so it declares no alias.
+        if crate::blade_directive_tokens::is_escaped_directive(source, at) {
+            continue;
+        }
         let args_from = at + "@use".len();
         let after = &source[args_from..];
         // `@used_by`-style word, or a bare `@use` with no argument list.

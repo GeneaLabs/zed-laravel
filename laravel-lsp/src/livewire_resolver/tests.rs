@@ -1202,3 +1202,32 @@ fn an_unterminated_verbatim_binds_normally() {
         "an unterminated @verbatim must not swallow the loop below it"
     );
 }
+
+#[test]
+fn an_escaped_directive_binds_nothing() {
+    // `@@foreach` renders the literal text `@foreach` and runs no loop, so it
+    // binds no loop variable. Same class as the comment and @verbatim cases:
+    // Blade does not execute it.
+    let live = "@foreach ($rows as $row)\n{{ $row }}";
+    let escaped = "@@foreach ($rows as $row)\n{{ $row }}";
+    assert!(
+        is_template_local_binding(live, 1, "row"),
+        "fixture check — the live loop must bind"
+    );
+    assert!(
+        !is_template_local_binding(escaped, 1, "row"),
+        "the escaped one must not"
+    );
+
+    // Same for the file-wide @props form.
+    assert!(is_template_local_binding(
+        "@props(['fake'])\n{{ $fake }}",
+        1,
+        "fake"
+    ));
+    assert!(!is_template_local_binding(
+        "@@props(['fake'])\n{{ $fake }}",
+        1,
+        "fake"
+    ));
+}
