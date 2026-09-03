@@ -6,11 +6,13 @@
 //! 1. **Identical output.** Sharing the read must not change either index.
 //! 2. **Fewer reads.** If it did not, the module would be pure overhead.
 //!
-//! #373 parallelized the pass, which adds a third: **order survives it.** The
-//! command index resolves a same-tier duplicate to the first file walked and
-//! persists `CommandScan::files` in insertion order, so a map that returned its
-//! answers out of order, or a fold that ran concurrently, would be wrong in a
-//! way no equality-of-contents assertion catches.
+//! #373 tried to parallelize the pass and backed it out on measurement, but
+//! left these behind: **the fold order is load-bearing.** The command index
+//! resolves a same-tier duplicate to the first file walked and persists
+//! `CommandScan::files` in insertion order, so a fold that reordered the walk —
+//! or ran concurrently — would be wrong in a way no equality-of-contents
+//! assertion catches. The module docs record why parallelizing this pass did
+//! not pay; these tests are what makes a second attempt safe to evaluate.
 
 use super::*;
 use crate::command_index::{build_command_index_with_vendor, CommandIndex, CommandPriority};
@@ -210,7 +212,7 @@ fn combined_pass_reads_each_vendor_file_once() {
 }
 
 // ---------------------------------------------------------------------------
-// Order survives the parallel map (issue #373)
+// The fold must reproduce walk order (issue #373)
 // ---------------------------------------------------------------------------
 
 /// A vendor tree of `n` packages that all declare the SAME command name at the
@@ -229,11 +231,11 @@ fn seed_colliding_packages(root: &Path, n: usize) {
 }
 
 #[test]
-fn the_parallel_pass_keeps_the_first_walked_winner_on_a_same_tier_collision() {
+fn the_pass_keeps_the_first_walked_winner_on_a_same_tier_collision() {
     // `CommandIndex::insert_entry` keeps the FIRST entry inserted when two
-    // declarations share a name and a tier. Folding the parallel map's output
-    // in input order is what preserves that; a `for_each` over the pool, or an
-    // unordered collect, would hand the win to whichever worker finished first.
+    // declarations share a name and a tier. Folding in walk order is what
+    // preserves that; a fold that reordered the walk, or a `for_each` over a
+    // worker pool, would hand the win to whichever file landed first.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     seed_colliding_packages(root, 200);
@@ -262,11 +264,13 @@ fn the_parallel_pass_keeps_the_first_walked_winner_on_a_same_tier_collision() {
 }
 
 #[test]
-fn the_parallel_pass_is_deterministic_across_repeated_runs() {
-    // The failure mode a single run cannot see: a pass that resolves the
-    // collision by whichever worker won the race is right about half the time.
-    // Ten runs over 200 colliding files would have to lose every race the same
-    // way to pass by luck.
+fn the_pass_is_deterministic_across_repeated_runs() {
+    // The guard against reintroducing concurrency here without the ordered
+    // fold. A pass that resolves the collision by whichever worker won the race
+    // is right about half the time, and a single run cannot see that; ten runs
+    // over 200 colliding files would have to lose every race the same way to
+    // pass by luck. Verified able to fail: it reddens against a `par_iter()
+    // .for_each()` writing into a shared `Mutex<Vec<_>>`.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     seed_colliding_packages(root, 200);
@@ -295,9 +299,9 @@ fn the_parallel_pass_is_deterministic_across_repeated_runs() {
 fn scanned_files_are_recorded_in_walk_order() {
     // `CommandScan::files` is what `command_disk_cache` persists, and the next
     // scan replays it into `insert_entry` — so its ORDER carries the same
-    // first-wins rule the index does. Sorting it, or letting the pool append
-    // as workers finish, would survive every contents-equality assertion here
-    // and corrupt the collision winner one startup later.
+    // first-wins rule the index does. Sorting it, or appending as a pool's
+    // workers finish, would survive every contents-equality assertion here and
+    // corrupt the collision winner one startup later.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     seed_colliding_packages(root, 200);
@@ -335,6 +339,7 @@ fn a_file_that_vanishes_between_the_walk_and_the_read_contributes_nothing() {
     // in between is unstattable for the pre-pass and unreadable for the read
     // pass, and BOTH must leave the scan untouched: an entry stored without a
     // usable mtime could never be invalidated, so it would be trusted forever.
+    // `cached_verdict` returning `Unstattable` is what keeps it out.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     let vendor_root = root.join("vendor");
@@ -381,11 +386,10 @@ fn a_file_that_vanishes_between_the_walk_and_the_read_contributes_nothing() {
 
 #[test]
 fn a_command_wanted_file_declaring_nothing_is_still_recorded_but_a_route_only_one_is_not() {
-    // `Some(None)` and `None` are different answers in the read pass, and the
-    // difference is the whole point of the scan cache's schema: "read, and
-    // declares nothing" must be recorded so the next scan can skip the file,
-    // while "the command side never wanted this file" must not be, or the
-    // cache would claim coverage it never had.
+    // "Read, and declares nothing" and "never wanted" are different answers,
+    // and the difference is the whole point of the scan cache's schema: the
+    // first must be recorded so the next scan can skip the file, the second
+    // must not be, or the cache would claim coverage it never had.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     let write = |rel: &str, body: &str| {

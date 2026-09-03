@@ -12,18 +12,15 @@
 //! 1. **The shared vendor pass** —
 //!    [`laravel_lsp::vendor_scan::build_route_files_and_command_index`], broken
 //!    into its stages so the parallelizable fraction is visible rather than
-//!    inferred. **Every stage is timed serially, one file at a time**, even
-//!    though production now runs the pass across a worker pool — the point of
-//!    the decomposition is the *shape* of the work, and only a serial timing
-//!    can attribute cost per stage:
+//!    inferred:
 //!
 //!    | Stage | Work | Parallelizes? |
 //!    |---|---|---|
 //!    | walk | [`VendorIndex::build`] — one directory traversal | no (single walk) |
 //!    | pre-pass | one `metadata` per command-wanted file | yes (I/O bound) |
 //!    | read | `read_to_string` per wanted file | yes (I/O bound) |
-//!    | classify (route) | `vendor_route_verdict` — pure CPU | yes |
-//!    | classify (command) | `command_entry_for` — pure CPU | yes |
+//!    | classify (route) | `accept_vendor_route_source` — pure CPU | yes |
+//!    | classify (command) | `record_source` — pure CPU | yes |
 //!
 //!    The `[removed] 2nd stat/file` row is why measuring beat estimating.
 //!    `record_source` used to stat each file again before classifying it — a
@@ -34,15 +31,27 @@
 //!
 //!    The answer the measurement gave: the classifiers are 2-6% of the pass on
 //!    every platform, not the majority #373 estimated, while the stat and read
-//!    stages are 93-97%. **The pass is I/O.** So #373's third item was built
-//!    against that finding rather than its own estimate — the parallel map
-//!    covers the reads and stats, not merely the classifiers it named, which
-//!    would have won 7-13 ms of a 151-604 ms pass.
+//!    stages are 93-97%. **The pass is I/O.**
 //!
-//!    **Read `staged / whole` accordingly.** The staged sum is serial and the
-//!    whole pass is parallel, so the ratio now runs *above* 100% by design:
-//!    that excess is the parallel speedup, and a ratio back near 100% means the
-//!    pass has fallen back to running serially.
+//!    ## Why this bench cannot settle whether to parallelize the pass
+//!
+//!    It can't, and it said the opposite. Parallelizing the whole pass measures
+//!    **2.1x here** (397.7 → 191.3 ms) and made real startup *worse*, so it was
+//!    built and backed out — see `vendor_scan`'s module docs for the numbers.
+//!    Two reasons this bench cannot see that, both worth knowing before
+//!    trusting its figures for a threading decision:
+//!
+//!    * It passes **`None` for the command scan cache**, so every wanted file is
+//!      read. Production only sees that shape on a cold start; on a warm one the
+//!      cache settles nearly every file in the stat pre-pass and there is almost
+//!      nothing left to read.
+//!    * It runs the pass **alone**. In production it runs beside the warm parse
+//!      pass and the disk-cache load, and it finishes about a second before the
+//!      parse does — so its duration is off the critical path exactly when this
+//!      bench says there is most to win.
+//!
+//!    Use it for *where the time goes*. Use an end-to-end startup measurement
+//!    for *whether a change helps*.
 //!
 //! 2. **The serialized parse point** — `SalsaHandle::get_patterns` driven in a
 //!    serial loop, which is exactly what `run_magic_batch_once` does per vendor
@@ -224,13 +233,12 @@ fn main() {
 
     // Every stage below is measured `PASSES` times and reported at its
     // MINIMUM. A single timed run of a 400 ms filesystem-heavy pass varies
-    // 10-15% between runs on an idle machine — measured on the serial pass,
-    // that was enough to swing `staged / whole` from 89% to 110% with no code
-    // change at all, which would make the cross-platform comparison this bench
-    // exists for unreadable. The minimum is the run least disturbed by the
-    // scheduler and by other processes, and it is the standard choice for
-    // exactly this reason: noise only ever adds time, so the floor is the
-    // honest figure.
+    // 10-15% between runs on an idle machine — enough to swing `staged / whole`
+    // from 89% to 110% with no code change at all, which would make the
+    // cross-platform comparison this bench exists for unreadable. The minimum
+    // is the run least disturbed by the scheduler and by other processes, and
+    // it is the standard choice for exactly this reason: noise only ever adds
+    // time, so the floor is the honest figure.
     let mut best = StageTimings::worst();
     let mut corpus = Corpus::default();
     for _ in 0..PASSES {
@@ -588,13 +596,15 @@ fn notes() {
     println!("    every stage is levelled. A cold first start reads slower.");
     println!("  * No command scan cache is passed, so every command-wanted file");
     println!("    is read. That is the cold-cache shape a composer install makes.");
-    println!("  * The stages above are timed SERIALLY, one file at a time, but");
-    println!("    the whole pass now runs across the bounded worker pool (#373).");
-    println!("    So 'staged / whole' is expected ABOVE 100%, and the excess IS");
-    println!("    the parallel speedup: 100% means the pass has fallen back to");
-    println!("    running serially. The stage split still says where the work");
-    println!("    is — that conclusion is an order of magnitude, not a few");
-    println!("    percent — but the ratio is no longer a decomposition check.");
+    println!("  * 'staged / whole' is a sanity check on the decomposition, not a");
+    println!("    precision instrument. Near 100% means the stages account for");
+    println!("    the real function; far from it means the split is not to be");
+    println!("    trusted. It does not need to be exact for the CPU-vs-I/O");
+    println!("    conclusion, which is an order of magnitude, not a few percent.");
+    println!("  * This bench runs the pass ALONE and with NO command scan cache.");
+    println!("    Both flatter parallelism, which is why #373's attempt at it");
+    println!("    measured 2.1x here and lost time in real startup. Decide");
+    println!("    threading end-to-end, not from these rows.");
 }
 
 /// Register a handle against `root` the way production does, so
