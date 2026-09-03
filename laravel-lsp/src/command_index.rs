@@ -358,6 +358,47 @@ pub enum CacheVerdict {
     NeedsSource { mtime: (u64, u32) },
 }
 
+/// What the scan cache and one `metadata` call say about a file, as **owned**
+/// data that no longer borrows the cache.
+///
+/// The pure half of [`try_cached`], split out so the shared vendor pass in
+/// [`crate::vendor_scan`] can run the stat and the lookup for every file across
+/// a worker pool and fold the answers afterwards (issue #373). Owned rather
+/// than borrowed because a verdict outlives the parallel map that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepassVerdict {
+    /// The file could not be stat'd, so it is deliberately left unread and
+    /// **nothing at all is recorded** for it. A verdict stored without a usable
+    /// mtime could never be validated against a later scan, so it would be
+    /// trusted forever.
+    Unstattable,
+    /// The cache answered. Fold with [`record_verdict`]; no read is needed.
+    Settled {
+        mtime: (u64, u32),
+        entry: Option<CommandEntry>,
+    },
+    /// The file still has to be read. `mtime` is the value already on hand, to
+    /// be handed straight to [`record_verdict`] once the content is classified.
+    NeedsSource { mtime: (u64, u32) },
+}
+
+/// Stat `path` and ask `cache` about it, without touching a scan.
+///
+/// Does no I/O beyond the single `metadata` call, and takes no `&mut`, so it is
+/// safe to call concurrently for many files.
+pub fn cached_verdict(cache: Option<&CommandScanCache>, path: &Path) -> PrepassVerdict {
+    let Some(mtime) = file_mtime(path) else {
+        return PrepassVerdict::Unstattable;
+    };
+    match cache.and_then(|c| c.verdict(path, mtime)) {
+        Some(entry) => PrepassVerdict::Settled {
+            mtime,
+            entry: entry.cloned(),
+        },
+        None => PrepassVerdict::NeedsSource { mtime },
+    }
+}
+
 /// Try to satisfy `path` from the scan cache, recording its verdict when the
 /// mtime is unchanged.
 ///
@@ -369,25 +410,38 @@ pub fn try_cached(
     cache: Option<&CommandScanCache>,
     path: &Path,
 ) -> CacheVerdict {
-    let Some(mtime) = file_mtime(path) else {
-        // Unstattable: do not read it either. A verdict recorded without a
-        // usable mtime could never be validated, so it would be trusted
-        // forever.
-        return CacheVerdict::Settled;
-    };
-    let Some(verdict) = cache.and_then(|c| c.verdict(path, mtime)) else {
-        return CacheVerdict::NeedsSource { mtime };
-    };
-    if let Some(entry) = verdict {
-        scan.index.insert_entry(entry.clone());
+    match cached_verdict(cache, path) {
+        PrepassVerdict::Unstattable => CacheVerdict::Settled,
+        PrepassVerdict::NeedsSource { mtime } => CacheVerdict::NeedsSource { mtime },
+        PrepassVerdict::Settled { mtime, entry } => {
+            record_verdict(scan, path, mtime, entry);
+            CacheVerdict::Settled
+        }
+    }
+}
+
+/// Fold one already-classified verdict into `scan`.
+///
+/// **The single place the scan's order-dependence lives.**
+/// [`CommandIndex::insert_entry`] keeps the first file inserted on a same-tier
+/// duplicate, and `scan.files` is persisted in insertion order, so every
+/// producer — the cache hit, the fresh read, and the parallel vendor pass —
+/// must funnel through here *in walk order*.
+pub fn record_verdict(
+    scan: &mut CommandScan,
+    path: &Path,
+    mtime: (u64, u32),
+    entry: Option<CommandEntry>,
+) {
+    if let Some(entry) = entry.clone() {
+        scan.index.insert_entry(entry);
     }
     scan.files.push(ScannedFile {
         mtime_secs: mtime.0,
         mtime_nanos: mtime.1,
         path: path.to_path_buf(),
-        entry: verdict.cloned(),
+        entry,
     });
-    CacheVerdict::Settled
 }
 
 /// Record a freshly-read file's verdict into `scan`, stamped with the `mtime`
@@ -402,16 +456,7 @@ pub fn try_cached(
 /// scan trusts it. Stamping the earlier mtime can only cause a needless
 /// re-read, never a stale hit.
 pub fn record_source(scan: &mut CommandScan, path: &Path, mtime: (u64, u32), content: &str) {
-    let entry = command_entry_for(path, content);
-    if let Some(entry) = entry.clone() {
-        scan.index.insert_entry(entry);
-    }
-    scan.files.push(ScannedFile {
-        mtime_secs: mtime.0,
-        mtime_nanos: mtime.1,
-        path: path.to_path_buf(),
-        entry,
-    });
+    record_verdict(scan, path, mtime, command_entry_for(path, content));
 }
 
 #[cfg(test)]

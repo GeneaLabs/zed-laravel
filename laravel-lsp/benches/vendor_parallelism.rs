@@ -1,37 +1,48 @@
-//! Step-0 measurement bench for issue #373 — where the remaining warm-start
-//! and dependency-change time actually goes, before anything is parallelized.
+//! Measurement bench for issue #373 — where the remaining warm-start and
+//! dependency-change time actually goes.
 //!
 //! #373 names two paths as the only ones with room left, and asks for both to
 //! be timed **in isolation** before an implementation is written, because this
 //! project has twice guessed the wrong target from architecture and been
-//! corrected by measurement. This bench is that measurement.
+//! corrected by measurement. This bench is that measurement, and it kept
+//! earning its keep afterwards: it decided what #373's third item became.
 //!
 //! # What it measures
 //!
 //! 1. **The shared vendor pass** —
 //!    [`laravel_lsp::vendor_scan::build_route_files_and_command_index`], broken
-//!    into its four stages so the parallelizable fraction is visible rather
-//!    than inferred:
+//!    into its stages so the parallelizable fraction is visible rather than
+//!    inferred. **Every stage is timed serially, one file at a time**, even
+//!    though production now runs the pass across a worker pool — the point of
+//!    the decomposition is the *shape* of the work, and only a serial timing
+//!    can attribute cost per stage:
 //!
 //!    | Stage | Work | Parallelizes? |
 //!    |---|---|---|
 //!    | walk | [`VendorIndex::build`] — one directory traversal | no (single walk) |
-//!    | pre-pass | one `metadata` per command-wanted file | I/O bound |
-//!    | read | `read_to_string` per wanted file | I/O bound |
-//!    | classify (route) | `accept_vendor_route_source` — pure CPU | yes |
-//!    | classify (command) | `record_source` — pure CPU | yes |
+//!    | pre-pass | one `metadata` per command-wanted file | yes (I/O bound) |
+//!    | read | `read_to_string` per wanted file | yes (I/O bound) |
+//!    | classify (route) | `vendor_route_verdict` — pure CPU | yes |
+//!    | classify (command) | `command_entry_for` — pure CPU | yes |
 //!
-//!    That last row is why measuring beat estimating. `record_source` used to
-//!    stat each file again before classifying it — a stat the pre-pass had
-//!    already paid — so "everything after the read is CPU" would have
-//!    overstated what threading could win by 5x. The bench found it, and #373
-//!    removed the second stat rather than parallelizing around it. The
-//!    `[removed] 2nd stat/file` row still measures what it used to cost, so a
-//!    regression that brings it back is legible in the log.
+//!    The `[removed] 2nd stat/file` row is why measuring beat estimating.
+//!    `record_source` used to stat each file again before classifying it — a
+//!    stat the pre-pass had already paid — so "everything after the read is
+//!    CPU" would have overstated what threading could win by 5x. #373 removed
+//!    that stat, and the row still times what it used to cost, so a regression
+//!    that brings it back is legible in the log.
 //!
 //!    The answer the measurement gave: the classifiers are 2-6% of the pass on
-//!    every platform, not the majority #373 estimated. Parallelizing them would
-//!    win 8-18 ms of a 198-962 ms pass. The pass is I/O.
+//!    every platform, not the majority #373 estimated, while the stat and read
+//!    stages are 93-97%. **The pass is I/O.** So #373's third item was built
+//!    against that finding rather than its own estimate — the parallel map
+//!    covers the reads and stats, not merely the classifiers it named, which
+//!    would have won 7-13 ms of a 151-604 ms pass.
+//!
+//!    **Read `staged / whole` accordingly.** The staged sum is serial and the
+//!    whole pass is parallel, so the ratio now runs *above* 100% by design:
+//!    that excess is the parallel speedup, and a ratio back near 100% means the
+//!    pass has fallen back to running serially.
 //!
 //! 2. **The serialized parse point** — `SalsaHandle::get_patterns` driven in a
 //!    serial loop, which is exactly what `run_magic_batch_once` does per vendor
@@ -213,12 +224,13 @@ fn main() {
 
     // Every stage below is measured `PASSES` times and reported at its
     // MINIMUM. A single timed run of a 400 ms filesystem-heavy pass varies
-    // 10-15% between runs on an idle machine — enough to swing `staged / whole`
-    // from 89% to 110% with no code change at all, which would make the
-    // cross-platform comparison this bench exists for unreadable. The minimum
-    // is the run least disturbed by the scheduler and by other processes, and
-    // it is the standard choice for exactly this reason: noise only ever adds
-    // time, so the floor is the honest figure.
+    // 10-15% between runs on an idle machine — measured on the serial pass,
+    // that was enough to swing `staged / whole` from 89% to 110% with no code
+    // change at all, which would make the cross-platform comparison this bench
+    // exists for unreadable. The minimum is the run least disturbed by the
+    // scheduler and by other processes, and it is the standard choice for
+    // exactly this reason: noise only ever adds time, so the floor is the
+    // honest figure.
     let mut best = StageTimings::worst();
     let mut corpus = Corpus::default();
     for _ in 0..PASSES {
@@ -576,11 +588,13 @@ fn notes() {
     println!("    every stage is levelled. A cold first start reads slower.");
     println!("  * No command scan cache is passed, so every command-wanted file");
     println!("    is read. That is the cold-cache shape a composer install makes.");
-    println!("  * 'staged / whole' is a sanity check on the decomposition, not a");
-    println!("    precision instrument. Near 100% means the stages account for");
-    println!("    the real function; far from it means the split is not to be");
-    println!("    trusted. It does not need to be exact for the CPU-vs-I/O");
-    println!("    conclusion, which is an order of magnitude, not a few percent.");
+    println!("  * The stages above are timed SERIALLY, one file at a time, but");
+    println!("    the whole pass now runs across the bounded worker pool (#373).");
+    println!("    So 'staged / whole' is expected ABOVE 100%, and the excess IS");
+    println!("    the parallel speedup: 100% means the pass has fallen back to");
+    println!("    running serially. The stage split still says where the work");
+    println!("    is — that conclusion is an order of magnitude, not a few");
+    println!("    percent — but the ratio is no longer a decomposition check.");
 }
 
 /// Register a handle against `root` the way production does, so
