@@ -1081,6 +1081,11 @@ fn commented_out_foreach_binds_nothing() {
 
 #[test]
 fn multiline_blade_comment_blanks_its_whole_body() {
+    // Asserts at line 2, INSIDE the comment body. Line 5 cannot discriminate:
+    // the commented `@foreach`/`@endforeach` are a symmetric pair, so even
+    // the unfixed substring scan pushes and pops `loop_stack` and is empty
+    // again by then. Line 2 sits between the push and the pop, which is the
+    // only place the bug is observable.
     let content = "\
 {{--
 @foreach ($rows as $row)
@@ -1088,6 +1093,7 @@ fn multiline_blade_comment_blanks_its_whole_body() {
 @endforeach
 --}}
 <span>{{ $row }}</span>";
+    assert!(!is_template_local_binding(content, 2, "row"));
     assert!(!is_template_local_binding(content, 5, "row"));
 }
 
@@ -1095,19 +1101,68 @@ fn multiline_blade_comment_blanks_its_whole_body() {
 fn html_comment_does_not_open_a_php_block() {
     // `<!-- @php -->` used to open a block that never closes, so every
     // later `$name = …` line registered as a local.
+    //
+    // The assertion is on `x` at line 2, not `total` at line 1. The line-1
+    // form could not fail: the scan breaks at `idx == line`, so line 2 is
+    // never visited, and `{{ $total }}` is a read rather than an assignment
+    // so `collect_assignments` would not add it either way. `x` on line 3 is
+    // assignment-shaped, and line 2 is far enough in for the phantom block
+    // to have swallowed it.
     let content = "\
 <!-- @php -->
 <span>{{ $total }}</span>
 {{ $x = 'not php, just an echo of an assignment' }}";
-    assert!(!is_template_local_binding(content, 1, "total"));
+    assert!(!is_template_local_binding(content, 2, "x"));
 }
 
 #[test]
 fn uncommented_directives_still_bind_next_to_commented_ones() {
+    // The two loops bind DIFFERENT names on purpose. Sharing one name makes
+    // the assertion pass whichever loop supplied the binding, so it could not
+    // tell over-blanking from correct behaviour.
     let content = "\
-{{-- @foreach ($old as $item) --}}
-@foreach ($rows as $item)
-    {{ $item }}
+{{-- @foreach ($old as $stale) --}}
+@foreach ($rows as $live)
+    {{ $live }}
 @endforeach";
-    assert!(is_template_local_binding(content, 2, "item"));
+    assert!(
+        is_template_local_binding(content, 2, "live"),
+        "the live loop must still bind"
+    );
+    assert!(
+        !is_template_local_binding(content, 2, "stale"),
+        "the commented loop must not"
+    );
+}
+
+#[test]
+fn an_unterminated_comment_opener_blanks_nothing() {
+    // Blade requires the closer: `CompilesComments::compileComments` is
+    // `preg_replace('/{{--(.*?)--}}/s', '', $value)`, which returns the input
+    // unchanged when `--}}` is absent, and Blade never handles `<!--` at all.
+    // Blanking to end of input instead would be a regression wider than the
+    // bug this fixes — one stray `<!--` in a `<script>` would unbind every
+    // directive below it.
+    let content = "\
+<script>
+<!--
+  var x = 'a typo, the closer was deleted';
+</script>
+@foreach ($users as $user)
+    {{ $user }}
+@endforeach";
+    assert!(
+        is_template_local_binding(content, 5, "user"),
+        "an unterminated <!-- must not swallow the live loop below it"
+    );
+
+    let blade = "\
+{{-- @foreach ($rows as $orphan)
+@foreach ($rows as $real)
+    {{ $real }}
+@endforeach";
+    assert!(
+        is_template_local_binding(blade, 2, "real"),
+        "an unterminated {{-- must not swallow the live loop below it"
+    );
 }
