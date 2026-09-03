@@ -529,3 +529,78 @@ fn an_unusable_cache_degrades_to_a_full_scan() {
         "fixture check — nothing has been saved for this project yet"
     );
 }
+
+// === the mtime hand-off between try_cached and record_source (issue #373) ===
+//
+// `record_source` used to stat the file itself, so every file that needed a
+// read was stat'd twice: once by `try_cached` deciding it needed reading, and
+// again by `record_source` stamping the entry. That second stat was 225 ms of
+// the shared vendor pass's 962 ms on a Windows CI runner, and roughly a fifth
+// of it on Linux and macOS. It is now passed across instead.
+
+/// The value `record_source` stamps must be the one it is HANDED. Fabricating
+/// an mtime the file cannot possibly have is what makes this discriminate: a
+/// `record_source` that stats again would record the real one and go red.
+#[test]
+fn record_source_stamps_the_mtime_it_is_given_rather_than_statting_again() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("MakeThing.php");
+    let src = command_class("MakeThing", "make:thing");
+    std::fs::write(&path, &src).unwrap();
+
+    // Far in the past, and a nanosecond value a real filesystem stamp would
+    // not land on by chance.
+    let fabricated = (1_234_567_890u64, 424_242u32);
+    let real = file_mtime(&path).expect("the fixture is stattable");
+    assert_ne!(
+        real, fabricated,
+        "fixture check — the fabricated mtime must differ from the real one"
+    );
+
+    let mut scan = CommandScan::default();
+    record_source(&mut scan, &path, fabricated, &src);
+
+    let recorded = scan
+        .files
+        .iter()
+        .find(|f| f.path == path)
+        .expect("the file is recorded");
+    assert_eq!(
+        (recorded.mtime_secs, recorded.mtime_nanos),
+        fabricated,
+        "record_source stat'd the file instead of using the mtime it was given"
+    );
+}
+
+/// The other half: the mtime `try_cached` hands out has to be the file's real
+/// one, or every entry would be stamped with a value the next scan can never
+/// match and the disk cache would never hit.
+#[test]
+fn try_cached_hands_back_the_real_mtime_when_a_read_is_needed() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("MakeThing.php");
+    std::fs::write(&path, command_class("MakeThing", "make:thing")).unwrap();
+
+    let mut scan = CommandScan::default();
+    let verdict = try_cached(&mut scan, None, &path);
+
+    let CacheVerdict::NeedsSource { mtime } = verdict else {
+        panic!("no cache was passed, so the file must need its source read");
+    };
+    assert_eq!(mtime, file_mtime(&path).expect("the fixture is stattable"));
+}
+
+/// An unstattable path is settled, not read. A verdict recorded without a
+/// usable mtime could never be validated, so it would be trusted forever.
+#[test]
+fn try_cached_settles_a_path_it_cannot_stat() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let missing = tmp.path().join("does/not/exist/Ghost.php");
+
+    let mut scan = CommandScan::default();
+    assert_eq!(try_cached(&mut scan, None, &missing), CacheVerdict::Settled);
+    assert!(
+        scan.files.is_empty(),
+        "an unstattable path must leave no verdict behind"
+    );
+}

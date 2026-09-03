@@ -95,6 +95,7 @@ pub mod magic_dependency_index;
 pub mod magic_disk_cache;
 pub mod markdown_safety;
 pub mod naming;
+pub mod parallelism;
 pub mod parse_budget;
 pub mod parser;
 pub mod path_containment;

@@ -216,6 +216,18 @@ pub fn collect_conventional_vendor_route_files(vendor: &VendorIndex, out: &mut R
     }
 }
 
+/// Decide whether an already-read vendor file is a route file, and at what
+/// priority, without touching an accumulator.
+///
+/// The pure half of [`accept_vendor_route_source`], split out so the shared
+/// vendor pass in [`crate::vendor_scan`] can run this per file across a worker
+/// pool and fold the answers afterwards (issue #373). Every classification
+/// still happens here, so the two callers cannot drift.
+pub fn vendor_route_verdict(path: &Path, content: &str) -> Option<(PathBuf, u8)> {
+    content_registers_named_routes(content)
+        .then(|| (path.to_path_buf(), priority_for_vendor_path(path)))
+}
+
 /// Record an already-read vendor file if its text shows route-registration
 /// shape (a router token AND a `->name(` call).
 ///
@@ -223,8 +235,8 @@ pub fn collect_conventional_vendor_route_files(vendor: &VendorIndex, out: &mut R
 /// service-provider `boot()` registrations, and Filament-style
 /// `Panel::routes(fn () => ...)` panels.
 pub fn accept_vendor_route_source(out: &mut RouteFileSet, path: &Path, content: &str) {
-    if content_registers_named_routes(content) {
-        out.promote(path.to_path_buf(), priority_for_vendor_path(path));
+    if let Some((path, priority)) = vendor_route_verdict(path, content) {
+        out.promote(path, priority);
     }
 }
 

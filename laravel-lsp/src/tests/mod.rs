@@ -58,6 +58,7 @@ mod module_livewire_namespaces;
 mod module_view_namespaces;
 mod mutex_poison_recovery;
 mod nested_module_root_correction;
+mod off_actor_batch_parse;
 mod post_warm_open_buffer_guard;
 mod query_chain_completion_handler;
 mod rename_integration;
