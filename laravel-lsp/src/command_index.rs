@@ -258,13 +258,13 @@ pub fn consider_project_commands(
 
 /// Index one file, reusing the cached verdict when its mtime is unchanged.
 fn consider_file(scan: &mut CommandScan, cache: Option<&CommandScanCache>, path: &Path) {
-    if try_cached(scan, cache, path) {
+    let CacheVerdict::NeedsSource { mtime } = try_cached(scan, cache, path) else {
         return;
-    }
+    };
     let Ok(content) = std::fs::read_to_string(path) else {
         return;
     };
-    record_source(scan, path, &content);
+    record_source(scan, path, mtime, &content);
 }
 
 /// A file's mtime as `(secs, nanos)`, matching the disk cache's representation.
@@ -341,21 +341,42 @@ pub fn command_entry_for(path: &Path, content: &str) -> Option<CommandEntry> {
     })
 }
 
+/// What [`try_cached`] decided about a file, and the mtime it already read.
+///
+/// The mtime is carried out rather than discarded because the caller's next
+/// step, [`record_source`], needs exactly that value. Returning a bare `bool`
+/// meant `record_source` stat'd the same file a second time — 225 ms of the
+/// 962 ms shared vendor pass on a Windows runner, and about a fifth of it on
+/// Linux and macOS too (issue #373).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheVerdict {
+    /// Nothing more to do: either the scan cache answered for this file, or it
+    /// could not be stat'd and so is deliberately left unread.
+    Settled,
+    /// The file still has to be read. `mtime` is the value already on hand, to
+    /// be handed straight to [`record_source`].
+    NeedsSource { mtime: (u64, u32) },
+}
+
 /// Try to satisfy `path` from the scan cache, recording its verdict when the
-/// mtime is unchanged. Returns `true` when the file needs no read.
+/// mtime is unchanged.
 ///
 /// Public so the combined warm-start pass in [`crate::vendor_scan`] can decide
 /// whether a vendor file still has to be read for the command index before it
 /// reads it for the route index.
-pub fn try_cached(scan: &mut CommandScan, cache: Option<&CommandScanCache>, path: &Path) -> bool {
+pub fn try_cached(
+    scan: &mut CommandScan,
+    cache: Option<&CommandScanCache>,
+    path: &Path,
+) -> CacheVerdict {
     let Some(mtime) = file_mtime(path) else {
         // Unstattable: do not read it either. A verdict recorded without a
         // usable mtime could never be validated, so it would be trusted
         // forever.
-        return true;
+        return CacheVerdict::Settled;
     };
     let Some(verdict) = cache.and_then(|c| c.verdict(path, mtime)) else {
-        return false;
+        return CacheVerdict::NeedsSource { mtime };
     };
     if let Some(entry) = verdict {
         scan.index.insert_entry(entry.clone());
@@ -366,14 +387,21 @@ pub fn try_cached(scan: &mut CommandScan, cache: Option<&CommandScanCache>, path
         path: path.to_path_buf(),
         entry: verdict.cloned(),
     });
-    true
+    CacheVerdict::Settled
 }
 
-/// Record a freshly-read file's verdict into `scan`.
-pub fn record_source(scan: &mut CommandScan, path: &Path, content: &str) {
-    let Some(mtime) = file_mtime(path) else {
-        return;
-    };
+/// Record a freshly-read file's verdict into `scan`, stamped with the `mtime`
+/// [`try_cached`] already read for it.
+///
+/// **Taking the mtime rather than reading one is also the more careful
+/// choice**, not only the cheaper one. The stored mtime is what the next scan
+/// validates the verdict against, and `content` was read *after* this mtime
+/// was taken. Stamping the entry with a *later* mtime — which is what a fresh
+/// stat here would produce — would mean a file rewritten between the read and
+/// the stat gets its stale verdict stored under the new mtime, and the next
+/// scan trusts it. Stamping the earlier mtime can only cause a needless
+/// re-read, never a stale hit.
+pub fn record_source(scan: &mut CommandScan, path: &Path, mtime: (u64, u32), content: &str) {
     let entry = command_entry_for(path, content);
     if let Some(entry) = entry.clone() {
         scan.index.insert_entry(entry);

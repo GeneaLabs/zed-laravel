@@ -13,12 +13,13 @@
 //! layering acyclic: `vendor_index` is a leaf, `route_discovery` and
 //! `command_index` depend on it, and only this module depends on all three.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::command_disk_cache::CommandScanCache;
 use crate::command_index::{
-    consider_project_commands, record_source, try_cached, vendor_command_needs_source, CommandScan,
+    consider_project_commands, record_source, try_cached, vendor_command_needs_source,
+    CacheVerdict, CommandScan,
 };
 use crate::route_discovery::{
     accept_vendor_route_source, collect_conventional_vendor_route_files,
@@ -56,23 +57,33 @@ pub fn build_route_files_and_command_index(
     // opened for it. Costs one `metadata` per command-wanted file, which the
     // verdict check needs anyway, and saves the read for the overwhelming
     // majority whose mtime has not moved (issue #371).
-    let mut command_needs_read: HashSet<PathBuf> = HashSet::new();
+    //
+    // The mtime is KEPT, not just the decision. `record_source` used to stat
+    // each file again to stamp its entry, so every file that needed a read was
+    // stat'd twice — 225 ms of this pass's 962 ms on a Windows CI runner, and
+    // about a fifth of it on Linux and macOS (issue #373, measured by
+    // `benches/vendor_parallelism.rs`). Carrying the value across removes the
+    // second stat outright.
+    let mut command_needs_read: HashMap<PathBuf, (u64, u32)> = HashMap::new();
     for file in vendor.files() {
-        if vendor_command_needs_source(&vendor_root, file)
-            && !try_cached(&mut commands, command_cache, &file.path)
+        if !vendor_command_needs_source(&vendor_root, file) {
+            continue;
+        }
+        if let CacheVerdict::NeedsSource { mtime } =
+            try_cached(&mut commands, command_cache, &file.path)
         {
-            command_needs_read.insert(file.path.clone());
+            command_needs_read.insert(file.path.clone(), mtime);
         }
     }
 
     vendor.for_each_source(
-        |file| vendor_route_needs_source(file) || command_needs_read.contains(&file.path),
+        |file| vendor_route_needs_source(file) || command_needs_read.contains_key(&file.path),
         |file, content| {
             if vendor_route_needs_source(file) {
                 accept_vendor_route_source(&mut routes, &file.path, content);
             }
-            if command_needs_read.contains(&file.path) {
-                record_source(&mut commands, &file.path, content);
+            if let Some(mtime) = command_needs_read.get(&file.path) {
+                record_source(&mut commands, &file.path, *mtime, content);
             }
         },
     );
