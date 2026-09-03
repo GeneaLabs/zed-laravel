@@ -90,7 +90,7 @@ use laravel_lsp::route_discovery::{
     accept_vendor_route_source, collect_conventional_vendor_route_files,
     collect_project_route_files, vendor_route_needs_source, RouteFileSet,
 };
-use laravel_lsp::salsa_impl::SalsaActor;
+use laravel_lsp::salsa_impl::{SalsaActor, SalsaHandle};
 use laravel_lsp::vendor_index::VendorIndex;
 use laravel_lsp::vendor_scan::build_route_files_and_command_index;
 
@@ -583,9 +583,93 @@ fn notes() {
     println!("    conclusion, which is an order of magnitude, not a few percent.");
 }
 
-/// Measure the single-threaded Salsa parse funnel: N vendor files pushed
-/// serially through `get_patterns`, which is what `run_magic_batch_once` does
-/// per vendor file after a dependency change.
+/// Register a handle against `root` the way production does, so
+/// `bulk_import_patterns` has a published pattern cache to write into.
+///
+/// Both regimes below get a registered handle, not just the one that needs it:
+/// registration records the file list and sizes the cache but parses nothing,
+/// so it leaves neither regime with warm data — and giving only one of them a
+/// registered actor would be an uncontrolled difference between them.
+async fn registered_handle(root: &Path, vendor_paths: Vec<PathBuf>) -> SalsaHandle {
+    let handle = SalsaActor::spawn();
+    let _ = handle
+        .register_config_files(root.to_path_buf(), None, None, None, None)
+        .await;
+    let _ = handle
+        .register_project_files(
+            root.to_path_buf(),
+            vec![PathBuf::from("app")],
+            vec![root.join("resources/views")],
+            None,
+            PathBuf::from("routes"),
+            vendor_paths,
+        )
+        .await;
+    handle
+}
+
+/// Parse `batch` the way `Backend::preparse_batch_off_actor` does — in
+/// parallel, off the actor, then handed over as finished results.
+///
+/// A deliberate copy of the production method rather than a call to it:
+/// `Backend` is private to `main.rs`, so a bench cannot reach it. The shape it
+/// mirrors is the semaphore, the `spawn_blocking` read-and-parse, and the two
+/// bulk imports; if that method changes, this must change with it.
+async fn preparse_like_production(handle: &SalsaHandle, batch: Vec<PathBuf>) {
+    type Parsed = (
+        PathBuf,
+        std::sync::Arc<laravel_lsp::salsa_impl::ParsedPatternsData>,
+        Vec<laravel_lsp::class_hierarchy_index::ClassNode>,
+    );
+
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        laravel_lsp::parallelism::bounded_pool_size(),
+    ));
+    let mut set: tokio::task::JoinSet<Option<Parsed>> = tokio::task::JoinSet::new();
+    for path in batch {
+        let permit_owner = semaphore.clone();
+        set.spawn(async move {
+            let _permit = permit_owner.acquire_owned().await.ok()?;
+            let for_task = path.clone();
+            let parsed = tokio::task::spawn_blocking(move || {
+                let text = std::fs::read_to_string(&for_task).ok()?;
+                Some(laravel_lsp::pattern_indexer::parse_owned_with_hierarchy(
+                    &for_task, &text,
+                ))
+            })
+            .await
+            .ok()
+            .flatten()?;
+            Some((path, parsed.0, parsed.1))
+        });
+    }
+
+    let mut patterns = Vec::new();
+    let mut hierarchy = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some((path, data, nodes))) = res {
+            patterns.push((path.clone(), data));
+            hierarchy.push((path, nodes));
+        }
+    }
+    if patterns.is_empty() {
+        return;
+    }
+    if handle.bulk_import_patterns(patterns).await.is_err() {
+        return;
+    }
+    let _ = handle.bulk_import_hierarchy(hierarchy).await;
+}
+
+/// Measure the single-threaded Salsa parse funnel — N vendor files pushed
+/// serially through `get_patterns`, which is what `run_magic_batch_once` did
+/// per vendor file after a dependency change — against the off-actor parallel
+/// path that replaced it (issue #373 item 1).
+///
+/// **Each regime gets its own fresh actor**, which is the whole reason this
+/// comparison is trustworthy. Both write into an actor-owned pattern cache; if
+/// they shared one, the second regime measured would be reading the first's
+/// results and would look arbitrarily fast.
 fn parse_funnel(vendor: &VendorIndex) {
     // Only files the parse budget admits — `run_magic_batch_once` skips the
     // rest (`*.json.php` and anything over the size cap), so including them
@@ -600,9 +684,13 @@ fn parse_funnel(vendor: &VendorIndex) {
         }
     }
 
-    println!("\n== 2. serialized parse point (SalsaHandle::get_patterns, serial loop) ==");
+    println!("\n== 2. the parse funnel: serial-in-actor vs parallel-off-actor ==");
     println!("  eligible vendor files : {}", eligible.len());
     println!("  excluded by budget    : {excluded}");
+    println!(
+        "  off-actor workers     : {}",
+        laravel_lsp::parallelism::bounded_pool_size()
+    );
 
     if eligible.len() < 2 {
         println!("  SKIPPED: not enough eligible files to measure.");
@@ -628,11 +716,17 @@ fn parse_funnel(vendor: &VendorIndex) {
         }
     };
 
+    let root = bench_root();
+    let vendor_paths: Vec<PathBuf> = vendor.files().iter().map(|f| f.path.clone()).collect();
+
     println!(
-        "\n  {:<10} {:>10}  {:>12}  {:>14}",
-        "batch", "total ms", "us / file", "files / sec"
+        "\n  {:<8} {:>12}  {:>12}  {:>12}  {:>9}",
+        "batch", "serial ms", "off-actor ms", "serial f/s", "speedup"
     );
-    println!("  {:-<10} {:->10}  {:->12}  {:->14}", "", "", "", "");
+    println!(
+        "  {:-<8} {:->12}  {:->12}  {:->12}  {:->9}",
+        "", "", "", "", ""
+    );
 
     for size in batch_sizes() {
         let n = size.min(eligible.len());
@@ -641,28 +735,54 @@ fn parse_funnel(vendor: &VendorIndex) {
         }
         let batch: Vec<PathBuf> = eligible[..n].to_vec();
 
-        // A FRESH actor per batch. Sharing one would let every batch after the
-        // first read the previous batch's warm pattern cache, which measures
-        // cache hits rather than parses.
-        let handle = SalsaActor::spawn();
-        let warm = warmup_path.clone();
+        // The NEW path runs FIRST, deliberately. Whichever regime runs second
+        // reads a filesystem cache the first one has just touched, and that
+        // advantage cannot be removed without dropping the page cache (which
+        // needs root). Running the new path first means any residual advantage
+        // falls to the OLD one, so the speedup below is a floor rather than a
+        // flattering number. The bench's levelling pass has already read the
+        // whole tree once, so the effect should be small either way.
+        //
+        // Each regime gets its OWN fresh actor. Sharing one would let the
+        // second read the first's imported entries and report a cache hit as a
+        // parse.
+        let off_actor = {
+            let handle = runtime.block_on(registered_handle(&root, vendor_paths.clone()));
+            let warm = warmup_path.clone();
+            let batch = batch.clone();
+            runtime.block_on(async move {
+                // Untimed first request, so the actor's one-time query-cache
+                // prewarm never lands inside the measured window. Taken from
+                // the END of the eligible list while every batch is measured
+                // from the front, so no measured file is served from its cache.
+                let _ = handle.get_patterns(warm).await;
+                let start = Instant::now();
+                preparse_like_production(&handle, batch).await;
+                start.elapsed()
+            })
+        };
 
-        let elapsed = runtime.block_on(async move {
-            let _ = handle.get_patterns(warm).await;
-
-            let start = Instant::now();
-            for path in batch {
-                black_box(handle.get_patterns(path).await.ok());
-            }
-            start.elapsed()
-        });
+        // The OLD path: every parse queued through the one actor thread.
+        let serial = {
+            let handle = runtime.block_on(registered_handle(&root, vendor_paths.clone()));
+            let warm = warmup_path.clone();
+            runtime.block_on(async move {
+                let _ = handle.get_patterns(warm).await;
+                let start = Instant::now();
+                for path in batch {
+                    black_box(handle.get_patterns(path).await.ok());
+                }
+                start.elapsed()
+            })
+        };
 
         println!(
-            "  {:<10} {:>10.2}  {:>12.2}  {:>14.0}",
+            "  {:<8} {:>12.2}  {:>12.2}  {:>12.0}  {:>8.1}x",
             n,
-            ms(elapsed),
-            us_each(elapsed, n),
-            n as f64 / elapsed.as_secs_f64()
+            ms(serial),
+            ms(off_actor),
+            n as f64 / serial.as_secs_f64(),
+            serial.as_secs_f64() / off_actor.as_secs_f64().max(f64::MIN_POSITIVE)
         );
 
         if n == eligible.len() {
@@ -671,6 +791,21 @@ fn parse_funnel(vendor: &VendorIndex) {
         }
     }
 
-    println!("\n  Every parse above runs on the ONE Salsa actor thread. A composer");
-    println!("  install rewrites thousands of vendor files straight into this loop.");
+    println!("\n  'serial' is the old path: every parse queued through the ONE Salsa");
+    println!("  actor thread, which is where a composer install's thousands of vendor");
+    println!("  files used to funnel. 'off-actor' is what run_magic_batch_once does");
+    println!("  now — parse in parallel outside the actor, hand it finished results.");
+    println!();
+    println!("  The speedup EXCEEDS the worker count, which is not a measurement");
+    println!("  error: the two paths differ in more than parallelism. The serial one");
+    println!("  pays an mpsc send plus a oneshot reply per file, and parses through");
+    println!("  Salsa's tracked-query machinery (a SourceFile input, interning,");
+    println!("  dependency tracking) for every one. The off-actor path calls the");
+    println!("  parser directly and sends two bulk messages for the whole batch. So");
+    println!("  the win is the worker count multiplied by the per-file overhead it");
+    println!("  no longer pays.");
+    println!();
+    println!("  The new path is timed FIRST at every batch size, so any leftover");
+    println!("  filesystem-cache advantage goes to the OLD one. The speedup is a");
+    println!("  floor.");
 }
