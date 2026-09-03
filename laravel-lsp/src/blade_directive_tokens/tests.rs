@@ -64,7 +64,7 @@ fn matches_directive_names_case_insensitively() {
 
 #[test]
 fn comment_spans_cover_blade_and_html() {
-    let spans = blade_comment_spans("a {{-- x --}} b <!-- y --> c");
+    let spans = dead_region_spans("a {{-- x --}} b <!-- y --> c");
     assert_eq!(spans.len(), 2);
 }
 
@@ -116,4 +116,62 @@ fn skips_alpine_event_bindings(/* issue #61 */) {
         vec![(0, 22, 3)],
         "only the @if directive survives"
     );
+}
+
+// ---- one dead-region scanner for the whole crate (issue #369 Part A) ------
+
+#[test]
+fn a_verbatim_body_is_dead_but_its_own_directives_are_not() {
+    // Blade emits a `@verbatim` body literally and compiles nothing inside it,
+    // so a directive there must not tokenise. The `@verbatim` and
+    // `@endverbatim` directives themselves ARE compiled and must still light
+    // up — which is why the span is the body, not the whole match.
+    let set = known(&["verbatim", "endverbatim", "csrf"]);
+    let positions = directive_token_positions("@verbatim @csrf @endverbatim", &set);
+    let columns: Vec<u32> = positions.iter().map(|(_, col, _)| *col).collect();
+    assert_eq!(
+        columns,
+        vec![0, 16],
+        "only @verbatim (col 0) and @endverbatim (col 16) tokenise; @csrf at col 10 does not"
+    );
+}
+
+#[test]
+fn an_unterminated_opener_yields_no_dead_span() {
+    // Blade requires the closer: `CompilesComments::compileComments` returns
+    // the input unchanged without `--}}`, and Blade never handles `<!--`.
+    // Masking to end of input would blank every directive below one typo.
+    for unterminated in [
+        "{{-- never closed @csrf",
+        "<!-- never closed @csrf",
+        "@verbatim never closed @csrf",
+    ] {
+        assert!(
+            dead_region_spans(unterminated).is_empty(),
+            "no span for {unterminated:?}"
+        );
+    }
+
+    let set = known(&["csrf"]);
+    assert_eq!(
+        directive_token_positions("<!-- typo, closer deleted\n@csrf", &set).len(),
+        1,
+        "a directive below an unterminated opener still tokenises"
+    );
+}
+
+#[test]
+fn blanking_preserves_offsets_and_newlines() {
+    // Every caller scans the masked copy and reports positions against the
+    // original, so length and newline positions must be identical.
+    let source = "a{{-- x\ny --}}b\n@verbatim\n$foo\n@endverbatim\n";
+    let masked = blank_dead_regions(source);
+    assert_eq!(masked.len(), source.len(), "byte length must not change");
+    assert_eq!(
+        masked.match_indices('\n').collect::<Vec<_>>(),
+        source.match_indices('\n').collect::<Vec<_>>(),
+        "newline positions must not change"
+    );
+    assert!(!masked.contains("$foo"), "the verbatim body is blanked");
+    assert!(masked.contains("@verbatim"), "its own directives are not");
 }

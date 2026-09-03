@@ -1166,3 +1166,39 @@ fn an_unterminated_comment_opener_blanks_nothing() {
         "an unterminated {{-- must not swallow the live loop below it"
     );
 }
+
+#[test]
+fn a_directive_inside_verbatim_binds_nothing() {
+    // Issue #369 A1. Blade emits a `@verbatim` body literally and compiles
+    // nothing inside it, so a `@foreach` there binds no loop variable. Unlike
+    // the HTML-comment case this is not a judgement call — Blade genuinely
+    // does not execute the body.
+    let content = "\
+@verbatim
+@foreach ($rows as $row)
+@endverbatim
+<span>{{ $row }}</span>";
+    assert!(
+        !is_template_local_binding(content, 3, "row"),
+        "a @foreach inside @verbatim must not shadow $row below it"
+    );
+    assert!(
+        !is_template_local_binding(content, 1, "row"),
+        "nor inside the body itself"
+    );
+}
+
+#[test]
+fn an_unterminated_verbatim_binds_normally() {
+    // Same terminator rule as the comment forms: without `@endverbatim` the
+    // region is not dead, so the live loop below it still binds.
+    let content = "\
+@verbatim
+@foreach ($rows as $row)
+    {{ $row }}
+@endforeach";
+    assert!(
+        is_template_local_binding(content, 2, "row"),
+        "an unterminated @verbatim must not swallow the loop below it"
+    );
+}

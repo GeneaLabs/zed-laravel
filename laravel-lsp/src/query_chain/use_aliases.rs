@@ -282,7 +282,7 @@ pub fn blade_use_sites(source: &str) -> Vec<BladeUseSite> {
     if !source.contains("@use") {
         return Vec::new();
     }
-    let comments = crate::blade_directive_tokens::blade_comment_spans(source);
+    let comments = crate::blade_directive_tokens::dead_region_spans(source);
     let mut out = Vec::new();
 
     for (at, _) in source.match_indices("@use") {

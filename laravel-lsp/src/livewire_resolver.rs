@@ -897,7 +897,7 @@ pub fn is_template_local_binding(content: &str, line: u32, var: &str) -> bool {
     // stay stable. A directive in ordinary prose is deliberately still
     // honored: Blade genuinely compiles those (that is what `@@` escaping
     // is for), so #351's third shape is out of scope here by design.
-    let content = blank_template_comments(content);
+    let content = crate::blade_directive_tokens::blank_dead_regions(content);
     let mut loop_stack: Vec<Vec<String>> = Vec::new();
     let mut for_stack: Vec<Vec<String>> = Vec::new();
     let mut persistent: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -984,38 +984,6 @@ pub fn is_template_local_binding(content: &str, line: u32, var: &str) -> bool {
             .iter()
             .any(|names| names.iter().any(|n| n == var))
         || for_stack.iter().any(|names| names.iter().any(|n| n == var))
-}
-
-/// `content` with every Blade (`{{-- --}}`) and HTML (`<!-- -->`) comment
-/// blanked to spaces — newlines kept, so per-line scans keep their line
-/// numbers.
-///
-/// The spans come from [`crate::blade_directive_tokens::blade_comment_spans`],
-/// the crate's shared comment scanner, rather than from a fourth hand-rolled
-/// one. `blade_use_sites` states the reason directly
-/// (`query_chain/use_aliases.rs`): the shared scanner exists so callers
-/// "can never disagree about which directives exist."
-///
-/// **An unterminated opener blanks nothing**, which is what the shared
-/// scanner's `(?s)\{\{--.*?--\}\}|<!--.*?-->` already requires, and what
-/// Blade does. `CompilesComments::compileComments` is a single
-/// `preg_replace` with `/{{--(.*?)--}}/s`: the pattern needs the closing
-/// `--}}`, and without it `preg_replace` returns the input unchanged. Blade
-/// has no handling for `<!--` at all. Blanking to end of input instead would
-/// be a regression wider than the bug it fixes — one stray `<!--` inside a
-/// `<script>` would unbind every `@foreach`, `@props` and `@php` below it.
-fn blank_template_comments(content: &str) -> String {
-    let mut out = content.as_bytes().to_vec();
-    for (start, end) in crate::blade_directive_tokens::blade_comment_spans(content) {
-        for b in &mut out[start..end] {
-            if *b != b'\n' {
-                *b = b' ';
-            }
-        }
-    }
-    // Only ASCII bytes are replaced, so this cannot fail; fall back to the
-    // original rather than panicking, matching `blade_var_rename::mask_non_code`.
-    String::from_utf8(out).unwrap_or_else(|_| content.to_string())
 }
 
 /// The text following `@{name}` on `line`, when the directive occurs with a

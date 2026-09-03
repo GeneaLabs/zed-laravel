@@ -37,21 +37,85 @@ lazy_static! {
     /// stops the wider pattern from over-matching.
     static ref DIRECTIVE_RE: Regex = Regex::new(r"@[a-zA-Z_][a-zA-Z0-9_]*").unwrap();
 
-    /// Blade (`{{-- --}}`) and HTML (`<!-- -->`) comment spans. Non-greedy so
-    /// neighbouring comments don't merge into one; `(?s)` lets a comment span
-    /// multiple lines.
-    static ref COMMENT_RE: Regex = Regex::new(r"(?s)\{\{--.*?--\}\}|<!--.*?-->").unwrap();
+    /// Every region Blade does not execute: a Blade comment (`{{-- --}}`), an
+    /// HTML comment (`<!-- -->`), or a `@verbatim … @endverbatim` body.
+    /// Non-greedy so neighbouring regions don't merge into one; `(?s)` lets a
+    /// region span multiple lines.
+    ///
+    /// **Every form requires its terminator** — see [`dead_region_spans`].
+    ///
+    /// The `@verbatim` alternative captures its BODY in group 1, because the
+    /// `@verbatim` and `@endverbatim` directives themselves are live tokens
+    /// that should still highlight. Comments have no such tokens, so their
+    /// whole match is dead.
+    static ref DEAD_REGION_RE: Regex =
+        Regex::new(r"(?s)\{\{--.*?--\}\}|<!--.*?-->|@verbatim(.*?)@endverbatim").unwrap();
 }
 
-/// Byte ranges (`start..end`) of Blade and HTML comments in `content`.
-pub fn blade_comment_spans(content: &str) -> Vec<(usize, usize)> {
-    COMMENT_RE
-        .find_iter(content)
-        .map(|m| (m.start(), m.end()))
+/// Byte ranges (`start..end`) of every region of `content` that Blade does not
+/// execute: Blade comments, HTML comments, and `@verbatim` bodies.
+///
+/// **The crate's one dead-region scanner.** It exists so callers "can never
+/// disagree about which directives exist" — the reason `blade_use_sites`
+/// already gives for sharing this scan (`query_chain/use_aliases.rs`). Before
+/// issue #369 Part A there were three implementations disagreeing on two axes:
+/// whether `<!-- -->` and `@verbatim` count as dead, and what an unterminated
+/// opener does.
+///
+/// # An unterminated opener yields no span
+///
+/// `{{--` with no `--}}`, `<!--` with no `-->`, and `@verbatim` with no
+/// `@endverbatim` all match nothing, so the text stays live.
+///
+/// Laravel is on this side for comments: `CompilesComments::compileComments`
+/// is a single `preg_replace` with `/{{--(.*?)--}}/s`, whose pattern requires
+/// the closing `--}}` and which returns the input unchanged without it. Blade
+/// has no handling for `<!--` at all. The `@verbatim` form follows the same
+/// rule so the three cannot drift apart again.
+///
+/// Masking to end of input instead — which two of the three old maskers did —
+/// is a regression wider than the bug it fixes: one stray `<!--` inside a
+/// `<script>` blanks every directive below it for the rest of the file.
+///
+/// # HTML comments are treated as dead by choice
+///
+/// Blade genuinely compiles a directive inside `<!-- -->`, because the
+/// compiler is a text transform with no HTML awareness. Treating them as dead
+/// is this repo's settled decision (issue #369 Part A records it), made once
+/// here rather than separately at each call site.
+pub fn dead_region_spans(content: &str) -> Vec<(usize, usize)> {
+    DEAD_REGION_RE
+        .captures_iter(content)
+        .map(|c| {
+            // Group 1 is present only for `@verbatim`, where the dead region
+            // is the body between the directives rather than the whole match.
+            let m = c
+                .get(1)
+                .unwrap_or_else(|| c.get(0).expect("group 0 always matches"));
+            (m.start(), m.end())
+        })
         .collect()
 }
 
-/// Whether byte offset `pos` falls inside any of the given comment spans.
+/// `content` with every [`dead_region_spans`] region blanked to spaces.
+/// Newlines are kept, so byte offsets, line numbers and columns are all
+/// unchanged and a caller can scan the masked copy and report positions
+/// against the original.
+pub fn blank_dead_regions(content: &str) -> String {
+    let mut out = content.as_bytes().to_vec();
+    for (start, end) in dead_region_spans(content) {
+        for b in &mut out[start..end] {
+            if *b != b'\n' {
+                *b = b' ';
+            }
+        }
+    }
+    // Only non-newline bytes are replaced, and only with ASCII spaces, so this
+    // cannot fail. Fall back to the original rather than panicking.
+    String::from_utf8(out).unwrap_or_else(|_| content.to_string())
+}
+
+/// Whether byte offset `pos` falls inside any of the given dead-region spans.
 fn in_comment(pos: usize, spans: &[(usize, usize)]) -> bool {
     spans.iter().any(|&(start, end)| pos >= start && pos < end)
 }
@@ -86,7 +150,7 @@ fn is_attribute_binding(content: &str, word_end: usize) -> bool {
 /// triples. A `@word` is included only when it is not inside a comment and its
 /// name is present in `known` (which must already be lowercased).
 pub fn directive_token_positions(content: &str, known: &HashSet<String>) -> Vec<(u32, u32, u32)> {
-    let comment_spans = blade_comment_spans(content);
+    let comment_spans = dead_region_spans(content);
 
     // Byte offset of each line start, for mapping a match offset to line/column.
     let mut line_starts: Vec<usize> = vec![0];
