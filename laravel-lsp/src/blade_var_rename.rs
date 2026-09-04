@@ -112,46 +112,19 @@ pub fn variable_spans(source: &str, name: &str) -> Vec<VarSpan> {
     spans
 }
 
-/// Replace the bytes of Blade comments and `@verbatim` regions with spaces,
-/// preserving newlines and overall length so that byte offsets — and hence
-/// line/column positions — are unchanged. Variable scanning runs over the
-/// masked copy so a `$foo` inside `{{-- $foo --}}` is never rewritten.
+/// Blank every region Blade does not execute — Blade comments, HTML comments
+/// and `@verbatim` bodies — preserving newlines and overall length so byte
+/// offsets, and hence line/column positions, are unchanged. Variable scanning
+/// runs over the masked copy so a `$foo` inside `{{-- $foo --}}` is never
+/// rewritten.
+///
+/// Delegates to the crate's single dead-region scanner (issue #369 Part A).
+/// This used to hand-roll its own, and differed from the other two on two
+/// axes: it ignored `<!-- -->`, and it masked an unterminated opener to end of
+/// file. Both are now settled in one place —
+/// [`crate::blade_directive_tokens::dead_region_spans`] documents why.
 fn mask_non_code(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut out: Vec<u8> = bytes.to_vec();
-
-    // Blade comments: `{{-- … --}}` (may span lines, non-nesting).
-    mask_delimited(source, &mut out, "{{--", "--}}");
-    // `@verbatim … @endverbatim`: Blade emits the body literally, so any
-    // `$foo` inside is template text, not a live variable.
-    mask_delimited(source, &mut out, "@verbatim", "@endverbatim");
-
-    // `out` only ever had non-newline bytes replaced with spaces, so it
-    // remains valid UTF-8 (we never split a multi-byte char: the delimiters
-    // are ASCII and we blank ASCII-or-continuation bytes uniformly to b' '
-    // only between ASCII delimiters — see the guard in `mask_delimited`).
-    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
-}
-
-/// Blank (replace with spaces, keeping `\n`) every region of `source` from an
-/// `open` delimiter to the next `close` delimiter, inclusive. Operates on the
-/// shared `out` buffer in place.
-fn mask_delimited(source: &str, out: &mut [u8], open: &str, close: &str) {
-    let mut search_from = 0;
-    while let Some(rel) = source[search_from..].find(open) {
-        let start = search_from + rel;
-        let after_open = start + open.len();
-        let end = match source[after_open..].find(close) {
-            Some(rel_end) => after_open + rel_end + close.len(),
-            None => source.len(), // unclosed: mask to end of file
-        };
-        for b in out.iter_mut().take(end).skip(start) {
-            if *b != b'\n' {
-                *b = b' ';
-            }
-        }
-        search_from = end;
-    }
+    crate::blade_directive_tokens::blank_dead_regions(source)
 }
 
 /// True if `name` surfaces as a Blade *template* variable — at least one
@@ -193,14 +166,10 @@ pub fn is_template_variable(source: &str, name: &str) -> bool {
 /// to tell a real Blade variable (surfaces in markup) from a PHP-block-only
 /// local. Length/newlines are preserved, like [`mask_non_code`].
 fn mask_non_template(source: &str) -> String {
-    // Stage 1: blank comments + verbatim (these genuinely extend to EOF when
-    // unclosed, matching `mask_non_code`).
-    let stage1 = {
-        let mut out: Vec<u8> = source.as_bytes().to_vec();
-        mask_delimited(source, &mut out, "{{--", "--}}");
-        mask_delimited(source, &mut out, "@verbatim", "@endverbatim");
-        String::from_utf8(out).unwrap_or_else(|_| source.to_string())
-    };
+    // Stage 1: blank every dead region, through the shared scanner. An
+    // unterminated opener blanks nothing (issue #369 Part A) — masking to EOF
+    // here would reject every later variable as out-of-context.
+    let stage1 = mask_non_code(source);
     // Stage 2: blank closed `@php … @endphp` blocks, searching the
     // comment-masked text so a `@php` token inside a comment can't anchor a
     // spurious block.

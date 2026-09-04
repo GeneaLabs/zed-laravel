@@ -889,6 +889,15 @@ fn front_matter_window(content: &str) -> &str {
 /// Line-granular by design: a binding and a use on the same line count as
 /// in scope (`@foreach ($users as $user)` — cursor on `$user`).
 pub fn is_template_local_binding(content: &str, line: u32, var: &str) -> bool {
+    // Blade (`{{-- --}}`) and HTML (`<!-- -->`) comments never execute, so a
+    // directive inside one binds nothing — a commented-out `@foreach` is the
+    // routine debugging move, and without this it would shadow its loop
+    // variable for the rest of the file (a single-line comment leaves no
+    // `@endforeach` to pop). Blanked rather than removed so line numbers
+    // stay stable. A directive in ordinary prose is deliberately still
+    // honored: Blade genuinely compiles those (that is what `@@` escaping
+    // is for), so #351's third shape is out of scope here by design.
+    let content = crate::blade_directive_tokens::blank_dead_regions(content);
     let mut loop_stack: Vec<Vec<String>> = Vec::new();
     let mut for_stack: Vec<Vec<String>> = Vec::new();
     let mut persistent: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -989,7 +998,10 @@ fn find_directive<'a>(line: &'a str, name: &str) -> Option<&'a str> {
             .chars()
             .next()
             .is_none_or(|c| !c.is_alphanumeric() && c != '_');
-        if boundary {
+        // `@@foreach` renders the literal text `@foreach` and executes
+        // nothing, so an escaped directive binds no variables.
+        let escaped = crate::blade_directive_tokens::is_escaped_directive(line, at);
+        if boundary && !escaped {
             return Some(&line[after..]);
         }
         from = after;

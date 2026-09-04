@@ -1064,3 +1064,170 @@ fn absolute_parent_segments_cannot_escape_via_the_v4_branch() {
         "absolute parent segments must not re-root the V4 component search"
     );
 }
+
+// ---- comments never execute, so they bind nothing (issue #351 item 2) -----
+
+#[test]
+fn commented_out_foreach_binds_nothing() {
+    // Commenting out a loop while debugging is routine — a single-line
+    // Blade comment leaves no @endforeach, so without comment-blanking the
+    // variable stayed "shadowed" for the rest of the file and a real class
+    // property stopped navigating.
+    let content = "\
+{{-- @foreach ($rows as $row) --}}
+<span>{{ $row }}</span>";
+    assert!(!is_template_local_binding(content, 1, "row"));
+}
+
+#[test]
+fn multiline_blade_comment_blanks_its_whole_body() {
+    // Asserts at line 2, INSIDE the comment body. Line 5 cannot discriminate:
+    // the commented `@foreach`/`@endforeach` are a symmetric pair, so even
+    // the unfixed substring scan pushes and pops `loop_stack` and is empty
+    // again by then. Line 2 sits between the push and the pop, which is the
+    // only place the bug is observable.
+    let content = "\
+{{--
+@foreach ($rows as $row)
+    {{ $row }}
+@endforeach
+--}}
+<span>{{ $row }}</span>";
+    assert!(!is_template_local_binding(content, 2, "row"));
+    assert!(!is_template_local_binding(content, 5, "row"));
+}
+
+#[test]
+fn html_comment_does_not_open_a_php_block() {
+    // `<!-- @php -->` used to open a block that never closes, so every
+    // later `$name = …` line registered as a local.
+    //
+    // The assertion is on `x` at line 2, not `total` at line 1. The line-1
+    // form could not fail: the scan breaks at `idx == line`, so line 2 is
+    // never visited, and `{{ $total }}` is a read rather than an assignment
+    // so `collect_assignments` would not add it either way. `x` on line 3 is
+    // assignment-shaped, and line 2 is far enough in for the phantom block
+    // to have swallowed it.
+    let content = "\
+<!-- @php -->
+<span>{{ $total }}</span>
+{{ $x = 'not php, just an echo of an assignment' }}";
+    assert!(!is_template_local_binding(content, 2, "x"));
+}
+
+#[test]
+fn uncommented_directives_still_bind_next_to_commented_ones() {
+    // The two loops bind DIFFERENT names on purpose. Sharing one name makes
+    // the assertion pass whichever loop supplied the binding, so it could not
+    // tell over-blanking from correct behaviour.
+    let content = "\
+{{-- @foreach ($old as $stale) --}}
+@foreach ($rows as $live)
+    {{ $live }}
+@endforeach";
+    assert!(
+        is_template_local_binding(content, 2, "live"),
+        "the live loop must still bind"
+    );
+    assert!(
+        !is_template_local_binding(content, 2, "stale"),
+        "the commented loop must not"
+    );
+}
+
+#[test]
+fn an_unterminated_comment_opener_blanks_nothing() {
+    // Blade requires the closer: `CompilesComments::compileComments` is
+    // `preg_replace('/{{--(.*?)--}}/s', '', $value)`, which returns the input
+    // unchanged when `--}}` is absent, and Blade never handles `<!--` at all.
+    // Blanking to end of input instead would be a regression wider than the
+    // bug this fixes — one stray `<!--` in a `<script>` would unbind every
+    // directive below it.
+    let content = "\
+<script>
+<!--
+  var x = 'a typo, the closer was deleted';
+</script>
+@foreach ($users as $user)
+    {{ $user }}
+@endforeach";
+    assert!(
+        is_template_local_binding(content, 5, "user"),
+        "an unterminated <!-- must not swallow the live loop below it"
+    );
+
+    let blade = "\
+{{-- @foreach ($rows as $orphan)
+@foreach ($rows as $real)
+    {{ $real }}
+@endforeach";
+    assert!(
+        is_template_local_binding(blade, 2, "real"),
+        "an unterminated {{-- must not swallow the live loop below it"
+    );
+}
+
+#[test]
+fn a_directive_inside_verbatim_binds_nothing() {
+    // Issue #369 A1. Blade emits a `@verbatim` body literally and compiles
+    // nothing inside it, so a `@foreach` there binds no loop variable. Unlike
+    // the HTML-comment case this is not a judgement call — Blade genuinely
+    // does not execute the body.
+    let content = "\
+@verbatim
+@foreach ($rows as $row)
+@endverbatim
+<span>{{ $row }}</span>";
+    assert!(
+        !is_template_local_binding(content, 3, "row"),
+        "a @foreach inside @verbatim must not shadow $row below it"
+    );
+    assert!(
+        !is_template_local_binding(content, 1, "row"),
+        "nor inside the body itself"
+    );
+}
+
+#[test]
+fn an_unterminated_verbatim_binds_normally() {
+    // Same terminator rule as the comment forms: without `@endverbatim` the
+    // region is not dead, so the live loop below it still binds.
+    let content = "\
+@verbatim
+@foreach ($rows as $row)
+    {{ $row }}
+@endforeach";
+    assert!(
+        is_template_local_binding(content, 2, "row"),
+        "an unterminated @verbatim must not swallow the loop below it"
+    );
+}
+
+#[test]
+fn an_escaped_directive_binds_nothing() {
+    // `@@foreach` renders the literal text `@foreach` and runs no loop, so it
+    // binds no loop variable. Same class as the comment and @verbatim cases:
+    // Blade does not execute it.
+    let live = "@foreach ($rows as $row)\n{{ $row }}";
+    let escaped = "@@foreach ($rows as $row)\n{{ $row }}";
+    assert!(
+        is_template_local_binding(live, 1, "row"),
+        "fixture check — the live loop must bind"
+    );
+    assert!(
+        !is_template_local_binding(escaped, 1, "row"),
+        "the escaped one must not"
+    );
+
+    // Same for the file-wide @props form.
+    assert!(is_template_local_binding(
+        "@props(['fake'])\n{{ $fake }}",
+        1,
+        "fake"
+    ));
+    assert!(!is_template_local_binding(
+        "@@props(['fake'])\n{{ $fake }}",
+        1,
+        "fake"
+    ));
+}

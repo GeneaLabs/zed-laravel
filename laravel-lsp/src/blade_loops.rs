@@ -359,6 +359,15 @@ pub fn find_loop_blocks(content: &str) -> Vec<BladeLoopBlock> {
             let Some(directive) = caps.get(1) else {
                 continue;
             };
+            // `@@foreach` renders the literal text and runs no loop, so it
+            // opens no block — and the body below it is therefore not loop
+            // scoped, exactly as for a commented-out header.
+            if crate::blade_directive_tokens::is_escaped_directive(
+                line,
+                caps.get(0).expect("group 0 always matches").start(),
+            ) {
+                continue;
+            }
             // The opening paren is the final byte of the whole match; the
             // argument list may continue onto following lines.
             let open = caps.get(0).unwrap().end() - 1;
@@ -385,6 +394,14 @@ pub fn find_loop_blocks(content: &str) -> Vec<BladeLoopBlock> {
         }
 
         for caps in LOOP_END_RE.captures_iter(line) {
+            // `@@endforeach` is literal text too, so it must not close a live
+            // block — otherwise an escaped closer would end a real loop early.
+            if crate::blade_directive_tokens::is_escaped_directive(
+                line,
+                caps.get(0).expect("group 0 always matches").start(),
+            ) {
+                continue;
+            }
             let end_directive = caps.get(1).map(|m| m.as_str()).unwrap_or("");
 
             let expected_type = match end_directive {
@@ -437,6 +454,13 @@ pub fn unbalanced_loop_head_lines(content: &str) -> Vec<usize> {
     let mut out = Vec::new();
     for line_idx in 0..lines.len() {
         for caps in LOOP_HEAD_RE.captures_iter(lines[line_idx]) {
+            // An escaped head is literal text; it cannot be "unbalanced".
+            if crate::blade_directive_tokens::is_escaped_directive(
+                lines[line_idx],
+                caps.get(0).expect("group 0 always matches").start(),
+            ) {
+                continue;
+            }
             let open = caps.get(0).unwrap().end() - 1;
             if balanced_directive_arguments(&lines, line_idx, open).is_none() {
                 out.push(line_idx);
@@ -633,6 +657,58 @@ mod tests {
             parse_foreach_variables(&args),
             vec![("user".to_string(), "mixed".to_string())],
             "the binding survives a `)` buried in a multi-line block comment"
+        );
+    }
+}
+
+// ---- Blade's `@@` escape: literal text opens and closes nothing ----------
+
+#[cfg(test)]
+mod escape_tests {
+    use super::*;
+
+    #[test]
+    fn an_escaped_head_opens_no_block() {
+        // `@@foreach` renders the literal text `@foreach (...)` and runs no
+        // loop, so nothing below it is loop scoped.
+        assert_eq!(
+            find_loop_blocks("@foreach ($rows as $row)\n{{ $row }}\n@endforeach").len(),
+            1,
+            "fixture check — the live head must open a block"
+        );
+        assert!(
+            find_loop_blocks("@@foreach ($rows as $row)\n{{ $row }}\n@endforeach").is_empty(),
+            "the escaped head must open none"
+        );
+    }
+
+    #[test]
+    fn an_escaped_closer_does_not_end_a_live_loop() {
+        // The dangerous direction: if `@@endforeach` closed the block, the
+        // real loop would end two lines early and `$row` would fall out of
+        // scope while still inside the loop body.
+        let blocks =
+            find_loop_blocks("@foreach ($rows as $row)\n@@endforeach\n{{ $row }}\n@endforeach");
+        assert_eq!(blocks.len(), 1, "one block, not one truncated by the text");
+        assert_eq!(
+            blocks[0].end_line,
+            Some(3),
+            "it must close on the REAL @endforeach at line 3, not the escaped one at line 1"
+        );
+    }
+
+    #[test]
+    fn an_escaped_head_is_never_reported_unbalanced() {
+        // An unbalanced head makes `in_scope_spans` refuse the rename outright
+        // (fail-closed). Literal text must not be able to trigger that.
+        assert_eq!(
+            unbalanced_loop_head_lines("@foreach ($rows as $row\n{{ $row }}"),
+            vec![0],
+            "fixture check — a genuinely broken head is still reported"
+        );
+        assert!(
+            unbalanced_loop_head_lines("@@foreach ($rows as $row\n{{ $row }}").is_empty(),
+            "an escaped head is literal text and cannot be unbalanced"
         );
     }
 }

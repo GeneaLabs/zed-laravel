@@ -1040,3 +1040,36 @@ return view('dash')->with(['count' => 3]);";
     // expansion updates the test deliberately.
     assert!(binding.is_none());
 }
+
+// ---- the shared dead-region scanner changed two things here (#369 A5) ----
+
+#[test]
+fn variable_spans_skip_html_comments() {
+    // New with the consolidation: this masker ignored `<!-- -->` entirely,
+    // while the crate's other two treated it as dead. The repo's settled
+    // choice is dead, so a `$foo` inside one is not a rename site.
+    let src = "{{ $foo }}\n<!-- $foo is hidden -->\n{{ $foo }}";
+    let spans = variable_spans(src, "foo");
+    assert_eq!(spans.len(), 2, "the commented $foo must be ignored");
+    assert_eq!(spans[0].line, 0);
+    assert_eq!(
+        spans[1].line, 2,
+        "the span after the comment, not inside it"
+    );
+}
+
+#[test]
+fn an_unterminated_comment_does_not_blank_the_rest_of_the_file() {
+    // Changed with the consolidation: this masker used to blank to end of
+    // file, so one stray opener made every later variable un-renameable.
+    // Blade requires the closer, so the text below stays live.
+    let spans = variable_spans("<!-- typo, closer deleted\n$foo\n", "foo");
+    assert_eq!(
+        spans.len(),
+        1,
+        "the $foo below an unterminated opener is still a rename site"
+    );
+
+    let blade = variable_spans("{{-- typo, closer deleted\n$foo\n", "foo");
+    assert_eq!(blade.len(), 1, "same for an unterminated Blade comment");
+}

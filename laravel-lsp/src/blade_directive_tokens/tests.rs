@@ -64,7 +64,7 @@ fn matches_directive_names_case_insensitively() {
 
 #[test]
 fn comment_spans_cover_blade_and_html() {
-    let spans = blade_comment_spans("a {{-- x --}} b <!-- y --> c");
+    let spans = dead_region_spans("a {{-- x --}} b <!-- y --> c");
     assert_eq!(spans.len(), 2);
 }
 
@@ -115,5 +115,116 @@ fn skips_alpine_event_bindings(/* issue #61 */) {
         positions,
         vec![(0, 22, 3)],
         "only the @if directive survives"
+    );
+}
+
+// ---- one dead-region scanner for the whole crate (issue #369 Part A) ------
+
+#[test]
+fn a_verbatim_body_is_dead_but_its_own_directives_are_not() {
+    // Blade emits a `@verbatim` body literally and compiles nothing inside it,
+    // so a directive there must not tokenise. The `@verbatim` and
+    // `@endverbatim` directives themselves ARE compiled and must still light
+    // up — which is why the span is the body, not the whole match.
+    let set = known(&["verbatim", "endverbatim", "csrf"]);
+    let positions = directive_token_positions("@verbatim @csrf @endverbatim", &set);
+    let columns: Vec<u32> = positions.iter().map(|(_, col, _)| *col).collect();
+    assert_eq!(
+        columns,
+        vec![0, 16],
+        "only @verbatim (col 0) and @endverbatim (col 16) tokenise; @csrf at col 10 does not"
+    );
+}
+
+#[test]
+fn an_unterminated_opener_yields_no_dead_span() {
+    // Blade requires the closer: `CompilesComments::compileComments` returns
+    // the input unchanged without `--}}`, and Blade never handles `<!--`.
+    // Masking to end of input would blank every directive below one typo.
+    for unterminated in [
+        "{{-- never closed @csrf",
+        "<!-- never closed @csrf",
+        "@verbatim never closed @csrf",
+    ] {
+        assert!(
+            dead_region_spans(unterminated).is_empty(),
+            "no span for {unterminated:?}"
+        );
+    }
+
+    let set = known(&["csrf"]);
+    assert_eq!(
+        directive_token_positions("<!-- typo, closer deleted\n@csrf", &set).len(),
+        1,
+        "a directive below an unterminated opener still tokenises"
+    );
+}
+
+#[test]
+fn blanking_preserves_offsets_and_newlines() {
+    // Every caller scans the masked copy and reports positions against the
+    // original, so length and newline positions must be identical.
+    let source = "a{{-- x\ny --}}b\n@verbatim\n$foo\n@endverbatim\n";
+    let masked = blank_dead_regions(source);
+    assert_eq!(masked.len(), source.len(), "byte length must not change");
+    assert_eq!(
+        masked.match_indices('\n').collect::<Vec<_>>(),
+        source.match_indices('\n').collect::<Vec<_>>(),
+        "newline positions must not change"
+    );
+    assert!(!masked.contains("$foo"), "the verbatim body is blanked");
+    assert!(masked.contains("@verbatim"), "its own directives are not");
+}
+
+// ---- `@@` escaping: Blade renders the text and compiles nothing -----------
+
+#[test]
+fn an_escaped_directive_is_not_a_token() {
+    // `BladeCompiler::compileStatement` starts `if (str_contains($match[1],
+    // '@'))` and replaces the match with its own text, so `@@csrf` renders the
+    // literal `@csrf` and executes nothing.
+    let set = known(&["csrf"]);
+    assert_eq!(
+        directive_token_positions("@csrf", &set),
+        vec![(0, 0, 5)],
+        "the live directive still tokenises"
+    );
+    assert!(
+        directive_token_positions("@@csrf", &set).is_empty(),
+        "the escaped one does not"
+    );
+    // Three or more behave the same way: `\B` makes the match start at the
+    // second `@`, group 1 is `@csrf`, and it is emitted literally. There is no
+    // parity rule — two or more `@` never execute.
+    assert!(
+        directive_token_positions("@@@csrf", &set).is_empty(),
+        "and neither does a longer run"
+    );
+}
+
+#[test]
+fn an_escaped_verbatim_opens_no_dead_region() {
+    assert_eq!(
+        dead_region_spans("@verbatim $x @endverbatim").len(),
+        1,
+        "a live @verbatim still marks its body dead"
+    );
+    assert!(
+        dead_region_spans("@@verbatim $x @endverbatim").is_empty(),
+        "an escaped one renders as text and opens nothing"
+    );
+}
+
+#[test]
+fn is_escaped_directive_reads_the_preceding_byte_only() {
+    assert!(
+        !is_escaped_directive("@csrf", 0),
+        "nothing precedes offset 0"
+    );
+    assert!(is_escaped_directive("@@csrf", 1));
+    assert!(is_escaped_directive("@@@csrf", 2));
+    assert!(
+        !is_escaped_directive("a@csrf", 1),
+        "an ordinary character before the @ is not an escape"
     );
 }

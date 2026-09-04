@@ -585,3 +585,21 @@ fn a_use_of_an_absent_trait_is_ignored() {
         .collect();
     assert_eq!(properties, vec!["own".to_string()]);
 }
+
+#[test]
+fn static_property_excluded_in_either_modifier_order() {
+    // PHP accepts both orders; a shared flag let `static public` through
+    // because the visibility modifier was visited second and reset it.
+    let source = r#"<?php
+class Page {
+    public static string $canonical = '';
+    static public string $reversed = '';
+    public string $kept = '';
+}
+"#;
+    let names: Vec<String> = public_property_types(source)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(names, vec!["kept".to_string()], "got {names:?}");
+}

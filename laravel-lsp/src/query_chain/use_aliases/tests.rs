@@ -475,3 +475,18 @@ fn blade_use_site_keeps_raw_text_while_import_is_normalised() {
         "raw span is verbatim source"
     );
 }
+
+#[test]
+fn an_escaped_use_declares_no_alias() {
+    // `@@use('App\Models\Flight')` renders the literal text `@use(...)` and
+    // compiles nothing, so it registers no alias for chain resolution.
+    assert_eq!(
+        blade_use_aliases(r"@use('App\Models\Flight')").len(),
+        1,
+        "fixture check — the live @use must register"
+    );
+    assert!(
+        blade_use_aliases(r"@@use('App\Models\Flight')").is_empty(),
+        "the escaped one must not"
+    );
+}
